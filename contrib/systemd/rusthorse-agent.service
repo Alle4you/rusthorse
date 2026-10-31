@@ -1,0 +1,31 @@
+# Rusthorse agent as a systemd user service.
+#
+# Install:
+#   install -Dm644 contrib/systemd/rusthorse-agent.service \
+#       ~/.config/systemd/user/rusthorse-agent.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rusthorse-agent
+#
+# The agent must be started by systemd, not from a shell that an AI agent
+# controls: see docs/threat-model.md ("Who starts the agent").
+#
+# Approved commands run as children of this service, so hardening options here
+# (PrivateTmp=, NoNewPrivileges=, ProtectHome=, ...) would also apply to them
+# and break ordinary commands such as `sudo` or tools that use /tmp. They are
+# deliberately not set; the agent hardens its own process at startup instead.
+
+[Unit]
+Description=Rusthorse secrets agent
+Documentation=https://github.com/Alle4you/rusthorse/blob/main/docs/installation.md
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/rusthorse agent
+Restart=on-failure
+RestartSec=2
+LimitCORE=0
+# Stop approved commands together with the agent.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

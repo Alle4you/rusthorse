@@ -1,0 +1,39 @@
+//! Rusthorse: a local secrets vault with an approval-gated agent.
+//!
+//! Secrets live in a KeePass KDBX4 file. A long-running **agent** holds the
+//! unlocked vault and is the only component that ever handles secret values.
+//! Clients (the `rusthorse` CLI, AI coding agents, scripts) talk to the agent
+//! over a Unix socket and can *use* a secret — for example by asking the agent
+//! to run a command with the secret in its environment — only after the human
+//! approves the exact request in a graphical dialog.
+//!
+//! The big picture is in `docs/architecture.md`, the security reasoning in
+//! `docs/threat-model.md` and the wire format in `docs/protocol.md`.
+//!
+//! Module map:
+//!
+//! - [`vault`]: reading and writing the KDBX4 file.
+//! - [`agent`]: the server side; policy, approvals, spawning approved commands.
+//! - [`client`]: the client side of the socket protocol.
+//! - [`protocol`]: request/response types and framing (including fd passing).
+//! - [`ui`]: approval and password dialogs (zenity).
+//! - [`exec`]: program resolution and environment preparation for `run`.
+//! - [`redact`]: streaming removal of secret values from command output.
+//! - [`peer`]: identifying the process on the other end of the socket.
+//! - [`audit`]: the append-only audit log.
+//! - [`import`]: importing secrets from `.env` files and Secret Service.
+//! - [`paths`]: default file locations.
+//! - [`util`]: small shared helpers.
+
+pub mod agent;
+pub mod audit;
+pub mod client;
+pub mod exec;
+pub mod import;
+pub mod paths;
+pub mod peer;
+pub mod protocol;
+pub mod redact;
+pub mod ui;
+pub mod util;
+pub mod vault;
