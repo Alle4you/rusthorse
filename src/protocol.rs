@@ -299,6 +299,22 @@ pub enum Response {
     },
 }
 
+impl Response {
+    /// The response's `type` name, for messages that must not print its
+    /// content (a [`Response::Secret`] holds a secret value).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Response::Ok { .. } => "ok",
+            Response::Status(_) => "status",
+            Response::Entries { .. } => "entries",
+            Response::Entry { .. } => "entry",
+            Response::Secret { .. } => "secret",
+            Response::Exited { .. } => "exited",
+            Response::Error { .. } => "error",
+        }
+    }
+}
+
 /// Answer to [`Request::Status`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusInfo {

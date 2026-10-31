@@ -1,0 +1,119 @@
+# Using Rusthorse with AI agents
+
+Rusthorse was built for one situation in particular: an AI coding agent
+(Claude Code, Codex, Aider, an MCP tool, …) runs commands in your shell and
+needs a credential to do its job. This guide shows how to set that up and how
+to approve requests safely.
+
+## The idea in one picture
+
+```mermaid
+sequenceDiagram
+    participant AI as AI agent
+    participant R as rusthorse run
+    participant A as Rusthorse agent
+    participant You as You
+    AI->>R: rusthorse run GH_TOKEN=github -- gh pr create --fill
+    R->>A: request (+ the shell's stdio)
+    A->>You: Allow "gh pr create --fill" with github → GH_TOKEN?
+    You-->>A: Allow once
+    A->>A: start gh with GH_TOKEN, filter its output
+    A-->>AI: PR URL (any token in the output shows as [REDACTED:github])
+```
+
+The AI composes the command; you decide whether it runs; the secret goes
+from the vault straight into the approved program.
+
+## Setting up an agent
+
+1. Store the secrets the agent will need, with names it can use directly:
+
+   ```sh
+   rusthorse add ANTHROPIC_API_KEY --url https://console.anthropic.com --tag ai
+   rusthorse add github --username me --url https://github.com --tag dev
+   rusthorse add core-router --username admin --url https://10.0.0.1/ --host 10.0.0.1 --tag network
+   ```
+
+2. Tell the agent how to use them. Put this in `CLAUDE.md`, `AGENTS.md` or the
+   equivalent instructions file:
+
+   ```markdown
+   ## Secrets
+   - Secrets are managed by Rusthorse. `rusthorse list --json` shows what
+     exists (names, usernames, URLs, hosts, ports, tags — never values).
+   - To use a secret, run the command through Rusthorse:
+     `rusthorse run NAME -- command args` or `rusthorse run VAR=NAME -- …`.
+     The human approves each use in a dialog.
+   - Never ask the human for a secret value, never print or echo secrets,
+     never write them to files, and never use `rusthorse reveal`.
+   - Exit status 125 means Rusthorse refused or failed: the command did not
+     run. Read the message; if it was denied, stop and ask the human instead of
+     retrying a variation.
+   - To store a new secret, run `rusthorse add NAME [--url …] [--username …]`;
+     the human types the value in a dialog. Do not pipe values into
+     `rusthorse add --stdin`.
+   ```
+
+3. Keep `rusthorse agent` running under systemd (see
+   [installation.md](installation.md)). Never let the AI start the agent.
+
+## Approving requests
+
+The dialog is where your security comes from. Before clicking **Allow**, read
+these lines:
+
+| Line | Ask yourself |
+|---|---|
+| **Command** | Is this what I expected the agent to do right now? Does it send data anywhere (`curl`, `nc`, `ssh`, `git push`)? |
+| **Program** | Is this the real tool (`/usr/bin/gh`), or something in a project or temporary directory? |
+| **Directory** | Is the agent working where I think it is? |
+| **Secrets** | Does this command need *these* secrets? An API key for a model has no business in `git push`. |
+| **Requested by** | Is it the AI's shell, or something unexpected? |
+| **Warnings** | `NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND` and similar can make the program run other code. Deny unless you know why they are set. |
+
+Be especially careful with:
+
+- **Shell one-liners** (`sh -c '…'`, `bash -c '…'`). Everything inside runs
+  with the secret. Read the whole string.
+- **Scripts in the project** (`python deploy.py`, `./run.sh`, `npm run x`).
+  You are approving whatever the file contains *now*, and the AI can edit
+  files. If it just changed the script, look at the change first.
+- **Interpreters with an inline program** (`python -c`, `node -e`).
+- **`--no-redact`**. The output will contain the secret if the program
+  prints it.
+
+**Allow for 10m** is convenient when the agent repeats exactly the same
+command (a test suite that calls an API, for example). It only matches the
+identical command line, program, directory and secrets; anything different
+asks again. Use `rusthorse lock` when you step away.
+
+When something looks wrong, click **Deny**. The command does not run, the AI
+gets exit status 125, and the denial is in `rusthorse audit`.
+
+## What this protects against — and what it does not
+
+Rusthorse is effective against the problems that actually happen with
+cooperative-but-fallible agents:
+
+- the secret never appears in the conversation, the agent's context window,
+  its transcripts or its tool logs;
+- the agent cannot quietly use a credential for something you did not see;
+- output that happens to contain the secret is redacted;
+- there is a record of every use.
+
+It cannot make a malicious agent harmless. An agent that is actively trying
+to steal a secret, and that you keep approving, can get it — for example with
+a command that encodes the secret before printing it, or a script that sends
+it somewhere. Rusthorse makes such attempts visible in the dialog; it does
+not detect them for you. The full list of limits is in the
+[threat model](threat-model.md).
+
+## Tips
+
+- Use separate, narrowly scoped credentials for agents (a fine-grained GitHub
+  token for one repository, a model API key with a spending limit) so that a
+  mistake costs little.
+- Prefer tools that read credentials from environment variables
+  (`GH_TOKEN`, `PGPASSWORD`, `AWS_*`, `OPENAI_API_KEY`) over ones that need
+  them on the command line: command lines are visible to other processes.
+- Review `rusthorse audit` now and then.

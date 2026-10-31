@@ -328,7 +328,7 @@ fn simple(client: &Client, request: &Request) -> anyhow::Result<u8> {
             eprintln!("{message}");
             Ok(0)
         }
-        other => bail!("unexpected response: {other:?}"),
+        other => bail!("unexpected {} response from the agent", other.kind()),
     }
 }
 
@@ -698,7 +698,7 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 eprintln!("rusthorse: {message}");
                 Ok(EXIT_RUN_FAILURE)
             }
-            other => bail!("unexpected response: {other:?}"),
+            other => bail!("unexpected {} response from the agent", other.kind()),
         }
     })();
     match outcome {

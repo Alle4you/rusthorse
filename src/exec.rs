@@ -88,6 +88,26 @@ pub fn prepare_env(client_env: &[(String, String)], secret_vars: &[&str]) -> Pre
     prepared
 }
 
+/// A program found for `run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProgram {
+    /// The path where it was found (may be a symlink, e.g. `.venv/bin/python`).
+    pub found: PathBuf,
+    /// The file that will actually be executed (symlinks resolved).
+    pub canonical: PathBuf,
+}
+
+impl ResolvedProgram {
+    /// `found → canonical`, or just the path when they are the same.
+    pub fn describe(&self) -> String {
+        if self.found == self.canonical {
+            self.canonical.display().to_string()
+        } else {
+            format!("{} → {}", self.found.display(), self.canonical.display())
+        }
+    }
+}
+
 /// Resolve `program` like `execvp` would, but up front, so that the approval
 /// dialog can show the absolute path that will actually be executed.
 ///
@@ -97,14 +117,14 @@ pub fn resolve_program(
     program: &str,
     path_var: Option<&str>,
     cwd: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<ResolvedProgram, String> {
     if program.is_empty() {
         return Err("empty program name".into());
     }
     if program.contains('/') {
         let candidate = cwd.join(program);
         return if is_executable(&candidate) {
-            Ok(canonical(&candidate))
+            Ok(resolved(candidate))
         } else {
             Err(format!("{program}: not an executable file"))
         };
@@ -118,21 +138,21 @@ pub fn resolve_program(
         };
         let candidate = dir.join(program);
         if is_executable(&candidate) {
-            return Ok(canonical(&candidate));
+            return Ok(resolved(candidate));
         }
     }
     Err(format!("{program}: command not found in PATH"))
+}
+
+fn resolved(found: PathBuf) -> ResolvedProgram {
+    let canonical = std::fs::canonicalize(&found).unwrap_or_else(|_| found.clone());
+    ResolvedProgram { found, canonical }
 }
 
 fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// The canonical path (symlinks resolved), so the dialog shows the real file.
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -178,7 +198,7 @@ mod tests {
     fn resolves_through_path_and_relative_names() {
         let sh = resolve_program("sh", Some("/nonexistent:/usr/bin:/bin"), Path::new("/"))
             .expect("sh exists");
-        assert!(sh.is_absolute());
+        assert!(sh.canonical.is_absolute());
         assert!(
             resolve_program(
                 "definitely-not-a-command-xyz",
@@ -193,7 +213,16 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\n").expect("write");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let resolved = resolve_program("./tool.sh", None, dir.path()).expect("relative");
-        assert_eq!(resolved, std::fs::canonicalize(&script).expect("canonical"));
+        assert_eq!(
+            resolved.canonical,
+            std::fs::canonicalize(&script).expect("canonical")
+        );
+
+        // A symlink shows both the link and its target.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&script, &link).expect("symlink");
+        let via_link = resolve_program("./link", None, dir.path()).expect("link");
+        assert!(via_link.describe().contains(" → "));
         // Not executable -> refused.
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert!(resolve_program("./tool.sh", None, dir.path()).is_err());

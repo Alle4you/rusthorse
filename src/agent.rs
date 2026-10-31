@@ -823,7 +823,7 @@ impl Agent {
             summary: "Run this command with the secrets below in its environment?".into(),
             details: vec![
                 ("Command".into(), truncate(&command_line, 600)),
-                ("Program".into(), program.display().to_string()),
+                ("Program".into(), program.describe()),
                 ("Directory".into(), run.cwd.clone()),
                 (
                     "Secrets".into(),
@@ -858,7 +858,7 @@ impl Agent {
             let key = serde_json::to_string(&(
                 &run.bindings,
                 &run.argv,
-                program.display().to_string(),
+                program.canonical.display().to_string(),
                 &run.cwd,
                 run.redact,
                 &env.risky,
@@ -881,7 +881,7 @@ impl Agent {
                 .collect()
         })?;
 
-        let mut command = Command::new(&program);
+        let mut command = Command::new(&program.canonical);
         command
             .arg0(&run.argv[0])
             .args(&run.argv[1..])
@@ -905,7 +905,7 @@ impl Agent {
         let mut child = command.spawn().map_err(|e| {
             Failure::new(
                 ErrorCode::InvalidRequest,
-                format!("cannot start {}: {e}", program.display()),
+                format!("cannot start {}: {e}", program.canonical.display()),
             )
         })?;
         drop(command);

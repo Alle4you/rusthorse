@@ -1,0 +1,187 @@
+# Rusthorse
+
+**A local KeePass vault whose secrets AI agents can use without seeing them.**
+
+[![CI](https://github.com/Alle4you/rusthorse/actions/workflows/ci.yml/badge.svg)](https://github.com/Alle4you/rusthorse/actions/workflows/ci.yml)
+[![License: GPL v3+](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
+Rusthorse stores your passwords, API keys and access details (URL, host/IP,
+port, username) in a standard KeePass KDBX4 file. A small background agent
+holds the unlocked vault. When a program — or an AI coding agent such as
+Claude Code or Codex — needs a secret, it asks the agent; **you approve the
+exact request in a dialog**, and the agent runs the command with the secret in
+its environment and scrubs the value from the output. The caller gets the
+result, never the secret.
+
+```console
+$ rusthorse add OPENAI_API_KEY --url https://api.openai.com --tag ai
+OPENAI_API_KEY added                       # you typed the value in a dialog
+
+$ rusthorse run OPENAI_API_KEY -- python summarize.py
+┌ Rusthorse — use a secret ────────────────────────────────────────┐
+│ Run this command with the secrets below in its environment?      │
+│ Command:      python summarize.py                                │
+│ Program:      /home/me/project/.venv/bin/python → /usr/bin/python3.12 │
+│ Directory:    /home/me/project                                   │
+│ Secrets:      OPENAI_API_KEY ← OPENAI_API_KEY                    │
+│ Output:       secret values are redacted                         │
+│ Requested by: rusthorse[8812] ← bash[8790] ← claude[4120]        │
+│                       [ Deny ]  [ Allow for 10m ]  [ Allow once ]│
+└──────────────────────────────────────────────────────────────────┘
+Summary written to out.md
+```
+
+> **Status: early development (0.1.0).** The design and code have had
+> AI-assisted reviews but no independent security audit. Read the
+> [threat model](docs/threat-model.md) before trusting it with anything that
+> matters, and keep a backup of your vault.
+
+## Why
+
+AI coding agents increasingly need credentials: an API key to call a model, a
+token to open a pull request, a password to log into a router. The usual
+options are all bad:
+
+- **Pasting the secret into the chat or a `.env` file** puts it in the model's
+  context, in transcripts, in logs and sometimes in commits.
+- **The desktop keyring** (GNOME Keyring, KWallet) is unlocked for the whole
+  session, and any process running as you — including the agent's shell — can
+  read every secret in it without asking.
+- **Password managers** are built for humans copying and pasting, not for a
+  program that should use a secret without learning it.
+
+Rusthorse puts a human-approved checkpoint between the agent and the secret,
+and keeps the value out of the agent's reach in the common case.
+
+## Features
+
+- **Standard, portable storage.** A KDBX4 file (Argon2id, AES-256) that opens
+  in [KeePassXC](https://keepassxc.org/), KeePassDX, Strongbox and other
+  KeePass clients on any platform. Entries carry a username, URL, host/IP,
+  port, tags, notes and history.
+- **Approval for every use.** Running a command with a secret, revealing a
+  value, editing or deleting an entry all require your approval in a dialog
+  shown by the agent — not in the terminal, where a program could answer.
+- **What you approve is what runs.** The agent itself resolves the program to
+  an absolute path, removes dynamic-loader variables (`LD_PRELOAD`, …), warns
+  about variables that can inject code (`NODE_OPTIONS`, `PYTHONPATH`, …) and
+  starts the command as its own child.
+- **Output redaction.** Secret values printed by the command are replaced with
+  `[REDACTED:<entry>]` before they reach the caller.
+- **The master password never touches the client.** The agent asks for it in
+  its own dialog and locks itself after 15 minutes of inactivity.
+- **Audit log.** Every unlock, approval, denial and command exit is recorded
+  (without values). If the log cannot be written, the request is refused.
+- **Migration.** Import from `.env` files and from GNOME Keyring / KWallet.
+
+## Quick start
+
+Requirements: Linux with a graphical session (X11 or Wayland), `zenity`,
+systemd user services, and Rust 1.89 or newer. Full instructions, including
+uninstalling, are in [docs/installation.md](docs/installation.md).
+
+```sh
+# 1. Build and install the binary into ~/.cargo/bin
+cargo install --locked --git https://github.com/Alle4you/rusthorse
+
+# 2. Start the agent as a systemd user service
+curl -fsSLo ~/.config/systemd/user/rusthorse-agent.service --create-dirs \
+  https://raw.githubusercontent.com/Alle4you/rusthorse/main/contrib/systemd/rusthorse-agent.service
+systemctl --user daemon-reload
+systemctl --user enable --now rusthorse-agent
+
+# 3. Create the vault (choose a strong master password)
+rusthorse init
+
+# 4. Add a secret — the agent asks for the value in a dialog
+rusthorse add GITHUB_TOKEN --url https://github.com --username me --tag dev
+
+# 5. Use it
+rusthorse run GITHUB_TOKEN -- gh repo list
+rusthorse run GH_TOKEN=GITHUB_TOKEN -- gh pr create --fill
+```
+
+## Using it with AI agents
+
+Tell the agent that secrets are available through `rusthorse` and that it must
+never try to read them. For example, in `CLAUDE.md` or `AGENTS.md`:
+
+```markdown
+## Secrets
+- Secrets live in Rusthorse. List what exists with `rusthorse list` (names and
+  metadata only).
+- Use a secret with `rusthorse run NAME -- command` (or `VAR=NAME`); the human
+  approves each use in a dialog. Never ask for or print secret values, never
+  use `rusthorse reveal`, never write secrets to files.
+- If a command is denied, stop and ask the human; do not retry variations.
+```
+
+[docs/ai-agents.md](docs/ai-agents.md) covers patterns, approval hygiene and
+what Rusthorse can and cannot protect against when the requester is an AI.
+
+## Commands
+
+| Command | What it does | Approval |
+|---|---|---|
+| `init` | Create a new vault | — |
+| `agent` | Run the agent (normally via systemd) | — |
+| `status` | Agent and lock state | — |
+| `unlock` / `lock` | Unlock (master password dialog) / lock now | — |
+| `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags | — |
+| `add NAME` | New entry; you type the value in a dialog | the dialog itself |
+| `add NAME --stdin` | New entry with a value from standard input | yes |
+| `edit NAME …` | Change fields, tags, name or value | yes |
+| `remove NAME` | Delete an entry | yes |
+| `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (can be remembered) |
+| `reveal NAME` | Print a value (for humans; avoid in automation) | yes (never remembered) |
+| `import dotenv FILE` | Import `NAME=value` pairs | yes (one for the batch) |
+| `import secret-service -a KEY=VALUE` | Import from GNOME Keyring / KWallet | yes (one for the batch) |
+| `audit` | Show recent audit records | — |
+
+See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
+
+## Security in one paragraph
+
+Rusthorse protects secrets from being **seen** by the programs that use them
+in the common case: values do not appear in the caller's process, output,
+logs or the AI's context, and every use is a decision you make with the exact
+command in front of you. It does **not** make a compromised user account safe:
+malware running as you can replace the binary, read the environment of a
+running approved command, or (on X11) click "Allow" for you. Approving a
+command means trusting everything that command does. The
+[threat model](docs/threat-model.md) lists every assumption and limitation.
+
+## Documentation
+
+- [Installation](docs/installation.md) — build, install, systemd, migration, uninstall
+- [CLI reference](docs/cli.md) — commands, options, environment, exit statuses
+- [Using Rusthorse with AI agents](docs/ai-agents.md)
+- [Architecture](docs/architecture.md) — components, request flow, storage format
+- [Threat model](docs/threat-model.md) — what is protected, what is not, and why
+- [Protocol](docs/protocol.md) — the agent socket protocol, for client authors
+- [Architecture decision records](docs/adr/README.md)
+
+## Roadmap
+
+- SSH agent: SSH keys stored in the vault, each signature approved, private
+  key never leaving the agent.
+- Local API proxy: clients call `http://127.0.0.1:…`, the agent adds the
+  credential header, so the key never enters the client process at all.
+- Browser integration through native messaging.
+- A small GTK interface for browsing and editing entries.
+- Packaged releases (`.deb`, static binaries) with signed checksums.
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md); for
+security issues, follow [SECURITY.md](SECURITY.md) instead of opening a public
+issue.
+
+## License
+
+Copyright © 2026 Alle4you and the Rusthorse contributors.
+
+Rusthorse is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).

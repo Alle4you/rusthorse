@@ -21,7 +21,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use keepass::config::{DatabaseConfig, KdfConfig};
+use keepass::config::{DatabaseConfig, DatabaseVersion, KdfConfig};
 use keepass::db::{EntryId, GroupId, Times, fields};
 use keepass::error::{DatabaseKeyError, DatabaseOpenError, DatabaseSaveError};
 use keepass::{Database, DatabaseKey};
@@ -232,6 +232,14 @@ impl Vault {
     }
 
     fn write_file(&mut self, check_unchanged: bool) -> Result<(), VaultError> {
+        if !matches!(self.db.config.version, DatabaseVersion::KDB4(_)) {
+            return Err(VaultError::Invalid(
+                "this vault uses an older KeePass format (KDBX3 or earlier); Rusthorse can read \
+                 it but only writes KDBX4. Convert it once in KeePassXC (Database → Database \
+                 Settings → Encryption → Database format: KDBX 4) and try again"
+                    .into(),
+            ));
+        }
         if check_unchanged {
             let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
             if current != self.fingerprint {
@@ -505,8 +513,12 @@ impl Vault {
         if let Some(port) = changes.port {
             e.set_unprotected(FIELD_PORT, port.to_string());
         }
-        if let Some(notes) = &changes.notes {
-            e.set_protected(fields::NOTES, notes.as_str());
+        match changes.notes.as_deref() {
+            Some("") => {
+                e.fields.remove(fields::NOTES);
+            }
+            Some(notes) => e.set_protected(fields::NOTES, notes),
+            None => {}
         }
         for tag in &changes.add_tags {
             if !e.tags.contains(tag) {
