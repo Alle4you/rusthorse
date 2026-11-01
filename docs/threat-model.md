@@ -300,7 +300,8 @@ visual manager uses both:
   wrong window (a chat with an AI) is gone. Mitigations: a separate approval
   whose dialog warns of exactly this; the value is delivered to the first
   request only, so a history that reads it uses it up and the human's own
-  paste comes back empty; it is wiped after that delivery, after 20 seconds,
+  paste usually comes back empty (not if that program puts the value back
+  on the clipboard as its own, which Rusthorse cannot see); it is wiped after that delivery, after 20 seconds,
   on lock (including one observed while a dialog waits), on close and at
   shutdown, signals included — before GTK could offer the clipboard to a
   clipboard manager, which declaring nothing storable does not prevent;
@@ -310,7 +311,8 @@ visual manager uses both:
 
 Status polling is not an immediate signal of a lock made elsewhere: the
 manager checks every five seconds, also while a request waits for the
-human, and drops a value that arrives after it saw a lock. `import` reads values in the client
+human, and drops what a waiting request returns after it saw a lock — a
+value, a list, an "unlocked" status read before the lock. `import` reads values in the client
 before sending them to the agent; `add --stdin` sends a value the client
 already has. None of these should be run by an AI agent. Importing also does
 not remove the original copies (for example in GNOME Keyring).
@@ -765,5 +767,17 @@ ready), and what was done:
 | The guide promised that a lock elsewhere is noticed "within five seconds" | **Fixed:** worded as a check every five seconds, also during requests. |
 
 Each fix was reverted in a copy of the tree to see a test fail.
+
+Verification of those fixes (Codex, AI-assisted, 2026-11-01; verdict: not
+ready): the clipboard race, the single delivery and the shutdown wipe were
+confirmed fixed; new findings and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Answers already on their way when a lock was seen could undo it on screen: a refresh's "unlocked" status, processed after a lock seen by a check of the same epoch, restored "Unlocked" and listed again, which made the agent ask for the master password; a pending list put entries back while the window said "Locked" (reproduced; no unlock without the password) | **Fixed:** after a lock is seen during a request, a returned value, list or "unlocked" status is dropped and the status asked again. Two widget tests queue each answer before the lock and check that the agent stays locked and the list empty. |
+| The SIGTERM test passed with the shutdown wipe disconnected | **Fixed:** the program and the widget test share the shutdown wiring (`wipe_at_shutdown`); the widget test copies a value, emits the application's shutdown, and checks the value is gone. The SIGTERM test checks that a signal quits normally. |
+| The guide and the ADR promised that a reader's copy is always noticed, and that an empty paste means another program read the clipboard | **Fixed:** the guarantee is stated as one delivery by Rusthorse's provider (a program can put the value back on the clipboard itself); an empty paste lists its possible causes. |
+
+Each fix was reverted in a copy of the tree to see a test fail (3 of 3).
 
 **Awaiting:** verification of these fixes (Codex).

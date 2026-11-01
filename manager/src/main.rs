@@ -79,6 +79,21 @@ fn watch_signals() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Wipe a shown or copied value when the application shuts down — when its
+/// window closes, when it quits, and when a termination signal makes it quit
+/// — before GTK can offer the clipboard to a clipboard manager.
+pub(crate) fn wipe_at_shutdown(
+    app: &adw::Application,
+    state: &Rc<RefCell<Option<Rc<window::Manager>>>>,
+) {
+    let at_exit = Rc::clone(state);
+    app.connect_shutdown(move |_| {
+        if let Some(manager) = at_exit.borrow().as_ref() {
+            manager.shutdown();
+        }
+    });
+}
+
 fn main() -> std::process::ExitCode {
     // Apply before GTK can hold a revealed value. No child program is started.
     if let Err(e) = rusthorse::agent::harden_process() {
@@ -95,15 +110,7 @@ fn main() -> std::process::ExitCode {
         .build();
     app.connect_startup(|_| load_style());
     let state = Rc::new(RefCell::new(None::<Rc<window::Manager>>));
-    // Wipe a shown or copied value before GTK shuts down — including when a
-    // signal ends the program — so that nothing is left for a clipboard
-    // manager to take at exit.
-    let at_exit = Rc::clone(&state);
-    app.connect_shutdown(move |_| {
-        if let Some(manager) = at_exit.borrow().as_ref() {
-            manager.shutdown();
-        }
-    });
+    wipe_at_shutdown(&app, &state);
     let quitting = app.downgrade();
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if !QUIT.load(Ordering::SeqCst) {

@@ -159,17 +159,26 @@ X11 every program of your session can read it, a clipboard history can keep
 it for ever, a phone link (GSConnect, KDE Connect) can send it to your phone,
 and a value pasted into the wrong window is gone — a chat with an AI sends it
 to the AI's provider. These copies happen in the first second; a timer that
-clears the clipboard later cannot undo them. Serving the value to a single
-paste means that whatever reads it first uses it up: if a program got there
-before you, **your own paste comes back empty, and you notice** instead of
-the value leaking silently.
+clears the clipboard later cannot undo them. Rusthorse therefore delivers
+the value **once**: whatever reads it first uses it up. If a program got
+there before you, your own paste usually comes back empty, and you notice
+instead of the value leaking silently. Not always: a program that took the
+value could put it back on the clipboard as its own (some clipboard tools
+do), and then your paste works; Rusthorse cannot see that.
 
-**If your paste comes back empty**, or the manager says *"Another program
-took the value as soon as it was copied — probably a clipboard history"*,
-some program read the clipboard before you. A clipboard history may now
-keep the value: open it and delete the item, or turn its history off, and
-consider rotating the secret (**New random value**, then update the
-provider). The manager marks the value with `x-kde-passwordManagerHint:
+**If your paste comes back empty**, one of these happened:
+
+- the value had already been wiped — 20 seconds passed, the vault was
+  locked, or you clicked **Clear now**; the bottom line says which;
+- the program you paste into asked twice for one paste and got nothing the
+  second time — copy again;
+- another program read the clipboard before you. If the manager said
+  *"Another program took the value as soon as it was copied — probably a
+  clipboard history"*, that is the likely case.
+
+When another program may have read it, assume a clipboard history keeps the
+value: open it and delete the item, or turn its history off, and consider
+rotating the secret (**New random value**, then update the provider). The manager marks the value with `x-kde-passwordManagerHint:
 secret`, which Klipper, KDE Connect and some other histories honour, but on
 X11 GTK 4 cannot deliver that mark, so on X11 no history is told.
 

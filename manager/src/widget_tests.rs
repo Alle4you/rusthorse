@@ -302,6 +302,9 @@ fn desktop_flow() {
         .build();
     app.register(None::<&gio::Cancellable>).unwrap();
     let s = Manager::new(&app, socket);
+    // The same shutdown wiring as the program's.
+    let state = Rc::new(RefCell::new(Some(Rc::clone(&s))));
+    crate::wipe_at_shutdown(&app, &state);
     s.window.present();
     s.refresh();
     settle(&s);
@@ -623,6 +626,56 @@ fn desktop_flow() {
     );
     assert_eq!(paste(), None);
 
+    // Answers already on their way when a lock is seen do not undo it: a
+    // refresh whose "unlocked" status is queued, then a lock elsewhere seen
+    // by a status check of the same epoch.
+    spin_until(|| s.poll.borrow().is_none());
+    s.refresh();
+    std::thread::sleep(Duration::from_millis(300));
+    let other = rusthorse::client::Client::new(s.socket.clone());
+    assert!(matches!(
+        other.call(&Request::Lock).unwrap(),
+        Response::Ok { .. }
+    ));
+    s.poll_status();
+    std::thread::sleep(Duration::from_millis(300));
+    settle(&s);
+    spin_until(|| s.poll.borrow().is_none());
+    assert_eq!(s.pill.text(), "Locked");
+    assert!(s.entries.borrow().is_empty());
+    let still_locked = |s: &Manager| {
+        matches!(
+            rusthorse::client::Client::new(s.socket.clone()).call(&Request::Status).unwrap(),
+            Response::Status(i) if i.locked
+        )
+    };
+    assert!(
+        still_locked(&s),
+        "a stale status made the manager list again"
+    );
+    // The same with a list on its way.
+    button(&s.window, "Unlock").emit_clicked();
+    settle(&s);
+    spin_until(|| s.job.borrow().is_none() && !s.entries.borrow().is_empty());
+    spin_until(|| s.poll.borrow().is_none());
+    s.submit(Request::List, Pending::List);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(matches!(
+        other.call(&Request::Lock).unwrap(),
+        Response::Ok { .. }
+    ));
+    s.poll_status();
+    std::thread::sleep(Duration::from_millis(300));
+    settle(&s);
+    spin_until(|| s.poll.borrow().is_none());
+    assert_eq!(s.pill.text(), "Locked");
+    assert!(s.entries.borrow().is_empty(), "a stale list came back");
+    assert!(still_locked(&s));
+    button(&s.window, "Unlock").emit_clicked();
+    settle(&s);
+    spin_until(|| s.job.borrow().is_none() && !s.entries.borrow().is_empty());
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+
     // A denied delete does not change the list on the next refresh.
     allowed.store(false, Ordering::SeqCst);
     button(&s.detail, "Delete…").emit_clicked();
@@ -692,6 +745,16 @@ fn desktop_flow() {
     s.window.close();
     assert!(s.closed.get());
     assert!(s.job.borrow().is_none());
+    assert!(s.copied.borrow().is_none());
+    assert_eq!(paste(), None);
+    // So does the application's shutdown, which a termination signal
+    // triggers (tests/signals.rs checks that a signal quits normally).
+    s.put_on_clipboard_for(
+        "Fake copy at shutdown",
+        "FAKE-copy-at-shutdown".to_string().into(),
+        Duration::from_secs(20),
+    );
+    app.emit_by_name::<()>("shutdown", &[]);
     assert!(s.copied.borrow().is_none());
     assert_eq!(paste(), None);
 }

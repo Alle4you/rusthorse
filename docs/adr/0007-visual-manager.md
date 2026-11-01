@@ -138,8 +138,11 @@ therefore built around **one paste**, not around a timer:
 What this does **not** protect against: a program of the session that reads
 the clipboard while the value is there; a history that ignores the hint (on
 X11, all of them) — although such a history uses up the single delivery, so
-the human's own paste comes back empty and the banner says what happened; the
-program the value is pasted into. On Wayland, other programs cannot read the
+the human's own paste usually comes back empty and the banner may say what
+happened, unless the history puts the value back on the clipboard as its own,
+which Rusthorse cannot see; the program the value is pasted into. The
+guarantee is one delivery by Rusthorse's own provider, not the detection of
+every copy. On Wayland, other programs cannot read the
 clipboard without focus unless the compositor offers a data-control protocol
 (wlroots, KDE do), which clipboard managers use.
 

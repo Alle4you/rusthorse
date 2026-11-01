@@ -63,7 +63,8 @@ pub(crate) struct Manager {
     /// `epoch` when the running status check started.
     poll_epoch: Cell<u64>,
     /// A status check saw the vault locked (or the agent gone) while the
-    /// current request was waiting: a value it returns is not used.
+    /// current request was waiting: a value, a list or an "unlocked" status
+    /// it returns is older than that lock and is not used.
     lock_seen: Cell<bool>,
     closed: Cell<bool>,
     filling: Cell<bool>,
@@ -814,6 +815,17 @@ impl Manager {
                     // the vault was locked meanwhile.
                     self.poll_status();
                 }
+            }
+            // An answer that describes the vault as open, read before a lock
+            // this window has since seen, must not undo that lock on screen
+            // (nor list again, which would ask for the password): ask anew.
+            Ok(Response::Status(info)) if self.lock_seen.get() && !info.locked => {
+                drop(info);
+                self.refresh();
+            }
+            Ok(Response::Entries { entries }) if self.lock_seen.get() => {
+                drop(entries);
+                self.refresh();
             }
             Ok(Response::Status(info)) => {
                 let list = matches!(purpose, Pending::Status { list: true });

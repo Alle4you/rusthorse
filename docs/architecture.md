@@ -412,9 +412,11 @@ its own dialog.
   request waits for the human; it never blocks the controls and does not
   postpone the idle lock. A result that predates a request of the human's is
   ignored. A lock it observes clears the entries, a shown value and a copied
-  value, and a value returned afterwards by the waiting request is dropped;
-  an unlock done elsewhere (the CLI) loads the list, which asks nothing
-  because the vault is open.
+  value; answers the waiting request returns afterwards that describe the
+  vault as open — a value, a list, an "unlocked" status read before the
+  lock — are dropped, and the manager asks for the status again. An unlock
+  done elsewhere (the CLI) loads the list, which asks nothing because the
+  vault is open.
 - **Show.** `reveal` with purpose `show`: the value appears in a window of its
   own, not selectable, grouped by four characters when that cannot mislead,
   for at most 30 seconds or until the window loses focus.
