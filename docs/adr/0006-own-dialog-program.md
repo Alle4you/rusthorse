@@ -245,3 +245,12 @@ which the threat model already treats as out of scope.
   is checked by hand, in light and dark themes.
 - **Follow-up**: the same program can later show the grants panel and the
   credential broker's approvals ([roadmap](../roadmap.md)).
+
+## Amendments
+
+- 2026-11-01, first installation: `cargo install` under the default umask
+  of Debian, Ubuntu and Linux Mint (002) makes the program group-writable,
+  which §2 refused, so no dialog could be shown. Group write is accepted when
+  the group is the user's private group — their primary group, named after
+  them, with no other member — as Debian's OpenSSH does for the same reason;
+  any other group-writable or world-writable program is still refused.

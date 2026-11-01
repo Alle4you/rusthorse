@@ -284,7 +284,11 @@ character it names.)
 
 **`rusthorse-dialog`.** The agent looks for it in the directory of its own
 executable only, and uses it if — after resolving links — it is a regular,
-executable file owned by the user or root that nobody else can modify. If
+executable file owned by the user or root that nobody else can modify (group
+write is accepted only when the group is the user's private group: their
+primary group, named after them, with no other member — what Debian, Ubuntu
+and their derivatives give every user, with a umask that makes installed
+files group-writable). If
 the agent's own executable was replaced since it started, it shows no dialog
 until restarted. The program gets one end of a socket pair as standard input
 and output: the agent sends one length-framed JSON request (at most 64 KiB:
