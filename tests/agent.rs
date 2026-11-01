@@ -34,6 +34,9 @@ struct ScriptedUi {
     /// Which master-password dialogs nobody answers, by their index in
     /// `password_prompts`.
     password_timeouts: Mutex<Vec<usize>>,
+    /// Behave like a dialog whose content scrolls (rusthorse-dialog), so the
+    /// agent applies no height limit.
+    scrolls: std::sync::atomic::AtomicBool,
 }
 
 /// `Some(text)` is typed and confirmed; `None` cancels.
@@ -89,6 +92,9 @@ impl Ui for SharedUi {
     }
     fn approve(&self, r: &ApprovalRequest) -> anyhow::Result<Decision> {
         self.0.approve(r)
+    }
+    fn limits_height(&self) -> bool {
+        !self.0.scrolls.load(Ordering::SeqCst)
     }
 }
 
@@ -1750,6 +1756,34 @@ fn a_value_prompt_too_tall_to_read_at_once_is_refused() {
     // No dialog was shown and nothing was stored.
     assert!(h.ui.values.lock().unwrap().is_empty());
     assert!(!text(&h.run(&["list"]).stdout).contains("WIDE"));
+}
+
+#[test]
+fn a_dialog_that_scrolls_takes_what_is_too_tall_for_zenity() {
+    let h = Harness::new();
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    assert!(h.run(&["unlock"]).status.success());
+    // The prompt that zenity could not show is asked.
+    let url = format!("https://{}", "W".repeat(1800));
+    h.ui.values
+        .lock()
+        .unwrap()
+        .push_back(Some("value".to_string()));
+    let out = h.run(&["add", "WIDE", "--url", &url]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // So is an approval taller than zenity allows.
+    h.decide(&[Decision::Deny]);
+    let out = h
+        .cmd(&["run", "WIDE", "--", "true"])
+        .env("GIT_SSH_COMMAND", "\n".repeat(600))
+        .finish();
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        text(&out.stderr).contains("denied"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
 }
 
 #[test]

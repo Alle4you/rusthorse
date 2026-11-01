@@ -254,3 +254,13 @@ which the threat model already treats as out of scope.
   the group is the user's private group — their primary group, named after
   them, with no other member — as Debian's OpenSSH does for the same reason;
   any other group-writable or world-writable program is still refused.
+- 2026-11-01, review round 24: the supervision of §4 now covers the
+  program's whole process group (descendants that keep the socket open are
+  killed with it, and the group is killed before the program is reaped, so
+  its id cannot be reused meanwhile), recalculates the time left before every
+  read and write (an answer sent a byte at a time cannot stretch the
+  deadline), and applies to zenity and to `doctor`'s `--check`, as §4 and §8
+  said. `doctor` relies on the agent's own report of the program it uses.
+  The widget tests cover focus, keyboard approval, the approval gate with a
+  long request, timeouts and the password field; resizing, scaling and
+  accessibility actions are not tested yet ([roadmap](../roadmap.md)).

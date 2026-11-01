@@ -296,8 +296,11 @@ version, a random identifier, the dialog's texts) and closes its sending
 side; the program answers with one frame (at most 8 KiB) carrying the same
 version and identifier, and exits. An approval needs that one well-formed
 answer, end of stream and a clean exit, all within one deadline (the dialog
-timeout plus 5 seconds); after it the agent kills the program and counts the
-dialog as unanswered. Anything else — a crash, a partial, oversized or
+timeout plus 5 seconds), recalculated before every read and write, so that an
+answer sent a byte at a time cannot stretch it; after it the dialog counts as
+unanswered. The program runs in its own process group, which the agent kills
+— descendants that kept the socket open included — before it reaps the
+program, so the group's id cannot have been reused. Anything else — a crash, a partial, oversized or
 contradictory answer, a failure after answering — is an error, never an
 approval. Its environment holds only the session's display, D-Bus and locale
 variables (and the X authority file, resolved before `HOME` changes), with
@@ -313,7 +316,8 @@ Selectable text takes the keyboard focus, so the end can be reached without a
 mouse.
 
 **zenity.** zenity is run from `/usr/bin` (or `/usr/local/bin`), never
-through `PATH`. Text for the entry dialog has backslashes and underscores
+through `PATH`, under the same supervision: its own process group, a deadline
+(its timeout plus 5 seconds), at most 64 KiB of output. Text for the entry dialog has backslashes and underscores
 escaped. The question dialog is laid out with Pango markup — a headline, an
 explanation, one block per detail, the facts in one quieter line, the
 warnings in bold — after `&`, `<`, `>`, quotes and the backslash become

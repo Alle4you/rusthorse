@@ -6,7 +6,6 @@
 //! and no colours or icons of its own, so the dialogs follow the desktop's
 //! theme. Tests use their own [`Ui`] implementation.
 
-use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -173,6 +172,13 @@ pub fn remember_note(label: &str, duration: Duration) -> String {
 const ZENITY_TIMEOUT: i32 = 5;
 
 impl ZenityUi {
+    /// When the agent stops waiting for zenity: its own timeout, plus a grace.
+    fn deadline(&self) -> std::time::Instant {
+        std::time::Instant::now()
+            + self.timeout.max(Duration::from_secs(1))
+            + crate::supervise::GRACE
+    }
+
     fn command(&self, title: &str) -> anyhow::Result<Command> {
         let program = ZENITY_PATHS
             .iter()
@@ -200,7 +206,7 @@ impl ZenityUi {
             .arg("--hide-text")
             .arg(format!("--text={}", entry_label(&prompt_text(prompt))))
             .arg(format!("--ok-label={}", prompt.confirm));
-        let (status, output) = capture_through_socket(cmd)?;
+        let (status, output) = capture_through_socket(cmd, self.deadline())?;
         match status {
             Some(0) => {
                 let mut value = String::from_utf8(output.to_vec())
@@ -218,25 +224,37 @@ impl ZenityUi {
     }
 }
 
-/// Run a dialog program and collect what it prints. Its stdout is one end of
-/// a socket pair, not a pipe: another process of the same user can open a
-/// pipe through `/proc/<pid>/fd/1` and race us for the typed password, but
-/// opening a socket that way fails (`ENXIO`).
+/// Most a dialog program may print.
+const MAX_DIALOG_OUTPUT: usize = 64 * 1024;
+
+/// Run a dialog program and collect what it prints, before `deadline`. Its
+/// stdout is one end of a socket pair, not a pipe: another process of the
+/// same user can open a pipe through `/proc/<pid>/fd/1` and race us for the
+/// typed password, but opening a socket that way fails (`ENXIO`). It runs
+/// under the agent's supervision of helper processes: its own process group,
+/// killed when done. A program that has not finished by the deadline is
+/// reported as zenity reports a timeout.
 pub fn capture_through_socket(
     mut cmd: Command,
+    deadline: std::time::Instant,
 ) -> anyhow::Result<(Option<i32>, Zeroizing<Vec<u8>>)> {
-    let (mut ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
+    use crate::supervise::{Supervised, read_to_end_by};
+    let timed_out = || (Some(ZENITY_TIMEOUT), Zeroizing::new(Vec::new()));
+    let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
     cmd.stdout(Stdio::from(OwnedFd::from(theirs)));
-    let spawned = cmd.spawn();
-    // Dropping the command closes our copy of the child's end, so that
-    // reading below sees end-of-file when the child exits.
-    drop(cmd);
-    let mut child = spawned.context("cannot run the dialog program")?;
-    let mut output = Zeroizing::new(Vec::with_capacity(4096));
-    let read = ours.read_to_end(&mut output);
-    let status = child.wait().context("cannot wait for the dialog program")?;
-    read.context("cannot read the dialog's answer")?;
-    Ok((status.code(), output))
+    let child = Supervised::spawn(cmd).context("cannot run the dialog program")?;
+    let output = match read_to_end_by(&ours, MAX_DIALOG_OUTPUT, deadline) {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(timed_out()),
+        Err(e) => return Err(e).context("cannot read the dialog's answer"),
+    };
+    match child
+        .exit_by(deadline)
+        .context("cannot wait for the dialog program")?
+    {
+        Some(exit) => Ok((exit.code(), output)),
+        None => Ok(timed_out()),
+    }
 }
 
 /// Interpret zenity's answer to a question dialog. Only two exact outcomes
@@ -294,7 +312,7 @@ impl Ui for ZenityUi {
         if offer_remember {
             cmd.arg(format!("--extra-button={remember_label}"));
         }
-        let (status, output) = capture_through_socket(cmd)?;
+        let (status, output) = capture_through_socket(cmd, self.deadline())?;
         let remember = offer_remember.then_some((remember_label.as_str(), self.remember_for));
         Ok(decision_from(status, &output, remember))
     }
@@ -495,6 +513,24 @@ pub fn approval_height(request: &ApprovalRequest) -> usize {
     height
 }
 
+/// With zenity, the height of an approval dialog — counting the "Allow for"
+/// note if it may be offered — when it is too tall to read at once.
+pub fn approval_too_tall(request: &ApprovalRequest) -> Option<usize> {
+    let note = if request.can_remember {
+        REMEMBER_NOTE_HEIGHT
+    } else {
+        0
+    };
+    let height = approval_height(request) + note;
+    (height > metrics::MAX_HEIGHT).then_some(height)
+}
+
+/// With zenity, the height of a prompt when it is too tall to read at once.
+pub fn prompt_too_tall(prompt: &Prompt) -> Option<usize> {
+    let height = prompt_height(&prompt_text(prompt));
+    (height > metrics::MAX_HEIGHT).then_some(height)
+}
+
 /// An estimate, erring high, of the height in pixels of a prompt's message.
 pub fn prompt_height(message: &str) -> usize {
     message
@@ -623,7 +659,8 @@ mod tests {
         std::thread::spawn(move || {
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "readlink /proc/self/fd/1"]);
-            let _ = tx.send(capture_through_socket(cmd).map(|(s, o)| (s, o.to_vec())));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let _ = tx.send(capture_through_socket(cmd, deadline).map(|(s, o)| (s, o.to_vec())));
         });
         let (status, output) = rx
             .recv_timeout(Duration::from_secs(20))
@@ -637,7 +674,34 @@ mod tests {
     #[test]
     fn a_missing_dialog_program_is_an_error() {
         let cmd = Command::new("/nonexistent/zenity");
-        assert!(capture_through_socket(cmd).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(capture_through_socket(cmd, deadline).is_err());
+    }
+
+    #[test]
+    fn a_dialog_program_that_hangs_is_stopped_with_its_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display()),
+        ]);
+        let started = std::time::Instant::now();
+        let (status, output) =
+            capture_through_socket(cmd, started + Duration::from_millis(500)).expect("capture");
+        assert_eq!(status, Some(ZENITY_TIMEOUT));
+        assert!(output.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let descendant: u32 = std::fs::read_to_string(&pidfile)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("number");
+        assert!(
+            crate::supervise::tests::gone(descendant),
+            "a descendant survived"
+        );
     }
 
     #[test]

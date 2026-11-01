@@ -37,9 +37,14 @@ impl Refusal {
     }
 }
 
-/// Read and check the request.
+/// Read and check the request: one frame, then the end of the stream (the
+/// agent closes its side after the request).
 fn read_request(input: &mut impl Read) -> Result<Request, Refusal> {
     let body = wire::read_frame(input, wire::MAX_REQUEST).map_err(|_| Refusal::Invalid)?;
+    let mut extra = [0u8; 1];
+    if !matches!(input.read(&mut extra), Ok(0)) {
+        return Err(Refusal::Invalid);
+    }
     // The version first, from a loose reading, so that a request of another
     // version is told apart from a malformed one.
     let version = serde_json::from_slice::<serde_json::Value>(&body)
@@ -539,6 +544,10 @@ mod tests {
             Err(Refusal::Invalid)
         );
         assert_eq!(read_request(&mut &b"\0\0"[..]), Err(Refusal::Invalid));
+        // Anything after the request.
+        let mut extra = framed(&request());
+        extra.push(b'x');
+        assert_eq!(read_request(&mut extra.as_slice()), Err(Refusal::Invalid));
     }
 
     #[test]

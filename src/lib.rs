@@ -21,6 +21,7 @@
 //! - [`dialog_protocol`]: the protocol between the agent and `rusthorse-dialog`.
 //! - [`exec`]: program resolution and environment preparation for `run`.
 //! - [`redact`]: streaming removal of secret values from command output.
+//! - `supervise`: deadlines and process groups for the helper processes of dialogs.
 //! - [`peer`]: identifying the process on the other end of the socket.
 //! - [`audit`]: the append-only audit log.
 //! - [`generate`]: generating random secret values.
@@ -40,6 +41,7 @@ pub mod paths;
 pub mod peer;
 pub mod protocol;
 pub mod redact;
+mod supervise;
 pub mod ui;
 pub mod util;
 pub mod vault;

@@ -558,8 +558,9 @@ impl Agent {
         // Room is kept for the "Wrong password" or "Nothing was typed" line.
         let base = crate::ui::prompt_text(&prompt_with(None));
         if base.chars().count() > MAX_DIALOG_CHARS - 100
-            || crate::ui::prompt_height(&base) + 3 * crate::ui::metrics::TEXT
-                > crate::ui::metrics::MAX_HEIGHT
+            || (self.ui.limits_height()
+                && crate::ui::prompt_height(&base) + 3 * crate::ui::metrics::TEXT
+                    > crate::ui::metrics::MAX_HEIGHT)
         {
             return Err(Failure::invalid(
                 "the unlock dialog would be too long to show (vault path or requester chain)",
@@ -678,13 +679,9 @@ impl Agent {
         // screen: a value that wraps over many lines must not push the rest
         // out of sight. Rusthorse's own dialog scrolls instead, and keeps
         // Allow disabled until the end has been reached.
-        let height = crate::ui::approval_height(&request)
-            + if request.can_remember {
-                crate::ui::REMEMBER_NOTE_HEIGHT
-            } else {
-                0
-            };
-        if self.ui.limits_height() && height > crate::ui::metrics::MAX_HEIGHT {
+        if let Some(height) = crate::ui::approval_too_tall(&request)
+            && self.ui.limits_height()
+        {
             return Err(Failure::invalid(format!(
                 "this request would make a dialog too tall to read at once (estimated {height} \
                  pixels, limit {}); split it into smaller requests or shorten what it shows",
@@ -747,8 +744,9 @@ impl Agent {
                  limit {MAX_DIALOG_CHARS})"
             )));
         }
-        let height = crate::ui::prompt_height(&text);
-        if height > crate::ui::metrics::MAX_HEIGHT {
+        if let Some(height) = crate::ui::prompt_too_tall(&prompt)
+            && self.ui.limits_height()
+        {
             return Err(Failure::invalid(format!(
                 "this request would make a dialog too tall to read at once (estimated {height} \
                  pixels, limit {})",

@@ -10,17 +10,20 @@
 //! exit, is an error — a denial for the caller.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 
 use crate::dialog_protocol::{self as wire, Answer, Dialog, Remember, Reply, Request};
+use crate::supervise::{
+    Exit, GRACE, Supervised, read_by, read_frame_by, read_to_end_by, write_all_by,
+};
 use crate::ui::{
     ApprovalRequest, Decision, Prompt, Typed, Ui, ZenityUi, dialog_env, dialog_text, remember_note,
 };
@@ -29,10 +32,6 @@ use crate::util::format_duration;
 /// File name of the dialog program, looked for next to the agent's
 /// executable.
 pub const PROGRAM: &str = "rusthorse-dialog";
-
-/// How long past the dialog's own timeout the agent waits before killing the
-/// program.
-const GRACE: Duration = Duration::from_secs(5);
 
 /// The only session variables the program receives.
 const PASSED: [&str; 9] = [
@@ -212,19 +211,6 @@ fn random_hex(bytes: usize) -> io::Result<String> {
     Ok(out)
 }
 
-/// A child process that is killed (if still running) and reaped when
-/// dropped.
-struct Reaped(Child);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
-
 /// How an exchange went wrong.
 enum Broken {
     /// The deadline passed.
@@ -233,37 +219,28 @@ enum Broken {
     Failed(anyhow::Error),
 }
 
-fn remaining(deadline: Instant) -> Result<Duration, Broken> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero())
-        .ok_or(Broken::Deadline)
-}
-
-/// An I/O error, or the deadline if a timed-out call is why.
+/// An I/O error, or the deadline if it is why.
 fn io_broken(e: io::Error, what: &str, deadline: Instant) -> Broken {
-    let timed_out = matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    );
-    if timed_out && Instant::now() >= deadline {
+    if e.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline {
         Broken::Deadline
     } else {
         Broken::Failed(anyhow!("{what}: {e}"))
     }
 }
 
-/// Show one dialog with `program` and return the human's reply. The deadline
-/// covers sending the request, reading the answer and the program's exit;
-/// when it passes, the program is killed and the reply is
-/// [`Reply::TimedOut`]. Any other problem is an error.
+/// Show one dialog with `program` and return the human's reply. One deadline
+/// covers sending the request, reading the answer, the end of the stream and
+/// the program's exit; when it passes before the answer, the reply is
+/// [`Reply::TimedOut`]. Any other problem is an error. In every case the
+/// program's whole process group is killed and the program reaped before
+/// this returns.
 pub fn exchange(
     program: &Path,
     env: &[(String, String)],
     request: &Request,
     deadline: Instant,
 ) -> anyhow::Result<Reply> {
-    let (mut ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
+    let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
     let mut cmd = Command::new(program);
     cmd.current_dir("/")
         .env_clear()
@@ -273,37 +250,31 @@ pub fn exchange(
         )))
         .stdout(Stdio::from(OwnedFd::from(theirs)))
         .stderr(Stdio::null());
-    let spawned = cmd.spawn();
-    // Dropping the command closes our copies of the program's end, so that
-    // its exit is seen as end of stream.
-    drop(cmd);
-    let mut child = Reaped(spawned.with_context(|| format!("cannot run {}", program.display()))?);
-    match talk(&mut ours, &mut child.0, request, deadline) {
+    let child =
+        Supervised::spawn(cmd).with_context(|| format!("cannot run {}", program.display()))?;
+    match talk(&ours, &child, request, deadline) {
         Ok(reply) => Ok(reply),
         Err(Broken::Deadline) => Ok(Reply::TimedOut),
-        Err(Broken::Failed(e)) => Err(explain(&mut child.0, e)),
+        Err(Broken::Failed(e)) => Err(explain(&child, e, deadline)),
     }
 }
 
 fn talk(
-    socket: &mut UnixStream,
-    child: &mut Child,
+    socket: &UnixStream,
+    child: &Supervised,
     request: &Request,
     deadline: Instant,
 ) -> Result<Reply, Broken> {
-    socket
-        .set_write_timeout(Some(remaining(deadline)?))
-        .map_err(|e| Broken::Failed(e.into()))?;
-    wire::write_frame(socket, request, wire::MAX_REQUEST)
+    let mut frame = Vec::new();
+    wire::write_frame(&mut frame, request, wire::MAX_REQUEST)
+        .map_err(|e| Broken::Failed(anyhow!("cannot frame the request: {e}")))?;
+    write_all_by(socket, &frame, deadline)
         .map_err(|e| io_broken(e, "cannot send the request", deadline))?;
     // One request only: the program sees its end.
     socket
         .shutdown(std::net::Shutdown::Write)
         .map_err(|e| Broken::Failed(anyhow!("cannot finish the request: {e}")))?;
-    socket
-        .set_read_timeout(Some(remaining(deadline)?))
-        .map_err(|e| Broken::Failed(e.into()))?;
-    let body = wire::read_frame(socket, wire::MAX_ANSWER)
+    let body = read_frame_by(socket, wire::MAX_ANSWER, deadline)
         .map_err(|e| io_broken(e, "no usable answer", deadline))?;
     let answer: Answer = wire::parse(&body).map_err(|e| Broken::Failed(anyhow!("{e}")))?;
     if answer.version != wire::VERSION || answer.id != request.id {
@@ -318,45 +289,27 @@ fn talk(
         failed => failed,
     };
     // Exactly one frame: then end of stream.
-    socket
-        .set_read_timeout(Some(remaining(deadline).map_err(after)?))
-        .map_err(|e| Broken::Failed(e.into()))?;
     let mut extra = [0u8; 1];
-    match socket.read(&mut extra) {
+    match read_by(socket, &mut extra, deadline) {
         Ok(0) => {}
         Ok(_) => return Err(Broken::Failed(anyhow!("more than one answer"))),
         Err(e) => return Err(after(io_broken(e, "the answer did not end", deadline))),
     }
     // And a clean exit, within the deadline.
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(answer.reply),
-            Ok(Some(status)) => {
-                return Err(Broken::Failed(anyhow!(
-                    "it answered, then failed ({status})"
-                )));
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                return Err(Broken::Failed(anyhow!("it answered, then did not exit")));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(Broken::Failed(e.into())),
-        }
+    match child.exit_by(deadline) {
+        Ok(Some(exit)) if exit.success() => Ok(answer.reply),
+        Ok(Some(exit)) => Err(Broken::Failed(anyhow!("it answered, then failed ({exit})"))),
+        Ok(None) => Err(Broken::Failed(anyhow!("it answered, then did not exit"))),
+        Err(e) => Err(Broken::Failed(e.into())),
     }
 }
 
-/// Add what the program's exit status says to an error, waiting briefly for
-/// it to exit.
-fn explain(child: &mut Child, error: anyhow::Error) -> anyhow::Error {
-    let until = Instant::now() + Duration::from_secs(1);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
-            _ => break None,
-        }
-    };
-    let reason = match status.and_then(|s| s.code()) {
+/// Add what the program's exit status says to an error, waiting for it to
+/// exit at most a second and never past the deadline.
+fn explain(child: &Supervised, error: anyhow::Error, deadline: Instant) -> anyhow::Error {
+    let until = deadline.min(Instant::now() + Duration::from_secs(1));
+    let code = child.exit_by(until).ok().flatten().and_then(Exit::code);
+    let reason = match code {
         Some(wire::EXIT_INCOMPATIBLE) => {
             "it speaks another protocol version: install the same version of rusthorse and \
              rusthorse-dialog, then restart the agent"
@@ -366,6 +319,38 @@ fn explain(child: &mut Child, error: anyhow::Error) -> anyhow::Error {
         _ => error.to_string(),
     };
     anyhow!("the dialog program failed ({reason})")
+}
+
+/// Run `program --check` with an empty environment and return the version
+/// and protocol it reports, within `limit` for everything — its output, the
+/// end of that output and its exit — under the same supervision as dialogs.
+pub fn check_program(program: &Path, limit: Duration) -> anyhow::Result<(String, u32)> {
+    #[derive(serde::Deserialize)]
+    struct Report {
+        version: String,
+        protocol: u32,
+    }
+    let deadline = Instant::now() + limit;
+    let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
+    let mut cmd = Command::new(program);
+    cmd.arg("--check")
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null());
+    let child = Supervised::spawn(cmd)?;
+    let output = read_to_end_by(&ours, 4096, deadline).map_err(|e| match e.kind() {
+        io::ErrorKind::TimedOut => anyhow!("no complete answer to --check within {limit:?}"),
+        _ => anyhow!("cannot read its answer to --check: {e}"),
+    })?;
+    match child.exit_by(deadline)? {
+        Some(exit) if exit.success() => {}
+        Some(exit) => bail!("--check failed ({exit})"),
+        None => bail!("it did not exit within {limit:?}"),
+    }
+    let report: Report = serde_json::from_slice(&output).context("unexpected answer to --check")?;
+    Ok((report.version, report.protocol))
 }
 
 /// The decision an approval reply stands for. `offered` tells whether
@@ -440,7 +425,14 @@ impl DesktopUi {
 
     fn entry(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
         match locate() {
-            Located::Absent(_) => self.zenity().master_password(prompt),
+            Located::Absent(_) => {
+                // The agent checked the height only if it expected zenity:
+                // check again, now that zenity it is.
+                if let Some(height) = crate::ui::prompt_too_tall(prompt) {
+                    bail!("this dialog would be too tall to read at once ({height} pixels)");
+                }
+                self.zenity().master_password(prompt)
+            }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
                 let dialog = Dialog::Entry {
@@ -468,7 +460,14 @@ impl Ui for DesktopUi {
 
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
         match locate() {
-            Located::Absent(_) => self.zenity().approve(request),
+            Located::Absent(_) => {
+                // The agent checked the height only if it expected zenity:
+                // check again, now that zenity it is.
+                if let Some(height) = crate::ui::approval_too_tall(request) {
+                    bail!("this dialog would be too tall to read at once ({height} pixels)");
+                }
+                self.zenity().approve(request)
+            }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
                 let offered = request.can_remember && !self.remember_for.is_zero();
@@ -646,6 +645,92 @@ mod tests {
         let started = Instant::now();
         let reply = run(&program, "abc", Duration::from_secs(1)).expect("reply");
         assert_eq!(reply, Reply::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_trickling_answer_cannot_stretch_the_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answer = frame(&answer("abc", Reply::AllowOnce));
+        let data = dir.path().join("answer.bin");
+        fs::write(&data, &answer).expect("write");
+        let program = dir.path().join(PROGRAM);
+        // One byte every 100 ms: the answer would take seconds.
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n/bin/cat >/dev/null\n\
+                 i=1; while [ $i -le {} ]; do /usr/bin/head -c $i '{}' | /usr/bin/tail -c 1; \
+                 /bin/sleep 0.1; i=$((i+1)); done\n",
+                answer.len(),
+                data.display()
+            ),
+        )
+        .expect("write");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let started = Instant::now();
+        let reply = run(&program, "abc", Duration::from_millis(400)).expect("reply");
+        assert_eq!(reply, Reply::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn descendants_of_the_program_do_not_survive_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let good = frame(&answer("abc", Reply::AllowOnce));
+        // It answers, leaves a descendant holding the socket, and exits.
+        let program = fake(
+            dir.path(),
+            &good,
+            &format!("/bin/sleep 30 & echo $! > '{}'; exit 0", pidfile.display()),
+        );
+        let started = Instant::now();
+        let reply = run(&program, "abc", Duration::from_millis(500));
+        assert!(reply.is_err(), "{reply:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let descendant: u32 = fs::read_to_string(&pidfile)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("number");
+        assert!(
+            crate::supervise::tests::gone(descendant),
+            "a descendant survived"
+        );
+    }
+
+    #[test]
+    fn the_check_run_by_doctor_is_bounded_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join(PROGRAM);
+        let write = |script: &str| {
+            fs::write(&program, script).expect("write");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).expect("chmod");
+        };
+        write("#!/bin/sh\necho '{\"version\":\"9.9\",\"protocol\":1}'\n");
+        let checked = (0..50)
+            .find_map(|_| match check_program(&program, Duration::from_secs(5)) {
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                }
+                other => Some(other),
+            })
+            .expect("ran");
+        assert_eq!(checked.expect("report"), ("9.9".to_string(), 1));
+        // Its output held open by a descendant: no end, a bounded wait.
+        write("#!/bin/sh\necho '{\"version\":\"9.9\",\"protocol\":1}'\n/bin/sleep 30 &\n");
+        let started = Instant::now();
+        let mut result = check_program(&program, Duration::from_millis(500));
+        while matches!(&result, Err(e) if format!("{e:#}").contains("Text file busy")) {
+            result = check_program(&program, Duration::from_millis(500));
+        }
+        assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

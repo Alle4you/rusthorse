@@ -158,3 +158,4 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | Build identifier in `status` and `doctor` | Later | Needs a build script to embed it. |
 | Tests for relay-thread creation failures | Later | Needs a preloaded `pthread_create` shim; verified by review until then. |
 | Dialog layout tests with the real Pango renderer | Idea | Would check the height estimate and drawn extents against real fonts. |
+| Widget tests of `rusthorse-dialog` for resizing, scaling and accessibility actions | Later | Focus, keyboard approval, the approval gate, timeouts and the password field are tested on Xvfb today. |

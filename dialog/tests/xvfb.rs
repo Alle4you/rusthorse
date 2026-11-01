@@ -192,11 +192,11 @@ fn allow_waits_until_the_end_of_a_long_request_has_been_reached() {
     if !tools_present() {
         return;
     }
-    // Too long to fit: Allow is disabled, so the same keys do not approve.
-    let reply = drive(&approval(80, false, 30), "key Tab Return");
-    assert!(
-        !matches!(reply, Some(Reply::AllowOnce | Reply::AllowFor)),
-        "{reply:?}"
+    // Too long to fit: Allow is disabled, so the same keys do not approve,
+    // and the dialog still answers: Escape denies.
+    assert_eq!(
+        drive(&approval(80, false, 30), "key Tab Return; key Escape"),
+        Some(Reply::Deny)
     );
     // Scrolled to the end with the mouse wheel, it can be approved.
     assert_eq!(

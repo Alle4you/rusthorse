@@ -19,8 +19,9 @@ use crate::protocol::SecretString;
 pub const VERSION: u32 = 1;
 /// Largest request frame, in bytes.
 pub const MAX_REQUEST: usize = 64 * 1024;
-/// Largest answer frame, in bytes.
-pub const MAX_ANSWER: usize = 8 * 1024;
+/// Largest answer frame, in bytes: room for [`MAX_TYPED`] bytes of text even
+/// if JSON escapes every one of them as `\u00XX`.
+pub const MAX_ANSWER: usize = 32 * 1024;
 /// Longest text a password or value dialog returns, in bytes.
 pub const MAX_TYPED: usize = 4096;
 /// Exit status of the program for a request of another version.
@@ -364,6 +365,20 @@ mod tests {
         let mut wire = serde_json::to_value(approval()).expect("value");
         wire["dialog"]["remember"]["extra"] = serde_json::json!(1);
         assert!(serde_json::from_value::<Request>(wire).is_err());
+    }
+
+    #[test]
+    fn the_longest_typed_text_fits_an_answer_frame() {
+        // Control characters cost six bytes each in JSON.
+        let answer = Answer {
+            version: VERSION,
+            id: "0123456789abcdef0123456789abcdef".into(),
+            reply: Reply::Typed {
+                text: SecretString::new("\u{1}".repeat(MAX_TYPED)),
+            },
+        };
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &answer, MAX_ANSWER).expect("fits");
     }
 
     #[test]

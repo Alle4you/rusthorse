@@ -1227,76 +1227,61 @@ enum Check {
     Fail(String),
 }
 
-/// The dialog program the agent uses, checked as the agent checks it and by
-/// running `rusthorse-dialog --check`, which opens no window.
-fn dialog_check(agent_executable: &str) -> Check {
-    use rusthorse::dialog_program::{Located, PROGRAM, locate_in};
-    let exe = agent_executable.trim_end_matches(" (deleted)");
-    let Some(dir) = std::path::Path::new(exe)
-        .parent()
-        .filter(|_| !exe.is_empty())
-    else {
-        return Check::Warn("cannot tell which dialog program the agent uses".into());
-    };
-    match locate_in(dir) {
-        Located::Absent(path) => Check::Warn(format!(
-            "{} is not installed: dialogs use zenity (see docs/installation.md)",
-            path.display()
-        )),
-        Located::Unusable(why) => Check::Fail(format!("dialogs cannot be shown: {why}")),
-        Located::Program(path) => match dialog_program_check(&path) {
-            Ok((version, protocol)) if protocol == rusthorse::dialog_protocol::VERSION => {
-                Check::Ok(format!("dialogs: {PROGRAM} {version} ({})", path.display()))
+/// What shows the agent's dialogs, as the agent itself reports it (it
+/// checked the program in its own mount namespace), and whether the program
+/// runs: `rusthorse-dialog --check`, under supervision and a 5-second limit,
+/// reports its version and protocol without opening a window.
+fn dialog_check(info: &rusthorse::protocol::StatusInfo) -> Check {
+    use rusthorse::dialog_program::{Located, PROGRAM, check_program, locate_in};
+    let program = match info.dialogs.as_deref() {
+        Some("zenity") => {
+            return Check::Warn(format!(
+                "{PROGRAM} is not installed next to the agent: dialogs use zenity \
+                 (see docs/installation.md)"
+            ));
+        }
+        Some(reason) if reason.starts_with("none: ") => {
+            return Check::Fail(format!(
+                "dialogs cannot be shown: {}",
+                &reason["none: ".len()..]
+            ));
+        }
+        Some(path) => std::path::PathBuf::from(path),
+        // An agent that predates the field: look next to its program file.
+        None => {
+            let exe = info.agent_executable.trim_end_matches(" (deleted)");
+            match std::path::Path::new(exe)
+                .parent()
+                .filter(|_| !exe.is_empty())
+                .map(locate_in)
+            {
+                Some(Located::Program(path)) => path,
+                Some(Located::Absent(path)) => {
+                    return Check::Warn(format!(
+                        "{} is not installed: dialogs use zenity (see docs/installation.md)",
+                        path.display()
+                    ));
+                }
+                Some(Located::Unusable(why)) => {
+                    return Check::Fail(format!("dialogs cannot be shown: {why}"));
+                }
+                None => {
+                    return Check::Warn("cannot tell which dialog program the agent uses".into());
+                }
             }
-            Ok((version, protocol)) => Check::Fail(format!(
-                "{PROGRAM} {version} speaks dialog protocol {protocol}, this rusthorse {}: \
-                 install the same version of both, then restart the agent",
-                rusthorse::dialog_protocol::VERSION
-            )),
-            Err(e) => Check::Fail(format!("{} does not run: {e:#}", path.display())),
-        },
-    }
-}
-
-/// Run `program --check` with an empty environment, for at most 5 seconds,
-/// and return the version and protocol it reports.
-fn dialog_program_check(program: &std::path::Path) -> anyhow::Result<(String, u32)> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    #[derive(serde::Deserialize)]
-    struct Report {
-        version: String,
-        protocol: u32,
-    }
-    let mut child = Command::new(program)
-        .arg("--check")
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("no answer to --check within 5 seconds");
-        }
-        std::thread::sleep(Duration::from_millis(20));
     };
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_string(&mut out)?;
+    match check_program(&program, Duration::from_secs(5)) {
+        Ok((version, protocol)) if protocol == rusthorse::dialog_protocol::VERSION => Check::Ok(
+            format!("dialogs: {PROGRAM} {version} ({})", program.display()),
+        ),
+        Ok((version, protocol)) => Check::Fail(format!(
+            "{PROGRAM} {version} speaks dialog protocol {protocol}, this rusthorse {}: \
+             install the same version of both, then restart the agent",
+            rusthorse::dialog_protocol::VERSION
+        )),
+        Err(e) => Check::Fail(format!("{} does not run: {e:#}", program.display())),
     }
-    if !status.success() {
-        bail!("--check failed ({status})");
-    }
-    let report: Report = serde_json::from_str(out.trim())?;
-    Ok((report.version, report.protocol))
 }
 
 /// Whether the agent still runs the program file it was started from, and
@@ -1378,7 +1363,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                 info.agent_executable_replaced,
                 info.agent_executable_id,
             ));
-            let dialogs = dialog_check(&info.agent_executable);
+            let dialogs = dialog_check(&info);
             dialog_program = matches!(dialogs, Check::Ok(_));
             checks.push(dialogs);
             if !info.vault_exists {

@@ -66,6 +66,9 @@ cargo test -p rusthorse-dialog
 The workspace's default member is `rusthorse`, so plain `cargo` commands do
 not build the dialog program; `cargo fmt --all` formats both.
 
+Documentation of public items must not link to private ones: `cargo doc`
+with `-D warnings` fails on it.
+
 The MSRV is **1.89**: do not use newer standard-library APIs, and avoid APIs
 deprecated in newer releases whose replacements 1.89 lacks (for example
 `AtomicUsize::fetch_update`; use a `Mutex`).
