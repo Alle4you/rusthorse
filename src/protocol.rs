@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// Protocol version spoken by this build. Bumped on incompatible changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2: data frames, per-channel credit (stdin credit granted when the
+/// command starts), `generate`, `change_password`, `backup`, `reveal.notes`,
+/// `status.audit_log`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -404,6 +408,9 @@ pub struct StatusInfo {
     pub vault: String,
     /// Whether the vault file exists.
     pub vault_exists: bool,
+    /// Audit log file the agent writes.
+    #[serde(default)]
+    pub audit_log: String,
     /// Whether the vault is locked.
     pub locked: bool,
     /// Idle time before the vault locks itself, in seconds (0 = never).

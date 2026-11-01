@@ -403,6 +403,9 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             | Command::Doctor
             | Command::Generate(_)
             | Command::Completions { .. }
+            // `run` checks inside its own error handling, so that a missing
+            // or incompatible agent is reported as "did not run" (125).
+            | Command::Run(_)
     );
     if talks_to_agent {
         client.check_compatible()?;
@@ -830,6 +833,7 @@ fn parse_binding(spec: &str) -> anyhow::Result<Binding> {
 
 fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     let outcome = (|| -> anyhow::Result<u8> {
+        client.check_compatible()?;
         let bindings = args
             .secrets
             .iter()
@@ -975,15 +979,26 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         if total > 1 {
             eprintln!("batch {} of {total} ({} entries):", i + 1, batch.len());
         }
-        let status = simple(
+        let result = simple(
             client,
             &Request::Import {
                 entries: batch,
                 replace,
             },
-        )?;
-        if status != 0 {
-            return Ok(status);
+        );
+        let failed = !matches!(result, Ok(0));
+        if failed && i > 0 {
+            eprintln!(
+                "rusthorse: stopped at batch {} of {total}: batches 1 to {i} were imported, \
+                 batch {} and later were not — run the same import again to finish \
+                 (already imported names are skipped)",
+                i + 1,
+                i + 1
+            );
+        }
+        match result {
+            Ok(0) => {}
+            other => return other,
         }
     }
     Ok(0)
@@ -1000,8 +1015,12 @@ fn import_preview(client: &Client, names: Vec<String>, replace: bool) -> anyhow:
     let existing: std::collections::HashSet<&str> =
         entries.iter().map(|e| e.name.as_str()).collect();
     let mut new = 0;
+    let mut seen = std::collections::HashSet::new();
     for name in &names {
-        let (mark, note) = if existing.contains(name.as_str()) {
+        let first = seen.insert(name.as_str());
+        let (mark, note) = if !first {
+            ("dup", "appears more than once; only the first is imported")
+        } else if existing.contains(name.as_str()) {
             (
                 "exists",
                 if replace {
@@ -1103,9 +1122,17 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
         rusthorse::protocol::PROTOCOL_VERSION
     )));
 
-    // The agent.
+    // The agent, and the files it actually uses.
+    let mut vault = paths::vault();
+    let mut audit = paths::audit_log();
+    let mut where_from = "the default location (the agent is not reachable)";
     match client.call(&Request::Status) {
         Ok(Response::Status(info)) => {
+            vault = PathBuf::from(&info.vault);
+            if !info.audit_log.is_empty() {
+                audit = PathBuf::from(&info.audit_log);
+            }
+            where_from = "the agent's configuration";
             if info.protocol_version == rusthorse::protocol::PROTOCOL_VERSION {
                 checks.push(Check::Ok(format!(
                     "agent {} is running ({})",
@@ -1179,7 +1206,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
     }
 
     // Files.
-    let vault = paths::vault();
+    checks.push(Check::Ok(format!("checking the files of {where_from}")));
     if vault.exists() {
         match mode(&vault) {
             Ok(m) if m & 0o077 == 0 => {
@@ -1203,7 +1230,6 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
             Err(e) => checks.push(Check::Fail(format!("the vault cannot be read: {e:#}"))),
         }
     }
-    let audit = paths::audit_log();
     if let Ok(m) = mode(&audit)
         && m & 0o077 != 0
     {

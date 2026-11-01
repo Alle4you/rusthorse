@@ -36,6 +36,15 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - `run` exits with 124 when the connection is lost after the request was
   sent (outcome unknown), keeping 125 for "did not run".
 
+### Changed
+
+- Protocol version 2 (data frames and credits, new requests); clients refuse
+  an agent that speaks another version.
+- `passwd` reports when the old-password backup could not be deleted.
+- `doctor` checks the files the agent actually uses.
+- Imports report which batches were imported when a later one fails, and
+  the dry run flags duplicate names.
+
 ### Security
 
 Changes from the adversarial review of 2026-10-31 (details in

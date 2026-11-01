@@ -139,8 +139,9 @@ rusthorse audit
 Migrate in four steps, and keep the originals until the last one is done.
 
 1. **Back up** the new vault (see below), so that you can go back.
-2. **Preview** what would be imported — names only, and which ones already
-   exist; no secret is read:
+2. **Preview** what would be imported — names only, which ones already exist
+   and which appear twice; nothing is sent to the agent (for Secret Service,
+   no secret is even read; a `.env` file is parsed locally):
 
    ```sh
    rusthorse import dotenv ~/project/.env --prefix MYAPP_ --dry-run

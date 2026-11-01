@@ -1727,6 +1727,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     agent_version: "fake".into(),
                     vault: "/nonexistent".into(),
                     vault_exists: true,
+                    audit_log: String::new(),
                     locked: false,
                     idle_timeout_secs: 0,
                     locks_in_secs: None,
@@ -1747,6 +1748,145 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
     fake.join().expect("fake agent");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("may or may not have run"));
+}
+
+/// A fake agent on `socket` that answers `status` with `version` and answers
+/// a run request with `run_reply` (raw JSON), or drops the connection.
+fn fake_agent(
+    socket: &Path,
+    version: u32,
+    run_reply: Option<&'static str>,
+    connections: usize,
+) -> std::thread::JoinHandle<()> {
+    use rusthorse::protocol::{Request, Response, StatusInfo, recv_frame, send_frame};
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+    std::thread::spawn(move || {
+        for _ in 0..connections {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let Ok((body, _fds)) = recv_frame(&stream) else {
+                continue;
+            };
+            let request: Request = serde_json::from_slice(&body).expect("json");
+            if matches!(request, Request::Status) {
+                let status = Response::Status(StatusInfo {
+                    protocol_version: version,
+                    agent_version: "fake".into(),
+                    vault: "/nonexistent".into(),
+                    vault_exists: true,
+                    audit_log: String::new(),
+                    locked: false,
+                    idle_timeout_secs: 0,
+                    locks_in_secs: None,
+                    remembered_approvals: 0,
+                });
+                let _ = send_frame(&stream, &status, &[]);
+            } else if let Some(reply) = run_reply {
+                let mut frame = (reply.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(reply.as_bytes());
+                use std::io::Write;
+                let _ = (&stream).write_all(&frame);
+            }
+        }
+    })
+}
+
+#[test]
+fn a_malformed_result_after_the_request_is_unknown_not_did_not_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_agent(
+        &socket,
+        rusthorse::protocol::PROTOCOL_VERSION,
+        Some(r#"{"type":"bogus"}"#),
+        2,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_missing_or_old_agent_means_did_not_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // No agent at all.
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", dir.path().join("nobody.sock"))
+        .stdin(Stdio::null())
+        .finish();
+    assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
+    // An agent speaking an older protocol.
+    let socket = dir.path().join("old.sock");
+    let fake = fake_agent(&socket, 1, None, 2);
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("restart the agent"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["list"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("restart the agent"));
+    drop(fake);
+}
+
+#[test]
+fn unread_acknowledgements_do_not_pin_a_finished_command() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let stream = raw_run(&h, &["head", "-c", "1000"], true);
+    let sender = stream.try_clone().expect("clone");
+    within(Duration::from_secs(20), move || {
+        for _ in 0..1000 {
+            rusthorse::protocol::send_data(&sender, rusthorse::protocol::STDIN, b"x")
+                .expect("the agent stopped reading the connection");
+        }
+    });
+    // The command has read its 1000 bytes and exited; acknowledgements were
+    // never read. A half-close must still end the request.
+    std::thread::sleep(Duration::from_millis(500));
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.audit_text().contains("\"outcome\":\"exited\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the request stayed pinned by unread acknowledgements"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stream);
+}
+
+#[test]
+fn doctor_checks_the_vault_the_agent_uses() {
+    let h = Harness::new();
+    let out = h
+        .cmd(&["doctor"])
+        .env(
+            "RUSTHORSE_VAULT",
+            h.dir.path().join("not-the-agents-vault.kdbx"),
+        )
+        .finish();
+    let report = text(&out.stdout);
+    assert!(
+        report.contains(&format!("{} is private", h.vault_path().display())),
+        "{report}"
+    );
+    assert!(report.contains("the agent's configuration"), "{report}");
 }
 
 #[test]

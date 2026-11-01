@@ -47,8 +47,9 @@ from the vault straight into the approved program.
    - Never ask the human for a secret value, never print or echo secrets,
      never write them to files, and never use `rusthorse reveal`.
    - Exit status 125 with a `rusthorse:` message means Rusthorse refused or
-     failed and the command did not run; if it was denied, stop and ask the
-     human instead of retrying a variation. Exit status 124 means the
+     failed before the command started — including when the agent is not
+     running or is out of date — so the command did not run; if it was
+     denied, stop and ask the human instead of retrying a variation. Exit status 124 means the
      connection was lost after the request was sent: the command may or may
      not have run, so check before repeating anything that is not idempotent.
      (A command can also exit with 124 or 125 itself; the `rusthorse:` message

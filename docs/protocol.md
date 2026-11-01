@@ -4,8 +4,17 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **1** (`PROTOCOL_VERSION` in
+Protocol version: **2** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
+
+| Version | Changes |
+|---|---|
+| 1 | First design: descriptors passed for every `run`. Never released. |
+| 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
+
+Clients should send `status` first and refuse to continue when
+`protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
+are not negotiated beyond that.
 
 ## Transport
 

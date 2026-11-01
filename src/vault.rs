@@ -174,6 +174,8 @@ pub struct Vault {
     /// Remove `<name>.bak` after the next successful save (it is encrypted
     /// with a password that is no longer current).
     discard_backup: bool,
+    /// Why that removal failed, if it did (see [`Vault::take_cleanup_error`]).
+    cleanup_error: Option<String>,
     /// Test hook: runs after the new file is written, before it replaces the
     /// old one (simulates another program saving at that moment).
     #[cfg(test)]
@@ -182,6 +184,9 @@ pub struct Vault {
     /// corruption on the way to the disk).
     #[cfg(test)]
     before_verify: Option<SaveHook>,
+    /// Test hook: make deleting the old-password backup fail.
+    #[cfg(test)]
+    fail_cleanup: bool,
 }
 
 impl std::fmt::Debug for Vault {
@@ -213,10 +218,13 @@ impl Vault {
             password,
             fingerprint: None,
             discard_backup: false,
+            cleanup_error: None,
             #[cfg(test)]
             before_rename: None,
             #[cfg(test)]
             before_verify: None,
+            #[cfg(test)]
+            fail_cleanup: false,
         };
         vault.write_file(false)?;
         Ok(vault)
@@ -252,10 +260,13 @@ impl Vault {
             password,
             fingerprint: Some(fingerprint),
             discard_backup: false,
+            cleanup_error: None,
             #[cfg(test)]
             before_rename: None,
             #[cfg(test)]
             before_verify: None,
+            #[cfg(test)]
+            fail_cleanup: false,
         })
     }
 
@@ -273,6 +284,12 @@ impl Vault {
             diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
         }
         diff == 0
+    }
+
+    /// Why deleting the old-password backup after a password change failed,
+    /// if it did. The password change itself is saved either way.
+    pub fn take_cleanup_error(&mut self) -> Option<String> {
+        self.cleanup_error.take()
     }
 
     /// Use `new` as the master password from the next save on. That save
@@ -368,7 +385,25 @@ impl Vault {
         // points to by now.
         self.fingerprint = Some(written);
         if self.discard_backup {
-            let _ = fs::remove_file(dir.join(format!("{name}.bak")));
+            let backup = dir.join(format!("{name}.bak"));
+            #[cfg(test)]
+            let removed = if self.fail_cleanup {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                fs::remove_file(&backup)
+            };
+            #[cfg(not(test))]
+            let removed = fs::remove_file(&backup);
+            self.cleanup_error = match removed {
+                Ok(()) => File::open(&dir).and_then(|d| d.sync_all()).err().map(|e| {
+                    format!(
+                        "{}: deleted, but the directory was not synced: {e}",
+                        backup.display()
+                    )
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(format!("{}: {e}", backup.display())),
+            };
             self.discard_backup = false;
         }
         Ok(())
@@ -1059,6 +1094,20 @@ mod tests {
             vault.backup_to(&dest),
             Err(VaultError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_failed_cleanup_after_a_password_change_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        vault.add(&entry("x"), &secret("abcd"), false).expect("add");
+        vault.save().expect("save");
+        vault.fail_cleanup = true;
+        vault.change_password(secret("another passphrase"));
+        vault.save().expect("the password change itself is saved");
+        let problem = vault.take_cleanup_error().expect("the failure is reported");
+        assert!(problem.contains("vault.kdbx.bak"), "{problem}");
+        assert!(Vault::open(&path, secret("another passphrase")).is_ok());
     }
 
     #[test]

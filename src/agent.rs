@@ -412,6 +412,7 @@ impl Agent {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             vault: self.config.vault.display().to_string(),
             vault_exists: self.config.vault.exists(),
+            audit_log: self.config.audit_log.display().to_string(),
             locked,
             idle_timeout_secs: idle.as_secs(),
             locks_in_secs: (!locked && !idle.is_zero())
@@ -961,10 +962,18 @@ impl Agent {
         self.record(event.outcome("changed"))?;
         self.commit(generation, |v| {
             v.change_password(first);
-            Ok(ok(
-                "master password changed (the previous file, encrypted with the old password, was removed)",
-            ))
-        })
+            Ok(())
+        })?;
+        let cleanup = self.with_vault(peer, |v| Ok(v.take_cleanup_error()))?;
+        Ok(ok(match cleanup {
+            None => "master password changed; the previous file (encrypted with the old \
+                     password) was deleted"
+                .to_string(),
+            Some(problem) => format!(
+                "master password changed, BUT the previous file could not be deleted: {problem}. \
+                 It still opens with the old password — delete it yourself"
+            ),
+        }))
     }
 
     fn reveal(&self, peer: &Peer, name: &str, notes: bool) -> Result<Response, Failure> {
@@ -1348,10 +1357,15 @@ impl Agent {
         } else {
             0
         }));
+        // Stops the acknowledgement writer. It is a different flag from
+        // `finished` so that the watcher keeps supervising the connection —
+        // and can cancel, releasing a blocked acknowledgement — until the
+        // writer has really stopped.
+        let acks_done = Arc::new(AtomicBool::new(false));
         let ack_writer = forwarding.then(|| {
             let (acks, writer) = (Arc::clone(&acks), Arc::clone(&writer));
-            let (finished, abort) = (Arc::clone(&finished), Arc::clone(&abort));
-            thread::spawn(move || acks.run(&writer, &finished, &abort))
+            let (acks_done, abort) = (Arc::clone(&acks_done), Arc::clone(&abort));
+            thread::spawn(move || acks.run(&writer, &acks_done, &abort))
         });
         let watcher = stream.try_clone().ok().map(|s| {
             let watch = Watch {
@@ -1386,13 +1400,18 @@ impl Agent {
         for pump in pumps {
             let _ = pump.join();
         }
-        finished.store(true, Ordering::SeqCst);
+        // Stop acknowledging input — the watcher still runs, so a client that
+        // half-closes or breaks the protocol while an acknowledgement is
+        // blocked still cancels (which releases it) — and only then stop
+        // supervising.
+        acks_done.store(true, Ordering::SeqCst);
         acks.wake();
-        if let Some(watcher) = watcher {
-            let _ = watcher.join();
-        }
         if let Some(ack_writer) = ack_writer {
             let _ = ack_writer.join();
+        }
+        finished.store(true, Ordering::SeqCst);
+        if let Some(watcher) = watcher {
+            let _ = watcher.join();
         }
         let status = child.wait();
         if let Err(e) = waited {

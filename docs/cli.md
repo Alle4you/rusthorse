@@ -287,7 +287,9 @@ rusthorse passwd
 Changes the master password. The agent asks, in its own dialogs, for the
 current password and then the new one twice. The vault is re-encrypted with
 the new password and the previous file (`vault.kdbx.bak`, encrypted with the
-old password) is deleted. Copies you made elsewhere keep the old password.
+old password) is deleted; if that deletion fails, the command says so and
+names the file to delete by hand (the password change itself is kept). Copies
+you made elsewhere keep the old password.
 
 ## `rusthorse generate`
 
@@ -365,6 +367,7 @@ rusthorse completions bash > ~/.local/share/bash-completion/completions/rusthors
 ## Upgrades
 
 Commands that talk to the agent first check that it speaks the same protocol
-version. After upgrading the binary, restart the agent
+version (for `run`, a missing or incompatible agent exits with 125: the
+command did not run). After upgrading the binary, restart the agent
 (`systemctl --user restart rusthorse-agent`); until then those commands stop
 with an explanation instead of failing in confusing ways.

@@ -135,9 +135,10 @@ impl Client {
     /// Check that the agent speaks this build's protocol version (for
     /// example after upgrading the binary without restarting the agent).
     pub fn check_compatible(&self) -> anyhow::Result<()> {
-        if let Response::Status(info) = self.call(&Request::Status)?
-            && info.protocol_version != protocol::PROTOCOL_VERSION
-        {
+        let Response::Status(info) = self.call(&Request::Status)? else {
+            bail!("the agent did not answer the version check; is it a Rusthorse agent?");
+        };
+        if info.protocol_version != protocol::PROTOCOL_VERSION {
             bail!(
                 "the running agent speaks protocol {} (version {}) but this rusthorse speaks {} \
                  (version {}); restart the agent: `systemctl --user restart rusthorse-agent`",
@@ -214,15 +215,16 @@ impl Client {
         }
         let forward = request.forward_stdin;
         let stream = self.connect()?;
-        protocol::send_frame(&stream, &Request::Run(request), &[])
-            .context("cannot send the request")?;
-
+        // Everything that can fail locally is prepared before the request is
+        // sent: once it is, a failure means the outcome is unknown.
         let sender = Arc::new(Mutex::new(
             stream.try_clone().context("cannot clone the connection")?,
         ));
         // Used only to shut the connection down, so that cancelling never
         // waits for the send lock.
         let canceller = Arc::new(stream.try_clone().context("cannot clone the connection")?);
+        protocol::send_frame(&stream, &Request::Run(request), &[])
+            .context("cannot send the request")?;
         let broken = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let input_credit = Arc::new(InputCredit::new());
@@ -276,7 +278,9 @@ impl Client {
                 }
                 Ok(Frame::Data(..)) => {}
                 Ok(Frame::Message(body, _fds)) => {
-                    break serde_json::from_slice::<Response>(&body).context("malformed response");
+                    break serde_json::from_slice::<Response>(&body).map_err(|e| {
+                        anyhow::Error::new(OutcomeUnknown(format!("malformed response: {e}")))
+                    });
                 }
                 Err(e) => break Err(anyhow::Error::new(OutcomeUnknown(e.to_string()))),
             }

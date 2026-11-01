@@ -372,6 +372,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Fifth review: verification of the new I/O design (AI-assisted, Codex). | See the fifth table. |
 | 2026-10-31 | Sixth review: verification of flow control and cancellation (AI-assisted, Codex). | See the sixth table. |
 | 2026-11-01 | Seventh review: verification and readiness for a first real use (AI-assisted, Codex). | See the seventh table. |
+| 2026-11-01 | Eighth review: verification of the new features (AI-assisted, Codex). | See the eighth table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -469,7 +470,7 @@ gaps it listed:
 
 | Finding | Disposition |
 |---|---|
-| N23 — the watcher wrote stdin acknowledgements to the socket itself; a client that never read them blocked that write, and the watcher stopped noticing half-closes and violations | **Fixed:** acknowledgements are written by a separate thread (released by cancellation); the watcher never writes to the socket. |
+| N23 — the watcher wrote stdin acknowledgements to the socket itself; a client that never read them blocked that write, and the watcher stopped noticing half-closes and violations | **Fixed:** acknowledgements are written by a separate thread; the watcher never writes to the socket (completed in the eighth round: the watcher now outlives that thread). |
 | Input read before approval | **Fixed:** the client starts with no stdin credit; the agent grants it when the command starts. |
 | "125 means the command did not run" was not always true | **Fixed:** 124 now means the connection was lost after the request was sent (outcome unknown); 125 is kept for refusals and failures before the command ran. |
 | Migration could only be checked with `list` | **Fixed:** `import --dry-run`, batching, and a documented procedure that verifies each entry by using it. |
@@ -481,3 +482,17 @@ gaps it listed:
 | CI never ran; no rehearsal on the real desktop | **Open:** runs once the repository is published; the desktop rehearsal is the owner's first test. |
 | MSRV | The declared minimum Rust version (1.89) was checked with that toolchain. |
 | Coverage | A mutation run reverted each of 41 fixes in turn: 39 make the suite fail (one only after a test that corrupts a backup before it is verified was added); the two not caught are the ones described in the sixth table. |
+
+Findings of the eighth review (generate, open, search, notes, completions and
+backup were confirmed; the reviewer listed N23, N24 and N25 as blockers for
+a first real test):
+
+| Finding | Disposition |
+|---|---|
+| N23 (residual) — after the command exited, the watcher stopped before the acknowledgement writer; a client that never read acknowledgements left the request pinned, and a half-close was no longer noticed | **Fixed:** the acknowledgement writer is stopped and joined first; the watcher keeps supervising (and can cancel, releasing it) until then. |
+| N24 — `passwd` said the old-password backup was deleted even when the deletion failed | **Fixed:** a failed deletion is reported with the file to delete by hand; the directory is synced after a successful one. |
+| N25 — exit 125 was still possible after the command started (local setup failures after sending, malformed results), and a missing agent gave 1 | **Fixed:** everything that can fail locally is prepared before sending; any failure after sending, including a malformed result, is 124; the version check for `run` is part of its error handling (125). |
+| N26 — the protocol version stayed 1 across incompatible changes, so an older agent passed the check and then deadlocked | **Fixed:** protocol version 2; a check that gets anything but a status answer fails. |
+| N27 — `doctor` checked the vault named in the client's environment, not the one the agent uses | **Fixed:** it checks the vault and audit log the agent reports (new `status.audit_log`). |
+| Partial imports were not summarised; duplicates were not shown in the preview | **Fixed.** |
+| KeePassXC round trip is checked with the same parser, not by opening the result in KeePassXC | **Open:** part of the owner's first test (open the vault in KeePassXC after using Rusthorse). |
