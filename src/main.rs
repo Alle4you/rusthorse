@@ -511,22 +511,33 @@ fn new_master_password() -> anyhow::Result<SecretString> {
             remember_for: Duration::ZERO,
             timeout: Duration::from_secs(300),
         };
-        let ask = |message: &str| -> anyhow::Result<SecretString> {
-            match ui.master_password(&Prompt {
-                title: "Rusthorse — new vault".into(),
-                message: message.into(),
-                confirm: "OK".into(),
-            })? {
-                Typed::Value(value) => Ok(value),
-                Typed::Cancelled => bail!("cancelled"),
-                Typed::TimedOut => bail!("nobody answered the dialog in time"),
-            }
-        };
+        let ask =
+            |headline: &str, explanation: &str, field: &str| -> anyhow::Result<SecretString> {
+                match ui.master_password(&Prompt {
+                    title: "Rusthorse — new vault".into(),
+                    headline: headline.into(),
+                    explanation: explanation.into(),
+                    notice: None,
+                    details: Vec::new(),
+                    field: field.into(),
+                    confirm: "OK".into(),
+                })? {
+                    Typed::Value(value) => Ok(value),
+                    Typed::Cancelled => bail!("cancelled"),
+                    Typed::TimedOut => bail!("nobody answered the dialog in time"),
+                }
+            };
         (
             ask(
-                "Choose a master password for the new Rusthorse vault.\nAt least 12 characters is recommended.",
+                "Choose a master password for the new Rusthorse vault.",
+                "At least 12 characters is recommended.",
+                "Master password",
             )?,
-            ask("Type the master password again.")?,
+            ask(
+                "Type the master password again.",
+                "",
+                "Master password, again",
+            )?,
         )
     };
     if *first != *second {

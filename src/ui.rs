@@ -25,10 +25,41 @@ use crate::util::format_duration;
 pub struct Prompt {
     /// Window title.
     pub title: String,
-    /// Explanation shown above the input field.
-    pub message: String,
+    /// What to type, as one sentence.
+    pub headline: String,
+    /// One or two sentences under it; may be empty.
+    pub explanation: String,
+    /// A line shown first, after a wrong or empty attempt.
+    pub notice: Option<String>,
+    /// Label/value pairs: vault, entry, requester.
+    pub details: Vec<(String, String)>,
+    /// Label of the input field.
+    pub field: String,
     /// Label of the confirm button.
     pub confirm: String,
+}
+
+/// A prompt as one block of text, as zenity's entry dialog shows it and as
+/// it is measured: the notice, the headline, the explanation, then one
+/// `label: value` line per detail. Every part goes through [`dialog_text`],
+/// so no value can add a line.
+pub fn prompt_text(prompt: &Prompt) -> String {
+    let mut lines = Vec::new();
+    if let Some(notice) = &prompt.notice {
+        lines.push(dialog_text(notice));
+        lines.push(String::new());
+    }
+    lines.push(dialog_text(&prompt.headline));
+    if !prompt.explanation.is_empty() {
+        lines.push(dialog_text(&prompt.explanation));
+    }
+    if !prompt.details.is_empty() {
+        lines.push(String::new());
+        for (label, value) in &prompt.details {
+            lines.push(format!("{}: {}", dialog_text(label), dialog_text(value)));
+        }
+    }
+    lines.join("\n")
 }
 
 /// A request for the human's approval.
@@ -41,8 +72,10 @@ pub struct ApprovalRequest {
     /// One or two sentences under the headline: what approving means. May
     /// be empty.
     pub explanation: String,
-    /// What to read before deciding (command, program, secrets, ...), as
-    /// label/value pairs; each is shown as its own block.
+    /// The command line, for `run`; shown before the details.
+    pub command: Option<String>,
+    /// What to read before deciding (program, secrets, ...), as label/value
+    /// pairs; each is shown as its own block.
     pub details: Vec<(String, String)>,
     /// Context shown in one quieter line under the details (input, output
     /// handling, ...), as label/value pairs.
@@ -157,10 +190,7 @@ impl ZenityUi {
         let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
-            .arg(format!(
-                "--text={}",
-                entry_label(&dialog_lines(&prompt.message))
-            ))
+            .arg(format!("--text={}", entry_label(&prompt_text(prompt))))
             .arg(format!("--ok-label={}", prompt.confirm));
         let (status, output) = capture_through_socket(cmd)?;
         match status {
@@ -272,13 +302,28 @@ pub fn approval_text(request: &ApprovalRequest) -> String {
         text.push_str(&dialog_text(&request.explanation));
     }
     text.push_str("\n\n");
-    for (label, value) in request.details.iter().chain(&request.facts) {
+    let facts = request.facts.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    for (label, value) in blocks(request).into_iter().chain(facts) {
         text.push_str(&format!("{label}: {}\n", dialog_text(value)));
     }
     for warning in &request.warnings {
         text.push_str(&format!("\n⚠ {}", dialog_text(warning)));
     }
     text
+}
+
+/// The blocks a zenity approval dialog shows: the command, then the details.
+fn blocks(request: &ApprovalRequest) -> Vec<(&str, &str)> {
+    let command = request.command.as_deref().map(|c| ("Command", c));
+    command
+        .into_iter()
+        .chain(
+            request
+                .details
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .collect()
 }
 
 /// A small vertical gap between blocks.
@@ -318,16 +363,6 @@ pub fn dialog_text(text: &str) -> String {
         }
     }
     out
-}
-
-/// [`dialog_text`] for a message whose line breaks are its own (requester
-/// values in it are already one line each).
-fn dialog_lines(message: &str) -> String {
-    message
-        .split('\n')
-        .map(dialog_text)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Text metrics for estimating a dialog's height: pixels for an 11-point
@@ -432,7 +467,7 @@ pub fn approval_height(request: &ApprovalRequest) -> usize {
     if !request.explanation.is_empty() {
         height += TEXT * text_lines(&request.explanation, PROSE_COLUMNS);
     }
-    for (label, value) in &request.details {
+    for (label, value) in blocks(request) {
         height += GAP + SMALL * text_lines(&label.to_uppercase(), SMALL_COLUMNS);
         height += TEXT * mono_lines(value);
     }
@@ -477,7 +512,7 @@ pub fn approval_markup(request: &ApprovalRequest, note: Option<&str>) -> String 
             markup_text(&request.explanation)
         ));
     }
-    for (label, value) in &request.details {
+    for (label, value) in blocks(request) {
         out.push_str(GAP);
         out.push_str(&format!(
             "<span size=\"small\" alpha=\"70%\" weight=\"bold\">{}</span>\n<tt>{}</tt>\n",
@@ -659,6 +694,7 @@ mod tests {
             title: "t".into(),
             summary: "Run a command".into(),
             explanation: String::new(),
+            command: None,
             details: vec![("Command".into(), "echo ok\nSecrets: none".into())],
             facts: Vec::new(),
             warnings: vec!["careful".into()],
@@ -732,6 +768,7 @@ mod tests {
                 title: "t".into(),
                 summary: format!("Headline {value}"),
                 explanation: format!("Explained {value}"),
+                command: None,
                 details: vec![
                     ("Command".into(), value.into()),
                     (format!("Label {value}"), value.into()),
@@ -756,6 +793,7 @@ mod tests {
             title: "t".into(),
             summary: "Run a command with your secrets?".into(),
             explanation: String::new(),
+            command: None,
             details: vec![(
                 "Command".into(),
                 format!("printf '{}'", "\u{2028}".repeat(60)),
@@ -786,6 +824,7 @@ mod tests {
                           its environment; programs it starts can use them too. Read the \
                           command before you allow it."
                 .into(),
+            command: None,
             details: vec![
                 ("Command".into(), command),
                 (
@@ -871,6 +910,7 @@ mod tests {
             title: "t".into(),
             summary: "s".into(),
             explanation: String::new(),
+            command: None,
             details: Vec::new(),
             facts: Vec::new(),
             warnings: vec![warning],
@@ -897,12 +937,21 @@ mod tests {
 
     #[test]
     fn prompts_are_shown_and_measured_as_dialogs_show_them() {
-        let message = "Entry \"\u{6F22}\".\n\nRequested by: x";
+        let prompt = Prompt {
+            title: "t".into(),
+            headline: "Type the value.".into(),
+            explanation: String::new(),
+            notice: Some("Wrong.".into()),
+            details: vec![("Entry".into(), "\u{6F22}\nForged: line".into())],
+            field: "Value".into(),
+            confirm: "Save".into(),
+        };
+        let text = prompt_text(&prompt);
         assert_eq!(
-            dialog_lines(message),
-            "Entry \"\\u{6f22}\".\n\nRequested by: x"
+            text,
+            "Wrong.\n\nType the value.\n\nEntry: \\u{6f22}\\u{a}Forged: line"
         );
-        assert_eq!(prompt_height(message), 3 * metrics::TEXT);
+        assert_eq!(prompt_height(&text), 5 * metrics::TEXT);
         assert_eq!(
             prompt_height(&"W".repeat(TEXT_COLUMNS * 2)),
             2 * metrics::TEXT
@@ -922,6 +971,7 @@ mod tests {
             title: "t".into(),
             summary: "Run a command with your secrets?".into(),
             explanation: "Read it.".into(),
+            command: None,
             details: vec![
                 ("Command".into(), "true".into()),
                 ("Requested by".into(), "bash[1]".into()),

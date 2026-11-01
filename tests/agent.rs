@@ -45,7 +45,7 @@ impl Ui for ScriptedUi {
     fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
         let index = {
             let mut prompts = self.password_prompts.lock().unwrap();
-            prompts.push(prompt.message.clone());
+            prompts.push(rusthorse::ui::prompt_text(prompt));
             prompts.len() - 1
         };
         if let Some(hook) = self.on_password.lock().unwrap().take() {

@@ -537,13 +537,22 @@ impl Agent {
             }
             state.generation
         };
-        let base = format!(
-            "Type the master password to unlock the Rusthorse vault.\n\nVault: {}\nRequested by (unverified): {}",
-            self.config.vault.display(),
-            peer.describe()
-        );
+        let vault = self.config.vault.display().to_string();
+        let prompt_with = |notice: Option<String>| Prompt {
+            title: "Rusthorse — unlock vault".into(),
+            headline: "Type the master password to unlock the Rusthorse vault.".into(),
+            explanation: String::new(),
+            notice,
+            details: vec![
+                ("Vault".into(), vault.clone()),
+                ("Requested by (unverified)".into(), peer.describe()),
+            ],
+            field: "Master password".into(),
+            confirm: "Unlock".into(),
+        };
         // Room is kept for the "Wrong password" or "Nothing was typed" line.
-        if crate::ui::dialog_text(&base).chars().count() > MAX_DIALOG_CHARS - 100
+        let base = crate::ui::prompt_text(&prompt_with(None));
+        if base.chars().count() > MAX_DIALOG_CHARS - 100
             || crate::ui::prompt_height(&base) + 3 * crate::ui::metrics::TEXT
                 > crate::ui::metrics::MAX_HEIGHT
         {
@@ -551,14 +560,10 @@ impl Agent {
                 "the unlock dialog would be too long to show (vault path or requester chain)",
             ));
         }
-        let mut message = base.clone();
+        let mut notice = None;
         let mut tried = false;
         for attempt in 1..=UNLOCK_ATTEMPTS {
-            let prompt = Prompt {
-                title: "Rusthorse — unlock vault".into(),
-                message: message.clone(),
-                confirm: "Unlock".into(),
-            };
+            let prompt = prompt_with(notice.take());
             let password = match self.ui.master_password(&prompt)? {
                 Typed::Value(password) => password,
                 Typed::Cancelled => {
@@ -577,10 +582,10 @@ impl Agent {
             // password (Rusthorse vaults always have one): ask again without
             // calling it wrong.
             if password.is_empty() {
-                message = format!(
+                notice = Some(format!(
                     "Nothing was typed (attempt {attempt} of {UNLOCK_ATTEMPTS}). Type the \
-                     master password, then click Unlock.\n\n{base}"
-                );
+                     master password, then click Unlock."
+                ));
                 continue;
             }
             tried = true;
@@ -609,9 +614,9 @@ impl Agent {
                 }
                 Err(VaultError::WrongPassword) => {
                     self.record(AuditEvent::new("unlock", peer).outcome("wrong_password"))?;
-                    message = format!(
-                        "Wrong password (attempt {attempt} of {UNLOCK_ATTEMPTS}).\n\n{base}"
-                    );
+                    notice = Some(format!(
+                        "Wrong password (attempt {attempt} of {UNLOCK_ATTEMPTS})."
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -727,14 +732,15 @@ impl Agent {
         prompt: Prompt,
         event: AuditEvent,
     ) -> Result<SecretString, Failure> {
-        let length = crate::ui::dialog_text(&prompt.message).chars().count();
+        let text = crate::ui::prompt_text(&prompt);
+        let length = text.chars().count();
         if length > MAX_DIALOG_CHARS {
             return Err(Failure::invalid(format!(
                 "this request has too much detail to show in one dialog ({length} characters, \
                  limit {MAX_DIALOG_CHARS})"
             )));
         }
-        let height = crate::ui::prompt_height(&prompt.message);
+        let height = crate::ui::prompt_height(&text);
         if height > crate::ui::metrics::MAX_HEIGHT {
             return Err(Failure::invalid(format!(
                 "this request would make a dialog too tall to read at once (estimated {height} \
@@ -796,6 +802,7 @@ impl Agent {
                     explanation: "Rusthorse creates a random value and stores it. The value is \
                                   not returned to the program that asked."
                         .into(),
+                    command: None,
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
@@ -814,20 +821,27 @@ impl Agent {
                 crate::generate::generate(spec).map_err(|e| Failure::invalid(e.to_string()))?
             }
             (None, None) => {
-                let message = format!(
-                    "Type the secret value for the entry \"{}\"{}.\n\nFields: {}\nRequested by (unverified): {}",
-                    util::visible(&entry.name),
-                    if exists {
-                        " (it replaces the current value)"
-                    } else {
-                        ""
-                    },
-                    describe_fields(&entry),
-                    peer.describe()
-                );
                 let prompt = Prompt {
                     title: "Rusthorse — new secret".into(),
-                    message,
+                    headline: if exists {
+                        "Type a new value for an existing entry."
+                    } else {
+                        "Type the value of a new entry."
+                    }
+                    .into(),
+                    explanation: if exists {
+                        "It replaces the entry's current value."
+                    } else {
+                        ""
+                    }
+                    .into(),
+                    notice: None,
+                    details: vec![
+                        ("Entry".into(), entry.name.clone()),
+                        ("Fields".into(), describe_fields(&entry)),
+                        ("Requested by (unverified)".into(), peer.describe()),
+                    ],
+                    field: "Secret value".into(),
                     confirm: "Save".into(),
                 };
                 self.ask_value(peer, prompt, event)?
@@ -839,6 +853,7 @@ impl Agent {
                     explanation: "The program that asked supplied the value, so it already knows \
                                   it. Rusthorse stores it as it is."
                         .into(),
+                    command: None,
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
@@ -920,6 +935,7 @@ impl Agent {
             explanation: "The program that asked supplied these names and values. Check the \
                           names before you allow it."
                 .into(),
+            command: None,
             details,
             facts: Vec::new(),
             warnings: Vec::new(),
@@ -974,6 +990,7 @@ impl Agent {
                 title: "Rusthorse — change an entry".into(),
                 summary: "Change an entry?".into(),
                 explanation: "The previous version is kept in the entry's history.".into(),
+                command: None,
                 details,
                 facts: Vec::new(),
                 warnings: Vec::new(),
@@ -989,11 +1006,14 @@ impl Agent {
             Some(ValueChange::Prompt) if prompt_for_value => {
                 let prompt = Prompt {
                     title: "Rusthorse — new value".into(),
-                    message: format!(
-                        "Type the new secret value for the entry \"{}\".\n\nRequested by (unverified): {}",
-                        util::visible(&current.identity()),
-                        peer.describe()
-                    ),
+                    headline: "Type the new value of an entry.".into(),
+                    explanation: String::new(),
+                    notice: None,
+                    details: vec![
+                        ("Entry".into(), current.identity()),
+                        ("Requested by (unverified)".into(), peer.describe()),
+                    ],
+                    field: "New value".into(),
                     confirm: "Save".into(),
                 };
                 Some(self.ask_value(peer, prompt, event)?)
@@ -1017,6 +1037,7 @@ impl Agent {
             title: "Rusthorse — delete an entry".into(),
             summary: "Delete an entry?".into(),
             explanation: "The entry and its history are removed from the vault.".into(),
+            command: None,
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Group".into(), info.group.clone().unwrap_or_else(|| "(root)".into())),
@@ -1043,13 +1064,17 @@ impl Agent {
     fn change_password(&self, peer: &Peer) -> Result<Response, Failure> {
         let generation = self.generation(peer)?;
         let event = AuditEvent::new("passwd", peer);
-        let ask = |message: &str| -> Result<SecretString, Failure> {
+        let ask = |headline: &str,
+                   explanation: &str,
+                   field: &str|
+         -> Result<SecretString, Failure> {
             let prompt = Prompt {
                 title: "Rusthorse — change the master password".into(),
-                message: format!(
-                    "{message}\n\nRequested by (unverified): {}",
-                    peer.describe()
-                ),
+                headline: headline.into(),
+                explanation: explanation.into(),
+                notice: None,
+                details: vec![("Requested by (unverified)".into(), peer.describe())],
+                field: field.into(),
                 confirm: "Next".into(),
             };
             let answer = {
@@ -1069,7 +1094,11 @@ impl Agent {
             self.record(event.clone().outcome(outcome))?;
             Err(failure)
         };
-        let current = ask("Type the CURRENT master password.")?;
+        let current = ask(
+            "Type the CURRENT master password.",
+            "",
+            "Current master password",
+        )?;
         let matches = self.with_vault_at(generation, |v| Ok(v.password_matches(&current)))?;
         if !matches {
             self.record(event.outcome("wrong_password"))?;
@@ -1079,9 +1108,15 @@ impl Agent {
             ));
         }
         let first = ask(
-            "Type the NEW master password (at least 8 characters; 12 or more, or a passphrase, is recommended).",
+            "Type the NEW master password.",
+            "At least 8 characters; 12 or more, or a passphrase, is recommended.",
+            "New master password",
         )?;
-        let second = ask("Type the new master password again.")?;
+        let second = ask(
+            "Type the new master password again.",
+            "",
+            "New master password, again",
+        )?;
         if *first != *second {
             self.record(event.outcome("mismatch"))?;
             return Err(Failure::invalid(
@@ -1131,6 +1166,7 @@ impl Agent {
                 "The program that asked receives the {what} in clear text and can do anything \
                  with it."
             ),
+            command: None,
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Reveals".into(), what.into()),
@@ -1323,8 +1359,8 @@ impl Agent {
                           environment; programs it starts can use them too. Read the command \
                           before you allow it."
                 .into(),
+            command: Some(command_line),
             details: vec![
-                ("Command".into(), command_line),
                 (
                     "Secrets".into(),
                     run.bindings

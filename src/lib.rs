@@ -17,6 +17,7 @@
 //! - [`client`]: the client side of the socket protocol.
 //! - [`protocol`]: request/response types and framing (including fd passing).
 //! - [`ui`]: approval and password dialogs (zenity).
+//! - [`dialog_protocol`]: the protocol between the agent and `rusthorse-dialog`.
 //! - [`exec`]: program resolution and environment preparation for `run`.
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`peer`]: identifying the process on the other end of the socket.
@@ -29,6 +30,7 @@
 pub mod agent;
 pub mod audit;
 pub mod client;
+pub mod dialog_protocol;
 pub mod exec;
 pub mod generate;
 pub mod import;
