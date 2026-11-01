@@ -4,10 +4,16 @@
 //! answer them by writing to a terminal. The production implementation uses
 //! `zenity` (tested with 3.44). Tests use their own [`Ui`] implementation.
 
+use std::io::Read;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+
+use zeroize::Zeroizing;
 
 use crate::protocol::SecretString;
 use crate::util::{format_duration, visible};
@@ -68,47 +74,97 @@ pub struct ZenityUi {
     pub timeout: Duration,
 }
 
+/// Where zenity is looked for. `PATH` is never consulted.
+const ZENITY_PATHS: [&str; 2] = ["/usr/bin/zenity", "/usr/local/bin/zenity"];
+
+/// The only environment variables zenity receives. In particular, zenity
+/// lets `ZENITY_*` variables remap its exit statuses, so nothing else is
+/// inherited.
+const DIALOG_ENV: [&str; 9] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_MESSAGES",
+];
+
 /// Exit status zenity uses for a timeout.
 const ZENITY_TIMEOUT: i32 = 5;
 
 impl ZenityUi {
-    fn command(&self, title: &str) -> Command {
-        let mut cmd = Command::new("zenity");
+    fn command(&self, title: &str) -> anyhow::Result<Command> {
+        let program = ZENITY_PATHS
+            .iter()
+            .find(|p| Path::new(p).is_file())
+            .context(
+                "zenity not found in /usr/bin or /usr/local/bin (`sudo apt install zenity`)",
+            )?;
+        let mut cmd = Command::new(program);
         cmd.arg(format!("--title={title}"))
             .arg(format!("--timeout={}", self.timeout.as_secs().max(1)))
-            .arg("--width=640")
+            .arg("--width=680")
+            // zenity looks for its UI definition relative to the working
+            // directory before the installed one.
+            .current_dir("/")
+            .env_clear()
+            .envs(dialog_env())
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        cmd.envs(graphical_session_env());
-        cmd
+        Ok(cmd)
+    }
+
+    /// Run zenity and collect what it prints. Its stdout is one end of a
+    /// socket pair, not a pipe: another process of the same user can open a
+    /// pipe through `/proc/<pid>/fd/1` and race us for the typed password, but
+    /// opening a socket that way fails (`ENXIO`).
+    fn run(&self, mut cmd: Command) -> anyhow::Result<(Option<i32>, Zeroizing<Vec<u8>>)> {
+        let (mut ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
+        cmd.stdout(Stdio::from(OwnedFd::from(theirs)));
+        let mut child = cmd.spawn().context("cannot run zenity")?;
+        // Dropping the command closes our copy of the child's end, so that
+        // reading below sees end-of-file when zenity exits.
+        drop(cmd);
+        let mut output = Zeroizing::new(Vec::with_capacity(4096));
+        let read = ours.read_to_end(&mut output);
+        let status = child.wait().context("cannot wait for zenity")?;
+        read.context("cannot read zenity's answer")?;
+        Ok((status.code(), output))
     }
 
     fn hidden_entry(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>> {
-        let mut cmd = self.command(&prompt.title);
+        let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
-            // The entry dialog's label uses GTK mnemonics: a single `_` would
-            // underline the next letter and disappear.
-            .arg(format!("--text={}", prompt.message.replace('_', "__")))
+            .arg(format!("--text={}", entry_label(&prompt.message)))
             .arg(format!("--ok-label={}", prompt.confirm));
-        let output = cmd
-            .output()
-            .context("cannot run zenity (is it installed? `sudo apt install zenity`)")?;
-        let stdout = zeroize::Zeroizing::new(output.stdout);
-        match output.status.code() {
+        let (status, output) = self.run(cmd)?;
+        match status {
             Some(0) => {
-                let mut value =
-                    String::from_utf8(stdout.to_vec()).context("zenity returned invalid UTF-8")?;
+                let mut value = String::from_utf8(output.to_vec())
+                    .map(SecretString::new)
+                    .map_err(|_| anyhow::anyhow!("zenity returned invalid UTF-8"))?;
                 if value.ends_with('\n') {
                     value.pop();
                 }
-                Ok(Some(SecretString::new(value)))
+                Ok(Some(value))
             }
             Some(1) | Some(ZENITY_TIMEOUT) => Ok(None),
             other => bail!("zenity failed (exit status {other:?})"),
         }
     }
+}
+
+/// Text for zenity's entry dialog, which (unlike the question dialog with
+/// `--no-markup`) passes its text through `g_strcompress` — so `\n` or
+/// `\000` sequences would be interpreted — and then uses it as a GTK mnemonic
+/// label, where a single `_` underlines the next letter and disappears.
+/// Backslashes must be escaped first, then underscores.
+fn entry_label(text: &str) -> String {
+    text.replace('\\', r"\\").replace('_', "__")
 }
 
 impl Ui for ZenityUi {
@@ -124,28 +180,36 @@ impl Ui for ZenityUi {
         let remember_label = format!("Allow for {}", format_duration(self.remember_for));
         let offer_remember = request.can_remember && !self.remember_for.is_zero();
 
-        let mut cmd = self.command(&request.title);
+        let mut text = approval_text(request);
+        if offer_remember {
+            text.push_str(&format!(
+                "\n\n“{remember_label}” lets identical requests run without asking for {} — \
+                 even if they read different input or files. Prefer “Allow once”.",
+                format_duration(self.remember_for)
+            ));
+        }
+        let mut cmd = self.command(&request.title)?;
         cmd.arg("--question")
+            // Literal text: no Pango markup and no escape-sequence processing.
             .arg("--no-markup")
             .arg("--default-cancel")
-            .arg(format!("--text={}", approval_text(request)))
+            .arg(format!("--text={text}"))
             .arg("--ok-label=Allow once")
             .arg("--cancel-label=Deny");
         if offer_remember {
             cmd.arg(format!("--extra-button={remember_label}"));
         }
-        let output = cmd
-            .output()
-            .context("cannot run zenity (is it installed? `sudo apt install zenity`)")?;
-        let pressed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(match output.status.code() {
-            Some(0) => Decision::AllowOnce,
-            // zenity reports the extra button as exit status 1 plus its label.
-            Some(1) if offer_remember && pressed == remember_label => {
+        let (status, output) = self.run(cmd)?;
+        let printed = String::from_utf8_lossy(&output).trim().to_string();
+        // Only two exact outcomes allow anything; everything else — Deny,
+        // closing the window, a timeout, an unexpected status or output —
+        // is a denial.
+        Ok(match status {
+            Some(0) if printed.is_empty() => Decision::AllowOnce,
+            Some(1) if offer_remember && printed == remember_label => {
                 Decision::AllowFor(self.remember_for)
             }
-            Some(1) | Some(ZENITY_TIMEOUT) => Decision::Deny,
-            other => bail!("zenity failed (exit status {other:?})"),
+            _ => Decision::Deny,
         })
     }
 }
@@ -164,38 +228,49 @@ pub fn approval_text(request: &ApprovalRequest) -> String {
     text
 }
 
-/// Variables a dialog needs to reach the desktop session. When the agent was
-/// started before the session exported them to systemd, read them from
-/// `systemctl --user show-environment`.
-fn graphical_session_env() -> Vec<(String, String)> {
-    const WANTED: [&str; 4] = [
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "XAUTHORITY",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ];
-    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        return Vec::new();
+/// The environment for dialogs: the [`DIALOG_ENV`] variables of the agent,
+/// plus the session's display variables from `systemctl --user
+/// show-environment` when the agent started before the desktop exported them.
+fn dialog_env() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = DIALOG_ENV
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect();
+    let has_display = env
+        .iter()
+        .any(|(k, _)| k == "DISPLAY" || k == "WAYLAND_DISPLAY");
+    if has_display {
+        return env;
     }
-    let Ok(output) = Command::new("systemctl")
+    let Ok(output) = Command::new("/usr/bin/systemctl")
         .args(["--user", "show-environment"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
-        return Vec::new();
+        return env;
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(k, v)| WANTED.contains(k) && !v.starts_with("$'"))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if DIALOG_ENV.contains(&k) && !v.starts_with("$'") && !env.iter().any(|(e, _)| e == k) {
+            env.push((k.to_string(), v.to_string()));
+        }
+    }
+    env
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_labels_are_escaped_for_zenity() {
+        assert_eq!(entry_label(r"prod\000HIDDEN"), r"prod\\000HIDDEN");
+        assert_eq!(entry_label("OPENAI_API_KEY"), "OPENAI__API__KEY");
+        assert_eq!(entry_label(r"a\_b"), r"a\\__b");
+    }
 
     #[test]
     fn approval_text_neutralizes_injection() {

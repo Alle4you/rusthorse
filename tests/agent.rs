@@ -25,6 +25,8 @@ struct ScriptedUi {
     decisions: Mutex<VecDeque<Decision>>,
     approvals_asked: AtomicUsize,
     last_approval: Mutex<Option<ApprovalRequest>>,
+    /// Runs (once) while the "human" is looking at the next approval dialog.
+    on_approve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Ui for ScriptedUi {
@@ -43,6 +45,9 @@ impl Ui for ScriptedUi {
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
         self.approvals_asked.fetch_add(1, Ordering::SeqCst);
         *self.last_approval.lock().unwrap() = Some(request.clone());
+        if let Some(hook) = self.on_approve.lock().unwrap().take() {
+            hook();
+        }
         Ok(self
             .decisions
             .lock()
@@ -76,6 +81,10 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
+        Harness::with_idle_timeout(Duration::ZERO)
+    }
+
+    fn with_idle_timeout(idle_timeout: Duration) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
         Vault::create(
@@ -91,7 +100,7 @@ impl Harness {
             vault,
             socket: socket.clone(),
             audit_log: audit.clone(),
-            idle_timeout: Duration::ZERO,
+            idle_timeout,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -466,6 +475,132 @@ fn unknown_entries_fail_before_asking() {
     assert_eq!(out.status.code(), Some(125));
     assert!(text(&out.stderr).contains("no entry named"));
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_writable_stdin_is_not_an_unredacted_way_out() {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let h = Harness::new();
+    h.add_secret("T", "leak-through-stdin", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    // The client's "stdin" is a bidirectional socket; the command tries to
+    // write the secret into it.
+    let (mut ours, theirs) = UnixStream::pair().expect("pair");
+    let out = h
+        .cmd(&[
+            "run",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$T\" >&0; echo done",
+        ])
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .output()
+        .expect("run");
+    assert!(text(&out.stdout).contains("done"));
+    ours.set_nonblocking(true).expect("nonblocking");
+    let mut received = Vec::new();
+    let _ = ours.read_to_end(&mut received);
+    assert!(
+        !String::from_utf8_lossy(&received).contains("leak-through-stdin"),
+        "the secret came back through stdin"
+    );
+}
+
+#[test]
+fn locking_while_the_dialog_is_open_cancels_the_run() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let socket = h.socket.clone();
+    *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+        let client = rusthorse::client::Client::new(socket);
+        client
+            .call(&rusthorse::protocol::Request::Lock)
+            .expect("lock");
+    }));
+    let marker = h.dir.path().join("ran");
+    let out = h.run(&["run", "T", "--", "touch", marker.to_str().expect("utf8")]);
+    assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("locked or changed"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn replacing_the_program_after_approval_cancels_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let script = h.dir.path().join("tool.sh");
+    std::fs::write(&script, "#!/bin/sh\necho approved-version\n").expect("write");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let swapped = script.clone();
+    *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+        let evil = swapped.with_extension("new");
+        std::fs::write(&evil, "#!/bin/sh\necho swapped-version\n").expect("write");
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::rename(&evil, &swapped).expect("rename");
+    }));
+    let out = h.run(&["run", "T", "--", "./tool.sh"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(!text(&out.stdout).contains("swapped-version"));
+    assert!(text(&out.stderr).contains("replaced after you approved"));
+}
+
+#[test]
+fn command_lines_too_long_to_read_are_refused() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    let long = "x".repeat(1200);
+    let out = h.run(&["run", "T", "--", "echo", &long]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(text(&out.stderr).contains("too long"));
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn descriptors_on_other_requests_are_rejected() {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    let h = Harness::new();
+    let stream = UnixStream::connect(&h.socket).expect("connect");
+    let devnull = std::fs::File::open("/dev/null").expect("devnull");
+    rusthorse::protocol::send_frame(
+        &stream,
+        &rusthorse::protocol::Request::Status,
+        &[devnull.as_fd()],
+    )
+    .expect("send");
+    let response: rusthorse::protocol::Response =
+        rusthorse::protocol::read_message(&stream).expect("read");
+    assert!(matches!(
+        response,
+        rusthorse::protocol::Response::Error {
+            code: rusthorse::protocol::ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn read_only_requests_do_not_keep_the_vault_unlocked() {
+    let h = Harness::with_idle_timeout(Duration::from_secs(2));
+    h.add_secret("T", "abcdefgh", &[]);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        let _ = h.run(&["list"]);
+        std::thread::sleep(Duration::from_millis(300));
+        let status = h.run(&["status", "--json"]);
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).expect("json");
+        if status["locked"] == true {
+            return;
+        }
+    }
+    panic!("polling `list` kept the vault unlocked past the idle timeout");
 }
 
 fn wait_for_pid(path: &Path) -> u32 {

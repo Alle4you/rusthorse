@@ -35,10 +35,13 @@ standard output.
 ## Entry names
 
 An entry name is the KeePass title. Names must be unique, at most 128
-characters, without leading or trailing spaces and without control or
-invisible formatting characters. Where a command takes a `NAME`, a
+characters, without `/`, without leading or trailing spaces and without
+control or invisible formatting characters. Where a command takes a `NAME`, a
 `Group/Sub/Name` path also works, which is only needed when a database edited
-elsewhere has two entries with the same title.
+elsewhere has two entries with the same title. If a name matches more than
+one entry in any way (for example a title containing `/` that looks like the
+path of another entry), the command fails with an "ambiguous" error listing
+the paths.
 
 Using environment-variable-style names (`OPENAI_API_KEY`) lets you write
 `rusthorse run OPENAI_API_KEY -- …` instead of `VAR=NAME`.
@@ -71,7 +74,7 @@ rusthorse agent [--vault PATH] [--audit-log PATH]
 | Option | Default | Meaning |
 |---|---|---|
 | `--idle-timeout` | `15m` | Lock after this much inactivity; `0` never locks. |
-| `--remember` | `10m` | Duration of "Allow for …" in approval dialogs; `0` removes the button. |
+| `--remember` | `0` (off) | Offer "Allow for DURATION" in `run` dialogs. Off by default; read [ADR 0005](adr/0005-remembered-approvals-opt-in.md) before enabling it. |
 | `--dialog-timeout` | `2m` | Unanswered dialogs are denied (or cancelled) after this long. |
 
 Durations are a number followed by `s`, `m` or `h`, or `0`.
@@ -99,8 +102,9 @@ rusthorse ls …
 ```
 
 Lists entries with their username, endpoint (URL, or `host:port`) and tags.
-Values and notes are never included. JSON output is an array of objects with
-the fields described in [protocol.md](protocol.md#entryinfo).
+Values and notes are never included, nor any field that the KeePass file marks
+as protected. JSON output is an array of objects with the fields described in
+[protocol.md](protocol.md#entryinfo), including each entry's UUID.
 
 ## `rusthorse show`
 
@@ -109,8 +113,8 @@ rusthorse show NAME [--json]
 ```
 
 Shows one entry's metadata: name, group, username, URL, host, port, tags,
-whether it has a value and notes, the names of any other fields, and the last
-modification time.
+whether it has a value and notes, the names of protected and other fields,
+and the last modification time.
 
 ## `rusthorse add`
 
@@ -176,22 +180,31 @@ variable name) or `VAR=NAME`. Requires approval; the dialog shows:
 - which secret goes into which variable;
 - whether output is redacted;
 - who is asking (the process chain, e.g. `bash ← claude`);
+- that the command runs as you, outside any sandbox the requester is in;
 - warnings about removed variables (`LD_*`) and variables that can make the
   program run other code (`NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND`, …).
 
-"Allow for 10m" remembers the approval for **exactly** the same secrets,
-command line, program, directory, redaction setting and risky variables;
-anything else asks again. Locking forgets all remembered approvals. Command
-lines longer than 600 characters cannot be remembered.
+Requests whose command line, program path or directory is longer than 1000
+characters are refused (put the command in a script): the dialog never
+truncates what you approve.
 
-The agent starts the command itself, in the requested directory, with your
-environment minus `LD_*` variables plus the secrets, and connects it to the
-caller's standard input, output and error. Unless `--no-redact` is given,
-every occurrence of a secret value (4 characters or longer) in the output is
-replaced with `[REDACTED:<entry>]`; output therefore goes through a pipe, so
-programs see a pipe rather than a terminal. If `rusthorse run` is
-interrupted, the command's process group gets `SIGTERM` and, 3 seconds later,
-`SIGKILL`.
+After you answer, the agent checks that the vault was not locked or changed,
+that the entries are the same (by UUID) and that the program file and the
+directory were not replaced; otherwise nothing runs. The agent then starts the
+command itself, in the requested directory, with your environment minus
+`LD_*` variables plus the secrets. Unless `--no-redact` is given, the command's
+standard input, output and error are pipes owned by the agent: your input is
+forwarded to it, and every occurrence of a secret value (4 characters or
+longer) in its output is replaced with `[REDACTED:<entry>]`. Programs
+therefore see pipes rather than a terminal. With `--no-redact`, the command
+gets the caller's descriptors directly. If `rusthorse run` is interrupted, the
+command's process group gets `SIGTERM` and, 3 seconds later, `SIGKILL`.
+
+If the agent runs with `--remember`, the dialog also offers "Allow for …",
+which lets **identical** requests (same vault state, entries, command line,
+program, directory, redaction and environment) run without asking for that
+long. It does not cover what the command reads, so use it only for commands
+whose input you control.
 
 Examples:
 

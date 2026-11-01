@@ -44,5 +44,13 @@ such as a GTK application) can provide their own implementation.
 - On X11, any program of the same user can synthesize input or read the
   screen, so a malicious local process could click a dialog. Wayland
   isolates clients; the threat model documents the difference.
-- Dialog text is limited to what zenity can display: very long command lines
-  are truncated and such requests can never be remembered.
+- Dialog text is limited to what zenity can display. Requests whose details
+  are too long to show in full are refused rather than truncated.
+- zenity is a separate, ordinary process: its standard output could be opened
+  by other processes of the same user through `/proc/<pid>/fd` if it were a
+  pipe, so the agent reads the answer through a socket pair (which cannot be
+  opened that way), runs zenity from an absolute path with a minimal
+  environment (zenity lets `ZENITY_*` variables remap its exit statuses) and
+  `/` as working directory, and escapes text for the entry dialog, which
+  interprets backslash sequences. An in-process GUI would remove this class of
+  problems and is on the roadmap.

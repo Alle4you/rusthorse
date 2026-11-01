@@ -123,8 +123,9 @@ struct AgentArgs {
     /// Lock after this much inactivity (`0` = never).
     #[arg(long, default_value = "15m", value_parser = parse_duration, value_name = "DURATION")]
     idle_timeout: Duration,
-    /// How long "Allow for …" lasts in approval dialogs (`0` hides the option).
-    #[arg(long, default_value = "10m", value_parser = parse_duration, value_name = "DURATION")]
+    /// Offer "Allow for DURATION" in run dialogs, approving identical requests
+    /// for that long without asking. Off (`0`) by default; see docs/cli.md.
+    #[arg(long, default_value = "0", value_parser = parse_duration, value_name = "DURATION")]
     remember: Duration,
     /// How long dialogs wait for an answer before denying.
     #[arg(long, default_value = "2m", value_parser = parse_duration, value_name = "DURATION")]
@@ -528,10 +529,11 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
     let f = &entry.fields;
     let line = |label: &str, value: Option<String>| {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
-            println!("{label:<10} {v}");
+            println!("{label:<11} {v}");
         }
     };
     line("name:", Some(entry.name.clone()));
+    line("id:", Some(entry.id.clone()));
     line("group:", entry.group.clone());
     line("username:", f.username.clone());
     line("url:", f.url.clone());
@@ -547,6 +549,7 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
         }),
     );
     line("notes:", entry.has_notes.then(|| "set (hidden)".into()));
+    line("protected:", Some(entry.protected_fields.join(", ")));
     line("fields:", Some(entry.other_fields.join(", ")));
     line("modified:", entry.modified.clone());
     Ok(0)

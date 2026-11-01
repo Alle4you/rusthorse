@@ -82,10 +82,18 @@ Be especially careful with:
 - **`--no-redact`**. The output will contain the secret if the program
   prints it.
 
-**Allow for 10m** is convenient when the agent repeats exactly the same
-command (a test suite that calls an API, for example). It only matches the
-identical command line, program, directory and secrets; anything different
-asks again. Use `rusthorse lock` when you step away.
+**Remembered approvals** ("Allow for N") are off by default. If you enable
+them (`rusthorse agent --remember 5m`), they skip the dialog for *identical*
+requests — same command line, program, directory, secrets, environment and
+vault state — but not for what the command reads: an agent can change a
+script, a config file or the command's input between runs. Enable them only
+for commands whose inputs you control, and use `rusthorse lock` when you
+step away.
+
+**Sandboxed agents.** If the AI agent runs in a sandbox (restricted network,
+read-only file system, container), remember that the command you approve is
+started by Rusthorse *outside* that sandbox, with your full access. The
+dialog says so on the "Runs" line.
 
 When something looks wrong, click **Deny**. The command does not run, the AI
 gets exit status 125, and the denial is in `rusthorse audit`.
@@ -101,12 +109,14 @@ cooperative-but-fallible agents:
 - output that happens to contain the secret is redacted;
 - there is a record of every use.
 
-It cannot make a malicious agent harmless. An agent that is actively trying
-to steal a secret, and that you keep approving, can get it — for example with
-a command that encodes the secret before printing it, or a script that sends
-it somewhere. Rusthorse makes such attempts visible in the dialog; it does
-not detect them for you. The full list of limits is in the
-[threat model](threat-model.md).
+It cannot make a malicious agent harmless when the agent runs as you in your
+desktop session. An agent that is actively trying to steal a secret can get
+it — by encoding it in an approved command's output, by having a script send
+it somewhere, by reading `/proc/<pid>/environ` of a running command, or on
+X11 by clicking "Allow" itself. Rusthorse makes such attempts visible and
+leaves a trail; it does not detect them for you. To resist a hostile agent,
+run it isolated from your session (separate user, no access to your display
+or processes) — see [threat model §8](threat-model.md#8-running-ai-agents-in-isolation).
 
 ## Tips
 

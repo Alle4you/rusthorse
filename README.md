@@ -25,8 +25,9 @@ $ rusthorse run OPENAI_API_KEY -- python summarize.py
 │ Directory:    /home/me/project                                   │
 │ Secrets:      OPENAI_API_KEY ← OPENAI_API_KEY                    │
 │ Output:       secret values are redacted                         │
+│ Runs:         as you, outside any sandbox the requester may be in│
 │ Requested by: rusthorse[8812] ← bash[8790] ← claude[4120]        │
-│                       [ Deny ]  [ Allow for 10m ]  [ Allow once ]│
+│                                       [ Deny ]  [ Allow once ]   │
 └──────────────────────────────────────────────────────────────────┘
 Summary written to out.md
 ```
@@ -62,12 +63,16 @@ and keeps the value out of the agent's reach in the common case.
 - **Approval for every use.** Running a command with a secret, revealing a
   value, editing or deleting an entry all require your approval in a dialog
   shown by the agent — not in the terminal, where a program could answer.
-- **What you approve is what runs.** The agent itself resolves the program to
-  an absolute path, removes dynamic-loader variables (`LD_PRELOAD`, …), warns
-  about variables that can inject code (`NODE_OPTIONS`, `PYTHONPATH`, …) and
-  starts the command as its own child.
+- **The command you approve is the command that starts.** The agent itself
+  resolves the program to an absolute path, removes dynamic-loader variables
+  (`LD_PRELOAD`, …), warns about variables that can inject code
+  (`NODE_OPTIONS`, `PYTHONPATH`, …), checks after your answer that the program
+  and directory were not swapped, and starts the command as its own child.
+  (What the program then reads — scripts, config files — is up to you to
+  trust; see the threat model.)
 - **Output redaction.** Secret values printed by the command are replaced with
-  `[REDACTED:<entry>]` before they reach the caller.
+  `[REDACTED:<entry>]` before they reach the caller; the command only ever
+  sees pipes owned by the agent.
 - **The master password never touches the client.** The agent asks for it in
   its own dialog and locks itself after 15 minutes of inactivity.
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
@@ -132,7 +137,7 @@ what Rusthorse can and cannot protect against when the requester is an AI.
 | `add NAME --stdin` | New entry with a value from standard input | yes |
 | `edit NAME …` | Change fields, tags, name or value | yes |
 | `remove NAME` | Delete an entry | yes |
-| `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (can be remembered) |
+| `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
 | `reveal NAME` | Print a value (for humans; avoid in automation) | yes (never remembered) |
 | `import dotenv FILE` | Import `NAME=value` pairs | yes (one for the batch) |
 | `import secret-service -a KEY=VALUE` | Import from GNOME Keyring / KWallet | yes (one for the batch) |
@@ -142,14 +147,17 @@ See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
 
 ## Security in one paragraph
 
-Rusthorse protects secrets from being **seen** by the programs that use them
-in the common case: values do not appear in the caller's process, output,
-logs or the AI's context, and every use is a decision you make with the exact
-command in front of you. It does **not** make a compromised user account safe:
-malware running as you can replace the binary, read the environment of a
-running approved command, or (on X11) click "Allow" for you. Approving a
-command means trusting everything that command does. The
-[threat model](docs/threat-model.md) lists every assumption and limitation.
+Rusthorse prevents **accidental** exposure: against a cooperative but
+fallible requester — the common case with AI agents — values do not appear in
+the caller's process, output, logs or the AI's context, and every use is a
+decision you make with the exact command in front of you. It does **not**
+resist a requester that deliberately attacks it from your own user account
+and desktop session: on X11 such a program can click "Allow" for you, and it
+can read the environment of a running approved command. For that, the AI
+agent must run isolated from your session. Approving a command means trusting
+everything that command does, and it runs outside any sandbox the requester
+is in. The [threat model](docs/threat-model.md) lists every assumption and
+limitation.
 
 ## Documentation
 

@@ -11,6 +11,7 @@ supersedes the old one, which is marked as such.
 | [0002](0002-agent-mediated-execution.md) | The agent, not the client, runs approved commands | Accepted |
 | [0003](0003-agent-side-dialogs.md) | Approvals are dialogs shown by the agent | Accepted |
 | [0004](0004-native-distribution.md) | Native binary and systemd user service, no Flatpak | Accepted |
+| [0005](0005-remembered-approvals-opt-in.md) | Remembered approvals are opt-in and bound to the vault generation | Accepted |
 
 ## Writing a new ADR
 

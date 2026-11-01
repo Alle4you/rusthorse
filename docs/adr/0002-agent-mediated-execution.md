@@ -28,9 +28,15 @@ The agent executes approved commands itself:
 - The agent resolves `argv[0]` to a canonical absolute path, removes `LD_*`
   variables, flags variables that can inject code, shows all of it in the
   approval dialog, and only then reads the secret values.
-- The agent spawns the command as its own child, in a new process group, with
-  the client's stdin and with stdout/stderr going through pipes that it
-  filters for secret values before writing to the client's descriptors.
+- The agent spawns the command as its own child, in a new process group.
+  With redaction (the default) the command's stdin, stdout and stderr are
+  pipes owned by the agent: the agent forwards the client's input and filters
+  the output for secret values before writing it to the client's
+  descriptors. The client's descriptors themselves never reach the command,
+  since a descriptor passed as "stdin" may be writable.
+- After the human answers, the agent checks that the vault generation, the
+  entries (by UUID) and the program's and directory's inodes are unchanged
+  before reading any value.
 - The client only receives the exit status. If it disconnects, the agent
   terminates the command.
 
@@ -47,15 +53,17 @@ The agent executes approved commands itself:
 
 ## Consequences
 
-- What the human approves is what runs: program path, arguments, directory,
-  secrets and risky variables are decided before the dialog, and the
-  approval-cache key covers all of them.
+- The command line, program, directory, environment and secrets that the
+  human approves are the ones used: they are decided before the dialog and
+  re-checked after it. The *contents* of the program and of the files it
+  reads are not pinned (threat model L4).
 - The approved command is not a descendant of the caller, and redaction
   cannot be bypassed by a modified client.
 - Commands run in the agent's systemd service, not in the caller's session:
   they have no controlling terminal (job control and some interactive
-  programs behave differently), their stdout/stderr are pipes when redaction
-  is on, and they are in the service's cgroup (stopping the agent stops them).
+  programs behave differently), their stdin, stdout and stderr are pipes when
+  redaction is on, and they are in the service's cgroup (stopping the agent
+  stops them). They also run outside any sandbox the requester is in.
 - The environment of a *running* approved command is still readable by other
   processes of the same user through `/proc/<pid>/environ`; this is a
   property of environment variables and is listed in the threat model.

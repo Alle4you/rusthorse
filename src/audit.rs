@@ -110,7 +110,8 @@ impl AuditLog {
         let mut line = serde_json::to_vec(event).map_err(io::Error::other)?;
         line.push(b'\n');
         file.write_all(&line)?;
-        file.flush()
+        // The record of a decision must survive a crash right after it.
+        file.sync_data()
     }
 }
 

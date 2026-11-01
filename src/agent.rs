@@ -27,7 +27,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,7 +47,7 @@ use crate::protocol::{
 };
 use crate::redact::Redactor;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Ui};
-use crate::util::{self, shell_join, truncate};
+use crate::util::{self, shell_join};
 use crate::vault::{Vault, VaultError};
 
 /// How many wrong master passwords are tolerated per unlock.
@@ -55,6 +55,22 @@ const UNLOCK_ATTEMPTS: u32 = 3;
 
 /// Grace period between SIGTERM and SIGKILL when a client goes away.
 const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// Connections handled at the same time; more are refused.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Requests that may wait for the human at the same time; more are refused.
+const MAX_WAITING_FOR_DIALOG: usize = 8;
+
+/// How long a client has to send its request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest text the approval dialog shows for one detail. Longer requests are
+/// refused instead of truncated: the human must see everything they approve.
+const MAX_DETAIL_CHARS: usize = 1000;
+
+/// Most entries in one import batch (all of them are listed in the dialog).
+const MAX_IMPORT: usize = 100;
 
 /// Agent settings.
 #[derive(Debug, Clone)]
@@ -123,8 +139,38 @@ struct Remembered {
 
 struct State {
     vault: Option<Vault>,
+    /// Last approved use; read-only requests (`list`, `show`, `status`) and
+    /// denied requests do not count, so they cannot keep the vault unlocked.
     last_used: Instant,
     remembered: Vec<Remembered>,
+    /// Incremented on every unlock, lock and saved change. An approval is
+    /// only acted on if the generation did not change while the human was
+    /// deciding, and remembered approvals are tied to one generation.
+    generation: u64,
+}
+
+impl State {
+    fn lock(&mut self) {
+        self.vault = None;
+        self.remembered.clear();
+        self.generation += 1;
+    }
+}
+
+/// Decrements a counter when dropped.
+struct CountGuard<'a>(&'a AtomicUsize);
+
+impl Drop for CountGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn locked_meanwhile() -> Failure {
+    Failure::new(
+        ErrorCode::Locked,
+        "the vault was locked or changed while the request was waiting; try again",
+    )
 }
 
 /// The agent. Create with [`Agent::new`], then call [`Agent::serve`].
@@ -134,6 +180,8 @@ pub struct Agent {
     state: Mutex<State>,
     /// Serializes dialogs: the human answers one question at a time.
     dialog: Mutex<()>,
+    waiting_for_dialog: AtomicUsize,
+    connections: Arc<AtomicUsize>,
     audit: AuditLog,
 }
 
@@ -148,8 +196,11 @@ impl Agent {
                 vault: None,
                 last_used: Instant::now(),
                 remembered: Vec::new(),
+                generation: 0,
             }),
             dialog: Mutex::new(()),
+            waiting_for_dialog: AtomicUsize::new(0),
+            connections: Arc::new(AtomicUsize::new(0)),
             audit,
         })
     }
@@ -183,10 +234,18 @@ impl Agent {
         for connection in listener.incoming() {
             match connection {
                 Ok(stream) => {
+                    if self.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                        self.connections.fetch_sub(1, Ordering::SeqCst);
+                        drop(stream);
+                        continue;
+                    }
                     let agent = Arc::clone(self);
                     thread::Builder::new()
                         .name("rusthorse-conn".into())
-                        .spawn(move || agent.handle_connection(stream))
+                        .spawn(move || {
+                            let _count = CountGuard(&agent.connections);
+                            agent.handle_connection(stream);
+                        })
                         .context("cannot start a connection thread")?;
                 }
                 Err(e) => eprintln!("rusthorse agent: accept failed: {e}"),
@@ -215,15 +274,29 @@ impl Agent {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn dialog(&self) -> MutexGuard<'_, ()> {
-        self.dialog.lock().unwrap_or_else(|p| p.into_inner())
+    /// Wait for our turn to show a dialog, refusing when too many requests
+    /// are already waiting (a flood of requests should not queue forever).
+    fn dialog(&self) -> Result<MutexGuard<'_, ()>, Failure> {
+        if self.waiting_for_dialog.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING_FOR_DIALOG {
+            self.waiting_for_dialog.fetch_sub(1, Ordering::SeqCst);
+            return Err(Failure::new(
+                ErrorCode::Denied,
+                "too many requests are waiting for your answer; try again later",
+            ));
+        }
+        let _waiting = CountGuard(&self.waiting_for_dialog);
+        Ok(self.dialog.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Note an approved use of the vault (postpones the idle lock).
+    fn touch(&self) {
+        self.state().last_used = Instant::now();
     }
 
     fn lock_if_idle(&self) {
         let mut state = self.state();
         if state.vault.is_some() && state.last_used.elapsed() >= self.config.idle_timeout {
-            state.vault = None;
-            state.remembered.clear();
+            state.lock();
             drop(state);
             let _ = self
                 .audit
@@ -258,7 +331,9 @@ impl Agent {
             // Another user (only possible if the socket directory was opened up).
             return Ok(());
         }
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
         let (body, fds) = protocol::recv_frame(stream)?;
+        stream.set_read_timeout(None)?;
         let request: Request = match serde_json::from_slice(&body) {
             Ok(request) => request,
             Err(e) => {
@@ -274,10 +349,10 @@ impl Agent {
 
         let result = match request {
             Request::Run(run) => self.run(stream, &peer, run, fds),
-            other => {
-                drop(fds);
-                self.dispatch(&peer, other)
-            }
+            _ if !fds.is_empty() => Err(Failure::invalid(
+                "only run requests may carry file descriptors",
+            )),
+            other => self.dispatch(&peer, other),
         };
         let response = result.unwrap_or_else(|f| Response::Error {
             code: f.code,
@@ -291,11 +366,7 @@ impl Agent {
         match request {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Lock => {
-                {
-                    let mut state = self.state();
-                    state.vault = None;
-                    state.remembered.clear();
-                }
+                self.state().lock();
                 self.record(AuditEvent::new("lock", peer).outcome("requested"))?;
                 Ok(ok("vault locked"))
             }
@@ -348,14 +419,42 @@ impl Agent {
     ) -> Result<R, Failure> {
         self.ensure_unlocked(peer)?;
         let mut state = self.state();
-        state.last_used = Instant::now();
-        let vault = state.vault.as_mut().ok_or_else(|| {
-            Failure::new(
-                ErrorCode::Locked,
-                "the vault was locked while the request was in progress",
-            )
-        })?;
+        let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
         f(vault)
+    }
+
+    /// The current generation, unlocking first if needed.
+    fn generation(&self, peer: &Peer) -> Result<u64, Failure> {
+        self.ensure_unlocked(peer)?;
+        Ok(self.state().generation)
+    }
+
+    /// Apply an approved change and save it, but only if nothing happened to
+    /// the vault since `generation`. `f` must not leave partial changes when
+    /// it fails. If saving fails, the vault is locked so that memory never
+    /// holds changes that are not on disk.
+    fn commit<R>(
+        &self,
+        generation: u64,
+        f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
+    ) -> Result<R, Failure> {
+        let mut state = self.state();
+        if state.generation != generation {
+            return Err(locked_meanwhile());
+        }
+        let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
+        let result = f(vault)?;
+        if let Err(e) = vault.save() {
+            state.lock();
+            let mut failure = Failure::from(e);
+            failure
+                .message
+                .push_str(" (the vault was locked to discard the unsaved change)");
+            return Err(failure);
+        }
+        state.generation += 1;
+        state.last_used = Instant::now();
+        Ok(result)
     }
 
     fn ensure_unlocked(&self, peer: &Peer) -> Result<(), Failure> {
@@ -365,7 +464,7 @@ impl Agent {
         if !self.config.vault.exists() {
             return Err(VaultError::Missing(self.config.vault.clone()).into());
         }
-        let _dialog = self.dialog();
+        let _dialog = self.dialog()?;
         if self.state().vault.is_some() {
             return Ok(());
         }
@@ -391,6 +490,7 @@ impl Agent {
                         let mut state = self.state();
                         state.vault = Some(vault);
                         state.last_used = Instant::now();
+                        state.generation += 1;
                     }
                     self.record(AuditEvent::new("unlock", peer).outcome("unlocked"))?;
                     return Ok(());
@@ -424,11 +524,13 @@ impl Agent {
             state.remembered.retain(|r| r.until > now);
             if state.remembered.iter().any(|r| &r.key == key) {
                 drop(state);
-                return self.record(event.outcome("allowed_remembered"));
+                self.record(event.outcome("allowed_remembered"))?;
+                self.touch();
+                return Ok(());
             }
         }
         let decision = {
-            let _dialog = self.dialog();
+            let _dialog = self.dialog()?;
             self.ui.approve(&request)?
         };
         match decision {
@@ -436,7 +538,11 @@ impl Agent {
                 self.record(event.outcome("denied"))?;
                 Err(Failure::new(ErrorCode::Denied, "the request was denied"))
             }
-            Decision::AllowOnce => self.record(event.outcome("allowed_once")),
+            Decision::AllowOnce => {
+                self.record(event.outcome("allowed_once"))?;
+                self.touch();
+                Ok(())
+            }
             Decision::AllowFor(duration) => match remember_key {
                 Some(key) if request.can_remember => {
                     self.record(
@@ -446,9 +552,14 @@ impl Agent {
                         key,
                         until: Instant::now() + duration,
                     });
+                    self.touch();
                     Ok(())
                 }
-                _ => self.record(event.outcome("allowed_once")),
+                _ => {
+                    self.record(event.outcome("allowed_once"))?;
+                    self.touch();
+                    Ok(())
+                }
             },
         }
     }
@@ -460,7 +571,7 @@ impl Agent {
         event: AuditEvent,
     ) -> Result<SecretString, Failure> {
         let value = {
-            let _dialog = self.dialog();
+            let _dialog = self.dialog()?;
             self.ui.secret_value(&prompt)?
         };
         match value {
@@ -485,6 +596,7 @@ impl Agent {
         replace: bool,
     ) -> Result<Response, Failure> {
         crate::vault::validate_name(&entry.name)?;
+        let generation = self.generation(peer)?;
         let exists = self.with_vault(peer, |v| Ok(v.contains(&entry.name)))?;
         if exists && !replace {
             return Err(VaultError::AlreadyExists(entry.name.clone()).into());
@@ -534,9 +646,8 @@ impl Agent {
                 value
             }
         };
-        self.with_vault(peer, |v| {
+        self.commit(generation, |v| {
             let replaced = v.add(&entry, &value, replace)?;
-            v.save()?;
             Ok(ok(format!(
                 "{} {}",
                 entry.name,
@@ -554,9 +665,16 @@ impl Agent {
         if entries.is_empty() {
             return Err(Failure::invalid("nothing to import"));
         }
+        if entries.len() > MAX_IMPORT {
+            return Err(Failure::invalid(format!(
+                "at most {MAX_IMPORT} entries can be imported at once (got {}); split the import",
+                entries.len()
+            )));
+        }
         for item in &entries {
             crate::vault::validate_name(&item.entry.name)?;
         }
+        let generation = self.generation(peer)?;
         let (new, existing): (Vec<&str>, Vec<&str>) = self.with_vault(peer, |v| {
             let mut new = Vec::new();
             let mut existing = Vec::new();
@@ -595,7 +713,7 @@ impl Agent {
             None,
             AuditEvent::new("import", peer).entries(names),
         )?;
-        self.with_vault(peer, |v| {
+        self.commit(generation, |v| {
             let (mut added, mut replaced, mut skipped) = (0, 0, 0);
             for item in &entries {
                 match v.add(&item.entry, &item.value, replace) {
@@ -605,7 +723,6 @@ impl Agent {
                     Err(e) => return Err(e.into()),
                 }
             }
-            v.save()?;
             Ok(ok(format!(
                 "imported {added}, replaced {replaced}, skipped {skipped}"
             )))
@@ -621,6 +738,7 @@ impl Agent {
         if changes.is_empty() {
             return Err(Failure::invalid("nothing to change"));
         }
+        let generation = self.generation(peer)?;
         let current = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
         let event = AuditEvent::new("edit", peer).entries(vec![current.name.clone()]);
 
@@ -654,10 +772,9 @@ impl Agent {
             }
             _ => None,
         };
-        self.with_vault(peer, |v| {
+        self.commit(generation, |v| {
             let id = v.find(name)?;
             v.edit(id, &changes, new_value.as_ref())?;
-            v.save()?;
             Ok(ok(format!(
                 "{} updated",
                 changes.rename.as_deref().unwrap_or(name)
@@ -666,6 +783,7 @@ impl Agent {
     }
 
     fn remove(&self, peer: &Peer, name: &str) -> Result<Response, Failure> {
+        let generation = self.generation(peer)?;
         let info = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
         let request = ApprovalRequest {
             title: "Rusthorse — delete an entry".into(),
@@ -683,15 +801,15 @@ impl Agent {
             None,
             AuditEvent::new("remove", peer).entries(vec![info.name.clone()]),
         )?;
-        self.with_vault(peer, |v| {
+        self.commit(generation, |v| {
             let id = v.find(name)?;
             v.remove(id);
-            v.save()?;
             Ok(ok(format!("{} deleted", info.name)))
         })
     }
 
     fn reveal(&self, peer: &Peer, name: &str) -> Result<Response, Failure> {
+        let generation = self.generation(peer)?;
         let info = self.with_vault(peer, |v| {
             let id = v.find(name)?;
             if v.secret(id).is_none() {
@@ -722,6 +840,9 @@ impl Agent {
             None,
             AuditEvent::new("reveal", peer).entries(vec![info.name.clone()]),
         )?;
+        if self.state().generation != generation {
+            return Err(locked_meanwhile());
+        }
         self.with_vault(peer, |v| {
             let id = v.find(name)?;
             let value = v
@@ -774,11 +895,39 @@ impl Agent {
             .map(|(_, v)| v.as_str());
         let program =
             exec::resolve_program(&run.argv[0], path_var, &cwd).map_err(Failure::invalid)?;
+        let program_id = file_id(&program.canonical)
+            .map_err(|e| Failure::invalid(format!("{}: {e}", program.canonical.display())))?;
+        let cwd_id = file_id(&cwd).map_err(|e| Failure::invalid(format!("{}: {e}", run.cwd)))?;
         let secret_vars: Vec<&str> = run.bindings.iter().map(|b| b.var.as_str()).collect();
         let env = exec::prepare_env(&run.env, &secret_vars);
 
+        // The human must be able to read everything that decides what runs.
+        let command_line = shell_join(&run.argv);
+        let program_text = program.describe();
+        for (what, text) in [
+            ("command line", &command_line),
+            ("program path", &program_text),
+            ("working directory", &run.cwd),
+        ] {
+            let length = text.chars().count();
+            if length > MAX_DETAIL_CHARS {
+                return Err(Failure::invalid(format!(
+                    "the {what} is too long to show in an approval dialog ({length} characters, \
+                     limit {MAX_DETAIL_CHARS}); put the command in a script and run that"
+                )));
+            }
+        }
+        for (name, value) in &env.risky {
+            if value.chars().count() > MAX_DETAIL_CHARS / 4 {
+                return Err(Failure::invalid(format!(
+                    "{name} is too long to show in an approval dialog; unset it or shorten it"
+                )));
+            }
+        }
+
         // Every entry must exist (and have a value) before the human is asked.
-        let entry_names: Vec<String> = self.with_vault(peer, |v| {
+        let generation = self.generation(peer)?;
+        let entries: Vec<(String, String)> = self.with_vault(peer, |v| {
             run.bindings
                 .iter()
                 .map(|b| {
@@ -789,10 +938,11 @@ impl Agent {
                             format!("{} has no value", b.entry),
                         ));
                     }
-                    Ok(v.info(id).name)
+                    Ok((id.to_string(), v.info(id).name))
                 })
                 .collect()
         })?;
+        let entry_names: Vec<String> = entries.iter().map(|(_, name)| name.clone()).collect();
 
         let mut warnings = Vec::new();
         if !env.removed.is_empty() {
@@ -806,7 +956,7 @@ impl Agent {
                 "These variables can change what the program executes: {}",
                 env.risky
                     .iter()
-                    .map(|(k, v)| format!("{k}={}", truncate(v, 60)))
+                    .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -817,19 +967,19 @@ impl Agent {
                     .into(),
             );
         }
-        let command_line = shell_join(&run.argv);
         let request = ApprovalRequest {
             title: "Rusthorse — use a secret".into(),
             summary: "Run this command with the secrets below in its environment?".into(),
             details: vec![
-                ("Command".into(), truncate(&command_line, 600)),
-                ("Program".into(), program.describe()),
+                ("Command".into(), command_line),
+                ("Program".into(), program_text),
                 ("Directory".into(), run.cwd.clone()),
                 (
                     "Secrets".into(),
                     run.bindings
                         .iter()
-                        .map(|b| format!("{} ← {}", b.var, b.entry))
+                        .zip(&entry_names)
+                        .map(|(b, name)| format!("{} ← {name}", b.var))
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
@@ -841,42 +991,69 @@ impl Agent {
                         "not redacted".into()
                     },
                 ),
+                (
+                    "Runs".into(),
+                    "as you, outside any sandbox the requester may be in".into(),
+                ),
                 ("Requested by".into(), peer.describe()),
             ],
             warnings,
             can_remember: true,
         };
-        if command_line.chars().count() > 600 {
-            // Never remember what the human could not fully read.
-            let mut request = request;
-            request.can_remember = false;
-            request
-                .warnings
-                .push("The command line is too long to show in full.".into());
-            self.approve(request, None, run_event(peer, &run, &entry_names))?;
-        } else {
-            let key = serde_json::to_string(&(
-                &run.bindings,
-                &run.argv,
-                program.canonical.display().to_string(),
-                &run.cwd,
-                run.redact,
-                &env.risky,
-            ))
-            .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
-            self.approve(request, Some(key), run_event(peer, &run, &entry_names))?;
+        // A remembered approval covers exactly this: the same entries (by
+        // UUID) in the same vault generation, command line, program, working
+        // directory, redaction and environment. Variables that change on
+        // every invocation without affecting the program are left out.
+        let key_env: Vec<&(String, String)> = env
+            .vars
+            .iter()
+            .filter(|(k, _)| k != "_" && k != "OLDPWD")
+            .collect();
+        let key = serde_json::to_string(&(
+            generation,
+            &run.bindings,
+            &entries,
+            &run.argv,
+            program.canonical.display().to_string(),
+            &run.cwd,
+            run.redact,
+            key_env,
+        ))
+        .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
+        self.approve(request, Some(key), run_event(peer, &run, &entry_names))?;
+
+        // The answer may have taken a while: make sure nothing that the
+        // dialog showed has changed since.
+        if self.state().generation != generation {
+            return Err(locked_meanwhile());
+        }
+        if file_id(&program.canonical).ok() != Some(program_id)
+            || file_id(&cwd).ok() != Some(cwd_id)
+        {
+            let _ = self.audit.record(
+                &run_event(peer, &run, &entry_names)
+                    .outcome("aborted")
+                    .detail("program or directory replaced after approval"),
+            );
+            return Err(Failure::invalid(
+                "the program or the working directory was replaced after you approved; nothing was run",
+            ));
         }
 
         // Fetch the values only now, after approval.
         let secrets: Vec<(String, String, SecretString)> = self.with_vault(peer, |v| {
             run.bindings
                 .iter()
-                .map(|b| {
-                    let id = v.find(&b.entry)?;
-                    let value = v.secret(id).ok_or_else(|| {
-                        Failure::new(ErrorCode::NotFound, format!("{} has no value", b.entry))
+                .zip(&entries)
+                .map(|(b, (id, name))| {
+                    let found = v.find(&b.entry)?;
+                    if found.to_string() != *id {
+                        return Err(locked_meanwhile());
+                    }
+                    let value = v.secret(found).ok_or_else(|| {
+                        Failure::new(ErrorCode::NotFound, format!("{name} has no value"))
                     })?;
-                    Ok((b.var.clone(), v.info(id).name, value))
+                    Ok((b.var.clone(), name.clone(), value))
                 })
                 .collect()
         })?;
@@ -888,20 +1065,29 @@ impl Agent {
             .current_dir(&cwd)
             .env_clear()
             .envs(env.vars.iter().map(|(k, v)| (k, v)))
-            .process_group(0)
-            .stdin(Stdio::from(stdin));
+            .process_group(0);
         for (var, _, value) in &secrets {
             command.env(var, value.as_str());
         }
-        let (out_dest, err_dest) = if run.redact {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            (Some(stdout), Some(stderr))
+        // With redaction, the command gets only pipes owned by the agent. The
+        // client's own descriptors never reach it: a descriptor passed as
+        // "stdin" may be writable (a socket or a terminal), which would be an
+        // unfiltered way back to the client.
+        let mut client_stdin = None;
+        let mut destinations = None;
+        if run.redact {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            client_stdin = Some(stdin);
+            destinations = Some((stdout, stderr));
         } else {
             command
+                .stdin(Stdio::from(stdin))
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr));
-            (None, None)
-        };
+        }
         let mut child = command.spawn().map_err(|e| {
             Failure::new(
                 ErrorCode::InvalidRequest,
@@ -910,9 +1096,10 @@ impl Agent {
         })?;
         drop(command);
         let pgid = Pid::from_raw(child.id() as i32);
+        let done = Arc::new(AtomicBool::new(false));
 
         let mut pumps = Vec::new();
-        if let (Some(out_dest), Some(err_dest)) = (out_dest, err_dest) {
+        if let Some((out_dest, err_dest)) = destinations {
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
                 .map(|(_, entry, value)| (entry.clone(), value.as_bytes().to_vec()))
@@ -930,9 +1117,14 @@ impl Agent {
                 zeroize::Zeroize::zeroize(&mut bytes);
             }
         }
+        if let (Some(from), Some(to)) = (client_stdin, child.stdin.take()) {
+            // Not joined: it ends when the client's input ends, when the
+            // command closes its input, or shortly after the command exits.
+            let done = Arc::clone(&done);
+            thread::spawn(move || pump_stdin(from, to, done));
+        }
         drop(secrets);
 
-        let done = Arc::new(AtomicBool::new(false));
         let watcher = stream.try_clone().ok().map(|s| {
             let done = Arc::clone(&done);
             thread::spawn(move || watch_client(s, pgid, done))
@@ -963,6 +1155,39 @@ impl Agent {
     }
 }
 
+/// Device and inode of a file, to notice it being replaced.
+fn file_id(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Forward the client's input to the command's stdin pipe until either side
+/// ends or the command exits.
+fn pump_stdin(from: OwnedFd, mut to: std::process::ChildStdin, done: Arc<AtomicBool>) {
+    let mut from = File::from(from);
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
+    while !done.load(Ordering::SeqCst) {
+        let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(100u16)) {
+            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(_) => match from.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::Interrupted
+                        || e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            },
+            Err(_) => return,
+        }
+    }
+}
+
 fn ok(message: impl Into<String>) -> Response {
     Response::Ok {
         message: message.into(),
@@ -976,21 +1201,13 @@ fn run_event(peer: &Peer, run: &RunRequest, entries: &[String]) -> AuditEvent {
     event
 }
 
+/// All names, comma-separated. Imports are capped at [`MAX_IMPORT`] entries
+/// so that the dialog can list every one of them.
 fn list_names(names: &[&str]) -> String {
-    const SHOWN: usize = 15;
     if names.is_empty() {
         return "(none)".into();
     }
-    let mut text = names
-        .iter()
-        .take(SHOWN)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.len() > SHOWN {
-        text.push_str(&format!(" … and {} more", names.len() - SHOWN));
-    }
-    text
+    names.join(", ")
 }
 
 fn describe_fields(entry: &NewEntry) -> String {

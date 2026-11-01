@@ -26,6 +26,9 @@ pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 /// Most file descriptors a frame may carry (stdin, stdout, stderr).
 pub const MAX_FDS: usize = 3;
 
+/// The kernel's limit on descriptors per `SCM_RIGHTS` message.
+const SCM_MAX_FD: usize = 253;
+
 /// A string holding secret material; its heap buffer is wiped on drop.
 pub type SecretString = Zeroizing<String>;
 
@@ -213,6 +216,8 @@ impl EntryChanges {
 /// What clients may learn about an entry without approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryInfo {
+    /// The entry's KeePass UUID; stable across renames.
+    pub id: String,
     /// Entry name.
     pub name: String,
     /// Group path, `None` for the root group.
@@ -221,6 +226,10 @@ pub struct EntryInfo {
     /// Non-secret metadata.
     #[serde(flatten)]
     pub fields: EntryFields,
+    /// Metadata fields that the KeePass file marks as protected; their values
+    /// are withheld like secrets (e.g. `UserName`, `URL`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_fields: Vec<String>,
     /// Whether the entry has a non-empty password.
     pub has_password: bool,
     /// Whether the entry has notes (their content is not disclosed).
@@ -445,7 +454,11 @@ pub fn read_message<T: DeserializeOwned>(stream: &UnixStream) -> io::Result<T> {
 fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     use std::os::fd::FromRawFd;
 
-    let mut cmsg_space = nix::cmsg_space!([RawFd; MAX_FDS]);
+    // Room for as many descriptors as the kernel will ever attach to one
+    // message (SCM_MAX_FD), so that it never truncates: truncated messages
+    // would leave descriptors installed in our table that `cmsgs()` does not
+    // hand back, leaking them. The count is validated by the caller.
+    let mut cmsg_space = nix::cmsg_space!([RawFd; SCM_MAX_FD]);
     loop {
         let mut iov = [IoSliceMut::new(buf)];
         let msg = match recvmsg::<()>(
@@ -507,6 +520,29 @@ mod tests {
         let mut text = String::new();
         reader.read_to_string(&mut text).expect("read");
         assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn every_received_descriptor_is_owned_even_beyond_the_limit() {
+        use std::os::fd::AsRawFd;
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        let pipes: Vec<(OwnedFd, OwnedFd)> =
+            (0..8).map(|_| nix::unistd::pipe().expect("pipe")).collect();
+        let raw: Vec<RawFd> = pipes.iter().map(|(r, _)| r.as_raw_fd()).collect();
+        let body = br#"{"type":"status"}"#;
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body);
+        sendmsg::<()>(
+            a.as_raw_fd(),
+            &[IoSlice::new(&frame)],
+            &[ControlMessage::ScmRights(&raw)],
+            MsgFlags::empty(),
+            None,
+        )
+        .expect("sendmsg");
+        let (_, fds) = recv_frame(&b).expect("recv");
+        // All eight arrive as OwnedFd (closed on drop), none is left behind.
+        assert_eq!(fds.len(), 8);
     }
 
     #[test]

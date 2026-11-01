@@ -74,7 +74,7 @@ systemctl --user edit rusthorse-agent
 Environment=RUSTHORSE_VAULT=%h/Sync/passwords.kdbx
 # Clear the original ExecStart, then set a new one
 ExecStart=
-ExecStart=%h/.cargo/bin/rusthorse agent --idle-timeout 30m --remember 5m
+ExecStart=%h/.cargo/bin/rusthorse agent --idle-timeout 30m
 ```
 
 Then `systemctl --user restart rusthorse-agent`. All agent options are listed

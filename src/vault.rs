@@ -34,6 +34,9 @@ pub const FIELD_HOST: &str = "Host";
 /// Custom KDBX field holding the port.
 pub const FIELD_PORT: &str = "Port";
 
+/// Vault files larger than this are refused before anything is decrypted.
+pub const MAX_VAULT_BYTES: u64 = 128 * 1024 * 1024;
+
 const KNOWN_FIELDS: [&str; 7] = [
     fields::TITLE,
     fields::USERNAME,
@@ -205,7 +208,15 @@ impl Vault {
             }
             Err(e) => return Err(e.into()),
         };
-        let fingerprint = Fingerprint::of(&file.metadata()?);
+        let meta = file.metadata()?;
+        if meta.len() > MAX_VAULT_BYTES {
+            return Err(VaultError::Invalid(format!(
+                "{} is larger than {} MiB; refusing to load it",
+                path.display(),
+                MAX_VAULT_BYTES / (1024 * 1024)
+            )));
+        }
+        let fingerprint = Fingerprint::of(&meta);
         let db = Database::open(&mut file, DatabaseKey::new().with_password(&password)).map_err(
             |e| match e {
                 DatabaseOpenError::Key(DatabaseKeyError::IncorrectKey) => VaultError::WrongPassword,
@@ -258,7 +269,7 @@ impl Vault {
             .into_owned();
         let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
 
-        let result = (|| -> Result<(), VaultError> {
+        let result = (|| -> Result<Fingerprint, VaultError> {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -269,11 +280,25 @@ impl Vault {
                 .map_err(VaultError::Save)?;
             file.flush()?;
             file.sync_all()?;
-            Ok(())
+            Ok(Fingerprint::of(&file.metadata()?))
         })();
-        if let Err(e) = result {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
+        let written = match result {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        // Check again right before replacing the file: serializing and the
+        // KDF take a while, and another program may have saved meanwhile.
+        // This narrows the window; it cannot close it against writers that do
+        // not cooperate (see docs/threat-model.md, L15).
+        if check_unchanged {
+            let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
+            if current != self.fingerprint {
+                let _ = fs::remove_file(&tmp);
+                return Err(VaultError::ChangedOnDisk);
+            }
         }
 
         if self.fingerprint.is_some() {
@@ -289,7 +314,9 @@ impl Vault {
             return Err(e.into());
         }
         File::open(&dir)?.sync_all()?;
-        self.fingerprint = Some(Fingerprint::of(&fs::metadata(&self.path)?));
+        // The renamed file is the one we wrote (same inode), whatever the path
+        // points to by now.
+        self.fingerprint = Some(written);
         Ok(())
     }
 
@@ -341,20 +368,17 @@ impl Vault {
             .collect()
     }
 
-    /// Find an entry by name, or by `Group/Sub/Name` path when the plain name
-    /// does not match.
+    /// Find an entry by title or by `Group/Sub/Title` path. A name that
+    /// matches more than one entry — including a title that looks like the
+    /// path of another entry — is ambiguous.
     pub fn find(&self, name: &str) -> Result<EntryId, VaultError> {
         let entries = self.entries();
-        let mut matches: Vec<&(EntryId, String, Vec<String>)> = entries
+        let matches: Vec<&(EntryId, String, Vec<String>)> = entries
             .iter()
-            .filter(|(_, title, _)| title == name)
+            .filter(|(_, title, group)| {
+                title == name || (name.contains('/') && display_path(group, title) == name)
+            })
             .collect();
-        if matches.is_empty() && name.contains('/') {
-            matches = entries
-                .iter()
-                .filter(|(_, title, group)| display_path(group, title) == name)
-                .collect();
-        }
         match matches.as_slice() {
             [] => Err(VaultError::NotFound(name.to_string())),
             [(id, _, _)] => Ok(*id),
@@ -379,7 +403,24 @@ impl Vault {
             .db
             .entry(id)
             .expect("entry id comes from this database");
-        let text = |key: &str| entry.get(key).filter(|v| !v.is_empty()).map(str::to_string);
+        let mut protected_fields = Vec::new();
+        // A field the KeePass file marks as protected is treated as secret,
+        // whatever its name: only its existence is reported.
+        let mut text = |key: &str| {
+            let value = entry.fields.get(key)?;
+            if value.get().is_empty() {
+                return None;
+            }
+            if value.is_protected() {
+                protected_fields.push(key.to_string());
+                return None;
+            }
+            Some(value.get().clone())
+        };
+        let username = text(fields::USERNAME);
+        let url = text(fields::URL);
+        let host = text(FIELD_HOST);
+        let port = text(FIELD_PORT).and_then(|p| p.trim().parse().ok());
         let group = self.group_path(entry.parent().id());
         let mut other_fields: Vec<String> = entry
             .fields
@@ -389,15 +430,17 @@ impl Vault {
             .collect();
         other_fields.sort();
         EntryInfo {
+            id: id.to_string(),
             name: entry.get_title().unwrap_or_default().to_string(),
             group: (!group.is_empty()).then(|| group.join("/")),
             fields: EntryFields {
-                username: text(fields::USERNAME),
-                url: text(fields::URL),
-                host: text(FIELD_HOST),
-                port: entry.get(FIELD_PORT).and_then(|p| p.trim().parse().ok()),
+                username,
+                url,
+                host,
+                port,
                 tags: entry.tags.clone(),
             },
+            protected_fields,
             has_password: entry.get_password().is_some_and(|p| !p.is_empty()),
             has_notes: entry.get(fields::NOTES).is_some_and(|n| !n.is_empty()),
             other_fields,
@@ -533,10 +576,12 @@ impl Vault {
         Ok(())
     }
 
-    /// Delete an entry permanently.
+    /// Delete an entry permanently, recording the deletion (KeePass
+    /// `DeletedObjects`) so that synchronizing with an older copy does not
+    /// bring it back.
     pub fn remove(&mut self, id: EntryId) {
-        if let Some(entry) = self.db.entry_mut(id) {
-            entry.remove();
+        if let Some(mut entry) = self.db.entry_mut(id) {
+            entry.track_changes().remove();
         }
     }
 
@@ -592,6 +637,11 @@ pub fn validate_name(name: &str) -> Result<(), VaultError> {
     if name.chars().count() > 128 {
         return Err(VaultError::Invalid(
             "the name must be at most 128 characters".into(),
+        ));
+    }
+    if name.contains('/') {
+        return Err(VaultError::Invalid(
+            "the name must not contain '/' (it separates groups in paths)".into(),
         ));
     }
     if crate::util::visible(name) != name {
@@ -817,6 +867,76 @@ mod tests {
         assert!(validate_name(" x").is_err());
         assert!(validate_name("a\nb").is_err());
         assert!(validate_name("evil\u{202E}txt").is_err());
+    }
+
+    #[test]
+    fn protected_metadata_is_not_disclosed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault
+            .add(&entry("signed"), &secret("abcd"), false)
+            .expect("add");
+        let id = vault.find("signed").expect("find");
+        // As if another KeePass client had marked these fields protected.
+        {
+            let mut e = vault.db.entry_mut(id).expect("entry");
+            e.set_protected(fields::URL, "https://x.example/?sig=SECRET");
+            e.set_protected(fields::USERNAME, "hidden-user");
+        }
+        let info = vault.info(id);
+        assert_eq!(info.fields.url, None);
+        assert_eq!(info.fields.username, None);
+        assert_eq!(info.protected_fields, vec!["UserName", "URL"]);
+        let listed = serde_json::to_string(&vault.list()).expect("json");
+        assert!(!listed.contains("SECRET") && !listed.contains("hidden-user"));
+    }
+
+    #[test]
+    fn a_title_that_looks_like_a_path_is_ambiguous() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let mut inner = entry("API");
+        inner.group = Some("Prod".into());
+        vault.add(&inner, &secret("aaaa"), false).expect("add");
+        // Titles with '/' cannot be created any more...
+        assert!(matches!(
+            vault.add(&entry("Prod/API"), &secret("bbbb"), false),
+            Err(VaultError::Invalid(_))
+        ));
+        // ...but a file edited elsewhere may contain one.
+        vault
+            .db
+            .root_mut()
+            .add_entry()
+            .set_unprotected(fields::TITLE, "Prod/API");
+        assert!(matches!(
+            vault.find("Prod/API"),
+            Err(VaultError::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn removal_is_recorded_for_synchronization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault
+            .add(&entry("gone"), &secret("abcd"), false)
+            .expect("add");
+        let id = vault.find("gone").expect("find");
+        vault.remove(id);
+        assert!(vault.db.deleted_objects.contains_key(&id.uuid()));
+    }
+
+    #[test]
+    fn oversized_files_are_refused_before_decryption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.kdbx");
+        let file = File::create(&path).expect("create");
+        file.set_len(MAX_VAULT_BYTES + 1).expect("sparse file");
+        assert!(matches!(
+            Vault::open(&path, secret("x")),
+            Err(VaultError::Invalid(_))
+        ));
     }
 
     #[test]

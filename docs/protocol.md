@@ -28,8 +28,11 @@ Protocol version: **1** (`PROTOCOL_VERSION` in
 - A `run` request carries exactly three file descriptors — the client's
   stdin, stdout and stderr, in that order — as `SCM_RIGHTS` ancillary data on
   the **first byte** of the frame (send the whole frame with one `sendmsg`
-  call; if it is short, write the rest normally). Descriptors attached to any
-  other request are closed and ignored.
+  call; if it is short, write the rest normally). Any other request that
+  carries descriptors is rejected with `invalid_request`.
+- The request must arrive within 10 seconds of connecting. The agent handles
+  at most 64 connections at a time and refuses (with `denied`) requests when
+  8 are already waiting for the human.
 - While a `run` request is in progress, the client must keep the connection
   open and must not send anything. Closing it makes the agent terminate the
   command.
@@ -120,7 +123,11 @@ All fields are optional; omitted fields are left unchanged.
 - `cwd` must be an absolute path to an existing directory.
 - `env` is the client's environment. The agent removes every variable whose
   name starts with `LD_` and those that a binding overrides.
-- Command lines, paths and environment must be valid UTF-8.
+- Command lines, paths and environment must be valid UTF-8. The command line,
+  the resolved program path and `cwd` must each fit in 1000 characters.
+- With `redact: true`, the agent reads the client's stdin descriptor and
+  forwards it to the command; it writes only to the stdout and stderr
+  descriptors.
 
 ## Responses
 
@@ -157,6 +164,7 @@ Clients should check `protocol_version` and refuse to continue on a mismatch.
 
 ```json
 {
+  "id": "8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f",
   "name": "core-router",
   "group": "Network/Core",
   "username": "admin",
@@ -171,24 +179,27 @@ Clients should check `protocol_version` and refuse to continue on a mismatch.
 }
 ```
 
-Optional fields are omitted when empty. `other_fields` lists the names of
-custom fields other than `Host` and `Port`; their values are not disclosed.
+`id` is the entry's KeePass UUID. Optional fields are omitted when empty.
+`protected_fields` lists metadata fields (`UserName`, `URL`, `Host`, `Port`)
+that the file marks as protected; their values are withheld. `other_fields`
+lists the names of custom fields other than `Host` and `Port`; their values
+are not disclosed.
 
 ## Errors
 
 | `code` | Meaning |
 |---|---|
-| `denied` | The human denied the request, or the dialog timed out. |
+| `denied` | The human denied the request, the dialog timed out, or too many requests were waiting. |
 | `cancelled` | The human cancelled a password or value dialog. |
-| `locked` | The vault was locked while the request was in progress. |
+| `locked` | The vault was locked or changed while the request was waiting; try again. |
 | `unlock_failed` | Wrong master password three times. |
 | `vault_missing` | There is no vault file yet. |
 | `vault_changed` | Another program changed the vault file since it was unlocked. |
 | `not_found` | No such entry, or the entry has no value. |
 | `already_exists` | An entry with that name exists (use `replace`). |
 | `ambiguous` | Several entries match; use a `Group/Name` path. |
-| `invalid_request` | Malformed or disallowed request (bad name, missing fds, …). |
-| `internal` | Anything else, including an unwritable audit log. |
+| `invalid_request` | Malformed or disallowed request (bad name, missing fds, details too long, program replaced after approval, …). |
+| `internal` | Anything else, including an unwritable audit log or a failed save (after which the vault is locked). |
 
 ## Compatibility
 

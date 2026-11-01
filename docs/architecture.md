@@ -83,18 +83,20 @@ sequenceDiagram
         Z-->>A: password
         A->>A: decrypt vault.kdbx (Argon2id)
     end
-    A->>A: check entries exist, resolve program, clean environment
-    alt identical request approved "for a while"
+    A->>A: check entries exist (UUIDs), resolve program, clean environment,<br/>refuse details too long to show
+    alt remembering enabled and an identical request was approved
         A->>A: use remembered approval
     else
         A->>Z: approval dialog (command, program, directory, secrets, requester, warnings)
-        Z-->>A: Allow once / Allow for 10m / Deny
+        Z-->>A: Allow once / Deny (/ Allow for N, if enabled) — via a socket pair
     end
     A->>A: audit record (fail closed)
-    A->>X: spawn with env + secrets, stdin = caller's fd 0, stdout/stderr = pipes
+    A->>A: re-check: same vault generation? same program and directory inodes? same entries?
+    A->>X: spawn with env + secrets; stdin, stdout, stderr = agent-owned pipes
     loop while running
+        C-->>A: caller's input (fd 0), forwarded to the command's stdin pipe
         X-->>A: output
-        A-->>C: redacted output, written straight to the caller's fds 1 and 2
+        A-->>C: redacted output, written to the caller's fds 1 and 2
     end
     X-->>A: exit status
     A->>A: audit record (exit status)
@@ -119,28 +121,42 @@ and `SIGKILL` three seconds later.
 | `edit` | yes | approval (+ value dialog with `--value`) | no |
 | `remove` | yes | approval | no |
 | `reveal` | yes | approval with a warning | no |
-| `run` | yes | approval | optional, exact match |
+| `run` | yes | approval | opt-in (`--remember`), exact match |
 
 "Metadata" is the entry name, group, username, URL, host, port, tags, whether
 a value and notes exist, the *names* of other fields and the modification
 time. Values, notes and the values of other fields are never sent without
 approval.
 
+Fields that the KDBX file marks as *protected* (KeePassXC lets you protect
+any field) are withheld from metadata as well; `protected_fields` lists their
+names.
+
+### Vault generation
+
+The agent keeps a *generation* counter, incremented on every unlock, lock and
+saved change. Every approval-gated request records the generation before it
+asks the human and acts only if it is unchanged afterwards, so a lock, edit or
+removal that happens while a dialog is open cancels the request instead of
+acting on stale information.
+
 ### Remembered approvals
 
-"Allow for 10m" stores, in memory only, a key made of the exact bindings,
-command line, canonical program path, working directory, redaction flag and
-the names and values of risky environment variables. A later request is
-approved without a dialog only if its key is identical and the time has not
-expired. `lock` (manual or automatic) forgets every remembered approval.
-Requests whose command line is too long to display in full are never
-remembered.
+Off by default ([ADR 0005](adr/0005-remembered-approvals-opt-in.md)). With
+`--remember DURATION`, "Allow for DURATION" stores, in memory only, a key made
+of the vault generation, the bindings and entry UUIDs, the exact command line,
+canonical program path, working directory, redaction flag and the complete
+environment (except `_` and `OLDPWD`). A later request is approved without a
+dialog only if its key is identical and the time has not expired; any change
+to the vault therefore invalidates it. Requests whose details are too long to
+display in full are refused outright.
 
 ### Locking
 
 The decrypted vault is dropped after `--idle-timeout` (default 15 minutes)
-without requests, on `rusthorse lock`, and when the agent stops. A command
-that is already running keeps the secrets it was given.
+without an *approved* use (`status`, `list`, `show` and denied requests do
+not count), on `rusthorse lock`, when a save fails, and when the agent stops.
+A command that is already running keeps the secrets it was given.
 
 ## Storage format
 
@@ -180,19 +196,40 @@ Every change is saved immediately:
 3. The temporary file is renamed over `vault.kdbx` (atomic) and the directory
    is `fsync`ed.
 
-Before step 1 the agent compares the file's device, inode, size and
-modification time with what it loaded. If another program (KeePassXC, a sync
-client) changed the file, the save is refused with `vault_changed` instead of
-silently discarding those changes; locking and unlocking reloads the file.
+Before step 1, and again just before step 3, the agent compares the file's
+device, inode, size and modification time with what it loaded. If another
+program (KeePassXC, a sync client) changed the file, the save is refused with
+`vault_changed` instead of silently discarding those changes; locking and
+unlocking reloads the file. The two checks narrow the window but are not an
+atomic compare-and-swap, so only one program should write the vault at a time
+(threat model L15). If a save fails, the agent locks the vault so that memory
+never holds changes that are not on disk.
+
+Deleted entries are recorded in the KDBX `DeletedObjects` list, so that
+merging with an older copy does not bring them back. Vault files larger than
+128 MiB are refused before anything is decrypted.
 
 ## Concurrency
 
 The agent accepts connections on one thread and handles each connection on
-its own thread; a connection carries exactly one request. Shared state (the
-vault, the last-use time and remembered approvals) sits behind one mutex that
-is never held while a dialog is open or a command is running. A second mutex
-serializes dialogs, so you are asked one question at a time. A background
-thread checks the idle timeout every second.
+its own thread; a connection carries exactly one request, which must arrive
+within 10 seconds. At most 64 connections are handled at once and at most 8
+requests may wait for a dialog; more are refused. Shared state (the vault,
+the generation, the last-use time and remembered approvals) sits behind one
+mutex that is never held while a dialog is open or a command is running. A
+second mutex serializes dialogs, so you are asked one question at a time. A
+background thread checks the idle timeout every second.
+
+### Dialogs
+
+zenity is run from `/usr/bin` (or `/usr/local/bin`), never through `PATH`,
+with `/` as its working directory and only the display, locale and D-Bus
+variables in its environment. Its answer is read from a socket pair rather
+than a pipe, because other processes of the same user can open a pipe through
+`/proc/<pid>/fd` but not a socket. Text for the entry dialog has backslashes
+and underscores escaped; the question dialog uses `--no-markup`. Only an exit
+status of 0 with no output (Allow once), or 1 with the exact label of the
+extra button (Allow for N), counts as approval.
 
 ## Audit log
 
@@ -228,3 +265,4 @@ The reasoning behind the main choices is recorded as
 - [ADR 0002](adr/0002-agent-mediated-execution.md) — the agent, not the client, runs approved commands
 - [ADR 0003](adr/0003-agent-side-dialogs.md) — approvals are dialogs shown by the agent
 - [ADR 0004](adr/0004-native-distribution.md) — native binary and systemd, no Flatpak
+- [ADR 0005](adr/0005-remembered-approvals-opt-in.md) — remembered approvals are opt-in
