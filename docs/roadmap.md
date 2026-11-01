@@ -37,8 +37,10 @@ the real credential on the client's behalf.
    - an expiry (minutes) and a maximum number of uses;
    - the approved command: it is revoked when the command ends, unless the
      human approved a longer lifetime; while it runs, the broker can also
-     require each connection to come from one of the command's own processes
-     (peer credentials), so that a copy of the token is useless elsewhere.
+     refuse new connections on its Unix socket from processes outside the
+     command (peer credentials). That does not stop a process of the command
+     from handing a connected socket to another one, and a loopback TCP
+     connection carries no peer credentials: questions for the ADR.
 2. **The broker checks the token on every use** and refuses anything outside
    its scope. `rusthorse lock` revokes every token at once.
 3. **The broker listens on a private Unix socket** (mode `0600`, same-user

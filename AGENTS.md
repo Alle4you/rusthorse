@@ -76,9 +76,11 @@ Breaking one of these is a security bug, whatever the tests say.
    one.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
-4. **Dialogs are shown by the agent**, never by the client. Default button
-   **Deny**; only the exact expected zenity results count as approval
-   (`ui::decision_from`); an unanswered dialog is `timed_out`, a denial.
+4. **Dialogs are shown by the agent**, never by the client — except `init`
+   without a terminal, which asks for the new master password itself because
+   no agent exists yet. Default button **Deny**; only the exact expected
+   zenity results count as approval (`ui::decision_from`); an unanswered
+   dialog is `timed_out`, a denial.
 5. **Everything a requester controls that a dialog shows goes through
    `ui::dialog_text`** (in markup, through `ui::markup_text`, which calls it).
    Only ordinary characters are drawn as themselves; the rest become
@@ -91,8 +93,10 @@ Breaking one of these is a security bug, whatever the tests say.
 7. **Error contract** (protocol 3): every error other than `outcome_unknown`
    means the vault file was not changed and no command was started. Clients
    treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
-   outcome unknown (any request with effects), `125` `run` did not start, `4`
-   an agent dialog was denied, cancelled or not answered, `1` other errors.
+   outcome unknown (any request with effects); `125` `run` did not start
+   (including when its dialog was denied, cancelled or not answered); `4` a
+   dialog was denied, cancelled or not answered, outside `run`; `1` other
+   errors.
    A command started by `run` can exit with 124 or 125 itself; a `rusthorse:`
    message tells them apart.
 8. **Protocol changes**: removing or changing the meaning of a field or error

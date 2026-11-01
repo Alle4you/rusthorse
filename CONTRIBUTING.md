@@ -65,11 +65,14 @@ And check the following by hand:
 
 ## Rules for security-sensitive code
 
-- Secret values are only ever handled by the agent. The CLI may hold a value
-  only when the user explicitly supplied it (`--stdin`) or asked for it
-  (`reveal`).
-- Never log, print, include in error messages or put in the audit log a
-  secret value, a master password or notes.
+- Secrets taken from the vault are only ever handled by the agent. The CLI
+  holds a secret only when the user supplies one — `init` (the new master
+  password), `add --stdin`, `import` (values read from a `.env` file or the
+  Secret Service, sent to the agent) — or asked for one: `reveal`, after
+  approval.
+- Never log, include in error messages or put in the audit log a secret
+  value, a master password or notes; the only place a value is printed is
+  `reveal`'s output.
 - Keep secret material in `Zeroizing` types where practical, and do not
   `Debug`-print structures that contain it.
 - Anything a requester controls that appears in a dialog must go through
