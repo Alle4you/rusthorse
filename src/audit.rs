@@ -20,9 +20,9 @@ use crate::util::ensure_private_dir;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEvent {
     /// When the record was written, as an RFC 3339 timestamp (local time
-    /// with offset) from the system clock: for an approval, just after the
-    /// human answered, not when the request arrived. [`AuditLog::record`]
-    /// sets it.
+    /// with offset) from the system clock: for an approval, after the human
+    /// answered (usually within a moment), not when the request arrived.
+    /// [`AuditLog::record`] sets it.
     pub time: String,
     /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...
     pub action: String,

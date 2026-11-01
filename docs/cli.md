@@ -347,10 +347,12 @@ rusthorse audit [-n LINES] [--json]
 Prints the last records of the audit log (default 20). `--json` prints the
 raw JSON Lines. Records contain the time, action, outcome, entry names,
 requester chain and, for `run`, the command line and directory — never values.
-The time is when the record was written, just after the decision: for an
-approval or a denial, when you answered the dialog, not when the request
-arrived. It comes from the system clock, so setting the clock back can make a
-later record show an earlier time.
+The time is when the record was written, after the decision — for an
+approval or a denial, after you answered the dialog, not when the request
+arrived. It is usually within a moment of your answer, but can be later when
+other records are being written or the disk is slow. It comes from the system
+clock, so setting the clock back can make a later record show an earlier
+time.
 
 ## `rusthorse doctor`
 

@@ -1176,6 +1176,32 @@ mod tests {
         let nowhere = dir.path().join("no-such-dir").join("backup.kdbx");
         let err = vault.backup_to(&nowhere).expect_err("created").to_string();
         assert!(err.starts_with("cannot create the backup file"), "{err}");
+
+        // A symbolic link is never followed: neither to a file, which keeps
+        // its content, nor to a missing one, which is not created.
+        let link = dir.path().join("link.kdbx");
+        std::os::unix::fs::symlink(&taken, &link).expect("symlink");
+        let err = vault.backup_to(&link).expect_err("followed").to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(fs::read(&taken).expect("read"), b"keep me");
+        let dangling = dir.path().join("dangling.kdbx");
+        let target = dir.path().join("created-through-link.kdbx");
+        std::os::unix::fs::symlink(&target, &dangling).expect("symlink");
+        assert!(vault.backup_to(&dangling).is_err());
+        assert!(!target.exists(), "a dangling link was followed");
+
+        // A directory we may not write to.
+        use std::os::unix::fs::PermissionsExt;
+        let closed = dir.path().join("closed");
+        fs::create_dir(&closed).expect("mkdir");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o500)).expect("chmod");
+        let result = vault.backup_to(&closed.join("backup.kdbx"));
+        let writable = closed.join("backup.kdbx").exists(); // root ignores the mode
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).expect("chmod");
+        if !writable {
+            let err = result.expect_err("created").to_string();
+            assert!(err.starts_with("cannot create the backup file"), "{err}");
+        }
     }
 
     #[test]

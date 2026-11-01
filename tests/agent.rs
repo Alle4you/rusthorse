@@ -1651,6 +1651,12 @@ fn every_unanswered_passwd_dialog_is_recorded_once_and_changes_nothing() {
                 Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).is_ok(),
                 "{case}: the password changed"
             );
+            // Nor did it change in memory: the next save still uses the
+            // original password.
+            h.add_secret("SAVED_AFTER", "value", &[]);
+            let reopened = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into()))
+                .unwrap_or_else(|e| panic!("{case}: the in-memory password changed: {e}"));
+            assert!(reopened.find("SAVED_AFTER").is_ok(), "{case}");
         }
     }
 }
