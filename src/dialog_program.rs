@@ -111,9 +111,9 @@ pub fn locate_in(dir: &Path) -> Located {
         // it as their primary group are not listed in it), so say how to fix
         // it instead.
         return Located::Unusable(format!(
-            "{} can be modified by its group or by others; run `chmod go-w {}`",
+            "{} can be modified by its group or by others; run `chmod go-w -- {}`",
             real.display(),
-            real.display()
+            crate::util::shell_quote(&real.to_string_lossy())
         ));
     } else {
         None
@@ -775,6 +775,20 @@ mod tests {
         assert!(matches!(locate_in(dir.path()), Located::Unusable(_)));
         fs::remove_dir(&program).expect("rmdir");
         fs::write(&program, "#!/bin/sh\n").expect("write");
+        // The fix it suggests is a command that works on any path.
+        let spaced = tempfile::tempdir().expect("tempdir");
+        let dir_with_space = spaced.path().join("my tools");
+        fs::create_dir(&dir_with_space).expect("mkdir");
+        fs::write(dir_with_space.join(PROGRAM), "#!/bin/sh\n").expect("write");
+        fs::set_permissions(
+            dir_with_space.join(PROGRAM),
+            fs::Permissions::from_mode(0o775),
+        )
+        .expect("chmod");
+        match locate_in(&dir_with_space) {
+            Located::Unusable(why) => assert!(why.contains("`chmod go-w -- '"), "{why}"),
+            other => panic!("{other:?}"),
+        }
         for (mode, usable) in [
             (0o644, false),
             (0o775, false),

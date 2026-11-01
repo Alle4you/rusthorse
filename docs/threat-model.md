@@ -680,3 +680,16 @@ below):
 | No compatibility contract between an agent and a program installed later | **Fixed (design):** protocol version, `--check`, `status` and `doctor` report the program. |
 | Replacing `HOME` would have hidden `~/.Xauthority` from X11 sessions that do not export `XAUTHORITY`, making every dialog fail | **Fixed (design):** the authority file is resolved before `HOME` is replaced and passed explicitly; tested with and without `XAUTHORITY`. |
 | Lesser points: the `init` exception, theme wording, icons, when zenity is the fallback, the private directory's lifetime, the light/dark preference depending on the portal | **Fixed (design).** |
+
+Findings of the twenty-fourth to twenty-sixth reviews, of the implementation
+of [ADR 0006](adr/0006-own-dialog-program.md) (verdicts: not ready, not
+ready, then ready for the owner to try it); and of its first installation:
+
+| Finding | Disposition |
+|---|---|
+| An answer sent a byte at a time stretched the deadline: each read renewed the timeout | **Fixed:** every read and write is bounded by the time left before one absolute deadline. |
+| zenity had no external deadline, though the ADR said it had; `doctor`'s `--check` read its output without one | **Fixed:** both run under the same supervision (process group, deadline, output limit). |
+| A descendant of the dialog program outlived it, holding the socket; a program that moved itself to another process group escaped the kill and kept the agent waiting | **Fixed:** the group is killed, then the program itself, and only then is it reaped, so neither id can have been reused. Tests cover both. |
+| First installation: `cargo install` under umask 002 left the program group-writable, the agent refused it, and no dialog could be shown | **Fixed:** the installation guide runs `chmod go-w`, and the agent's and `doctor`'s messages give the command. A first fix that accepted the user's "private group" was withdrawn: users sharing a group as their primary group are not listed among its members. |
+| Lesser points: typed text that JSON escaping made too large for an answer frame, height limits applied to dialogs that scroll, a race between the height check and the choice of program, bytes after the request accepted, a test that took a crash for a denial, `doctor` checking a path in its own mount namespace, a suggested command without shell quoting | **Fixed**, except the namespace point, which is documented. |
+| Coverage | Reverting each fix makes the suite fail; widget tests for resizing, scaling and accessibility actions are not written yet ([roadmap](roadmap.md)). |

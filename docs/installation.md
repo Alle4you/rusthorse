@@ -54,8 +54,10 @@ It must sit next to `rusthorse` (both in `~/.cargo/bin`): the agent looks for
 it there and nowhere else, and refuses it if its group or other users can
 modify it. Debian, Ubuntu and their derivatives use a umask of 002, so
 `cargo install` leaves the programs group-writable: `chmod go-w` removes
-that, and should be run again after every upgrade. Without it, the agent shows its dialogs with
-zenity. `rusthorse doctor` says which one the agent uses.
+that, and should be run again after every upgrade. When `rusthorse-dialog`
+is not installed, the agent shows its dialogs with zenity; one that is
+installed but can be modified by others is refused, with no fallback.
+`rusthorse doctor` says which one the agent uses.
 
 AI agents usually run commands in non-interactive shells, which on many
 distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds

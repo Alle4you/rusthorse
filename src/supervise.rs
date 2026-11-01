@@ -316,18 +316,23 @@ pub(crate) mod tests {
             eprintln!("skipped: no python3 to move a process to another group");
             return;
         }
-        let (_ours, theirs) = UnixStream::pair().expect("pair");
+        let (ours, theirs) = UnixStream::pair().expect("pair");
         let mut cmd = Command::new("/usr/bin/python3");
         cmd.args([
             "-c",
-            "import os, time; os.setpgid(0, os.getpgid(os.getppid())); time.sleep(30)",
+            "import os, sys, time; os.setpgid(0, os.getpgid(os.getppid())); \
+             sys.stdout.write('moved'); sys.stdout.flush(); time.sleep(30)",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(OwnedFd::from(theirs)))
         .stderr(Stdio::null());
         let child = Supervised::spawn(cmd).expect("spawn");
         let leader = child.id();
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait until it has left its group.
+        let mut moved = [0u8; 5];
+        read_exact_by(&ours, &mut moved, Instant::now() + Duration::from_secs(10))
+            .expect("it says when it has moved");
+        assert_eq!(&moved, b"moved");
         // Dropping must not wait for the 30 seconds.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
