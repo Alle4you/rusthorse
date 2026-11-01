@@ -104,6 +104,7 @@ cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse
 #    and Rusthorse's own dialogs (without them, the agent uses zenity)
 sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
 cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-dialog
+chmod go-w ~/.cargo/bin/rusthorse ~/.cargo/bin/rusthorse-dialog
 
 # 2. Start the agent as a systemd user service
 curl -fsSLo ~/.config/systemd/user/rusthorse-agent.service --create-dirs \

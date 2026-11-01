@@ -47,10 +47,14 @@ sudo dnf install gtk4-devel libadwaita-devel pkgconf-pkg-config  # Fedora
 
 cargo install --locked --path dialog      # from the clone
 # or: cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-dialog
+chmod go-w ~/.cargo/bin/rusthorse ~/.cargo/bin/rusthorse-dialog
 ```
 
 It must sit next to `rusthorse` (both in `~/.cargo/bin`): the agent looks for
-it there and nowhere else. Without it, the agent shows its dialogs with
+it there and nowhere else, and refuses it if its group or other users can
+modify it. Debian, Ubuntu and their derivatives use a umask of 002, so
+`cargo install` leaves the programs group-writable: `chmod go-w` removes
+that, and should be run again after every upgrade. Without it, the agent shows its dialogs with
 zenity. `rusthorse doctor` says which one the agent uses.
 
 AI agents usually run commands in non-interactive shells, which on many

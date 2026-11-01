@@ -81,8 +81,7 @@ pub fn locate() -> Located {
 
 /// Find and check the dialog program in `dir`: after resolving links, a
 /// regular, executable file, owned by this user or root, that nobody else
-/// can modify — group write is allowed only for the user's private group
-/// (their primary group, named after them, with no other member).
+/// can modify: not writable by its group or by others.
 pub fn locate_in(dir: &Path) -> Located {
     let path = dir.join(PROGRAM);
     match fs::symlink_metadata(&path) {
@@ -105,10 +104,17 @@ pub fn locate_in(dir: &Path) -> Located {
         Some("is not executable")
     } else if meta.uid() != me && meta.uid() != 0 {
         Some("belongs to another user")
-    } else if meta.mode() & 0o002 != 0 {
-        Some("can be modified by other users")
-    } else if meta.mode() & 0o020 != 0 && !private_group(meta.gid()) {
-        Some("can be modified by other members of its group")
+    } else if meta.mode() & 0o022 != 0 {
+        // Under the umask of Debian, Ubuntu and their derivatives (002),
+        // `cargo install` leaves programs group-writable; whether the group
+        // has other members cannot be established reliably (users who share
+        // it as their primary group are not listed in it), so say how to fix
+        // it instead.
+        return Located::Unusable(format!(
+            "{} can be modified by its group or by others; run `chmod go-w {}`",
+            real.display(),
+            real.display()
+        ));
     } else {
         None
     };
@@ -116,27 +122,6 @@ pub fn locate_in(dir: &Path) -> Located {
         Some(problem) => Located::Unusable(format!("{} {problem}", real.display())),
         None => Located::Program(real),
     }
-}
-
-/// Whether `gid` is this user's private group: the user's primary group,
-/// named after the user, with no other member. Debian, Ubuntu and their
-/// derivatives give every user one and a umask of 002, so files they install
-/// are group-writable without anyone else being able to write them; Debian's
-/// OpenSSH accepts group-writable files for the same reason.
-fn private_group(gid: u32) -> bool {
-    use nix::unistd::{Gid, Group, User, getuid};
-    let (Ok(Some(user)), Ok(Some(group))) = (
-        User::from_uid(getuid()),
-        Group::from_gid(Gid::from_raw(gid)),
-    ) else {
-        return false;
-    };
-    is_private_group(&user.name, user.gid.as_raw(), &group.name, gid, &group.mem)
-}
-
-/// [`private_group`] on plain values.
-fn is_private_group(user: &str, primary: u32, group: &str, gid: u32, members: &[String]) -> bool {
-    primary == gid && group == user && members.iter().all(|m| m == user)
 }
 
 /// The program's environment: the display, D-Bus and locale variables of
@@ -790,12 +775,9 @@ mod tests {
         assert!(matches!(locate_in(dir.path()), Located::Unusable(_)));
         fs::remove_dir(&program).expect("rmdir");
         fs::write(&program, "#!/bin/sh\n").expect("write");
-        // Group write is fine only for the user's private group, which is
-        // what a test's files get on systems that have one.
-        let group_ok = private_group(fs::metadata(&program).expect("meta").gid());
         for (mode, usable) in [
             (0o644, false),
-            (0o775, group_ok),
+            (0o775, false),
             (0o757, false),
             (0o777, false),
             (0o755, true),
@@ -813,17 +795,6 @@ mod tests {
         std::os::unix::fs::symlink(&program, other.path().join(PROGRAM)).expect("symlink");
         let real = fs::canonicalize(&program).expect("canonical");
         assert_eq!(locate_in(other.path()), Located::Program(real));
-    }
-
-    #[test]
-    fn group_write_is_allowed_only_for_a_private_group() {
-        let none: Vec<String> = Vec::new();
-        assert!(is_private_group("ana", 1000, "ana", 1000, &none));
-        assert!(is_private_group("ana", 1000, "ana", 1000, &["ana".into()]));
-        // Another member, another name, or not the primary group: no.
-        assert!(!is_private_group("ana", 1000, "ana", 1000, &["bob".into()]));
-        assert!(!is_private_group("ana", 1000, "staff", 1000, &none));
-        assert!(!is_private_group("ana", 100, "ana", 1000, &none));
     }
 
     #[test]

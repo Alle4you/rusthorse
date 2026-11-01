@@ -284,11 +284,10 @@ character it names.)
 
 **`rusthorse-dialog`.** The agent looks for it in the directory of its own
 executable only, and uses it if — after resolving links — it is a regular,
-executable file owned by the user or root that nobody else can modify (group
-write is accepted only when the group is the user's private group: their
-primary group, named after them, with no other member — what Debian, Ubuntu
-and their derivatives give every user, with a umask that makes installed
-files group-writable). If
+executable file owned by the user or root that neither its group nor others
+can write (under the umask of Debian, Ubuntu and their derivatives,
+`cargo install` leaves it group-writable: the installation guide removes that
+bit). If
 the agent's own executable was replaced since it started, it shows no dialog
 until restarted. The program gets one end of a socket pair as standard input
 and output: the agent sends one length-framed JSON request (at most 64 KiB:
@@ -299,8 +298,9 @@ answer, end of stream and a clean exit, all within one deadline (the dialog
 timeout plus 5 seconds), recalculated before every read and write, so that an
 answer sent a byte at a time cannot stretch it; after it the dialog counts as
 unanswered. The program runs in its own process group, which the agent kills
-— descendants that kept the socket open included — before it reaps the
-program, so the group's id cannot have been reused. Anything else — a crash, a partial, oversized or
+— descendants that kept the socket open included — and then the program
+itself, in case it left the group, before it reaps it, so neither id can
+have been reused. Anything else — a crash, a partial, oversized or
 contradictory answer, a failure after answering — is an error, never an
 approval. Its environment holds only the session's display, D-Bus and locale
 variables (and the X authority file, resolved before `HOME` changes), with

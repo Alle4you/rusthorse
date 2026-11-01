@@ -372,7 +372,9 @@ warning) — which program shows the agent's dialogs (`rusthorse-dialog` next
 to the agent's executable, checked as the agent checks it and by running
 `rusthorse-dialog --check`, which opens no window and reports its version and
 protocol, under the same supervision as dialogs and a 5-second limit; the
-program is the one the agent reports using; missing is a warning, since zenity then shows the dialogs; unusable
+program is the one the agent reports using, run by its path in `doctor`'s own
+mount namespace, which is the agent's in a normal installation; missing is a
+warning, since zenity then shows the dialogs; unusable
 or incompatible is an error), the systemd service is enabled, zenity is
 installed (only a warning when `rusthorse-dialog` is), the session type (X11
 is reported as a warning — see the threat model), Yama `ptrace_scope`, the

@@ -115,8 +115,12 @@ impl Supervised {
 
 impl Drop for Supervised {
     fn drop(&mut self) {
-        // The leader is not reaped yet: the group id is still its own.
+        // The leader is not reaped yet, so neither its process id nor its
+        // group's can have been reused: kill the group (descendants), then
+        // the leader itself, which may have moved to another group, and only
+        // then wait — for a process that is certainly dying.
         let _ = killpg(self.group, Signal::SIGKILL);
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -304,6 +308,35 @@ pub(crate) mod tests {
         drop(child);
         assert!(gone(descendant), "a descendant outlived the supervisor");
         assert!(gone(leader), "the leader was not reaped");
+    }
+
+    #[test]
+    fn a_leader_that_leaves_its_group_is_still_killed() {
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            eprintln!("skipped: no python3 to move a process to another group");
+            return;
+        }
+        let (_ours, theirs) = UnixStream::pair().expect("pair");
+        let mut cmd = Command::new("/usr/bin/python3");
+        cmd.args([
+            "-c",
+            "import os, time; os.setpgid(0, os.getpgid(os.getppid())); time.sleep(30)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::null());
+        let child = Supervised::spawn(cmd).expect("spawn");
+        let leader = child.id();
+        std::thread::sleep(Duration::from_millis(300));
+        // Dropping must not wait for the 30 seconds.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(child);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("dropping the supervisor hung");
+        assert!(gone(leader));
     }
 
     #[test]

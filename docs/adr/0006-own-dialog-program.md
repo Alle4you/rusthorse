@@ -264,3 +264,12 @@ which the threat model already treats as out of scope.
   The widget tests cover focus, keyboard approval, the approval gate with a
   long request, timeouts and the password field; resizing, scaling and
   accessibility actions are not tested yet ([roadmap](../roadmap.md)).
+- 2026-11-01, review round 25: the private-group exception of the first
+  amendment is withdrawn. Users who share a group as their primary group are
+  not listed among its members, so a group named after the user with no
+  listed member can still have other users in it. The program must not be
+  writable by its group or by others, as §2 said; the installation guide
+  removes those bits (`chmod go-w`) after `cargo install`, and the agent's and
+  `doctor`'s messages give the command. The supervisor also kills the program
+  itself, not only its group, before waiting for it: a program that moved to
+  another group would otherwise have kept the agent waiting.

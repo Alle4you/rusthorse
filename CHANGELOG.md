@@ -19,9 +19,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   uses it when it is installed next to `rusthorse`, zenity otherwise; it
   talks to it over one socket with a framed, versioned protocol under a
   deadline, and starts it with no per-user GTK configuration. `status` and
-  `doctor` report it. It must not be writable by anyone else (group write
-  only for the user's private group, as the default umask of Debian-based
-  systems produces).
+  `doctor` report it. It must not be writable by its group or by others: on
+  systems whose umask is 002 (Debian, Ubuntu, Mint), run `chmod go-w` on it
+  after `cargo install`.
 - KeePass KDBX4 vault with username, URL, host, port, tags, notes and groups;
   Argon2id (64 MiB, 20 passes) for new vaults; atomic saves with a `.bak`
   copy; refusal to overwrite changes made by other programs.
