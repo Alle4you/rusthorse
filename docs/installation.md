@@ -151,7 +151,13 @@ Migrate in four steps, and keep the originals until the last one is done.
    The Secret Service form selects items by attribute. For example, items
    stored with `secret-tool store --label=... service myapp key token` are
    matched by `-a service=myapp`, and `--name-from key` names each entry
-   after its `key` attribute.
+   after its `key` attribute. Check that the preview lists only what you
+   mean to move: an attribute that is too broad selects other applications'
+   items too.
+
+   **Start with one item.** Add an attribute that selects only it
+   (`-a service=myapp -a key=token`), go through steps 3 and 4 with it, and
+   import the rest only once it works.
 3. **Import**, tagging the result so it is easy to find:
 
    ```sh
@@ -163,11 +169,18 @@ Migrate in four steps, and keep the originals until the last one is done.
    names per batch).
 4. **Verify each entry by using it**, not just by listing it: run a real,
    harmless command with it — an API call that only reads, a login check —
-   for example `rusthorse run OPENAI_API_KEY -- curl -fsS -o /dev/null
-   -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models`
-   (inside `sh -c '…'` so that the variable is expanded by the command).
-   Only when every entry has worked, delete the originals with the tool that
-   created them, and update scripts that used the old tool.
+   for example:
+
+   ```sh
+   rusthorse run OPENAI_API_KEY -- sh -c \
+       'curl -fsS -o /dev/null -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models'
+   ```
+
+   (The single quotes make the command's shell, not yours, expand the
+   variable.) If you will also use KeePassXC, open a backup copy in it and
+   check that the entries are there. Only when every entry has worked, delete
+   the originals with the tool that created them, and update scripts that
+   used the old tool.
 
 ## Backups and restore
 
@@ -232,7 +245,8 @@ rusthorse doctor
 ```
 
 Commands refuse to talk to an agent that speaks another protocol version and
-say how to restart it. Read [CHANGELOG.md](../CHANGELOG.md) before
+say how to restart it; `rusthorse doctor` also notices an agent that still
+runs the build an upgrade replaced, even when the protocol did not change. Read [CHANGELOG.md](../CHANGELOG.md) before
 upgrading.
 
 ## File locations

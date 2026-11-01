@@ -479,6 +479,10 @@ fn simple(client: &Client, request: &Request) -> anyhow::Result<u8> {
             eprintln!("{message}");
             Ok(0)
         }
+        // An answer that makes no sense says nothing about what happened.
+        other if request.has_effects() => Err(anyhow::Error::new(
+            rusthorse::client::OutcomeUnknown(format!("unexpected {} response", other.kind())),
+        )),
         other => bail!("unexpected {} response from the agent", other.kind()),
     }
 }
@@ -605,6 +609,9 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
         (false, None) => println!("state:      unlocked (auto-lock off)"),
     }
     println!("remembered: {} approval(s)", info.remembered_approvals);
+    if !info.agent_executable.is_empty() {
+        println!("program:    {}", info.agent_executable);
+    }
     Ok(0)
 }
 
@@ -875,7 +882,9 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             Response::Exited {
                 signal: Some(sig), ..
             } => Ok((128 + sig).clamp(0, 255) as u8),
-            Response::Exited { .. } => Ok(EXIT_RUN_FAILURE),
+            Response::Exited { .. } => Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
+                "an exit status with neither a code nor a signal".into(),
+            ))),
             Response::Error {
                 code: ErrorCode::OutcomeUnknown,
                 message,
@@ -1191,6 +1200,29 @@ enum Check {
     Fail(String),
 }
 
+/// Whether the agent runs the program file this `rusthorse` was started from.
+fn agent_executable_check(agent: &str) -> Check {
+    const RESTART: &str = "run `systemctl --user restart rusthorse-agent`";
+    if agent.is_empty() {
+        return Check::Warn("the agent did not say which program file it runs".into());
+    }
+    if agent.ends_with(" (deleted)") {
+        return Check::Fail(format!(
+            "the agent runs an old build: its program file was replaced or removed after it \
+             started ({agent}) — {RESTART}"
+        ));
+    }
+    let ours = std::fs::read_link("/proc/self/exe").map(|p| p.display().to_string());
+    match ours {
+        Ok(ours) if ours == agent => Check::Ok(format!("the agent runs this build ({agent})")),
+        Ok(ours) => Check::Warn(format!(
+            "the agent runs {agent}, but this is {ours}; if both should be the same build, \
+             {RESTART}"
+        )),
+        Err(_) => Check::Ok(format!("the agent runs {agent}")),
+    }
+}
+
 fn doctor(client: &Client) -> anyhow::Result<u8> {
     use std::os::unix::fs::PermissionsExt;
     let mut checks = Vec::new();
@@ -1227,6 +1259,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                     rusthorse::protocol::PROTOCOL_VERSION
                 )));
             }
+            checks.push(agent_executable_check(&info.agent_executable));
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
                     "no vault at {} — run `rusthorse init`",
@@ -1369,4 +1402,27 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
         println!("{line}");
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_notices_an_agent_running_a_replaced_binary() {
+        assert!(matches!(
+            agent_executable_check("/home/me/.cargo/bin/rusthorse (deleted)"),
+            Check::Fail(m) if m.contains("restart")
+        ));
+        let ours = std::fs::read_link("/proc/self/exe").expect("exe");
+        assert!(matches!(
+            agent_executable_check(&ours.display().to_string()),
+            Check::Ok(_)
+        ));
+        assert!(matches!(
+            agent_executable_check("/somewhere/else/rusthorse"),
+            Check::Warn(_)
+        ));
+        assert!(matches!(agent_executable_check(""), Check::Warn(_)));
+    }
 }

@@ -21,7 +21,16 @@ use zeroize::Zeroizing;
 /// 2: data frames, per-channel credit (stdin credit granted when the
 /// command starts), `generate`, `change_password`, `backup`, `reveal.notes`,
 /// `status.audit_log`.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// 3: every error other than `outcome_unknown` is definite (the vault file
+/// was not changed and no command was started), which clients rely on;
+/// `status.agent_executable`.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+// Clients trust that errors other than `outcome_unknown` mean nothing changed;
+// agents of version 2 and earlier do not guarantee it, so the version must
+// never go back below 3 (N31).
+const _: () = assert!(PROTOCOL_VERSION >= 3);
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -443,6 +452,11 @@ pub struct StatusInfo {
     pub locks_in_secs: Option<u64>,
     /// Number of approvals currently remembered.
     pub remembered_approvals: usize,
+    /// The program file the agent runs, as the kernel reports it; it ends in
+    /// ` (deleted)` when that file was replaced or removed after the agent
+    /// started (an upgrade without a restart).
+    #[serde(default)]
+    pub agent_executable: String,
 }
 
 /// Why a request failed.

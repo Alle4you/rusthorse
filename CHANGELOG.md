@@ -39,10 +39,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
-- Protocol version 2 (data frames and credits, new requests); clients refuse
-  an agent that speaks another version.
+- Protocol version 3 (data frames and credits, new requests, definite
+  errors); clients refuse an agent that speaks another version.
 - `passwd` reports when the old-password backup could not be deleted.
-- `doctor` checks the files the agent actually uses.
+- `doctor` checks the files the agent actually uses, and notices an agent
+  still running a build that an upgrade replaced; `status` shows the agent's
+  program file.
 - Imports report which batches were imported when a later one fails — or
   that a batch's outcome is unknown when its answer is lost — and imports
   with duplicate names are refused.

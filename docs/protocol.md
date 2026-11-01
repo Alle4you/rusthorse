@@ -4,13 +4,14 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **2** (`PROTOCOL_VERSION` in
+Protocol version: **3** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
 |---|---|
 | 1 | First design: descriptors passed for every `run`. Never released. |
 | 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
+| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -199,7 +200,7 @@ All fields are optional; omitted fields are left unchanged.
 | `entries` | `entries`: array of [EntryInfo](#entryinfo), sorted by group and name |
 | `entry` | `entry`: [EntryInfo](#entryinfo) |
 | `secret` | `value` (string) |
-| `exited` | `code` (integer or `null`), `signal` (integer or `null`) |
+| `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome |
 | `error` | `code` (see [Errors](#errors)), `message` (string) |
 
 ### StatusInfo
@@ -207,18 +208,23 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 2,
+  "protocol_version": 3,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
+  "audit_log": "/home/me/.local/state/rusthorse/audit.jsonl",
   "locked": false,
   "idle_timeout_secs": 900,
   "locks_in_secs": 812,
-  "remembered_approvals": 1
+  "remembered_approvals": 1,
+  "agent_executable": "/home/me/.cargo/bin/rusthorse"
 }
 ```
 
 `locks_in_secs` is omitted when the vault is locked or auto-lock is off.
+`agent_executable` is the program file the agent runs, as the kernel reports
+it; it ends in ` (deleted)` when that file was replaced or removed after the
+agent started — an upgrade without a restart.
 Clients should check `protocol_version` and refuse to continue on a mismatch.
 
 ### EntryInfo
@@ -276,5 +282,6 @@ treat the outcome as unknown.
 - Within a protocol version, new optional request fields, new response
   fields and new error codes may be added. Clients must ignore unknown
   response fields and treat an unknown error code like `outcome_unknown`.
-- Removing or changing the meaning of a field, or changing framing, bumps
-  `PROTOCOL_VERSION`.
+- Removing or changing the meaning of a field or of an error code —
+  including what an error guarantees about the request's effects — or
+  changing framing, bumps `PROTOCOL_VERSION`.

@@ -1741,6 +1741,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     idle_timeout_secs: 0,
                     locks_in_secs: None,
                     remembered_approvals: 0,
+                    agent_executable: String::new(),
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -1789,6 +1790,7 @@ fn fake_agent(
                     idle_timeout_secs: 0,
                     locks_in_secs: None,
                     remembered_approvals: 0,
+                    agent_executable: String::new(),
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -1832,7 +1834,8 @@ fn a_missing_or_old_agent_means_did_not_run() {
     assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
     // An agent speaking an older protocol.
     let socket = dir.path().join("old.sock");
-    let fake = fake_agent(&socket, 1, None, 2);
+    // The previous version: it lacks the definite-error guarantee (N31).
+    let fake = fake_agent(&socket, rusthorse::protocol::PROTOCOL_VERSION - 1, None, 2);
     let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
         .args(["run", "T", "--", "true"])
         .env("RUSTHORSE_SOCKET", &socket)
@@ -1979,6 +1982,7 @@ fn fake_import_agent(
                         idle_timeout_secs: 0,
                         locks_in_secs: None,
                         remembered_approvals: 0,
+                        agent_executable: String::new(),
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }
@@ -2139,22 +2143,74 @@ fn an_unknown_outcome_reported_for_a_change_exits_124() {
 
 #[test]
 fn an_unexpected_answer_to_run_is_an_unknown_outcome() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket = dir.path().join("fake.sock");
-    let fake = fake_agent(
-        &socket,
-        rusthorse::protocol::PROTOCOL_VERSION,
-        Some(r#"{"type":"ok","message":"?"}"#),
-        2,
-    );
-    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
-        .args(["run", "T", "--", "true"])
-        .env("RUSTHORSE_SOCKET", &socket)
-        .stdin(Stdio::null())
-        .finish();
-    fake.join().expect("fake");
-    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
-    assert!(text(&out.stderr).contains("may or may not have run"));
+    for reply in [
+        r#"{"type":"ok","message":"?"}"#,
+        // An exit status with neither a code nor a signal.
+        r#"{"type":"exited"}"#,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("fake.sock");
+        let fake = fake_agent(
+            &socket,
+            rusthorse::protocol::PROTOCOL_VERSION,
+            Some(reply),
+            2,
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args(["run", "T", "--", "true"])
+            .env("RUSTHORSE_SOCKET", &socket)
+            .stdin(Stdio::null())
+            .finish();
+        fake.join().expect("fake");
+        assert_eq!(
+            out.status.code(),
+            Some(124),
+            "{reply}: {}",
+            text(&out.stderr)
+        );
+        assert!(text(&out.stderr).contains("may or may not have run"));
+    }
+}
+
+#[test]
+fn an_unexpected_answer_to_a_change_is_an_unknown_outcome() {
+    for (args, expected) in [(&["remove", "X"][..], 124), (&["lock"][..], 1)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("fake.sock");
+        let fake = fake_agent(
+            &socket,
+            rusthorse::protocol::PROTOCOL_VERSION,
+            Some(r#"{"type":"exited","code":0}"#),
+            2,
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args(args)
+            .env("RUSTHORSE_SOCKET", &socket)
+            .stdin(Stdio::null())
+            .finish();
+        fake.join().expect("fake");
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn status_names_the_agents_program_file() {
+    let h = Harness::new();
+    let client = rusthorse::client::Client::new(h.socket.clone());
+    let rusthorse::protocol::Response::Status(info) = client
+        .call(&rusthorse::protocol::Request::Status)
+        .expect("status")
+    else {
+        panic!("not a status answer");
+    };
+    // The harness agent runs inside this test binary.
+    let ours = std::fs::read_link("/proc/self/exe").expect("exe");
+    assert_eq!(info.agent_executable, ours.display().to_string());
 }
 
 #[test]

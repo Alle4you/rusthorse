@@ -89,7 +89,8 @@ rusthorse status [--json]
 ```
 
 Shows the agent version, the vault path, whether it is locked, when it will
-lock itself and how many approvals are remembered.
+lock itself, how many approvals are remembered and the program file the agent
+runs (marked `(deleted)` if it was replaced since the agent started).
 
 ## `rusthorse unlock` / `rusthorse lock`
 
@@ -349,8 +350,10 @@ requester chain and, for `run`, the command line and directory — never values.
 rusthorse doctor
 ```
 
-Checks the installation without touching any secret: the agent is running
-and speaks the same protocol version, the systemd service is enabled, zenity
+Checks the installation without touching any secret: the agent is running,
+speaks the same protocol version and runs the same program file as this
+`rusthorse` (an agent still running a build that was since replaced or
+removed is an error: restart it), the systemd service is enabled, zenity
 is installed, the session type (X11 is reported as a warning — see the threat
 model), Yama `ptrace_scope`, the vault's format and permissions, and the
 socket directory's permissions. Exits with status 1 if anything failed.

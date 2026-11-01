@@ -426,6 +426,9 @@ impl Agent {
             locks_in_secs: (!locked && !idle.is_zero())
                 .then(|| idle.saturating_sub(state.last_used.elapsed()).as_secs()),
             remembered_approvals: state.remembered.len(),
+            agent_executable: std::fs::read_link("/proc/self/exe")
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
         }
     }
 
