@@ -141,6 +141,8 @@ needs no lock) and exits with status 141, like a process killed by
 | `list`, `show` | yes | none — metadata only | — |
 | `add` (value typed by you) | yes | value dialog | — |
 | `add --stdin` | yes | approval | no |
+| `add --generate` | yes | approval (the agent generates the value) | no |
+| `change_password` | yes | current and new password dialogs | no |
 | `import` | yes | one approval for the batch | no |
 | `edit` | yes | approval (+ value dialog with `--value`) | no |
 | `remove` | yes | approval | no |

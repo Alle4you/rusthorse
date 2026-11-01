@@ -85,8 +85,13 @@ pub enum Request {
         /// The new entry's metadata.
         entry: NewEntry,
         /// The secret value. `None` makes the agent ask the human for it in a
-        /// dialog; `Some` (value supplied by the client) requires approval.
+        /// dialog (or generate it, with `generate`); `Some` (value supplied
+        /// by the client) requires approval.
         value: Option<SecretString>,
+        /// Generate the value in the agent instead (requires approval). Not
+        /// allowed together with `value`.
+        #[serde(default)]
+        generate: Option<crate::generate::Spec>,
         /// Overwrite an existing entry with the same name.
         replace: bool,
     },
@@ -109,6 +114,9 @@ pub enum Request {
         /// Entry name or `Group/Name` path.
         name: String,
     },
+    /// Change the master password. The agent asks for the current one and
+    /// the new one (twice) in its own dialogs.
+    ChangePassword,
     /// Return an entry's password to the client (requires approval).
     Reveal {
         /// Entry name or `Group/Name` path.
@@ -187,6 +195,8 @@ pub enum ValueChange {
     Prompt,
     /// The client supplies the new value.
     Provided(SecretString),
+    /// The agent generates the new value.
+    Generate(crate::generate::Spec),
 }
 
 /// The changes requested by [`Request::Edit`]. Unset fields stay as they are.

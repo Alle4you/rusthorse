@@ -388,8 +388,10 @@ impl Agent {
             Request::Add {
                 entry,
                 value,
+                generate,
                 replace,
-            } => self.add(peer, entry, value, replace),
+            } => self.add(peer, entry, value, generate, replace),
+            Request::ChangePassword => self.change_password(peer),
             Request::Import { entries, replace } => self.import(peer, entries, replace),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
@@ -655,9 +657,15 @@ impl Agent {
         peer: &Peer,
         entry: NewEntry,
         value: Option<SecretString>,
+        generate: Option<crate::generate::Spec>,
         replace: bool,
     ) -> Result<Response, Failure> {
         crate::vault::validate_name(&entry.name)?;
+        if value.is_some() && generate.is_some() {
+            return Err(Failure::invalid(
+                "give a value or ask for one to be generated, not both",
+            ));
+        }
         let generation = self.generation(peer)?;
         let exists = self.with_vault(peer, |v| Ok(v.contains(&entry.name)))?;
         if exists && !replace {
@@ -665,8 +673,31 @@ impl Agent {
         }
         let verb = if exists { "Replace" } else { "Create" };
         let event = AuditEvent::new("add", peer).entries(vec![entry.name.clone()]);
-        let value = match value {
-            None => {
+        let value = match (value, generate) {
+            (None, Some(spec)) => {
+                let request = ApprovalRequest {
+                    title: "Rusthorse — generate a secret".into(),
+                    summary: format!(
+                        "{verb} the entry \"{}\" with a newly generated value?",
+                        entry.name
+                    ),
+                    details: vec![
+                        ("Entry".into(), entry.name.clone()),
+                        ("Fields".into(), describe_fields(&entry)),
+                        ("Value".into(), describe_spec(spec)),
+                        ("Requested by".into(), peer.describe()),
+                    ],
+                    warnings: if exists {
+                        vec!["The current value will be overwritten.".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    can_remember: false,
+                };
+                self.approve(request, None, event)?;
+                crate::generate::generate(spec).map_err(|e| Failure::invalid(e.to_string()))?
+            }
+            (None, None) => {
                 let message = format!(
                     "{verb} the entry \"{}\"{}\n{}\nType the secret value, or Cancel.\n\nRequested by: {}",
                     util::visible(&entry.name),
@@ -685,7 +716,7 @@ impl Agent {
                 };
                 self.ask_value(peer, prompt, event)?
             }
-            Some(value) => {
+            (Some(value), _) => {
                 let request = ApprovalRequest {
                     title: "Rusthorse — store a secret".into(),
                     summary: format!(
@@ -805,7 +836,12 @@ impl Agent {
         let event = AuditEvent::new("edit", peer).entries(vec![current.identity()]);
 
         let prompt_for_value = matches!(changes.value, Some(ValueChange::Prompt));
-        if changes.touches_metadata() || matches!(changes.value, Some(ValueChange::Provided(_))) {
+        if changes.touches_metadata()
+            || matches!(
+                changes.value,
+                Some(ValueChange::Provided(_) | ValueChange::Generate(_))
+            )
+        {
             let mut details = vec![("Entry".into(), current.identity())];
             details.extend(describe_changes(&changes));
             details.push(("Requested by".into(), peer.describe()));
@@ -820,6 +856,9 @@ impl Agent {
         }
         let new_value = match changes.value.take() {
             Some(ValueChange::Provided(v)) => Some(v),
+            Some(ValueChange::Generate(spec)) => {
+                Some(crate::generate::generate(spec).map_err(|e| Failure::invalid(e.to_string()))?)
+            }
             Some(ValueChange::Prompt) if prompt_for_value => {
                 let prompt = Prompt {
                     title: "Rusthorse — new value".into(),
@@ -867,6 +906,63 @@ impl Agent {
             let id = v.find(&info.id)?;
             v.remove(id);
             Ok(ok(format!("{} deleted", info.name)))
+        })
+    }
+
+    /// Change the master password: the human proves they know the current
+    /// one and types the new one twice, all in the agent's own dialogs.
+    fn change_password(&self, peer: &Peer) -> Result<Response, Failure> {
+        let generation = self.generation(peer)?;
+        let event = AuditEvent::new("passwd", peer);
+        let ask = |message: &str| -> Result<SecretString, Failure> {
+            let prompt = Prompt {
+                title: "Rusthorse — change the master password".into(),
+                message: format!("{message}\n\nRequested by: {}", peer.describe()),
+                confirm: "Next".into(),
+            };
+            let answer = {
+                let _dialog = self.dialog()?;
+                self.ui.master_password(&prompt)?
+            };
+            answer.ok_or_else(|| Failure::new(ErrorCode::Cancelled, "cancelled"))
+        };
+        let current = match ask("Type the CURRENT master password.") {
+            Ok(v) => v,
+            Err(f) => {
+                self.record(event.outcome("cancelled"))?;
+                return Err(f);
+            }
+        };
+        let matches = self.with_vault_at(generation, |v| Ok(v.password_matches(&current)))?;
+        if !matches {
+            self.record(event.outcome("wrong_password"))?;
+            return Err(Failure::new(
+                ErrorCode::UnlockFailed,
+                "wrong master password",
+            ));
+        }
+        let first = ask(
+            "Type the NEW master password (at least 8 characters; 12 or more, or a passphrase, is recommended).",
+        )?;
+        let second = ask("Type the new master password again.")?;
+        if *first != *second {
+            self.record(event.outcome("mismatch"))?;
+            return Err(Failure::invalid(
+                "the new passwords do not match; nothing changed",
+            ));
+        }
+        if first.chars().count() < 8 {
+            self.record(event.outcome("too_short"))?;
+            return Err(Failure::invalid(
+                "the new master password must have at least 8 characters",
+            ));
+        }
+        self.record(event.outcome("changed"))?;
+        self.commit(generation, |v| {
+            v.change_password(first);
+            Ok(ok(
+                "master password changed (the previous file, encrypted with the old password, was removed)",
+            ))
         })
     }
 
@@ -1461,9 +1557,23 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
         Some(ValueChange::Prompt) => {
             out.push(("Value".into(), "you will type the new value next".into()))
         }
+        Some(ValueChange::Generate(spec)) => out.push(("Value".into(), describe_spec(*spec))),
         None => {}
     }
     out
+}
+
+fn describe_spec(spec: crate::generate::Spec) -> String {
+    format!(
+        "a new random value: {} {} characters (about {:.0} bits); nobody will see it",
+        spec.length,
+        match spec.alphabet {
+            crate::generate::Alphabet::Alnum => "letters and digits",
+            crate::generate::Alphabet::Symbols => "letters, digits and symbols",
+            crate::generate::Alphabet::Hex => "hexadecimal",
+        },
+        spec.entropy_bits()
+    )
 }
 
 /// Per-channel flow control for output frames. The agent may send at most

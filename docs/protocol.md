@@ -92,6 +92,7 @@ Every request is an object with a `type` field.
 | `edit` | `name`, `changes` ([EntryChanges](#entrychanges)) | `ok` |
 | `remove` | `name` | `ok` |
 | `reveal` | `name` | `secret` |
+| `change_password` | — | `ok` |
 | `run` | see [Run](#run) | `exited` |
 
 Any request can also be answered with an [`error`](#errors).
@@ -108,7 +109,11 @@ Any request can also be answered with an [`error`](#errors).
 ```
 
 With `"value": null`, `add` makes the agent ask the human for the value. A
-string value is accepted only after approval.
+string value is accepted only after approval. Instead of a value, `add` may
+carry `"generate": {"length": 32, "alphabet": "alnum"}` (alphabets `alnum`,
+`symbols`, `hex`; length 8–1024): the agent generates the value after
+approval. `change_password` makes the agent ask for the current and the new
+master password in its own dialogs.
 
 ### NewEntry
 
@@ -140,7 +145,7 @@ All fields are optional; omitted fields are left unchanged.
 | `port` | integer 0–65535 | New port. |
 | `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"` | Fields to remove. |
 | `add_tags`, `remove_tags` | array of strings | Tag changes. |
-| `value` | `"prompt"` or `{"provided": "…"}` | New secret value: ask the human, or use the given one. |
+| `value` | `"prompt"`, `{"provided": "…"}` or `{"generate": {"length": N, "alphabet": "…"}}` | New secret value: ask the human, use the given one, or generate one. |
 
 ### Run
 

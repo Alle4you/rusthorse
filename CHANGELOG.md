@@ -24,8 +24,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - Commands: `init`, `agent`, `status`, `unlock`, `lock`, `list`, `show`, `add`,
   `edit`, `remove`, `reveal`, `run`, `import dotenv`, `import secret-service`,
   `audit`.
-- systemd user unit, documentation (installation, CLI, AI agents,
-  architecture, threat model, protocol, ADRs) and CI.
+- systemd user unit, documentation (getting started, installation, CLI, AI
+  agents, architecture, threat model, protocol, ADRs) and CI.
+- `add --generate` / `edit --generate` (the agent creates a random value
+  nobody sees), `generate`, `passwd`, `open` (an entry's URL in the
+  browser), `list --search`, `doctor` and `completions`.
+- Commands check that the agent speaks the same protocol version and explain
+  how to restart it after an upgrade.
 
 ### Security
 

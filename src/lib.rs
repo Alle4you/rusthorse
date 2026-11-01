@@ -21,6 +21,7 @@
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`peer`]: identifying the process on the other end of the socket.
 //! - [`audit`]: the append-only audit log.
+//! - [`generate`]: generating random secret values.
 //! - [`import`]: importing secrets from `.env` files and Secret Service.
 //! - [`paths`]: default file locations.
 //! - [`util`]: small shared helpers.
@@ -29,6 +30,7 @@ pub mod agent;
 pub mod audit;
 pub mod client;
 pub mod exec;
+pub mod generate;
 pub mod import;
 pub mod paths;
 pub mod peer;

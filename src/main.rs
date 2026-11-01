@@ -6,10 +6,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use rusthorse::agent::{self, Agent, AgentConfig};
 use rusthorse::client::Client;
+use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
     Binding, EntryChanges, EntryFields, EntryInfo, ErrorCode, Field, ImportedEntry, NewEntry,
     Request, Response, RunRequest, SecretString, ValueChange,
@@ -69,6 +70,10 @@ enum Command {
         /// Only entries with this tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Only entries whose name, group, username, URL, host or tags contain
+        /// this text (case-insensitive).
+        #[arg(long, short = 's', value_name = "TEXT")]
+        search: Option<String>,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -96,6 +101,15 @@ enum Command {
         /// Entry name or Group/Name path.
         name: String,
     },
+    /// Open an entry's URL (its access link) in the default browser.
+    Open {
+        /// Entry name or Group/Name path.
+        name: String,
+    },
+    /// Change the master password (the agent asks for the current and the new one).
+    Passwd,
+    /// Generate a random value and print it; nothing is stored.
+    Generate(GenerateArgs),
     /// Run a command with secrets in its environment (requires approval).
     Run(RunArgs),
     /// Import secrets from other stores.
@@ -110,6 +124,69 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check the installation and the environment, and explain any problem.
+    Doctor,
+    /// Print a shell completion script (bash, zsh, fish, elvish, powershell).
+    Completions {
+        /// The shell.
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AlphabetArg {
+    /// Letters and digits.
+    Alnum,
+    /// Letters, digits and -_.:@+=~%^
+    Symbols,
+    /// Hexadecimal digits.
+    Hex,
+}
+
+impl From<AlphabetArg> for Alphabet {
+    fn from(a: AlphabetArg) -> Self {
+        match a {
+            AlphabetArg::Alnum => Alphabet::Alnum,
+            AlphabetArg::Symbols => Alphabet::Symbols,
+            AlphabetArg::Hex => Alphabet::Hex,
+        }
+    }
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+    /// Number of characters (8–1024).
+    #[arg(long, short = 'l', default_value_t = 32)]
+    length: u16,
+    /// Characters to use.
+    #[arg(long, short = 'a', value_enum, default_value = "alnum")]
+    alphabet: AlphabetArg,
+}
+
+/// `--generate` options shared by `add` and `edit`.
+#[derive(Args)]
+struct GenerateOptions {
+    /// Let the agent generate a random value (requires approval); nobody
+    /// types or sees it.
+    #[arg(long, conflicts_with = "stdin")]
+    generate: bool,
+    /// Length of the generated value (default 32).
+    #[arg(long, requires = "generate", value_name = "N")]
+    length: Option<u16>,
+    /// Characters of the generated value (default alnum).
+    #[arg(long, requires = "generate", value_enum)]
+    alphabet: Option<AlphabetArg>,
+}
+
+impl GenerateOptions {
+    fn spec(&self) -> Option<Spec> {
+        self.generate.then(|| Spec {
+            length: self.length.unwrap_or(Spec::default().length),
+            alphabet: self
+                .alphabet
+                .map_or(Spec::default().alphabet, Alphabet::from),
+        })
+    }
 }
 
 #[derive(Args)]
@@ -167,6 +244,8 @@ struct AddArgs {
     /// Read the value from standard input instead of a dialog (requires approval).
     #[arg(long)]
     stdin: bool,
+    #[command(flatten)]
+    generate: GenerateOptions,
     /// Overwrite an existing entry with the same name.
     #[arg(long)]
     replace: bool,
@@ -200,11 +279,13 @@ struct EditArgs {
     #[arg(long = "remove-tag", value_name = "TAG")]
     remove_tags: Vec<String>,
     /// Also change the value; the agent asks you for it in a dialog.
-    #[arg(long, conflicts_with = "stdin")]
+    #[arg(long, conflicts_with_all = ["stdin", "generate"])]
     value: bool,
     /// Read the new value from standard input.
     #[arg(long)]
     stdin: bool,
+    #[command(flatten)]
+    generate: GenerateOptions,
 }
 
 #[derive(Args)]
@@ -294,13 +375,39 @@ impl std::fmt::Display for Exit {
 impl std::error::Error for Exit {}
 
 fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
+    let talks_to_agent = !matches!(
+        command,
+        Command::Init { .. }
+            | Command::Agent(_)
+            | Command::Status { .. }
+            | Command::Audit { .. }
+            | Command::Doctor
+            | Command::Generate(_)
+            | Command::Completions { .. }
+    );
+    if talks_to_agent {
+        ensure_compatible(client)?;
+    }
     match command {
         Command::Init { vault } => init(vault.unwrap_or_else(paths::vault)).map(|_| 0),
         Command::Agent(args) => run_agent(args, client.socket().to_path_buf()).map(|_| 0),
         Command::Status { json } => status(client, json),
+        Command::Passwd => simple(client, &Request::ChangePassword),
+        Command::Open { name } => open(client, name),
+        Command::Generate(args) => generate_cmd(args),
+        Command::Doctor => doctor(client),
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "rusthorse",
+                &mut std::io::stdout(),
+            );
+            Ok(0)
+        }
         Command::Unlock => simple(client, &Request::Unlock),
         Command::Lock => simple(client, &Request::Lock),
-        Command::List { tag, json } => list(client, tag, json),
+        Command::List { tag, search, json } => list(client, tag, search, json),
         Command::Show { name, json } => show(client, name, json),
         Command::Add(args) => add(client, args),
         Command::Edit(args) => edit(client, args),
@@ -310,6 +417,24 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
         Command::Import(cmd) => import_cmd(client, cmd),
         Command::Audit { lines, json } => show_audit(lines, json),
     }
+}
+
+/// Refuse to talk to an agent that speaks another protocol version (for
+/// example after upgrading the binary without restarting the agent).
+fn ensure_compatible(client: &Client) -> anyhow::Result<()> {
+    if let Response::Status(info) = client.call(&Request::Status)?
+        && info.protocol_version != rusthorse::protocol::PROTOCOL_VERSION
+    {
+        bail!(
+            "the running agent speaks protocol {} (version {}) but this rusthorse speaks {} \
+             (version {}); restart the agent: `systemctl --user restart rusthorse-agent`",
+            info.protocol_version,
+            info.agent_version,
+            rusthorse::protocol::PROTOCOL_VERSION,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(())
 }
 
 /// Turn an error response into an error (with the right exit status).
@@ -471,12 +596,34 @@ fn endpoint(info: &EntryInfo) -> String {
     }
 }
 
-fn list(client: &Client, tag: Option<String>, json: bool) -> anyhow::Result<u8> {
+fn list(
+    client: &Client,
+    tag: Option<String>,
+    search: Option<String>,
+    json: bool,
+) -> anyhow::Result<u8> {
     let Response::Entries { mut entries } = check(client.call(&Request::List)?)? else {
         bail!("unexpected response");
     };
     if let Some(tag) = tag {
         entries.retain(|e| e.fields.tags.contains(&tag));
+    }
+    if let Some(search) = search {
+        let needle = search.to_lowercase();
+        entries.retain(|e| {
+            let f = &e.fields;
+            [
+                Some(&e.name),
+                e.group.as_ref(),
+                f.username.as_ref(),
+                f.url.as_ref(),
+                f.host.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(f.tags.iter())
+            .any(|text| text.to_lowercase().contains(&needle))
+        });
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -597,6 +744,7 @@ fn add(client: &Client, args: AddArgs) -> anyhow::Result<u8> {
         &Request::Add {
             entry,
             value,
+            generate: args.generate.spec(),
             replace: args.replace,
         },
     )
@@ -605,6 +753,8 @@ fn add(client: &Client, args: AddArgs) -> anyhow::Result<u8> {
 fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
     let value = if args.stdin {
         Some(ValueChange::Provided(read_stdin_value()?))
+    } else if let Some(spec) = args.generate.spec() {
+        Some(ValueChange::Generate(spec))
     } else if args.value {
         Some(ValueChange::Prompt)
     } else {
@@ -774,6 +924,213 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         })
         .collect();
     simple(client, &Request::Import { entries, replace })
+}
+
+fn open(client: &Client, name: String) -> anyhow::Result<u8> {
+    let Response::Entry { entry } = check(client.call(&Request::Show { name })?)? else {
+        bail!("unexpected response");
+    };
+    let Some(url) = entry.fields.url.clone() else {
+        if entry.protected_fields.iter().any(|f| f == "URL") {
+            bail!(
+                "{}: the URL is a protected field; it is not disclosed",
+                entry.name
+            );
+        }
+        bail!(
+            "{} has no URL (add one with `rusthorse edit {} --url …`)",
+            entry.name,
+            entry.name
+        );
+    };
+    let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+    if !matches!(scheme.as_deref(), Some("http" | "https")) {
+        bail!("{url}: only http:// and https:// links are opened");
+    }
+    eprintln!("Opening {url}");
+    let status = std::process::Command::new("xdg-open")
+        .arg(&url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("cannot run xdg-open")?;
+    if !status.success() {
+        bail!("xdg-open failed ({status})");
+    }
+    Ok(0)
+}
+
+fn generate_cmd(args: GenerateArgs) -> anyhow::Result<u8> {
+    let spec = Spec {
+        length: args.length,
+        alphabet: args.alphabet.into(),
+    };
+    let value = rusthorse::generate::generate(spec)?;
+    println!("{}", value.as_str());
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "({} characters, about {:.0} bits)",
+            spec.length,
+            spec.entropy_bits()
+        );
+    }
+    Ok(0)
+}
+
+/// One line of `rusthorse doctor`.
+enum Check {
+    Ok(String),
+    Warn(String),
+    Fail(String),
+}
+
+fn doctor(client: &Client) -> anyhow::Result<u8> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut checks = Vec::new();
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).map(|m| m.permissions().mode() & 0o777);
+
+    checks.push(Check::Ok(format!(
+        "rusthorse {} (protocol {})",
+        env!("CARGO_PKG_VERSION"),
+        rusthorse::protocol::PROTOCOL_VERSION
+    )));
+
+    // The agent.
+    match client.call(&Request::Status) {
+        Ok(Response::Status(info)) => {
+            if info.protocol_version == rusthorse::protocol::PROTOCOL_VERSION {
+                checks.push(Check::Ok(format!(
+                    "agent {} is running ({})",
+                    info.agent_version,
+                    if info.locked { "locked" } else { "unlocked" }
+                )));
+            } else {
+                checks.push(Check::Fail(format!(
+                    "the agent speaks protocol {}, this binary {}: run `systemctl --user restart rusthorse-agent`",
+                    info.protocol_version,
+                    rusthorse::protocol::PROTOCOL_VERSION
+                )));
+            }
+            if !info.vault_exists {
+                checks.push(Check::Fail(format!(
+                    "no vault at {} — run `rusthorse init`",
+                    info.vault
+                )));
+            }
+        }
+        Ok(_) => checks.push(Check::Fail(
+            "the agent answered something unexpected".into(),
+        )),
+        Err(e) => checks.push(Check::Fail(format!("{e:#}"))),
+    }
+
+    // How the agent is started.
+    let systemctl = |args: &[&str]| {
+        std::process::Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    match systemctl(&["is-enabled", "rusthorse-agent"]).as_str() {
+        "enabled" => checks.push(Check::Ok("the systemd user service is enabled".into())),
+        other => checks.push(Check::Warn(format!(
+            "the systemd user service is {} — the agent should be started by systemd (docs/installation.md)",
+            if other.is_empty() { "not installed" } else { other }
+        ))),
+    }
+
+    // Dialogs.
+    if ["/usr/bin/zenity", "/usr/local/bin/zenity"]
+        .iter()
+        .any(|p| std::path::Path::new(p).is_file())
+    {
+        checks.push(Check::Ok("zenity is installed".into()));
+    } else {
+        checks.push(Check::Fail(
+            "zenity is not installed — `sudo apt install zenity`".into(),
+        ));
+    }
+    match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => checks.push(Check::Ok("Wayland session: other programs cannot click dialogs".into())),
+        Ok("x11") => checks.push(Check::Warn(
+            "X11 session: any program of your user can click \"Allow\" or read keystrokes (threat model L2)".into(),
+        )),
+        other => checks.push(Check::Warn(format!("unknown session type {other:?}"))),
+    }
+
+    // Kernel protections.
+    match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").map(|s| s.trim().to_string()) {
+        Ok(v) if v != "0" => checks.push(Check::Ok(format!("Yama ptrace_scope = {v}"))),
+        Ok(_) => checks.push(Check::Fail(
+            "Yama ptrace_scope = 0: any process of your user can debug any other (set kernel.yama.ptrace_scope=1)".into(),
+        )),
+        Err(_) => checks.push(Check::Warn("Yama is not available: process isolation is weaker".into())),
+    }
+
+    // Files.
+    let vault = paths::vault();
+    if vault.exists() {
+        match mode(&vault) {
+            Ok(m) if m & 0o077 == 0 => {
+                checks.push(Check::Ok(format!("{} is private ({m:o})", vault.display())))
+            }
+            Ok(m) => checks.push(Check::Fail(format!(
+                "{} is readable by others ({m:o}) — chmod 600",
+                vault.display()
+            ))),
+            Err(e) => checks.push(Check::Fail(format!("{}: {e}", vault.display()))),
+        }
+        match std::fs::File::open(&vault).map_err(anyhow::Error::from).and_then(|mut f| {
+            keepass::Database::get_version(&mut f).map_err(anyhow::Error::from)
+        }) {
+            Ok(keepass::config::DatabaseVersion::KDB4(minor)) => {
+                checks.push(Check::Ok(format!("the vault is KDBX 4.{minor}")))
+            }
+            Ok(other) => checks.push(Check::Warn(format!(
+                "the vault is {other:?}: Rusthorse can read it but not save it (convert it to KDBX 4 in KeePassXC)"
+            ))),
+            Err(e) => checks.push(Check::Fail(format!("the vault cannot be read: {e:#}"))),
+        }
+    }
+    let audit = paths::audit_log();
+    if let Ok(m) = mode(&audit)
+        && m & 0o077 != 0
+    {
+        checks.push(Check::Warn(format!(
+            "{} is readable by others ({m:o})",
+            audit.display()
+        )));
+    }
+    if let Some(dir) = client.socket().parent()
+        && let Ok(m) = mode(dir)
+    {
+        if m & 0o077 == 0 {
+            checks.push(Check::Ok(format!("{} is private ({m:o})", dir.display())));
+        } else {
+            checks.push(Check::Fail(format!(
+                "{} is accessible to others ({m:o})",
+                dir.display()
+            )));
+        }
+    }
+
+    let mut failed = false;
+    for check in &checks {
+        match check {
+            Check::Ok(text) => println!("  ok    {text}"),
+            Check::Warn(text) => println!("  warn  {text}"),
+            Check::Fail(text) => {
+                failed = true;
+                println!("  FAIL  {text}");
+            }
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
 }
 
 fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {

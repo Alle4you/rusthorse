@@ -228,8 +228,11 @@ chain is informative only. A flood of requests can cause approval fatigue.
 Anyone with a copy of the file or one of its backups can try passwords at a
 cost set by Argon2id. A weak master password will fall. Old values remain in
 entry history, in `vault.kdbx.bak` and in any copies you made. *Mitigation:* a
-long, unique passphrase; rotate credentials at the provider when they may have
-leaked — deleting an entry does not revoke anything.
+long, unique passphrase (`rusthorse passwd` changes it and deletes the
+`.bak` file encrypted with the old one — but not copies made elsewhere);
+rotate credentials at the provider when they may have leaked — deleting an
+entry does not revoke anything (`rusthorse edit NAME --generate` makes the
+new value).
 
 ### L11 — Command lines are not secret
 

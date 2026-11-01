@@ -128,6 +128,7 @@ impl Harness {
         cmd.args(args)
             .env("RUSTHORSE_SOCKET", &self.socket)
             .env("RUSTHORSE_AUDIT_LOG", &self.audit)
+            .env("RUSTHORSE_VAULT", self.dir.path().join("vault.kdbx"))
             .current_dir(self.dir.path())
             .stdin(Stdio::null());
         cmd
@@ -1413,6 +1414,160 @@ fn end_of_input_waits_for_pending_input() {
         (3 * MAX_DATA_LEN).to_string(),
         "input was cut short"
     );
+}
+
+#[test]
+fn the_master_password_can_be_changed() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    let new = "a brand new passphrase";
+    h.ui.passwords.lock().unwrap().extend([
+        Some(PASSWORD.to_string()),
+        Some(new.to_string()),
+        Some(new.to_string()),
+    ]);
+    let out = h.run(&["passwd"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        !h.dir.path().join("vault.kdbx.bak").exists(),
+        "old-password backup kept"
+    );
+    assert!(Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).is_err());
+    let reopened =
+        Vault::open(&h.vault_path(), SecretString::new(new.into())).expect("new password");
+    assert!(reopened.find("T").is_ok());
+    assert!(
+        h.audit_text()
+            .contains("\"action\":\"passwd\",\"outcome\":\"changed\"")
+    );
+}
+
+#[test]
+fn a_wrong_or_mismatched_password_changes_nothing() {
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    h.ui.passwords
+        .lock()
+        .unwrap()
+        .push_back(Some("not the password".into()));
+    assert!(!h.run(&["passwd"]).status.success());
+    h.ui.passwords.lock().unwrap().extend([
+        Some(PASSWORD.to_string()),
+        Some("first version!".to_string()),
+        Some("second version".to_string()),
+    ]);
+    assert!(!h.run(&["passwd"]).status.success());
+    assert!(Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).is_ok());
+}
+
+#[test]
+fn generated_values_are_created_without_anyone_typing_them() {
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    h.decide(&[Decision::Deny]);
+    let out = h.run(&["add", "GEN", "--generate"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(!text(&h.run(&["list"]).stdout).contains("GEN"));
+
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&[
+        "add",
+        "GEN",
+        "--generate",
+        "--length",
+        "40",
+        "--alphabet",
+        "hex",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "Value" && v.contains("40 hexadecimal"))
+    );
+
+    h.decide(&[Decision::AllowOnce]);
+    let first = text(&h.run(&["reveal", "GEN"]).stdout).trim().to_string();
+    assert_eq!(first.len(), 40);
+    assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+    assert!(h.run(&["edit", "GEN", "--generate"]).status.success());
+    let second = text(&h.run(&["reveal", "GEN"]).stdout).trim().to_string();
+    assert_eq!(second.len(), 32);
+    assert_ne!(first, second);
+}
+
+#[test]
+fn list_search_matches_names_urls_hosts_and_tags() {
+    let h = Harness::new();
+    h.add_secret(
+        "core-router",
+        "abcdefgh",
+        &["--host", "10.0.0.1", "--tag", "network"],
+    );
+    h.add_secret("GITHUB_TOKEN", "abcdefgh", &["--url", "https://github.com"]);
+    let names = |search: &str| text(&h.run(&["list", "--search", search]).stdout);
+    assert!(names("10.0.0").contains("core-router") && !names("10.0.0").contains("GITHUB"));
+    assert!(names("GitHub.COM").contains("GITHUB_TOKEN"));
+    assert!(names("netw").contains("core-router"));
+}
+
+#[test]
+fn open_hands_only_http_links_to_the_browser() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    h.add_secret("site", "abcdefgh", &["--url", "https://router.lan/admin"]);
+    h.add_secret("shell", "abcdefgh", &["--url", "ssh://admin@10.0.0.1"]);
+    h.add_secret("bare", "abcdefgh", &[]);
+    // A stand-in for xdg-open that records what it was asked to open.
+    let bin = h.dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let opened = h.dir.path().join("opened");
+    let fake = bin.join("xdg-open");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\necho \"$1\" > {}\n", opened.display()),
+    )
+    .expect("write");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let out = h.cmd(&["open", "site"]).env("PATH", &path).finish();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&opened).expect("opened").trim(),
+        "https://router.lan/admin"
+    );
+    assert!(
+        !h.cmd(&["open", "shell"])
+            .env("PATH", &path)
+            .finish()
+            .status
+            .success()
+    );
+    assert!(
+        !h.cmd(&["open", "bare"])
+            .env("PATH", &path)
+            .finish()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn generate_completions_and_doctor_work_offline() {
+    let h = Harness::new();
+    let out = h.run(&["generate", "--length", "20", "--alphabet", "symbols"]);
+    let value = text(&out.stdout).trim().to_string();
+    assert_eq!(value.chars().count(), 20);
+    let out = h.run(&["completions", "bash"]);
+    assert!(out.status.success() && text(&out.stdout).contains("rusthorse"));
+    let out = h.run(&["doctor"]);
+    let report = text(&out.stdout);
+    assert!(report.contains("agent 0.1.0 is running"), "{report}");
+    assert!(report.contains("the vault is KDBX 4."), "{report}");
 }
 
 #[test]

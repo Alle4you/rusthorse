@@ -171,6 +171,9 @@ pub struct Vault {
     path: PathBuf,
     password: SecretString,
     fingerprint: Option<Fingerprint>,
+    /// Remove `<name>.bak` after the next successful save (it is encrypted
+    /// with a password that is no longer current).
+    discard_backup: bool,
     /// Test hook: runs after the new file is written, before it replaces the
     /// old one (simulates another program saving at that moment).
     #[cfg(test)]
@@ -205,6 +208,7 @@ impl Vault {
             path: path.to_path_buf(),
             password,
             fingerprint: None,
+            discard_backup: false,
             #[cfg(test)]
             before_rename: None,
         };
@@ -241,6 +245,7 @@ impl Vault {
             path: path.to_path_buf(),
             password,
             fingerprint: Some(fingerprint),
+            discard_backup: false,
             #[cfg(test)]
             before_rename: None,
         })
@@ -249,6 +254,24 @@ impl Vault {
     /// The vault file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether `candidate` is the current master password (compared in
+    /// constant time).
+    pub fn password_matches(&self, candidate: &str) -> bool {
+        let (a, b) = (self.password.as_bytes(), candidate.as_bytes());
+        let mut diff = a.len() ^ b.len();
+        for i in 0..a.len().max(b.len()) {
+            diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+        }
+        diff == 0
+    }
+
+    /// Use `new` as the master password from the next save on. That save
+    /// also removes `<name>.bak`, which is encrypted with the old password.
+    pub fn change_password(&mut self, new: SecretString) {
+        self.password = new;
+        self.discard_backup = true;
     }
 
     /// Write the vault back to disk, atomically, keeping the previous file as
@@ -336,6 +359,10 @@ impl Vault {
         // The renamed file is the one we wrote (same inode), whatever the path
         // points to by now.
         self.fingerprint = Some(written);
+        if self.discard_backup {
+            let _ = fs::remove_file(dir.join(format!("{name}.bak")));
+            self.discard_backup = false;
+        }
         Ok(())
     }
 
@@ -933,6 +960,30 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn changing_the_password_reencrypts_and_drops_the_old_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        vault.add(&entry("x"), &secret("abcd"), false).expect("add");
+        vault.save().expect("save");
+        let backup = dir.path().join("sub").join("vault.kdbx.bak");
+        assert!(backup.exists());
+        assert!(vault.password_matches("correct horse"));
+        assert!(!vault.password_matches("correct hors"));
+        vault.change_password(secret("new passphrase here"));
+        vault.save().expect("save with the new password");
+        assert!(
+            !backup.exists(),
+            "the backup encrypted with the old password remains"
+        );
+        assert!(matches!(
+            Vault::open(&path, secret("correct horse")),
+            Err(VaultError::WrongPassword)
+        ));
+        let reopened = Vault::open(&path, secret("new passphrase here")).expect("open");
+        assert!(reopened.find("x").is_ok());
     }
 
     #[test]

@@ -138,13 +138,19 @@ what Rusthorse can and cannot protect against when the requester is an AI.
 | `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags | — |
 | `add NAME` | New entry; you type the value in a dialog | the dialog itself |
 | `add NAME --stdin` | New entry with a value from standard input | yes |
+| `add NAME --generate` | New entry with a random value nobody sees | yes |
 | `edit NAME …` | Change fields, tags, name or value | yes |
 | `remove NAME` | Delete an entry | yes |
 | `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
 | `reveal NAME` | Print a value (for humans; avoid in automation) | yes (never remembered) |
+| `open NAME` | Open the entry's URL (access link) in the browser | — |
+| `passwd` | Change the master password | the dialogs themselves |
+| `generate` | Print a random value (nothing stored) | — |
 | `import dotenv FILE` | Import `NAME=value` pairs | yes (one for the batch) |
 | `import secret-service -a KEY=VALUE` | Import from GNOME Keyring / KWallet | yes (one for the batch) |
 | `audit` | Show recent audit records | — |
+| `doctor` | Check the installation and environment | — |
+| `completions SHELL` | Print a shell completion script | — |
 
 See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
 
@@ -164,6 +170,7 @@ limitation.
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md) — the first ten minutes
 - [Installation](docs/installation.md) — build, install, systemd, migration, uninstall
 - [CLI reference](docs/cli.md) — commands, options, environment, exit statuses
 - [Using Rusthorse with AI agents](docs/ai-agents.md)
