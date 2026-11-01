@@ -31,8 +31,9 @@ struct ScriptedUi {
     on_password: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The text of every master-password dialog shown.
     password_prompts: Mutex<Vec<String>>,
-    /// How many of the next master-password dialogs nobody answers.
-    password_timeouts: Mutex<usize>,
+    /// Which master-password dialogs nobody answers, by their index in
+    /// `password_prompts`.
+    password_timeouts: Mutex<Vec<usize>>,
 }
 
 /// `Some(text)` is typed and confirmed; `None` cancels.
@@ -42,19 +43,16 @@ fn typed(answer: Option<String>) -> Typed {
 
 impl Ui for ScriptedUi {
     fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.password_prompts
-            .lock()
-            .unwrap()
-            .push(prompt.message.clone());
+        let index = {
+            let mut prompts = self.password_prompts.lock().unwrap();
+            prompts.push(prompt.message.clone());
+            prompts.len() - 1
+        };
         if let Some(hook) = self.on_password.lock().unwrap().take() {
             hook();
         }
-        {
-            let mut timeouts = self.password_timeouts.lock().unwrap();
-            if *timeouts > 0 {
-                *timeouts -= 1;
-                return Ok(Typed::TimedOut);
-            }
+        if self.password_timeouts.lock().unwrap().contains(&index) {
+            return Ok(Typed::TimedOut);
         }
         let next = self.passwords.lock().unwrap().pop_front();
         Ok(typed(next.unwrap_or(Some(PASSWORD.to_string()))))
@@ -536,7 +534,7 @@ fn an_unlock_with_nothing_ever_typed_is_cancelled_not_wrong() {
 #[test]
 fn unanswered_dialogs_are_reported_as_timed_out() {
     let h = Harness::new();
-    *h.ui.password_timeouts.lock().unwrap() = 1;
+    h.ui.password_timeouts.lock().unwrap().push(0);
     let out = h.run(&["list"]);
     assert_eq!(out.status.code(), Some(4));
     assert!(
@@ -1615,6 +1613,49 @@ fn the_master_password_can_be_changed() {
 }
 
 #[test]
+fn every_unanswered_passwd_dialog_is_recorded_once_and_changes_nothing() {
+    let new = "a brand new passphrase";
+    for position in 0..3 {
+        for timed_out in [false, true] {
+            let h = Harness::new();
+            assert!(h.run(&["unlock"]).status.success()); // dialog 0
+            // Answer the dialogs before `position` (current, new, new again),
+            // then leave that one cancelled or unanswered.
+            let mut answers: Vec<Option<String>> = [PASSWORD, new, new][..position]
+                .iter()
+                .map(|a| Some(a.to_string()))
+                .collect();
+            if timed_out {
+                h.ui.password_timeouts.lock().unwrap().push(1 + position);
+            } else {
+                answers.push(None);
+            }
+            h.ui.passwords.lock().unwrap().extend(answers);
+            let out = h.run(&["passwd"]);
+            let case = format!("dialog {position}, timed out: {timed_out}");
+            assert_eq!(out.status.code(), Some(4), "{case}: {}", text(&out.stderr));
+            assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 2 + position);
+            let audit = h.audit_text();
+            let records: Vec<&str> = audit
+                .lines()
+                .filter(|l| l.contains("\"action\":\"passwd\""))
+                .collect();
+            assert_eq!(records.len(), 1, "{case}: {records:?}");
+            let outcome = if timed_out { "timed_out" } else { "cancelled" };
+            assert!(
+                records[0].contains(&format!("\"outcome\":\"{outcome}\"")),
+                "{case}: {}",
+                records[0]
+            );
+            assert!(
+                Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).is_ok(),
+                "{case}: the password changed"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_wrong_or_mismatched_password_changes_nothing() {
     let h = Harness::new();
     assert!(h.run(&["unlock"]).status.success());
@@ -2080,11 +2121,12 @@ fn fake_import_agent(
     use rusthorse::protocol::{
         PROTOCOL_VERSION, Request, Response, StatusInfo, recv_frame, send_frame,
     };
-    let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+    let mut listener = Some(std::os::unix::net::UnixListener::bind(socket).expect("bind"));
+    let path = socket.to_path_buf();
     std::thread::spawn(move || {
         let mut replies = replies.into_iter();
-        loop {
-            let Ok((stream, _)) = listener.accept() else {
+        while let Some(open) = &listener {
+            let Ok((stream, _)) = open.accept() else {
                 return;
             };
             let (body, _fds) = recv_frame(&stream).expect("request");
@@ -2110,14 +2152,21 @@ fn fake_import_agent(
                     let Some(reply) = replies.next() else {
                         panic!("more batches than expected");
                     };
+                    if replies.len() == 0 {
+                        // Stop listening *before* answering, so that no later
+                        // connection can be queued and then reset; its request
+                        // must never be sent. Closing the listener is not
+                        // enough: a child forked by another test keeps a copy
+                        // of it until its exec. Removing the socket file makes
+                        // every later connect fail at once.
+                        std::fs::remove_file(&path).expect("remove socket");
+                        listener = None;
+                    }
                     if let Some(reply) = reply {
                         let mut frame = (reply.len() as u32).to_be_bytes().to_vec();
                         frame.extend_from_slice(reply.as_bytes());
                         use std::io::Write;
                         (&stream).write_all(&frame).expect("reply");
-                    }
-                    if replies.len() == 0 {
-                        return; // stop listening: later connections fail
                     }
                 }
                 other => panic!("unexpected request {other:?}"),
