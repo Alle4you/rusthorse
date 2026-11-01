@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rusthorse
+GenericName=Secrets Manager
+Comment=Manage local credentials through the Rusthorse agent
+Exec=rusthorse-manager
+Icon=io.github.alle4you.Rusthorse
+Terminal=false
+Categories=Utility;Security;
+StartupNotify=true
+DBusActivatable=false

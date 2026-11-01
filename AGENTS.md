@@ -61,10 +61,14 @@ cargo +1.89 check --all-targets    # MSRV; CI runs the same
 # widget tests run on a virtual display (xvfb, xdotool), never on yours.
 cargo clippy -p rusthorse-dialog --all-targets -- -D warnings
 cargo test -p rusthorse-dialog
+
+# The manager uses the same GTK requirements and isolated widget tests.
+cargo clippy -p rusthorse-manager --all-targets -- -D warnings
+cargo test -p rusthorse-manager
 ```
 
 The workspace's default member is `rusthorse`, so plain `cargo` commands do
-not build the dialog program; `cargo fmt --all` formats both.
+not build the dialog or manager; `cargo fmt --all` formats all members.
 
 Documentation of public items must not link to private ones: `cargo doc`
 with `-D warnings` fails on it.
@@ -77,19 +81,24 @@ deprecated in newer releases whose replacements 1.89 lacks (for example
 
 Breaking one of these is a security bug, whatever the tests say.
 
-1. **Only the agent handles secrets taken from the vault.** The CLI holds a
-   secret only when the user supplies one — `init` (the new master password),
-   `add --stdin`, `import` (values read from a `.env` file or the Secret
-   Service, sent to the agent) — or asked for one: `reveal`, after approval.
+1. **Only the agent handles secrets taken from the vault.** A client — the
+   CLI or the manager — holds a secret only when the user supplies one —
+   `init` (the new master password), `add --stdin`, `import` (values read
+   from a `.env` file or the Secret Service, sent to the agent) — or asked
+   for one: `reveal`, after approval (the manager's Show and Copy are
+   reveals). The manager's forms carry metadata only: they never ask for a
+   master password or a value.
 2. **Never** log, audit or put in an error message a secret value, the master
-   password or notes; the only place a value is printed is `reveal`'s output.
-   Keep secrets in `Zeroizing` types; never `Debug` a structure that contains
-   one.
+   password or notes. A value leaves a client only where the human asked for
+   it: printed by `reveal`, shown in the manager's Show window, or put on the
+   clipboard by its Copy for a single paste
+   ([ADR 0007](docs/adr/0007-visual-manager.md)). Keep secrets in `Zeroizing`
+   types; never `Debug` a structure that contains one.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
-4. **Dialogs are shown by the agent**, never by the client — except `init`
-   without a terminal, which asks for the new master password itself because
-   no agent exists yet. Default button **Deny**; only the exact expected
+4. **Approval and secret-entry dialogs are shown by the agent**, never by
+   a client — except `init` without a terminal, which asks for the new
+   master password itself because no agent exists yet. Default button **Deny**; only the exact expected
    zenity results count as approval (`ui::decision_from`); an unanswered
    dialog is `timed_out`, a denial.
 5. **Everything a requester controls that a dialog shows goes through
@@ -189,6 +198,7 @@ present and capture only its window, in a dark and a light theme
 | `src/agent.rs` | The agent: policy, approvals, dialogs, `run` |
 | `src/ui.rs` | The `Ui` trait, `dialog_text`, zenity dialogs and their height estimate |
 | `src/dialog_program.rs`, `src/dialog_protocol.rs` | Driving `rusthorse-dialog`; the protocol between them |
+| `manager/` | The GTK metadata client; Show requires agent approval (ADR 0007). |
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |

@@ -13,7 +13,6 @@ supersedes the old one, which is marked as such.
 | [0004](0004-native-distribution.md) | Native binary and systemd user service, no Flatpak | Accepted |
 | [0005](0005-remembered-approvals-opt-in.md) | Remembered approvals are opt-in and bound to the vault generation | Accepted |
 | [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Accepted |
-
 | [0007](0007-visual-manager.md) | A visual manager that remains a client of the agent | Proposed |
 
 ## Writing a new ADR

@@ -34,15 +34,21 @@ flowchart LR
     P --> L
 ```
 
-There are two programs in one binary, and a third, optional one:
+The CLI and agent share a binary; the dialog and manager are optional
+separate programs:
 
 - **The agent** (`rusthorse agent`) runs for the whole desktop session. It is
-  the only component that decrypts the vault, sees secret values, shows
-  dialogs and starts approved commands.
+  the only component that decrypts the vault, holds the decrypted database, shows approval/secret-entry
+  dialogs and starts approved commands. An approved `reveal` also sends one
+  value to its client.
 - **The CLI** (every other subcommand) is a thin client. It turns command-line
   arguments into one request, sends it over the socket, prints the response
   and exits. It never handles the master password, and for `run` it never
   handles secret values.
+- **`rusthorse-manager`** (GTK 4 and libadwaita, built separately) is a
+  window to manage entries: a client of the agent like the CLI, which shows
+  or copies a value only through an approved `reveal`. It never opens the
+  vault or asks for a master password. See [Visual manager](#visual-manager).
 - **`rusthorse-dialog`** (GTK 4 and libadwaita, built separately) shows one
   dialog for the agent and exits. Without it, the agent uses zenity.
 
@@ -149,7 +155,7 @@ needs no lock) and exits with status 141, like a process killed by
 | `import` | yes | one approval for the batch | no |
 | `edit` | yes | approval (+ value dialog with `--value`) | no |
 | `remove` | yes | approval | no |
-| `reveal` | yes | approval with a warning | no |
+| `reveal` | yes | approval with a warning; the dialog names the client's stated purpose (print, show, copy) | no |
 | `run` | yes | approval | opt-in (`--remember`), exact match |
 
 "Metadata" is the entry name, group, username, URL, host, port, tags, whether
@@ -369,6 +375,7 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/dialog_program.rs`](../src/dialog_program.rs) | Finding, starting and supervising `rusthorse-dialog`; falling back to zenity. |
 | [`src/dialog_protocol.rs`](../src/dialog_protocol.rs) | The protocol between the agent and `rusthorse-dialog`. |
 | [`dialog/`](../dialog) | `rusthorse-dialog`, the GTK 4 dialog program, and its tests on a virtual display. |
+| [`manager/`](../manager) | `rusthorse-manager`, the GTK 4 window to manage entries: agent requests on a worker, the single-paste clipboard content, tests on a virtual display. |
 | [`src/exec.rs`](../src/exec.rs) | Program resolution and environment cleaning for `run`. |
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |
 | [`src/peer.rs`](../src/peer.rs) | Peer credentials and the requester process chain. |
@@ -388,11 +395,32 @@ The reasoning behind the main choices is recorded as
 - [ADR 0004](adr/0004-native-distribution.md) — native binary and systemd, no Flatpak
 - [ADR 0005](adr/0005-remembered-approvals-opt-in.md) — remembered approvals are opt-in
 
-## Visual manager design
+## Visual manager
 
-[ADR 0007](adr/0007-visual-manager.md) proposes `rusthorse-manager`, a separate
-GTK 4 client. It uses the existing agent requests and never opens the vault.
-Metadata forms do not authorize changes; the agent still shows approvals.
-Show is an explicit, approved reveal into the manager; secret clipboard Copy
-is excluded. The first milestone and later settings, grants/history, import
-and restoration work are distinguished in the ADR and roadmap.
+`rusthorse-manager` ([ADR 0007](adr/0007-visual-manager.md),
+[user guide](manager.md)) is a separate GTK 4 client of the agent, like the
+CLI: it never opens the vault and never receives the master password. Its
+forms carry metadata only; every change is a request the agent approves in
+its own dialog.
+
+- **Requests.** It uses the protocol-3 requests and targets entries by UUID.
+  Before each request it checks the agent's protocol version. One request
+  started by the human runs at a time, on a worker thread, with bounded
+  waits; closing the window shuts the connection down. A lost answer to a
+  request with effects is reported as an unknown outcome, never retried.
+- **Status.** A background `status` every five seconds, which never blocks
+  the controls and does not postpone the idle lock. A lock it observes clears
+  the entries, a shown value and a copied value; an unlock done elsewhere
+  (the CLI) loads the list, which asks nothing because the vault is open.
+- **Show.** `reveal` with purpose `show`: the value appears in a window of its
+  own, not selectable, grouped by four characters when that cannot mislead,
+  for at most 30 seconds or until the window loses focus.
+- **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard
+  through a content provider that serves it to a **single paste** (plus a
+  one-second grace for that paste's repeated requests) and is cleared after
+  20 seconds, on lock and on close, if still there. Nothing is storable by a
+  clipboard manager. See [ADR 0007, section 2](adr/0007-visual-manager.md#2-show-copy-and-memory)
+  and [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client).
+- **Memory.** Values live in zeroizing buffers in Rust; GTK's own copies
+  (labels, clipboard transfers) are emptied when no longer needed but cannot
+  be wiped reliably. The process is non-dumpable.

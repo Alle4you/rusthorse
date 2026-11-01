@@ -2,6 +2,8 @@
 
 - Status: Proposed
 - Date: 2026-11-01
+- Amended: 2026-11-01 — Copy of a value for a single paste (section 2), at
+  the maintainer's request: without it, long random keys had to be retyped.
 
 ## Context
 
@@ -25,8 +27,9 @@ protocol compatibility before operations. No service is started or restarted.
 
 M1 implements status, explicit unlock/lock, metadata list/search/group
 filter, details, create (including group), edit/rename/delete, generated
-values, approved Show of password/notes, a safely quoted UUID-based command
-snippet, password change and verified backup through existing requests.
+values, approved Show and single-paste Copy of password/notes, a safely
+quoted UUID-based command snippet, password change and verified backup
+through existing requests.
 Existing groups cannot be changed by `edit`; M1 says so instead of emulating
 a move with delete/add (which would lose identity/history). Notes can be
 shown but not edited in M1. Protected metadata is displayed as withheld and
@@ -47,23 +50,98 @@ is no synchronous push notification of external locks in protocol 3.
 
 ### 2. Show, Copy and memory
 
-**Show is included, secret Copy is not.** Each Show sends a fresh `reveal`
-request (password or notes) and waits for the agent's non-rememberable
-approval. The result appears in a non-selectable, plain-text window for at
-most 30 seconds, cleared on close/focus loss, local lock or observed external
-lock. It is not cached in entry models. Rust-owned value buffers are
-zeroizing; GTK, accessibility, display and allocator copies cannot be
-reliably wiped. Disable core dumps and mark the manager non-dumpable before
-GTK starts; this does not protect its screen from X11 or its accessibility
-tree. A reveal authorizes this extra exposure, as it does with the CLI.
+Some uses of a secret need it outside a command: pasting an API key into a
+provider's web console or a CI settings page, signing in to a web interface
+(a router, an intranet), a graphical program that asks for a password, a
+prompt that reads no environment variable (`ssh`, `mysql -p`). A long random
+key cannot reasonably be retyped from the screen. So the manager offers two
+ways to get a value out — Show and Copy — each after its own approval in the
+agent's dialog. They are for the human at the desktop; an AI agent uses
+`rusthorse run`, which keeps the value inside the approved command.
 
-X11 clipboard managers can retain values forever, and clearing the clipboard
-does not recall those copies. A timer therefore cannot justify a promise of
-safe secret Copy. M1 copies **only the command snippet**, containing a UUID,
-never a secret. There is no selectable secret label that quietly exports to
-the primary selection. A future opt-in secret Copy requires an explicit
-agent-side purpose/warning, ownership-aware best-effort clearing, and wording
-that clipboard history remains outside our control, on Wayland too.
+#### The stated purpose
+
+`reveal` gains an optional `purpose` field: `show` or `copy`
+([protocol.md](../protocol.md#requests)). The agent cannot verify it — the
+requester receives the value and can do anything with it — so the dialog
+labels it **"Stated purpose (unverified)"** and its explanation says so. The
+purpose changes the dialog's title, question and warning, and is written in
+the audit record (`value, to copy to the clipboard`), so the log tells a
+copy from a display. Without the field (the CLI), nothing changes. Within
+protocol 3 this is an optional field: an agent that predates it ignores it
+and shows the CLI's wording, which is stricter, not weaker.
+
+#### Show
+
+Each Show sends a fresh `reveal` with purpose `show` and waits for an
+approval that is never remembered. The value appears in a window of its own:
+
+- plain text, not selectable, so it never reaches the primary selection;
+- in groups of four characters when it is made of printable ASCII without
+  spaces (easier to read and compare); anything else is shown as it is, so
+  the grouping can never be mistaken for part of the value; characters
+  outside the dialogs' allow-list appear as `\u{…}` escapes, as in the
+  agent's dialogs;
+- hidden after 30 seconds, when the window loses focus, on close, on a lock
+  the manager observes, and before any other request; its labels are emptied
+  when it closes.
+
+It is not cached in entry models. Rust-owned value buffers are zeroizing;
+GTK, accessibility, display and allocator copies cannot be reliably wiped.
+Disable core dumps and mark the manager non-dumpable before GTK starts; this
+does not protect its screen from X11 or its accessibility tree. A reveal
+authorizes this extra exposure, as it does with the CLI.
+
+#### Copy, for a single paste
+
+The clipboard is the riskiest place a value can go: on X11 every program of
+the session can read it, on any desktop a clipboard history can keep it for
+ever, a phone link (GSConnect, KDE Connect) can send it to another device,
+and a value pasted into the wrong window — a chat with an AI, say — is sent
+away. A timer that clears the clipboard after a while (the common design)
+addresses none of these: the copies are made in the first second. Copy is
+therefore built around **one paste**, not around a timer:
+
+1. **Its own approval.** Copy sends a `reveal` with purpose `copy`; the
+   dialog asks "Copy the value of an entry to the clipboard?" and warns that
+   other programs can read the clipboard and that it must never be pasted
+   into a chat with an AI. Copying from the Show window asks again: that
+   approval said "show".
+2. **One paste.** The value is not handed to GTK as a string. A
+   `GdkContentProvider` of the manager's own answers each request: the first
+   request for text starts a one-second grace period (one paste can make more
+   than one request), and every request after it fails. The manager then
+   clears the clipboard.
+3. **Cleared anyway** after 20 seconds without a paste, on Lock now, on a
+   lock it observes, when the agent becomes unreachable and when the window
+   closes — but only if the clipboard still holds this value: something the
+   user copied afterwards is left alone.
+4. **Never stored.** The provider declares no storable format, so GTK does
+   not hand the value to a clipboard manager (`SAVE_TARGETS`) when the app
+   exits.
+5. **Marked as a password** with `x-kde-passwordManagerHint: secret`, which
+   Klipper, KDE Connect and some other histories honour. *On X11, GTK 4
+   serves only formats whose name contains a slash (verified with GTK 4.14),
+   so this hint is announced but cannot be read there.* It may help on
+   Wayland; that is not verified.
+6. **Visible.** A banner shows what is on the clipboard and the seconds
+   left, with "Clear now". When the value is taken within half a second of
+   the copy — faster than a human pastes — the manager says that another
+   program, probably a clipboard history, took it and may keep it.
+
+What this does **not** protect against: a program of the session that reads
+the clipboard while the value is there; a history that ignores the hint (on
+X11, all of them) — although such a history uses up the single paste, so the
+human's own paste comes back empty and the banner says what happened; the
+program the value is pasted into. On Wayland, other programs cannot read the
+clipboard without focus unless the compositor offers a data-control protocol
+(wlroots, KDE do), which clipboard managers use.
+
+Not chosen, for now: **drag and drop** of the value onto a field (only the
+drop target receives it, no clipboard involved — an idea for a later
+milestone); **auto-type** into the focused window (KeePassXC's approach;
+X11 only, and it can type into the wrong window); the **primary selection**
+(filled by any text selection, cleared by none).
 
 ### 3. Persistent agent configuration (M2)
 
@@ -139,9 +217,10 @@ launch of the live vault. The manager never writes a KDBX itself.
 
 ### 7. Protocol, packaging and tests
 
-M1 uses existing protocol 3 without changing any request/response. Future
-requests in M2/M3 need documented capabilities or a version bump before a
-new client uses them. Changes to meaning, framing or error guarantees always
+M1 adds one optional field to protocol 3, `reveal.purpose` (section 2); no
+other request or response changes, and the field is omitted when absent, so
+the CLI's requests are unchanged. Future requests in M2/M3 need documented
+capabilities or a version bump before a new client uses them. Changes to meaning, framing or error guarantees always
 bump `PROTOCOL_VERSION`; new fields are optional and omitted when absent.
 All clients preserve definite versus uncertain outcomes, even for unknown
 error codes or unexpected response kinds.
@@ -166,14 +245,21 @@ require allowed and denied end-to-end tests in `tests/agent.rs` as well.
   unnecessary when the library's protocol types already exist.
 - Implement all prototype pages immediately: would hide new policy and
   persistence mechanisms inside a GUI change. Milestones keep them reviewable.
-- Use a clipboard timer as a security boundary: cannot revoke clipboard
-  histories or copies; explicitly rejected above.
+- No Copy at all (the first version of this ADR): long random keys had to be
+  retyped, or revealed in a terminal, whose scrollback keeps them.
+- Copy with only a timer that clears the clipboard: histories and other
+  programs copy the value long before the timer fires, and any number of
+  pastes work meanwhile; see section 2.
+- Copy without a new approval after Show: the approval said "show", and the
+  audit log would not record the copy.
 
 ## Consequences
 
 The first milestone is useful but does not reproduce every prototype control.
 No persistent settings, grants/history viewer, import UI, restoration,
 automatic screen/suspend lock or exclusive KeePassXC handoff is claimed yet.
+Copy puts a value where other programs can read it, for a short time and a
+single paste; the threat model (L14) records what it does not protect.
 Before real credentials, the maintainer must review the reveal exposure,
-clipboard choice, milestones and manual-lock limitations. ADR and M1 remain
+the Copy design, milestones and manual-lock limitations. ADR and M1 remain
 **awaiting independent review**, not Accepted by their implementer.

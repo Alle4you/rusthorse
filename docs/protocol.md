@@ -321,3 +321,12 @@ treat the outcome as unknown.
 - Removing or changing the meaning of a field or of an error code —
   including what an error guarantees about the request's effects — or
   changing framing, bumps `PROTOCOL_VERSION`.
+
+## Visual manager client
+
+`rusthorse-manager` uses the version-3 requests above, with the same
+approvals as the CLI. It targets entries by UUID, sends `reveal` with purpose
+`show` or `copy` for its Show and Copy actions, and never sends a master
+password. See [ADR 0007](adr/0007-visual-manager.md); the configuration,
+grant, history and restore requests it proposes for later milestones do not
+exist yet.

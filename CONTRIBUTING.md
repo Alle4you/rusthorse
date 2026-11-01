@@ -65,14 +65,16 @@ And check the following by hand:
 
 ## Rules for security-sensitive code
 
-- Secrets taken from the vault are only ever handled by the agent. The CLI
-  holds a secret only when the user supplies one — `init` (the new master
-  password), `add --stdin`, `import` (values read from a `.env` file or the
-  Secret Service, sent to the agent) — or asked for one: `reveal`, after
-  approval.
+- Secrets taken from the vault are only ever handled by the agent. A client
+  — the CLI or the manager — holds a secret only when the user supplies one
+  — `init` (the new master password), `add --stdin`, `import` (values read
+  from a `.env` file or the Secret Service, sent to the agent) — or asked for
+  one: `reveal`, after approval (the manager's Show and Copy are reveals).
+  The manager's forms carry metadata only and approve nothing.
 - Never log, include in error messages or put in the audit log a secret
-  value, a master password or notes; the only place a value is printed is
-  `reveal`'s output.
+  value, a master password or notes. A value leaves a client only where the
+  human asked for it: printed by `reveal`, shown in the manager's Show
+  window, or put on the clipboard by its Copy for a single paste.
 - Keep secret material in `Zeroizing` types where practical, and do not
   `Debug`-print structures that contain it.
 - Anything a requester controls that appears in a dialog must go through
@@ -102,3 +104,8 @@ And check the following by hand:
 By contributing, you agree that your contributions are licensed under the
 GNU General Public License, version 3 or (at your option) any later version,
 the same license as the project.
+
+The graphical programs (`dialog/`, `manager/`) need Rust 1.92, GTK 4.12+
+and libadwaita 1.4+, and their widget tests need `xvfb-run`,
+`dbus-run-session`, `xdotool` and `xclip`; the tests run on a virtual
+display, never on yours. Their checks are listed in AGENTS.md.

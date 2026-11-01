@@ -318,3 +318,48 @@ sure you no longer need the secrets:
 ```sh
 rm -r ~/.local/share/rusthorse ~/.local/state/rusthorse
 ```
+
+## Optional visual manager
+
+`rusthorse-manager` ([guide](manager.md)) is a separate program, built like
+`rusthorse-dialog`: Rust 1.92 or later and the GTK 4 and libadwaita
+development packages (`libgtk-4-dev`, `libadwaita-1-dev`). Plain `cargo`
+commands in the source tree do not build it.
+
+To try it without installing anything, when you are at the desktop and
+ready to answer the agent's dialogs:
+
+```sh
+cargo run --locked -p rusthorse-manager
+```
+
+To install it, with a menu entry and its icon:
+
+```sh
+cargo install --locked --path manager
+chmod go-w ~/.cargo/bin/rusthorse-manager
+install -Dm644 data/icons/hicolor/scalable/apps/io.github.alle4you.Rusthorse.svg \
+    ~/.local/share/icons/hicolor/scalable/apps/io.github.alle4you.Rusthorse.svg
+install -Dm644 data/io.github.alle4you.Rusthorse.desktop \
+    ~/.local/share/applications/io.github.alle4you.Rusthorse.desktop
+```
+
+The menu entry runs `rusthorse-manager` from the `PATH` of your graphical
+session, which may not include `~/.cargo/bin` even when your terminal's does.
+If the menu entry does nothing, put the full path in its `Exec=` line (for
+example `Exec=/home/you/.cargo/bin/rusthorse-manager`). `chmod go-w` keeps
+other users of your group from replacing the program; the agent does not run
+the manager, so it does not check it as it checks `rusthorse-dialog`.
+
+The manager starts nothing and writes no settings. Installing or upgrading it
+needs no restart of the agent.
+
+To uninstall it:
+
+```sh
+cargo uninstall rusthorse-manager
+rm ~/.local/share/applications/io.github.alle4you.Rusthorse.desktop \
+   ~/.local/share/icons/hicolor/scalable/apps/io.github.alle4you.Rusthorse.svg
+```
+
+This leaves the vault, its backups and the agent as they are.

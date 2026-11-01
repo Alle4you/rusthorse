@@ -401,3 +401,10 @@ version (for `run`, a missing or incompatible agent exits with 125: the
 command did not run). After upgrading the binary, restart the agent
 (`systemctl --user restart rusthorse-agent`); until then those commands stop
 with an explanation instead of failing in confusing ways.
+
+## Separate visual manager
+
+`rusthorse-manager` is an optional GTK client, not a `rusthorse` subcommand.
+It uses the existing agent protocol and `RUSTHORSE_SOCKET` override. See
+[manager.md](manager.md) for its first milestone and pending features. It
+does not start the agent or replace the CLI's commands or exit statuses.

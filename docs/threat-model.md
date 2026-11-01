@@ -11,7 +11,7 @@ document and the code, that is a bug; please report it
 ## 1. Scope and the exact guarantee
 
 Rusthorse is a local, single-user secrets vault for Linux desktops. A
-long-running agent holds the decrypted KeePass database; clients (the CLI,
+long-running agent holds the decrypted KeePass database; clients (the CLI, the visual manager,
 scripts, AI coding agents) ask it to *use* secrets. Two different guarantees
 are easy to confuse, so they are stated separately:
 
@@ -280,10 +280,37 @@ records command lines, which may contain sensitive data if you put it there.
 ### L14 — Some flows move values through the client
 
 `reveal` returns the value to the requesting process (its purpose; never
-remembered); `import` reads values in the client before sending them to the
-agent; `add --stdin` sends a value the client already has. None of these
-should be run by an AI agent. Importing also does not remove the original
-copies (for example in GNOME Keyring).
+remembered). A client may state what it will do with it — `purpose`: `show`
+or `copy` ([protocol](protocol.md#reveal)) — and the dialog and the audit log
+say so, but the agent cannot enforce it: the requester has the value. The
+visual manager uses both:
+
+- **Show** displays the value in a window of its own. GTK, the screen and
+  accessibility tools then hold copies, which cannot all be wiped; on X11,
+  other programs of the session can capture the window. The manager is
+  non-dumpable, keeps the value in zeroizing buffers, and hides it after 30
+  seconds, on focus loss, on close and on an observed lock, emptying the
+  labels.
+- **Copy** puts the value on the clipboard for **one paste**, for at most 20
+  seconds. Meanwhile, other programs of the session can read it (on X11 any
+  of them; on Wayland those using a data-control protocol, as clipboard
+  managers do), a clipboard history may keep it — on X11, GTK 4 cannot
+  deliver the `x-kde-passwordManagerHint` that tells histories to skip it —
+  and the program it is pasted into receives it, so a value pasted into the
+  wrong window (a chat with an AI) is gone. Mitigations: a separate approval
+  whose dialog warns of exactly this; the content is served to the first
+  paste only (plus a one-second grace for that paste's repeated requests),
+  so a history that reads it uses up the paste and the human notices; it is
+  cleared after the paste, after 20 seconds, on lock and on close, only if
+  the clipboard still holds it; nothing is storable by a clipboard manager
+  at exit; and the manager warns when the value was taken faster than a
+  human pastes. See [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
+
+Status polling is not an immediate signal of a lock made elsewhere: the
+manager notices within five seconds. `import` reads values in the client
+before sending them to the agent; `add --stdin` sends a value the client
+already has. None of these should be run by an AI agent. Importing also does
+not remove the original copies (for example in GNOME Keyring).
 
 ### L15 — Concurrent edits by other programs
 
@@ -694,18 +721,34 @@ ready, then ready for the owner to try it); and of its first installation:
 | Lesser points: typed text that JSON escaping made too large for an answer frame, height limits applied to dialogs that scroll, a race between the height check and the choice of program, bytes after the request accepted, a test that took a crash for a denial, `doctor` checking a path in its own mount namespace, a suggested command without shell quoting | **Fixed**, except the namespace point, which is documented. |
 | Coverage | Reverting each fix makes the suite fail; widget tests for resizing, scaling and accessibility actions are not written yet ([roadmap](roadmap.md)). |
 
-### ADR 0007 and manager milestone 1 — awaiting independent review
+### ADR 0007 and manager milestone 1
 
-This is implementation planning, not an additional review round or approval.
-The maintainer will obtain Claude's independent review. Self-identified risks:
+The first implementation of milestone 1 was written by Codex and reviewed by
+Claude (AI-assisted) on 2026-11-01, before any commit of the code. Findings
+and what was done:
 
-- Approved Show adds GTK/accessibility/display copies of secrets; zeroization
-  is best effort, and X11 still exposes windows. No secret clipboard Copy.
+| Finding | Disposition |
+|---|---|
+| The widget test failed: in the test's empty environment (C locale), `xdotool` could not read the window title, which contains "—", so it never found the window; the runtime directory was group-writable (umask 002) | **Fixed:** the test sets `LANG=C.UTF-8` and creates the directory `0700`; a failed search prints the display's window tree. |
+| Any failed request — a denial included — cleared the entry list and the details | **Fixed:** a failure keeps what is shown; a background status check decides whether the vault was locked meanwhile. Tested. |
+| The five-second status check disabled every control and showed "Waiting for the agent" each time; a click during it was silently ignored | **Fixed:** the status check runs apart from the human's requests, never touches the controls, and is cancelled when the human starts a request. |
+| Long random values could be shown but not copied, so they had to be retyped | **Changed by the maintainer's decision:** single-paste Copy after its own approval ([ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory), L14); `reveal` gains an optional `purpose`, shown in the dialog and audited. End-to-end and widget tests cover the allowed and denied paths, one paste, expiry, a later copy left alone, and clearing on lock. |
+| `AGENTS.md`: invariant 1 had been reworded so that its rule ("only the agent handles secrets taken from the vault") disappeared | **Fixed:** the rule is back, extended to the manager. |
+| The interface was far from the approved prototype; the command snippet named the variable `SECRET`; install commands had lost their line continuations; the guide was dense | **Fixed:** sidebar with icons, grouped list with avatars, Secret and Details rows, the app's accent; the variable takes the entry's name when that is a valid variable name; commands and guide rewritten. |
+
+Open risks, by design or for later milestones:
+
+- Show and Copy put copies of a value where Rusthorse cannot wipe them (L14).
 - Closing a client during a change does not undo it; lost or unexpected
-  replies must be uncertain outcomes, without automatic retries.
-- Metadata forms must preserve protected fields and target stable UUIDs.
-- Status polling observes locks after a delay; no push notification exists.
-- A plain lock is not exclusive access for KeePassXC; automated handoff waits
-  for maintenance mode. Screen/suspend locking is not implemented by M1.
+  replies are reported as uncertain outcomes, without automatic retries.
+- Status polling observes locks after a delay; there is no push notification.
+  A lock between a status check and the listing makes the agent ask for the
+  master password; the manager does not answer or retry it.
+- A plain lock is not exclusive access for KeePassXC; an automated handoff
+  waits for a maintenance mode (ADR 0007, M3). Locking on screen lock and
+  suspend is not implemented yet (M2).
+- No keyboard and accessibility review yet, and no tests at other display
+  scales.
 
-See [ADR 0007](adr/0007-visual-manager.md) for milestones and boundaries.
+**Awaiting:** an independent review of the whole milestone, Copy included
+(Codex).

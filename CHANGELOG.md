@@ -9,16 +9,21 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ## [Unreleased]
 
-- Propose ADR 0007 for a visual manager that remains an agent client; preserve
-  the approved reference prototype and Abrigo app icon.
-
 ### Added
 
+- `rusthorse-manager`, first milestone ([ADR 0007](docs/adr/0007-visual-manager.md),
+  [guide](docs/manager.md)): a GTK 4 and libadwaita window, client of the
+  agent, to browse, search and filter entries by group; create, edit, rename
+  and delete them; generate values; **Show** a value in a window that hides
+  after 30 seconds or on focus loss; **Copy** a value for a single paste,
+  cleared after 20 seconds, on lock and on close; copy the `rusthorse run`
+  command for an entry; lock and unlock; back up; change the master password.
+  Every change and every value still goes through the agent's approval.
+  Awaiting independent review.
 - `reveal` takes an optional `purpose` (`show` or `copy`): the approval
   dialog asks the matching question, labels it as stated by the requester,
   warns accordingly, and the audit record names it. Requests without it — the
   CLI's — are unchanged.
-
 - `rusthorse-dialog`, Rusthorse's own dialog program (GTK 4 and libadwaita,
   [ADR 0006](docs/adr/0006-own-dialog-program.md)): approvals with the command
   in its own card and the details in two columns, content that scrolls while

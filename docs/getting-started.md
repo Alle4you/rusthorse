@@ -119,3 +119,12 @@ Then tell your AI agent how to use them — paste the snippet from
 | Rotate a credential | `rusthorse edit NAME --generate` (then update it at the provider) |
 | Edit in KeePassXC | `rusthorse lock` first, then open the vault file in KeePassXC |
 | Back up | copy `~/.local/share/rusthorse/vault.kdbx` (it is encrypted) |
+
+## Visual entry management
+
+The optional [manager](manager.md) shows the same vault in a window
+(`cargo run --locked -p rusthorse-manager` from the source tree). Try it with
+a fake entry first: create it, edit it, copy its `rusthorse run` command, and
+try **Show** and **Copy** — Copy puts the value on the clipboard for a single
+paste. Both are for you at the desktop and ask for your approval; an AI agent
+uses `rusthorse run`.
