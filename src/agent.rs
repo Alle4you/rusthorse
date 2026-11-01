@@ -438,6 +438,11 @@ impl Agent {
             agent_executable_replaced: executable
                 .as_deref()
                 .and_then(|path| util::replaced(path, running)),
+            dialogs: Some(match crate::dialog_program::locate() {
+                crate::dialog_program::Located::Program(path) => path.display().to_string(),
+                crate::dialog_program::Located::Absent(_) => "zenity".into(),
+                crate::dialog_program::Located::Unusable(why) => format!("none: {why}"),
+            }),
         }
     }
 
@@ -669,15 +674,17 @@ impl Agent {
                  limit {MAX_DIALOG_CHARS}); split it into smaller requests"
             )));
         }
-        // The whole dialog, buttons included, must fit on the screen: a value
-        // that wraps over many lines must not push the rest out of sight.
+        // With zenity, the whole dialog, buttons included, must fit on the
+        // screen: a value that wraps over many lines must not push the rest
+        // out of sight. Rusthorse's own dialog scrolls instead, and keeps
+        // Allow disabled until the end has been reached.
         let height = crate::ui::approval_height(&request)
             + if request.can_remember {
                 crate::ui::REMEMBER_NOTE_HEIGHT
             } else {
                 0
             };
-        if height > crate::ui::metrics::MAX_HEIGHT {
+        if self.ui.limits_height() && height > crate::ui::metrics::MAX_HEIGHT {
             return Err(Failure::invalid(format!(
                 "this request would make a dialog too tall to read at once (estimated {height} \
                  pixels, limit {}); split it into smaller requests or shorten what it shows",

@@ -2002,6 +2002,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     agent_executable: String::new(),
                     agent_executable_id: None,
                     agent_executable_replaced: None,
+                    dialogs: None,
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -2053,6 +2054,7 @@ fn fake_agent(
                     agent_executable: String::new(),
                     agent_executable_id: None,
                     agent_executable_replaced: None,
+                    dialogs: None,
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -2248,6 +2250,7 @@ fn fake_import_agent(
                         agent_executable: String::new(),
                         agent_executable_id: None,
                         agent_executable_replaced: None,
+                        dialogs: None,
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }

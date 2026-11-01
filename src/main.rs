@@ -10,12 +10,13 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use rusthorse::agent::{self, Agent, AgentConfig};
 use rusthorse::client::Client;
+use rusthorse::dialog_program::DesktopUi;
 use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
     Binding, EntryChanges, EntryFields, EntryInfo, ErrorCode, Field, ImportedEntry, NewEntry,
     Request, Response, RunRequest, SecretString, ValueChange,
 };
-use rusthorse::ui::{Prompt, Typed, Ui, ZenityUi};
+use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
 use rusthorse::{audit, import, paths};
@@ -507,7 +508,7 @@ fn new_master_password() -> anyhow::Result<SecretString> {
             SecretString::new(rpassword::prompt_password("Repeat it: ")?),
         )
     } else {
-        let ui = ZenityUi {
+        let ui = DesktopUi {
             remember_for: Duration::ZERO,
             timeout: Duration::from_secs(300),
         };
@@ -573,7 +574,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         request_timeout: Duration::from_secs(10),
         send_buffer: None,
     };
-    let ui = ZenityUi {
+    let ui = DesktopUi {
         remember_for: args.remember,
         timeout: args.dialog_timeout,
     };
@@ -623,6 +624,9 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
         (false, None) => println!("state:      unlocked (auto-lock off)"),
     }
     println!("remembered: {} approval(s)", info.remembered_approvals);
+    if let Some(dialogs) = &info.dialogs {
+        println!("dialogs:    {dialogs}");
+    }
     if !info.agent_executable.is_empty() {
         println!(
             "program:    {}{}",
@@ -1223,6 +1227,78 @@ enum Check {
     Fail(String),
 }
 
+/// The dialog program the agent uses, checked as the agent checks it and by
+/// running `rusthorse-dialog --check`, which opens no window.
+fn dialog_check(agent_executable: &str) -> Check {
+    use rusthorse::dialog_program::{Located, PROGRAM, locate_in};
+    let exe = agent_executable.trim_end_matches(" (deleted)");
+    let Some(dir) = std::path::Path::new(exe)
+        .parent()
+        .filter(|_| !exe.is_empty())
+    else {
+        return Check::Warn("cannot tell which dialog program the agent uses".into());
+    };
+    match locate_in(dir) {
+        Located::Absent(path) => Check::Warn(format!(
+            "{} is not installed: dialogs use zenity (see docs/installation.md)",
+            path.display()
+        )),
+        Located::Unusable(why) => Check::Fail(format!("dialogs cannot be shown: {why}")),
+        Located::Program(path) => match dialog_program_check(&path) {
+            Ok((version, protocol)) if protocol == rusthorse::dialog_protocol::VERSION => {
+                Check::Ok(format!("dialogs: {PROGRAM} {version} ({})", path.display()))
+            }
+            Ok((version, protocol)) => Check::Fail(format!(
+                "{PROGRAM} {version} speaks dialog protocol {protocol}, this rusthorse {}: \
+                 install the same version of both, then restart the agent",
+                rusthorse::dialog_protocol::VERSION
+            )),
+            Err(e) => Check::Fail(format!("{} does not run: {e:#}", path.display())),
+        },
+    }
+}
+
+/// Run `program --check` with an empty environment, for at most 5 seconds,
+/// and return the version and protocol it reports.
+fn dialog_program_check(program: &std::path::Path) -> anyhow::Result<(String, u32)> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    #[derive(serde::Deserialize)]
+    struct Report {
+        version: String,
+        protocol: u32,
+    }
+    let mut child = Command::new(program)
+        .arg("--check")
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("no answer to --check within 5 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_string(&mut out)?;
+    }
+    if !status.success() {
+        bail!("--check failed ({status})");
+    }
+    let report: Report = serde_json::from_str(out.trim())?;
+    Ok((report.version, report.protocol))
+}
+
 /// Whether the agent still runs the program file it was started from, and
 /// whether that is the same file as this `rusthorse` — compared by the device
 /// and inode the agent reads through its own `/proc/self/exe`, never by name.
@@ -1301,6 +1377,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                 info.agent_executable_replaced,
                 info.agent_executable_id,
             ));
+            checks.push(dialog_check(&info.agent_executable));
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
                     "no vault at {} — run `rusthorse init`",

@@ -469,6 +469,11 @@ pub struct StatusInfo {
     /// to examine the path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_executable_replaced: Option<bool>,
+    /// The dialogs the agent shows: the path of `rusthorse-dialog`, `zenity`
+    /// when that program is not installed, or `none: ` and why neither can
+    /// be used. Left out by agents that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogs: Option<String>,
 }
 
 /// Why a request failed.
@@ -837,6 +842,7 @@ mod tests {
             agent_executable: "/bin/x".into(),
             agent_executable_id: None,
             agent_executable_replaced: None,
+            dialogs: None,
         };
         let json = serde_json::to_value(&status).expect("json");
         assert!(json.get("agent_executable_replaced").is_none(), "{json}");

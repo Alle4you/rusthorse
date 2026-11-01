@@ -119,6 +119,13 @@ pub trait Ui: Send + Sync {
     fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed>;
     /// Ask whether to allow a request.
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision>;
+    /// Whether approval dialogs must fit on the screen without scrolling, so
+    /// that requests taller than [`metrics::MAX_HEIGHT`] are refused (zenity);
+    /// `false` for dialogs whose content scrolls while the buttons stay in
+    /// view.
+    fn limits_height(&self) -> bool {
+        true
+    }
 }
 
 /// Dialogs implemented with `zenity`.
@@ -136,7 +143,7 @@ const ZENITY_PATHS: [&str; 2] = ["/usr/bin/zenity", "/usr/local/bin/zenity"];
 /// The only environment variables zenity receives. In particular, zenity
 /// lets `ZENITY_*` variables remap its exit statuses, so nothing else is
 /// inherited.
-const DIALOG_ENV: [&str; 9] = [
+const DIALOG_ENV: [&str; 10] = [
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "XAUTHORITY",
@@ -146,6 +153,7 @@ const DIALOG_ENV: [&str; 9] = [
     "LANG",
     "LC_ALL",
     "LC_MESSAGES",
+    "LANGUAGE",
 ];
 
 /// Room the agent reserves in a dialog for the note explaining "Allow for …"
@@ -573,7 +581,7 @@ pub fn markup_text(text: &str) -> String {
 /// The environment for dialogs: the [`DIALOG_ENV`] variables of the agent,
 /// plus the session's display variables from `systemctl --user
 /// show-environment` when the agent started before the desktop exported them.
-fn dialog_env() -> Vec<(String, String)> {
+pub(crate) fn dialog_env() -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = DIALOG_ENV
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
