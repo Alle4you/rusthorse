@@ -106,4 +106,11 @@ From the fifth review:
 - `Client::run_with` with explicit I/O for library users; its input reader
   stops when the call returns.
 
+From the sixth review:
+
+- Stdin has its own credit window; the agent reads the connection at all
+  times, so large input plus large output no longer deadlocks.
+- The client cancels through a lock-free handle, and returns `SIGPIPE` within
+  about half a second even when its other destination is stuck.
+
 [Unreleased]: https://github.com/Alle4you/rusthorse/commits/main

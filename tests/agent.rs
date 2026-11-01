@@ -1190,6 +1190,201 @@ fn the_library_input_reader_stops_when_the_run_returns() {
     assert_eq!(left, "LATER\n", "input written after the run was consumed");
 }
 
+fn run_request(h: &Harness, argv: &[&str], forward_stdin: bool) -> rusthorse::protocol::RunRequest {
+    rusthorse::protocol::RunRequest {
+        bindings: vec![rusthorse::protocol::Binding {
+            var: "T".into(),
+            entry: "T".into(),
+        }],
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        cwd: h.dir.path().to_str().expect("utf8").into(),
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        redact: true,
+        forward_stdin,
+    }
+}
+
+/// A destination that fails every write, like a closed pipe.
+struct Broken;
+impl std::io::Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A destination that blocks forever, like a pipe nobody reads.
+struct Stuck;
+impl std::io::Write for Stuck {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        loop {
+            std::thread::park();
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn big_input_and_big_output_do_not_deadlock() {
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    // 2 MiB of input, more than every window; the command first writes 2 MiB
+    // and only then reads its input.
+    std::thread::spawn(move || {
+        let chunk = vec![b'i'; 64 * 1024];
+        for _ in 0..32 {
+            if writer.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+    let client = h
+        .cmd(&[
+            "run",
+            "--stdin",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            "head -c 2097152 /dev/zero; wc -c >&2",
+        ])
+        .stdin(Stdio::from(OwnedFd::from(reader)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let out = within(Duration::from_secs(30), move || {
+        client.wait_with_output().expect("wait")
+    });
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr).trim(), "2097152");
+}
+
+#[test]
+fn a_violation_behind_pending_input_still_cancels() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("idle2.pid");
+    let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+    let stream = raw_run(&h, &["sh", "-c", &script], true);
+    let pid = wait_for_pid(&pidfile);
+    let chunk = vec![b'x'; rusthorse::protocol::MAX_DATA_LEN];
+    for _ in 0..3 {
+        rusthorse::protocol::send_data(&stream, rusthorse::protocol::STDIN, &chunk).expect("send");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    rusthorse::protocol::send_data(&stream, 7, b"garbage").expect("send garbage");
+    wait_until_dead(
+        pid,
+        "a protocol violation behind pending input was not noticed",
+    );
+    drop(stream);
+}
+
+#[test]
+fn a_failing_destination_cancels_without_waiting_for_input() {
+    use rusthorse::client::{Client, RunIo};
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    std::thread::spawn(move || {
+        let chunk = vec![b'i'; 64 * 1024];
+        for _ in 0..32 {
+            if writer.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+    let client = Client::new(h.socket.clone());
+    let request = run_request(&h, &["sh", "-c", "echo oops >&2; exec sleep 30"], true);
+    let started = Instant::now();
+    let response = within(Duration::from_secs(20), move || {
+        client
+            .run_with(
+                request,
+                RunIo {
+                    input: Some(OwnedFd::from(reader)),
+                    stdout: Box::new(std::io::sink()),
+                    stderr: Box::new(Broken),
+                },
+            )
+            .expect("run")
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            response,
+            rusthorse::protocol::Response::Exited {
+                signal: Some(13),
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn a_stuck_destination_does_not_hold_back_a_broken_pipe() {
+    use rusthorse::client::{Client, RunIo};
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let client = Client::new(h.socket.clone());
+    let request = run_request(
+        &h,
+        &[
+            "sh",
+            "-c",
+            "echo out; sleep 0.3; echo err >&2; exec sleep 30",
+        ],
+        false,
+    );
+    let started = Instant::now();
+    let response = within(Duration::from_secs(20), move || {
+        client
+            .run_with(
+                request,
+                RunIo {
+                    input: None,
+                    stdout: Box::new(Stuck),
+                    stderr: Box::new(Broken),
+                },
+            )
+            .expect("run")
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            response,
+            rusthorse::protocol::Response::Exited {
+                signal: Some(13),
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+}
+
 #[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();

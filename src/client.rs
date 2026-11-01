@@ -6,7 +6,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,54 @@ pub struct RunIo {
     pub stdout: Box<dyn Write + Send>,
     /// Receives the command's (redacted) standard error.
     pub stderr: Box<dyn Write + Send>,
+}
+
+/// How much the agent still accepts on stdin (granted with credit frames).
+struct InputCredit {
+    available: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl InputCredit {
+    fn new() -> Self {
+        Self {
+            available: Mutex::new(protocol::INITIAL_CREDIT),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn grant(&self, amount: usize) {
+        let mut available = self.available.lock().unwrap_or_else(|p| p.into_inner());
+        *available = available
+            .saturating_add(amount)
+            .min(protocol::INITIAL_CREDIT);
+        self.changed.notify_all();
+    }
+
+    /// Wait until at least `amount` may be sent; `false` once `done` is set.
+    fn wait_for(&self, amount: usize, done: &AtomicBool) -> bool {
+        let mut available = self.available.lock().unwrap_or_else(|p| p.into_inner());
+        while *available < amount {
+            if done.load(Ordering::SeqCst) {
+                return false;
+            }
+            available = self
+                .changed
+                .wait_timeout(available, Duration::from_millis(100))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        true
+    }
+
+    fn take(&self, amount: usize) {
+        let mut available = self.available.lock().unwrap_or_else(|p| p.into_inner());
+        *available = available.saturating_sub(amount);
+    }
+
+    fn wake(&self) {
+        self.changed.notify_all();
+    }
 }
 
 impl Client {
@@ -115,7 +163,11 @@ impl Client {
     /// separately (the client grants the agent credit as it writes), so a
     /// destination that blocks does not hold up the other one. If writing a
     /// destination fails (it was closed), the connection is closed — which
-    /// makes the agent stop the command — and the result reports `SIGPIPE`.
+    /// makes the agent stop the command — and the result reports `SIGPIPE`
+    /// within about half a second, even if the other destination is blocked:
+    /// a writer still blocked in its destination after that is left running
+    /// detached (`Write` offers no way to interrupt it), and ends when that
+    /// destination accepts the data or fails.
     pub fn run_with(&self, request: RunRequest, io: RunIo) -> anyhow::Result<Response> {
         if !request.redact {
             bail!("run_with relays output and needs redaction; use `run` to pass descriptors");
@@ -128,23 +180,37 @@ impl Client {
         let sender = Arc::new(Mutex::new(
             stream.try_clone().context("cannot clone the connection")?,
         ));
+        // Used only to shut the connection down, so that cancelling never
+        // waits for the send lock.
+        let canceller = Arc::new(stream.try_clone().context("cannot clone the connection")?);
         let broken = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
+        let input_credit = Arc::new(InputCredit::new());
 
         let mut writers = Vec::new();
         let mut queues = Vec::new();
         for (channel, dest) in [(protocol::STDOUT, io.stdout), (protocol::STDERR, io.stderr)] {
             let (tx, rx) = mpsc::channel::<Zeroizing<Vec<u8>>>();
-            let (sender, broken) = (Arc::clone(&sender), Arc::clone(&broken));
+            let (sender, canceller, broken) = (
+                Arc::clone(&sender),
+                Arc::clone(&canceller),
+                Arc::clone(&broken),
+            );
             writers.push(thread::spawn(move || {
-                write_output(rx, dest, channel, sender, broken)
+                write_output(rx, dest, channel, sender, canceller, broken)
             }));
             queues.push(tx);
         }
         let input_worker = match (forward, io.input) {
             (true, Some(input)) => {
-                let (sender, done) = (Arc::clone(&sender), Arc::clone(&done));
-                Some(thread::spawn(move || forward_input(input, sender, done)))
+                let (sender, done, credit) = (
+                    Arc::clone(&sender),
+                    Arc::clone(&done),
+                    Arc::clone(&input_credit),
+                );
+                Some(thread::spawn(move || {
+                    forward_input(input, sender, credit, done)
+                }))
             }
             (true, None) => {
                 // Forwarding was requested but there is nothing to read.
@@ -164,6 +230,10 @@ impl Client {
                 Ok(Frame::Data(protocol::STDERR, data)) => {
                     let _ = queues[1].send(data);
                 }
+                Ok(Frame::Data(protocol::CREDIT_STDIN, data)) if data.len() == 4 => {
+                    input_credit
+                        .grant(u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize);
+                }
                 Ok(Frame::Data(..)) => {}
                 Ok(Frame::Message(body, _fds)) => {
                     break serde_json::from_slice::<Response>(&body).context("malformed response");
@@ -174,10 +244,9 @@ impl Client {
             }
         };
         drop(queues);
-        for writer in writers {
-            let _ = writer.join();
-        }
+        join_writers(writers, &broken);
         done.store(true, Ordering::SeqCst);
+        input_credit.wake();
         if let Some(worker) = input_worker {
             join_within(worker, Duration::from_millis(500));
         }
@@ -191,12 +260,32 @@ impl Client {
     }
 }
 
+/// Wait for the output writers to deliver everything — however long a slow
+/// destination takes — unless one of them failed: then wait at most half a
+/// second more and leave any writer still blocked in its destination behind.
+fn join_writers(writers: Vec<thread::JoinHandle<()>>, broken: &AtomicBool) {
+    let mut failed_at: Option<Instant> = None;
+    while !writers.iter().all(|w| w.is_finished()) {
+        if broken.load(Ordering::SeqCst) {
+            let since = *failed_at.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(500) {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for writer in writers {
+        let _ = writer.join();
+    }
+}
+
 /// Write one output channel and grant the agent credit for what was written.
 fn write_output(
     queue: mpsc::Receiver<Zeroizing<Vec<u8>>>,
     mut dest: Box<dyn Write + Send>,
     channel: u8,
     sender: Arc<Mutex<UnixStream>>,
+    canceller: Arc<UnixStream>,
     broken: Arc<AtomicBool>,
 ) {
     for chunk in queue {
@@ -205,8 +294,7 @@ fn write_output(
         }
         if dest.write_all(&chunk).and_then(|()| dest.flush()).is_err() {
             broken.store(true, Ordering::SeqCst);
-            let stream = sender.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = canceller.shutdown(std::net::Shutdown::Both);
             continue;
         }
         let stream = sender.lock().unwrap_or_else(|p| p.into_inner());
@@ -214,15 +302,27 @@ fn write_output(
     }
 }
 
-/// Send `input` to the agent until end-of-file, or until the run is done.
-fn forward_input(input: OwnedFd, sender: Arc<Mutex<UnixStream>>, done: Arc<AtomicBool>) {
+/// Send `input` to the agent until end-of-file, or until the run is done,
+/// never more than the agent's stdin credit allows.
+fn forward_input(
+    input: OwnedFd,
+    sender: Arc<Mutex<UnixStream>>,
+    credit: Arc<InputCredit>,
+    done: Arc<AtomicBool>,
+) {
+    const CHUNK: usize = 16 * 1024;
     let mut input = File::from(input);
-    let mut buf = Zeroizing::new(vec![0u8; 16 * 1024]);
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
     let send = |data: &[u8]| -> bool {
         let stream = sender.lock().unwrap_or_else(|p| p.into_inner());
         protocol::send_data(&stream, protocol::STDIN, data).is_ok()
     };
     while !done.load(Ordering::SeqCst) {
+        // Read only what the agent can take now, so a command that does not
+        // read its input leaves the rest unread here.
+        if !credit.wait_for(CHUNK, &done) {
+            return;
+        }
         let mut fds = [PollFd::new(input.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(100u16)) {
             Ok(0) | Err(Errno::EINTR) => continue,
@@ -237,6 +337,7 @@ fn forward_input(input: OwnedFd, sender: Arc<Mutex<UnixStream>>, done: Arc<Atomi
         match input.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                credit.take(n);
                 if !send(&buf[..n]) {
                     return;
                 }

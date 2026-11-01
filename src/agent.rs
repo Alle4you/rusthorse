@@ -1187,14 +1187,14 @@ impl Agent {
 
         let mut pumps = Vec::new();
         let credits = Arc::new(Credits::new());
+        // Frames to the client from the output workers and the watcher go
+        // through one lock, so they never interleave.
+        let writer = Arc::new(Mutex::new(
+            stream
+                .try_clone()
+                .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?,
+        ));
         if run.redact {
-            // Output frames from both workers go through one lock, so frames
-            // never interleave.
-            let writer = Arc::new(Mutex::new(
-                stream
-                    .try_clone()
-                    .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?,
-            ));
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
                 .map(|(_, entry, value)| (entry.clone(), value.as_bytes().to_vec()))
@@ -1223,6 +1223,7 @@ impl Agent {
         let watcher = stream.try_clone().ok().map(|s| {
             let watch = Watch {
                 stream: s,
+                writer: Arc::clone(&writer),
                 pgid: pid,
                 child_stdin,
                 forward_stdin: run.redact && run.forward_stdin,
@@ -1606,8 +1607,13 @@ fn poll_raw(fds: &mut [nix::libc::pollfd], timeout_ms: i32) -> io::Result<usize>
 /// The connection's side of a running command: forwards input frames to the
 /// command's stdin, applies credit frames, and cancels the request when the
 /// client goes away or breaks the protocol.
+///
+/// It reads the socket continuously — input waiting for the command is held
+/// in a buffer bounded by the stdin credit window — so control frames are
+/// never stuck behind input (which could deadlock with output credit).
 struct Watch {
     stream: UnixStream,
+    writer: Arc<Mutex<UnixStream>>,
     pgid: Pid,
     child_stdin: Option<std::process::ChildStdin>,
     forward_stdin: bool,
@@ -1642,18 +1648,17 @@ impl Watch {
         {
             stdin = None;
         }
-        let mut pending = zeroize::Zeroizing::new(Vec::new());
+        // Input received but not yet taken by the command; never more than
+        // one credit window.
+        let mut pending: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(Vec::new());
+        let mut end_of_input = false;
+        // Input delivered (or discarded) but not yet acknowledged to the
+        // client with a stdin credit frame.
+        let mut owed: usize = 0;
         while !self.finished.load(Ordering::SeqCst) {
-            // A half-closed or closed connection is noticed even while input
-            // is pending (POLLRDHUP); new frames are read only once the
-            // previous input was delivered.
-            let mut socket_events = POLLRDHUP;
-            if pending.is_empty() {
-                socket_events |= POLLIN;
-            }
             let mut fds = vec![pollfd {
                 fd: self.stream.as_raw_fd(),
-                events: socket_events,
+                events: POLLIN | POLLRDHUP,
                 revents: 0,
             }];
             if let (false, Some(file)) = (pending.is_empty(), &stdin) {
@@ -1663,8 +1668,8 @@ impl Watch {
                     revents: 0,
                 });
             }
-            match poll_raw(&mut fds, 200) {
-                Ok(0) => continue,
+            let timeout = if owed > 0 { 20 } else { 200 };
+            match poll_raw(&mut fds, timeout) {
                 Ok(_) => {}
                 Err(_) => return self.cancel(),
             }
@@ -1677,11 +1682,20 @@ impl Watch {
             if socket & POLLIN != 0 {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 match protocol::recv_any_before(&self.stream, Some(deadline)) {
-                    Ok(protocol::Frame::Data(protocol::STDIN, data)) if self.forward_stdin => {
+                    Ok(protocol::Frame::Data(protocol::STDIN, data))
+                        if self.forward_stdin && !end_of_input =>
+                    {
                         if data.is_empty() {
-                            stdin = None; // end of input: the command sees EOF
+                            end_of_input = true;
+                        } else if pending.len() + data.len() > protocol::INITIAL_CREDIT {
+                            // More input than the client was allowed to send.
+                            return self.cancel();
                         } else if stdin.is_some() {
-                            pending = data;
+                            pending.extend_from_slice(&data);
+                        } else {
+                            // The command closed its input: discard, but
+                            // keep the client's window open.
+                            owed += data.len();
                         }
                     }
                     Ok(protocol::Frame::Data(
@@ -1708,6 +1722,7 @@ impl Watch {
                 match file.write(&pending) {
                     Ok(n) => {
                         pending.drain(..n);
+                        owed += n;
                     }
                     Err(e)
                         if e.kind() == io::ErrorKind::WouldBlock
@@ -1715,12 +1730,30 @@ impl Watch {
                     Err(_) => {
                         // The command closed its input.
                         stdin = None;
+                        owed += pending.len();
                         pending.clear();
                     }
                 }
             } else if input & (POLLERR | POLLHUP) != 0 {
                 stdin = None;
+                owed += pending.len();
                 pending.clear();
+            }
+            if end_of_input && pending.is_empty() {
+                stdin = None; // the command sees end-of-file
+            }
+            // Acknowledge delivered input — but never wait for the send lock:
+            // an output worker may hold it while the client is slow, and this
+            // thread must keep watching the connection.
+            if owed > 0
+                && let Ok(writer) = self.writer.try_lock()
+            {
+                let amount = owed.min(u32::MAX as usize);
+                if protocol::send_credit(&writer, protocol::STDIN, amount as u32).is_err() {
+                    drop(writer);
+                    return self.cancel();
+                }
+                owed -= amount;
             }
         }
     }

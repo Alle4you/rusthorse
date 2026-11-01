@@ -42,6 +42,10 @@ pub const STDOUT: u8 = 1;
 /// Data channel: the command's standard error (agent → client).
 pub const STDERR: u8 = 2;
 
+/// Flow-control channel (agent → client): the payload is a big-endian `u32`
+/// number of bytes of [`STDIN`] data the agent has delivered to the command
+/// and is ready to receive again.
+pub const CREDIT_STDIN: u8 = 0x80;
 /// Flow-control channel (client → agent): the payload is a big-endian `u32`
 /// number of bytes of [`STDOUT`] data the client has written out and is ready
 /// to receive again.
@@ -49,9 +53,11 @@ pub const CREDIT_STDOUT: u8 = 0x81;
 /// Flow-control channel (client → agent) for [`STDERR`]; see [`CREDIT_STDOUT`].
 pub const CREDIT_STDERR: u8 = 0x82;
 
-/// How much data the agent may send on each output channel before the client
-/// grants more credit. Each channel has its own window, so a client whose
-/// stdout is stuck still receives stderr.
+/// How much data may be in flight on each channel before the receiver grants
+/// more credit: the agent's output channels, and the client's stdin. Each
+/// channel has its own window, so a client whose stdout is stuck still
+/// receives stderr, and input waiting for the command never stops the agent
+/// from reading control frames.
 pub const INITIAL_CREDIT: usize = 1024 * 1024;
 
 /// A string holding secret material; its heap buffer is wiped on drop.
@@ -525,16 +531,17 @@ pub fn send_data(stream: &UnixStream, channel: u8, data: &[u8]) -> io::Result<()
     writer.write_all(&frame)
 }
 
-/// Grant `amount` more bytes of credit for an output channel ([`STDOUT`] or
-/// [`STDERR`]).
+/// Grant `amount` more bytes of credit for a channel: [`STDOUT`] or
+/// [`STDERR`] (client → agent) or [`STDIN`] (agent → client).
 pub fn send_credit(stream: &UnixStream, channel: u8, amount: u32) -> io::Result<()> {
     let credit_channel = match channel {
+        STDIN => CREDIT_STDIN,
         STDOUT => CREDIT_STDOUT,
         STDERR => CREDIT_STDERR,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "credit is only granted for stdout and stderr",
+                "credit is only granted for stdin, stdout and stderr",
             ));
         }
     };

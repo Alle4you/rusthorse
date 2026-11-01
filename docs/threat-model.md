@@ -304,9 +304,12 @@ it to the agent while the command runs. Input typed in the instant the command
 finishes may be read by `rusthorse run` — which exits right after — and lost
 instead of reaching the next program that reads the terminal. Programs using
 the library API (`Client::run_with`) get the same behaviour: the input reader
-reads only after `poll` reports data and stops within about 100 ms after the
-call returns. Without `--stdin` (the default), the requester's input is never
-read.
+reads only after `poll` reports data and normally stops within about 100 ms
+after the call returns. If another process reads the same input at the same
+moment — between that `poll` and the `read` — the reader stays blocked in
+`read` and may later consume input meant for someone else; interrupting it
+would require changing file flags shared with the caller. Without `--stdin`
+(the default), the requester's input is never read.
 
 ## 8. Running AI agents in isolation
 
@@ -362,6 +365,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Third review: verification of the second round (AI-assisted, Codex). | See the third table. |
 | 2026-10-31 | Fourth review: verification of the third round (AI-assisted, Codex). | See the fourth table. |
 | 2026-10-31 | Fifth review: verification of the new I/O design (AI-assisted, Codex). | See the fifth table. |
+| 2026-10-31 | Sixth review: verification of flow control and cancellation (AI-assisted, Codex). | See the sixth table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -436,8 +440,19 @@ N16 were confirmed fixed):
 
 | Finding | Disposition |
 |---|---|
-| N17 — cancelling (on a protocol violation or a half-close) killed the command but left the socket open, so a blocked send kept the request stuck; a half-close went unnoticed while input was pending | **Fixed:** one cancellation path shuts the socket down (failing any pending send without taking the send lock) and terminates the group; the watcher polls with `POLLRDHUP` through raw `poll(2)`, so a half-close is seen even with input pending; half-close and any protocol violation are defined as cancellation. |
+| N17 — cancelling (on a protocol violation or a half-close) killed the command but left the socket open, so a blocked send kept the request stuck; a half-close went unnoticed while input was pending | **Fixed** (completed in the sixth round, N20): one cancellation path shuts the socket down (failing any pending send without taking the send lock) and terminates the group; the watcher polls with `POLLRDHUP` through raw `poll(2)`, so a half-close is seen even with input pending; half-close and any protocol violation are defined as cancellation. |
 | N18 — the CLI relayed stdout and stderr in order, so a stuck stdout held stderr back | **Fixed:** per-channel writer threads and per-channel credit windows (1 MiB). |
-| N19 — the library's `Client::run` left a stdin reader running after it returned | **Fixed:** `Client::run_with` takes the input and outputs explicitly; its reader reads only after `poll` and stops within ~100 ms of the return. |
+| N19 — the library's `Client::run` left a stdin reader running after it returned | **Mostly fixed** (residual race documented in L18): `Client::run_with` takes the input and outputs explicitly; its reader reads only after `poll` and stops within ~100 ms of the return. |
 | Docs: "one response frame", "the client only receives the exit status", cancellation states | **Fixed** (protocol, ADR 0002, architecture, L18, L19). |
 | Coverage | A mutation run after this round reverted each of 27 fixes from all five rounds in turn; the test suite failed for every one (one test had a race that let its mutation pass; it now waits long enough to be deterministic). |
+
+Findings of the sixth review (verification of flow control and cancellation;
+N12 and N18 were confirmed fixed):
+
+| Finding | Disposition |
+|---|---|
+| N20 — input pending for the command stopped the agent from reading the connection, so output credit could not arrive: a command that writes a lot before reading its input deadlocked (and a protocol violation queued behind the input went unnoticed) | **Fixed:** stdin has its own credit window (`0x80`); the agent buffers pending input within it and reads the connection continuously. |
+| N21 — the client's cancellation waited for the send lock, which a blocked send could hold | **Fixed:** cancellation uses a separate handle that needs no lock. |
+| N22 — a destination blocked forever kept `run_with` from returning after the other destination failed | **Fixed:** after a failure, writers are awaited for at most half a second; one still blocked in its destination is left detached (documented on `run_with`). |
+| N7 / N19 — a concurrent reader of the same input between `poll` and `read` leaves the input reader blocked | **Documented** (L18): cannot be interrupted without changing flags shared with the caller. |
+| The client trusts the agent's credit window (its queues are unbounded) | **Accepted:** the agent is part of the trusted computing base (§4). |

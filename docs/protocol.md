@@ -38,15 +38,19 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   | `0` | client → agent | The command's stdin; an empty frame means end of input. Only allowed when the request set `forward_stdin`. |
   | `1` | agent → client | The command's (redacted) stdout. |
   | `2` | agent → client | The command's (redacted) stderr. |
+  | `0x80` | agent → client | Credit for channel 0: a big-endian `u32` number of input bytes the agent has delivered to the command. |
   | `0x81` | client → agent | Credit for channel 1: a big-endian `u32` number of bytes the client has written out. |
   | `0x82` | client → agent | Credit for channel 2. |
 
   Data frames are only valid during a `run` with redaction, and never carry
   file descriptors.
-- **Flow control.** The agent sends at most 1 MiB on each output channel
-  beyond what the client has acknowledged with credit frames. The client
-  grants credit as it writes data out. Each channel has its own window, so a
-  client whose stdout is stuck still receives stderr.
+- **Flow control.** Every channel has a 1 MiB window. The agent sends at most
+  1 MiB on each output channel beyond what the client has acknowledged with
+  credit frames, and the client grants credit as it writes data out. The
+  client sends at most 1 MiB of input beyond what the agent has acknowledged;
+  sending more cancels the request. Because input waiting for the command is
+  buffered within that window, the agent keeps reading the connection — and
+  sees credit frames, closes and violations — at all times.
 - A `run` request **without redaction** carries exactly three file
   descriptors — the client's stdin, stdout and stderr, in that order — as
   `SCM_RIGHTS` ancillary data on the **first byte** of the frame (send the

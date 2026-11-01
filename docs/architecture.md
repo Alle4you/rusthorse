@@ -125,9 +125,12 @@ grants the agent credit per channel as it writes, so a stuck stdout does not
 hold up stderr (each channel has a 1 MiB window). The only thing the agent
 writes is its own socket. A full close, a half-close or a protocol violation
 by the caller cancels the request: the agent shuts the socket down — which
-fails any send in progress at once — and terminates the command. If the
-caller's stdout is closed (`| head`), `rusthorse run` closes the connection
-and exits with status 141, like a process killed by `SIGPIPE`.
+fails any send in progress at once — and terminates the command. Input has
+its own window too, so input that the command has not read yet never stops
+the agent from reading the connection. If the caller's stdout is closed
+(`| head`), `rusthorse run` shuts the connection down (through a handle that
+needs no lock) and exits with status 141, like a process killed by
+`SIGPIPE` — within about half a second, even if its other output is stuck.
 
 ## Policy
 
