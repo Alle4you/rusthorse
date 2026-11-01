@@ -97,30 +97,20 @@ fn entry_rows(root: &impl IsA<gtk::Widget>) -> Vec<adw::EntryRow> {
     rows
 }
 
-/// The text a revealed value shows, whether grouped by four or not.
+/// The text a revealed value shows: one plain label, never split.
 fn shown_text(root: &impl IsA<gtk::Widget>) -> String {
-    let flow = descendants(root)
+    let labels = value_labels(root);
+    assert_eq!(labels.len(), 1, "the value is one label");
+    labels[0].text().to_string()
+}
+
+/// The labels that draw a revealed value.
+fn value_labels(root: &impl IsA<gtk::Widget>) -> Vec<gtk::Label> {
+    descendants(root)
         .into_iter()
-        .find_map(|w| w.downcast::<gtk::FlowBox>().ok());
-    match flow {
-        Some(flow) => {
-            let mut parts = vec![];
-            let mut i = 0;
-            while let Some(child) = flow.child_at_index(i) {
-                if let Some(l) = child.child().and_downcast::<gtk::Label>() {
-                    parts.push(l.text().to_string());
-                }
-                i += 1;
-            }
-            parts.concat()
-        }
-        None => descendants(root)
-            .into_iter()
-            .filter_map(|w| w.downcast::<gtk::Label>().ok())
-            .filter(|l| l.has_css_class("monospace"))
-            .map(|l| l.text().to_string())
-            .collect(),
-    }
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .filter(|l| l.has_css_class("monospace"))
+        .collect()
 }
 
 /// Run an X11 client on this test's virtual display while the GTK main loop
@@ -401,13 +391,19 @@ fn desktop_flow() {
     settle(&s);
     let reveal = s.revealed.borrow().as_ref().unwrap().clone();
     assert_eq!(shown_text(&reveal), "FAKE-desktop-value");
-    let parts: Vec<_> = descendants(&reveal)
-        .into_iter()
-        .filter_map(|w| w.downcast::<gtk::Label>().ok())
-        .filter(|l| l.has_css_class("monospace"))
-        .collect();
-    assert_eq!(parts.len(), 5, "grouped by four");
+    let parts = value_labels(&reveal);
+    // Plain text: not selectable (no PRIMARY), not bold, not split up.
     assert!(parts.iter().all(|l| !l.is_selectable()));
+    assert!(
+        parts
+            .iter()
+            .all(|l| !l.has_css_class("title-4") && !l.has_css_class("heading"))
+    );
+    assert!(
+        !descendants(&reveal)
+            .iter()
+            .any(|w| w.clone().downcast::<gtk::FlowBox>().is_ok())
+    );
     snapshot_window(&reveal, "reveal.png");
     button(&reveal, "Hide now").emit_clicked();
     assert!(parts.iter().all(|l| l.text().is_empty()));
@@ -432,7 +428,6 @@ fn desktop_flow() {
     button(&s.detail, "Show notes…").emit_clicked();
     settle(&s);
     let notes = s.revealed.borrow().as_ref().unwrap().clone();
-    // Short or spaced values are shown as they are, never grouped.
     assert_eq!(shown_text(&notes), "FAKE-notes");
     button(&notes, "Hide now").emit_clicked();
 
@@ -445,11 +440,7 @@ fn desktop_flow() {
     );
     let expiring = s.revealed.borrow().as_ref().unwrap().clone();
     assert_eq!(shown_text(&expiring), "FAKE-expiring");
-    let expiring_parts: Vec<_> = descendants(&expiring)
-        .into_iter()
-        .filter_map(|w| w.downcast::<gtk::Label>().ok())
-        .filter(|l| l.has_css_class("monospace"))
-        .collect();
+    let expiring_parts = value_labels(&expiring);
     spin_until(|| !expiring.is_visible());
     assert!(expiring_parts.iter().all(|l| l.text().is_empty()));
 
@@ -501,13 +492,8 @@ fn desktop_flow() {
         Duration::from_secs(30),
     );
     let escaped = s.revealed.borrow().as_ref().unwrap().clone();
-    // Shown escaped and not grouped (grouping could cut the escape).
+    // Shown escaped, as the agent's dialogs would draw it.
     assert_eq!(shown_text(&escaped), "price-\\u{20ac}-1");
-    assert!(
-        !descendants(&escaped)
-            .iter()
-            .any(|w| w.clone().downcast::<gtk::FlowBox>().is_ok())
-    );
     button(&escaped, "Copy").emit_clicked();
     assert_eq!(paste().as_deref(), Some("price-\u{20ac}-1"));
     button(&escaped, "Hide now").emit_clicked();

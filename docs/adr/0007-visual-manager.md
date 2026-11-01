@@ -80,11 +80,11 @@ Each Show sends a fresh `reveal` with purpose `show` and waits for an
 approval that is never remembered. The value appears in a window of its own:
 
 - plain text, not selectable, so it never reaches the primary selection;
-- in groups of four characters when it is made of printable ASCII without
-  spaces (easier to read and compare); anything else is shown as it is, so
-  the grouping can never be mistaken for part of the value; characters
-  outside the dialogs' allow-list appear as `\u{…}` escapes, as in the
-  agent's dialogs;
+- as one piece of plain text in the monospace font, wrapped at the line's
+  end and never split into groups (an earlier version grouped it by four
+  characters; with a Copy button next to it, reading it in chunks no longer
+  pays for the clutter); characters outside the dialogs' allow-list appear
+  as `\u{…}` escapes, as in the agent's dialogs;
 - hidden after 30 seconds, when the window loses focus, on close, on a lock
   the manager observes, and before any other request; its labels are emptied
   when it closes;

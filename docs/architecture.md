@@ -418,9 +418,8 @@ its own dialog.
   done elsewhere (the CLI) loads the list, which asks nothing because the
   vault is open.
 - **Show.** `reveal` with purpose `show`: the value appears in a window of its
-  own, not selectable, grouped by four characters when the value is plain
-  ASCII without spaces, for at most 30 seconds or until the window loses
-  focus. Its Copy button copies the shown value without a new approval.
+  own, as plain monospace text that is not selectable, for at most 30
+  seconds or until the window loses focus. Its Copy button copies the shown value without a new approval.
 - **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard as
   plain text and stays until something else is copied; the desktop and
   clipboard histories may keep it. See

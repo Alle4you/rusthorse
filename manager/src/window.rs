@@ -140,15 +140,36 @@ fn group(title: &str, description: Option<&str>) -> adw::PreferencesGroup {
     g
 }
 
-/// A row showing requester-independent metadata as plain, selectable text.
-fn fact_row(title: &str, value: &str) -> adw::ActionRow {
-    adw::ActionRow::builder()
-        .title(title)
-        .subtitle(rusthorse::ui::dialog_text(value))
-        .use_markup(false)
-        .subtitle_selectable(true)
-        .css_classes(["property"])
+/// Width of the sidebar; the entry list is 340 and the details take the rest,
+/// as in the approved prototype (`docs/design/manager/`).
+const SIDEBAR_WIDTH: i32 = 230;
+
+/// Width of the key column in key/value rows, so that values line up.
+const KEY_WIDTH: i32 = 150;
+
+/// A boxed row laid out as a key on the left and its content on the right.
+fn key_row(key: &str, content: &impl IsA<gtk::Widget>) -> adw::PreferencesRow {
+    let line = row_box(12);
+    margins(&line, 12, 16);
+    let k = styled(key, &["dim-label"]);
+    k.set_width_request(KEY_WIDTH);
+    k.set_valign(gtk::Align::Center);
+    line.append(&k);
+    line.append(content);
+    adw::PreferencesRow::builder()
+        .title(key)
+        .activatable(false)
+        .child(&line)
         .build()
+}
+
+/// A row showing requester-independent metadata as plain, selectable text.
+fn fact_row(key: &str, value: &str) -> adw::PreferencesRow {
+    let v = label(value);
+    v.set_selectable(true);
+    v.set_hexpand(true);
+    v.set_valign(gtk::Align::Center);
+    key_row(key, &v)
 }
 
 fn button(text: &str, icon: Option<&str>) -> gtk::Button {
@@ -166,57 +187,17 @@ fn button(text: &str, icon: Option<&str>) -> gtk::Button {
     b
 }
 
-/// Whether a value is shown in groups of four characters, which are easier
-/// to read and compare: only values made of printable ASCII without spaces,
-/// judged on the value itself (its escaped form is always ASCII), so that the
-/// grouping can never cut an escape or be mistaken for part of the value.
-fn groupable(value: &str) -> bool {
-    value.len() > 8 && value.bytes().all(|b| b.is_ascii_graphic())
-}
-
-/// The value as drawn (escaped), grouped by four if `grouped`.
-fn value_view(value: &str, grouped: bool) -> gtk::Widget {
-    if !grouped {
-        let shown = label(value);
-        shown.set_selectable(false);
-        shown.add_css_class("monospace");
-        shown.add_css_class("title-4");
-        return shown.upcast();
-    }
-    let flow = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .max_children_per_line(8)
-        .min_children_per_line(4)
-        .column_spacing(10)
-        .row_spacing(6)
-        .homogeneous(true)
-        .can_focus(false)
-        .build();
-    for chunk in value.as_bytes().chunks(4) {
-        let text = String::from_utf8_lossy(chunk);
-        let part = gtk::Label::builder()
-            .label(text.as_ref())
-            .use_markup(false)
-            .selectable(false)
-            .css_classes(["monospace", "title-4"])
-            .build();
-        flow.insert(&part, -1);
-    }
-    flow.upcast()
-}
-
 impl Manager {
     pub fn new(app: &adw::Application, socket: PathBuf) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Rusthorse")
-            .default_width(1180)
+            .default_width(1240)
             .default_height(780)
             .build();
 
         // Sidebar: identity, navigation, and the lock.
         let sidebar = column(12);
-        sidebar.set_width_request(220);
         margins(&sidebar, 14, 12);
         let brand = row_box(10);
         let icon_bytes = glib::Bytes::from_static(include_bytes!(
@@ -253,6 +234,8 @@ impl Manager {
         // Entries: list on the left, details on the right.
         let entries_page = gtk::Paned::new(gtk::Orientation::Horizontal);
         entries_page.set_position(340);
+        // A wider window widens the details, not the list.
+        entries_page.set_resize_start_child(false);
         entries_page.set_shrink_start_child(false);
         entries_page.set_shrink_end_child(false);
         let left = column(10);
@@ -471,6 +454,11 @@ impl Manager {
         let split = row_box(0);
         let side = column(0);
         side.add_css_class("background");
+        // Fixed width. Set explicitly, because the brand label's hexpand
+        // would otherwise propagate up and give the sidebar half of any spare
+        // width, squeezing the details.
+        side.set_width_request(SIDEBAR_WIDTH);
+        side.set_hexpand(false);
         let side_header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
             .title_widget(&gtk::Label::new(None))
@@ -1129,9 +1117,11 @@ impl Manager {
             ("Value", false, entry.has_password),
             ("Notes", true, entry.has_notes),
         ] {
-            let row = adw::ActionRow::builder()
-                .title(title)
-                .subtitle(if present {
+            let line = row_box(8);
+            // Fixed text of this app, not from the vault: no dialog filter
+            // (which would escape the bullets).
+            let state = gtk::Label::builder()
+                .label(if present {
                     if notes {
                         "Hidden"
                     } else {
@@ -1143,7 +1133,12 @@ impl Manager {
                     "No value"
                 })
                 .use_markup(false)
+                .xalign(0.0)
+                .css_classes(["dim-label"])
                 .build();
+            state.set_hexpand(true);
+            state.set_valign(gtk::Align::Center);
+            line.append(&state);
             let what = if notes { "notes" } else { "value" };
             let show = button(&format!("Show {what}…"), Some("view-reveal-symbolic"));
             show.set_valign(gtk::Align::Center);
@@ -1162,14 +1157,14 @@ impl Manager {
                     },
                 )
             });
-            row.add_suffix(&show);
+            line.append(&show);
             let copy = button(&format!("Copy {what}…"), Some("edit-copy-symbolic"));
             copy.set_valign(gtk::Align::Center);
             copy.set_sensitive(present);
             let e = entry.clone();
             self.connect_button(&copy, move |s| s.copy(&e, notes));
-            row.add_suffix(&copy);
-            secret.add(&row);
+            line.append(&copy);
+            secret.add(&key_row(title, &line));
         }
         self.detail.append(&secret);
 
@@ -1303,12 +1298,26 @@ impl Manager {
         let body = column(14);
         margins(&body, 18, 24);
         body.append(&styled(title, &["title-4"]));
-        // Not selectable: no accidental export to the PRIMARY selection. The
-        // Copy button below copies the value exactly, escapes undone.
+        // Plain text in the monospace font, which tells 0 from O and l from
+        // 1; it wraps anywhere. Not selectable: no accidental export to the
+        // PRIMARY selection. The Copy button below copies the value exactly,
+        // escapes undone.
         let display = SecretString::new(rusthorse::ui::dialog_text(&value));
-        let shown = value_view(display.as_str(), groupable(&value));
+        let text = gtk::Label::builder()
+            .label(display.as_str())
+            .use_markup(false)
+            .selectable(false)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::Char)
+            .xalign(0.0)
+            .css_classes(["monospace"])
+            .build();
         drop(display);
         let kept = Rc::new(RefCell::new(Some(value)));
+        let shown = column(0);
+        shown.add_css_class("card");
+        margins(&text, 14, 16);
+        shown.append(&text);
         body.append(&shown);
         let countdown = styled("", &["caption", "dim-label"]);
         body.append(&countdown);
@@ -1348,7 +1357,7 @@ impl Manager {
                 s.put_on_clipboard(&copied, v);
             }
         });
-        let shown_ref = shown.clone();
+        let shown_ref = shown.upcast::<gtk::Widget>();
         window.connect_close_request(move |w| {
             kept.borrow_mut().take();
             wipe_labels(&shown_ref);

@@ -44,6 +44,9 @@ cargo run --locked -p rusthorse-manager
 
 ## The window
 
+The window has three columns: a sidebar of fixed width, the entry list, and
+the details, which take any extra width.
+
 - **Sidebar.** The state of the vault (Locked, Unlocked, Unavailable), the
   pages, and one button that unlocks or locks. Under it, when the vault is
   open, the time left before the agent locks it by itself.
@@ -53,7 +56,9 @@ cargo run --locked -p rusthorse-manager
 - **Details.** The selected entry: its actions (Edit, New random value,
   Delete), the **Secret** rows (Value and Notes, with Show and Copy), the
   **Details** (login, URL, host, port, tags, the names of other fields, the
-  UUID) and the command to use it.
+  UUID) and the command to use it. Each row has its name on the left and
+  its content on the right; the details can be selected and copied, since
+  none of them is secret.
 - **Bottom line.** The result of the last action, and a spinner while the
   agent is waiting for you to answer one of its dialogs.
 
@@ -121,10 +126,10 @@ safe.
 "Show the value of an entry on screen?". After you allow it, the value
 appears in a small window:
 
-- in groups of four characters, easier to read and compare —
-  `abcd ef12 …` — when the value is made of letters, digits and symbols
-  without spaces; otherwise as it is. Characters that the agent's dialogs
-  would not draw appear as `\u{…}` escapes;
+- as plain text in the monospace font, which tells `0` from `O` and `l`
+  from `1`, wrapped where the line ends — never split into groups or
+  changed. Characters that the agent's dialogs would not draw appear as
+  `\u{…}` escapes;
 - not selectable, so that it never lands in the X11 primary selection;
 - for 30 seconds at most, and it closes as soon as the window loses focus,
   when you click **Hide now**, or when the vault is locked.
