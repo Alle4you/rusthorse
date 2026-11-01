@@ -15,7 +15,7 @@ use rusthorse::protocol::{
     ValueChange,
 };
 
-use crate::clipboard::{CLIPBOARD_SECONDS, PASTE_GRACE, SecretContent};
+use crate::clipboard::{CLIPBOARD_SECONDS, SecretContent};
 use crate::connection::{Failure, Job};
 use crate::model::{self, Form, ValueMode};
 
@@ -53,8 +53,18 @@ pub(crate) struct Manager {
     status: RefCell<Option<StatusInfo>>,
     /// The request the human started; the controls wait for it.
     job: RefCell<Option<(Job, Pending)>>,
-    /// A background status check; never blocks the controls.
+    /// A background status check; never blocks the controls, and runs while
+    /// a request waits for the human too.
     poll: RefCell<Option<Job>>,
+    /// Bumped when a request of the human's starts or ends. A status check
+    /// started under an older value may describe a state that request
+    /// changed, so it is ignored.
+    epoch: Cell<u64>,
+    /// `epoch` when the running status check started.
+    poll_epoch: Cell<u64>,
+    /// A status check saw the vault locked (or the agent gone) while the
+    /// current request was waiting: a value it returns is not used.
+    lock_seen: Cell<bool>,
     closed: Cell<bool>,
     filling: Cell<bool>,
     search: gtk::SearchEntry,
@@ -495,6 +505,9 @@ impl Manager {
             status: RefCell::new(None),
             job: RefCell::new(None),
             poll: RefCell::new(None),
+            epoch: Cell::new(0),
+            poll_epoch: Cell::new(0),
+            lock_seen: Cell::new(false),
             closed: Cell::new(false),
             filling: Cell::new(false),
             search,
@@ -582,15 +595,7 @@ impl Manager {
         let weak = Rc::downgrade(&manager);
         manager.window.connect_close_request(move |_| {
             if let Some(s) = weak.upgrade() {
-                s.closed.set(true);
-                s.job.borrow_mut().take();
-                s.poll.borrow_mut().take();
-                s.hide_revealed();
-                s.clear_clipboard("");
-                if let Some(editor) = s.editor.borrow_mut().take() {
-                    editor.close();
-                }
-                s.clear_entries();
+                s.shutdown();
             }
             glib::Propagation::Proceed
         });
@@ -612,6 +617,22 @@ impl Manager {
             glib::ControlFlow::Continue
         });
         manager
+    }
+
+    /// Forget everything secret and stop talking to the agent. Called when
+    /// the window closes and when the application shuts down (including on
+    /// SIGINT, SIGTERM and SIGHUP), before GTK can offer the clipboard to a
+    /// clipboard manager.
+    pub fn shutdown(&self) {
+        self.closed.set(true);
+        self.job.borrow_mut().take();
+        self.poll.borrow_mut().take();
+        self.hide_revealed();
+        self.clear_clipboard("");
+        if let Some(editor) = self.editor.borrow_mut().take() {
+            editor.close();
+        }
+        self.clear_entries();
     }
 
     fn planned_page(icon: &str, title: &str, text: &str) -> gtk::Widget {
@@ -681,12 +702,14 @@ impl Manager {
         }
     }
 
-    /// Check the status in the background, unless a request is pending.
+    /// Check the status in the background, also while a request waits for
+    /// the human, so that a lock made elsewhere is seen meanwhile.
     fn poll_status(&self) {
-        if self.closed.get() || self.job.borrow().is_some() || self.poll.borrow().is_some() {
+        if self.closed.get() || self.poll.borrow().is_some() {
             return;
         }
         if let Ok(job) = Job::start(self.socket.clone(), Request::Status) {
+            self.poll_epoch.set(self.epoch.get());
             *self.poll.borrow_mut() = Some(job);
         }
     }
@@ -695,8 +718,8 @@ impl Manager {
         if self.closed.get() || self.job.borrow().is_some() {
             return;
         }
-        // A background check must not delay what the human asked for.
-        self.poll.borrow_mut().take();
+        self.epoch.set(self.epoch.get() + 1);
+        self.lock_seen.set(false);
         if !matches!(request, Request::Status | Request::List) {
             self.hide_revealed();
         }
@@ -741,10 +764,28 @@ impl Manager {
             });
         if let Some(answer) = polled {
             self.poll.borrow_mut().take();
+            // A request started or ended since this check began: its own
+            // result is newer.
+            let fresh = self.poll_epoch.get() == self.epoch.get();
+            let pending = self.job.borrow().is_some();
             match answer {
-                Ok(Response::Status(info)) => self.apply_status(info, false),
+                _ if !fresh => {}
+                Ok(Response::Status(info)) if info.locked => {
+                    // Locked elsewhere, maybe while a dialog is open: forget
+                    // what is shown and copied now, and any value to come.
+                    self.lock_seen.set(pending);
+                    self.apply_status(info, false);
+                }
+                Ok(Response::Status(info)) => {
+                    if !pending {
+                        self.apply_status(info, false);
+                    }
+                }
                 Ok(_) => {}
-                Err(failure) => self.unreachable(&failure),
+                Err(failure) => {
+                    self.lock_seen.set(pending);
+                    self.unreachable(&failure);
+                }
             }
         }
 
@@ -761,6 +802,7 @@ impl Manager {
         let Some((_, purpose)) = self.job.borrow_mut().take() else {
             return;
         };
+        self.epoch.set(self.epoch.get() + 1);
         self.set_busy(false);
         match answer {
             Err(failure) => {
@@ -785,6 +827,13 @@ impl Manager {
             Ok(Response::Ok { message }) => {
                 self.feedback(&message, false);
                 self.refresh();
+            }
+            Ok(Response::Secret { value }) if self.lock_seen.get() => {
+                drop(value);
+                self.feedback(
+                    "The vault was locked while the agent was asking you, so the value was neither shown nor copied.",
+                    true,
+                );
             }
             Ok(Response::Secret { value }) => match purpose {
                 Pending::Reveal { title, notes } => self.show_secret(&title, notes, value),
@@ -1236,25 +1285,22 @@ impl Manager {
         self.banner.set_revealed(true);
     }
 
-    /// Keep the banner's countdown current, and clear the clipboard after
-    /// the paste or the deadline.
+    /// Keep the banner's countdown current, and clear the value after its
+    /// paste or its deadline.
     fn tick_clipboard(&self) {
         let outcome = {
             let copied = self.copied.borrow();
             let Some(c) = copied.as_ref() else { return };
-            let clipboard = self.window.clipboard();
-            if !c.content.is_on(&clipboard) {
-                Some("Something else was copied; the value is no longer on the clipboard.")
-            } else if let Some(t) = c.content.served_at()
-                && t.elapsed() > PASTE_GRACE
-            {
+            if let Some(t) = c.content.served_at() {
                 Some(if t.saturating_duration_since(c.at) < TAKEN_AT_ONCE {
-                    "Another program took the value as soon as it was copied — probably a clipboard history, which may keep it. Your own paste will come back empty. The value was cleared from the clipboard."
+                    "Another program took the value as soon as it was copied — probably a clipboard history, which may keep it. Your own paste will come back empty. The value is no longer on the clipboard."
                 } else {
-                    "Pasted once. The value was cleared from the clipboard."
+                    "The value was pasted once and is no longer on the clipboard. If your own paste came back empty, another program took it first."
                 })
+            } else if !c.content.is_on(&self.window.clipboard()) {
+                Some("Something else was copied; the value is no longer on the clipboard.")
             } else if Instant::now() >= c.until {
-                Some("Not pasted in time. The value was cleared from the clipboard.")
+                Some("Not pasted in time. The value is no longer on the clipboard.")
             } else {
                 let left = c.until.saturating_duration_since(Instant::now()).as_secs() + 1;
                 self.banner.set_title(&rusthorse::ui::dialog_text(&format!(
@@ -1269,17 +1315,14 @@ impl Manager {
         }
     }
 
-    /// Clear the clipboard if it still holds our value, and forget it.
+    /// Wipe the copied value, so that no later request gets it. The
+    /// clipboard itself is not claimed again to empty it: another program
+    /// may own it by now without GTK knowing yet, and claiming it would
+    /// destroy what that program copied.
     fn clear_clipboard(&self, reason: &str) {
         let Some(c) = self.copied.borrow_mut().take() else {
             return;
         };
-        let clipboard = self.window.clipboard();
-        if c.content.is_on(&clipboard) {
-            clipboard
-                .set_content(None::<&gtk::gdk::ContentProvider>)
-                .ok();
-        }
         c.content.wipe();
         self.banner.set_revealed(false);
         if !reason.is_empty() {

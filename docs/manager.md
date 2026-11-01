@@ -71,8 +71,11 @@ approval; commands already running keep the secrets they were given. Closing
 the manager does **not** lock the vault.
 
 If the vault is locked by something else — the agent's idle timer,
-`rusthorse lock` — the manager notices within five seconds and clears what it
-shows. If you unlock with the CLI, the list appears by itself.
+`rusthorse lock` — the manager notices at its next check (every five
+seconds, also while one of the agent's dialogs waits for you) and clears
+what it shows and what it copied; a value that arrives after such a lock is
+neither shown nor copied. If you unlock with the CLI, the list appears by
+itself.
 
 ### Create an entry
 
@@ -139,13 +142,17 @@ Show window).
 2. A banner at the top says what is on the clipboard and counts down:
    *"… is on the clipboard for one paste · cleared in 20 s"*, with
    **Clear now**.
-3. **Paste it once**, right away. The first paste gets the value; after it,
-   the manager clears the clipboard and says *"Pasted once"*. A second paste
-   gets nothing.
-4. Without a paste, the value is cleared after **20 seconds**. It is also
-   cleared when you lock, when the vault is locked elsewhere, when the agent
-   becomes unreachable and when you close the manager. If you copy something
-   else meanwhile, your new content is left alone.
+3. **Paste it once**, right away. The first program that asks for the
+   clipboard gets the value — normally your paste — and nothing after it:
+   the manager says *"The value was pasted once and is no longer on the
+   clipboard"*. A second paste, from any program, gets nothing. (A program
+   that asks twice for a single paste gets nothing the second time: copy
+   again.)
+4. Without a paste, the value is wiped after **20 seconds**. It is also
+   wiped when you lock, when the vault is locked elsewhere, when the agent
+   becomes unreachable, and when you close the manager or it is stopped
+   (Ctrl+C, a logout). If you copy something else meanwhile, the manager
+   does not touch it.
 
 **Why one paste and not a timer.** The clipboard is where values leak: on
 X11 every program of your session can read it, a clipboard history can keep
@@ -153,9 +160,9 @@ it for ever, a phone link (GSConnect, KDE Connect) can send it to your phone,
 and a value pasted into the wrong window is gone — a chat with an AI sends it
 to the AI's provider. These copies happen in the first second; a timer that
 clears the clipboard later cannot undo them. Serving the value to a single
-paste means that anything that reads it uses up that paste: if a program got
-there before you, **your own paste comes back empty, and you notice** instead
-of the value leaking silently.
+paste means that whatever reads it first uses it up: if a program got there
+before you, **your own paste comes back empty, and you notice** instead of
+the value leaking silently.
 
 **If your paste comes back empty**, or the manager says *"Another program
 took the value as soon as it was copied — probably a clipboard history"*,

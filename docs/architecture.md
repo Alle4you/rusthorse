@@ -408,18 +408,22 @@ its own dialog.
   started by the human runs at a time, on a worker thread, with bounded
   waits; closing the window shuts the connection down. A lost answer to a
   request with effects is reported as an unknown outcome, never retried.
-- **Status.** A background `status` every five seconds, which never blocks
-  the controls and does not postpone the idle lock. A lock it observes clears
-  the entries, a shown value and a copied value; an unlock done elsewhere
-  (the CLI) loads the list, which asks nothing because the vault is open.
+- **Status.** A background `status` every five seconds, also while a
+  request waits for the human; it never blocks the controls and does not
+  postpone the idle lock. A result that predates a request of the human's is
+  ignored. A lock it observes clears the entries, a shown value and a copied
+  value, and a value returned afterwards by the waiting request is dropped;
+  an unlock done elsewhere (the CLI) loads the list, which asks nothing
+  because the vault is open.
 - **Show.** `reveal` with purpose `show`: the value appears in a window of its
   own, not selectable, grouped by four characters when that cannot mislead,
   for at most 30 seconds or until the window loses focus.
 - **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard
-  through a content provider that serves it to a **single paste** (plus a
-  one-second grace for that paste's repeated requests) and is cleared after
-  20 seconds, on lock and on close, if still there. Nothing is storable by a
-  clipboard manager. See [ADR 0007, section 2](adr/0007-visual-manager.md#2-show-copy-and-memory)
+  through a content provider that delivers it **once** — every later request
+  fails — and wipes it after 20 seconds, on lock, on close and at shutdown
+  (signals included). Wiping empties the provider and never claims the
+  clipboard again, which could destroy what another program has just
+  copied. See [ADR 0007, section 2](adr/0007-visual-manager.md#2-show-copy-and-memory)
   and [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client).
 - **Memory.** Values live in zeroizing buffers in Rust; GTK's own copies
   (labels, clipboard transfers) are emptied when no longer needed but cannot

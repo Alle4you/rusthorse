@@ -298,16 +298,19 @@ visual manager uses both:
   deliver the `x-kde-passwordManagerHint` that tells histories to skip it —
   and the program it is pasted into receives it, so a value pasted into the
   wrong window (a chat with an AI) is gone. Mitigations: a separate approval
-  whose dialog warns of exactly this; the content is served to the first
-  paste only (plus a one-second grace for that paste's repeated requests),
-  so a history that reads it uses up the paste and the human notices; it is
-  cleared after the paste, after 20 seconds, on lock and on close, only if
-  the clipboard still holds it; nothing is storable by a clipboard manager
-  at exit; and the manager warns when the value was taken faster than a
-  human pastes. See [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
+  whose dialog warns of exactly this; the value is delivered to the first
+  request only, so a history that reads it uses it up and the human's own
+  paste comes back empty; it is wiped after that delivery, after 20 seconds,
+  on lock (including one observed while a dialog waits), on close and at
+  shutdown, signals included — before GTK could offer the clipboard to a
+  clipboard manager, which declaring nothing storable does not prevent;
+  wiping never claims the clipboard back, so what another program copied
+  meanwhile survives; and the manager warns when the value was taken faster
+  than a human pastes. See [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
 
 Status polling is not an immediate signal of a lock made elsewhere: the
-manager notices within five seconds. `import` reads values in the client
+manager checks every five seconds, also while a request waits for the
+human, and drops a value that arrives after it saw a lock. `import` reads values in the client
 before sending them to the agent; `add --stdin` sends a value the client
 already has. None of these should be run by an AI agent. Importing also does
 not remove the original copies (for example in GNOME Keyring).
@@ -750,5 +753,17 @@ Open risks, by design or for later milestones:
 - No keyboard and accessibility review yet, and no tests at other display
   scales.
 
-**Awaiting:** an independent review of the whole milestone, Copy included
-(Codex).
+Review of milestone 1 with Copy (Codex, AI-assisted, 2026-11-01; verdict: not
+ready), and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Clearing could destroy what another program had just copied: when it took the clipboard before GTK processed the change of owner, GTK still believed it owned it, and emptying the clipboard claimed it back (reproduced on Xvfb) | **Fixed:** clearing wipes the value inside the provider and never claims the clipboard. A widget test lets `xclip` take the clipboard without GTK noticing, clears, and checks that `xclip`'s content survives. |
+| "One paste" was not what the code did: during a one-second grace, two different programs both got the value, and a reader 600 ms after the copy got the plain "Pasted once" message | **Fixed:** a single delivery, no grace; a second reader, however soon, gets nothing (tested with two `xclip` readers). The message no longer claims the paste was the human's. Programs that ask twice for one paste get nothing the second time; documented. |
+| While a request waited for the human, status checks stopped, so a lock made elsewhere went unseen and a copied value stayed available (6.2 s after the lock, in the reviewer's run) | **Fixed:** checks continue during a request; a result older than the request is ignored (tested: an "unlocked" read before Lock now does not make the manager list again and the agent ask for the password); a lock seen meanwhile wipes the copied value at once, and a value the request returns afterwards is dropped. Tested with an approval held open while another client locks. |
+| Declaring no storable format does not stop GTK 4.14 from offering the clipboard to a clipboard manager (`SAVE_TARGETS`) at exit, unlike what the code and the ADR said | **Fixed:** the value is wiped on window close and on application shutdown, and SIGINT, SIGTERM and SIGHUP quit through that path (a test sends SIGTERM to the real program on Xvfb and checks a normal exit). Comments, ADR and L14 corrected. |
+| The guide promised that a lock elsewhere is noticed "within five seconds" | **Fixed:** worded as a check every five seconds, also during requests. |
+
+Each fix was reverted in a copy of the tree to see a test fail.
+
+**Awaiting:** verification of these fixes (Codex).

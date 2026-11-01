@@ -9,7 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-struct Scripted(Arc<AtomicBool>);
+/// Decisions: `allow`; `hold`, which keeps the "human" looking at the
+/// dialog until it is cleared; and `asking`, set while held.
+struct Scripted(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
 impl Ui for Scripted {
     fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
         Ok(Typed::Value("fake master password".to_string().into()))
@@ -18,6 +20,12 @@ impl Ui for Scripted {
         Ok(Typed::Value("FAKE-desktop-value".to_string().into()))
     }
     fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+        let until = Instant::now() + Duration::from_secs(30);
+        while self.1.load(Ordering::SeqCst) && Instant::now() < until {
+            self.2.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.2.store(false, Ordering::SeqCst);
         Ok(if self.0.load(Ordering::SeqCst) {
             Decision::AllowOnce
         } else {
@@ -161,9 +169,11 @@ fn focus(name: &str) {
     }
 }
 
+/// What another program gets when it pastes; `None` when it gets nothing
+/// (an error, or empty content from a wiped value).
 fn paste() -> Option<String> {
     let (ok, text) = x11(&["/usr/bin/xclip", "-o", "-selection", "clipboard"]);
-    ok.then_some(text)
+    (ok && !text.is_empty()).then_some(text)
 }
 
 fn snapshot(s: &Manager, name: &str) {
@@ -265,6 +275,8 @@ fn desktop_flow() {
     .unwrap();
     let socket = dir.path().join("run/agent.sock");
     let allowed = Arc::new(AtomicBool::new(true));
+    let hold = Arc::new(AtomicBool::new(false));
+    let asking = Arc::new(AtomicBool::new(false));
     let agent = Agent::new(
         AgentConfig {
             vault,
@@ -274,7 +286,11 @@ fn desktop_flow() {
             request_timeout: Duration::from_secs(5),
             send_buffer: None,
         },
-        Box::new(Scripted(Arc::clone(&allowed))),
+        Box::new(Scripted(
+            Arc::clone(&allowed),
+            Arc::clone(&hold),
+            Arc::clone(&asking),
+        )),
     );
     let listener = Agent::bind(&socket).unwrap();
     // This thread exists only in this test's subprocess; no daemon outlives it.
@@ -333,11 +349,13 @@ fn desktop_flow() {
     assert!(s.actions.borrow().iter().all(|b| b.is_sensitive()));
     assert!(!s.waiting.is_visible());
     spin_until(|| s.poll.borrow().is_none());
-    // A request of the human's cancels a check still under way.
+    // It runs beside a request of the human's; a result that predates that
+    // request is not used.
     s.poll_status();
     s.refresh();
-    assert!(s.poll.borrow().is_none() && s.job.borrow().is_some());
+    assert!(s.poll.borrow().is_some() && s.job.borrow().is_some());
     settle(&s);
+    spin_until(|| s.poll.borrow().is_none());
 
     // Local filters really hide the selection; full metadata comes back.
     s.search.set_text("no match");
@@ -459,16 +477,16 @@ fn desktop_flow() {
     let wait = Instant::now() + Duration::from_millis(600);
     spin_until(|| Instant::now() >= wait);
     assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
-    let after_grace = Instant::now() + crate::clipboard::PASTE_GRACE + Duration::from_millis(300);
-    spin_until(|| Instant::now() >= after_grace);
-    assert!(s.copied.borrow().is_none());
+    // A second reader, right away, gets nothing.
+    assert_eq!(paste(), None);
+    spin_until(|| s.copied.borrow().is_none());
     assert!(!s.banner.is_revealed());
     assert!(
-        s.message.text().contains("Pasted once"),
+        s.message.text().contains("pasted once"),
         "{}",
         s.message.text()
     );
-    assert_ne!(paste().as_deref(), Some("FAKE-desktop-value"));
+    assert_eq!(paste(), None);
 
     // Taken right after the copy (as a clipboard history does): say so.
     s.put_on_clipboard_for(
@@ -504,6 +522,43 @@ fn desktop_flow() {
     spin_until(|| s.copied.borrow().is_none());
     assert_eq!(paste().as_deref(), Some("not a secret"));
 
+    // Another program that takes the clipboard before GTK has noticed keeps
+    // it: clearing wipes our value and never claims the clipboard back.
+    s.put_on_clipboard_for(
+        "Fake raced copy",
+        "FAKE-copy-raced".to_string().into(),
+        Duration::from_secs(20),
+    );
+    let mut owner = std::process::Command::new("/usr/bin/xclip")
+        .args(["-selection", "clipboard", "-i", "-quiet"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut input = owner.stdin.take().unwrap();
+        input.write_all(b"copied by another program").unwrap();
+    }
+    // Without running the main loop, GTK cannot see that it lost the
+    // clipboard: it still believes it owns it.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        s.copied
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .content
+            .is_on(&s.window.clipboard())
+    );
+    s.clear_clipboard("cleared during a race");
+    let settle_frame = Instant::now() + Duration::from_millis(300);
+    spin_until(|| Instant::now() >= settle_frame);
+    assert_eq!(paste().as_deref(), Some("copied by another program"));
+    let _ = owner.kill();
+    let _ = owner.wait();
+
     // Locking clears a copied value at once.
     s.put_on_clipboard_for(
         "Fake locked copy",
@@ -519,6 +574,54 @@ fn desktop_flow() {
     settle(&s);
     spin_until(|| s.job.borrow().is_none() && !s.entries.borrow().is_empty());
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
+
+    // A lock made elsewhere while a request waits for the human is seen,
+    // and the copied value goes at once.
+    button(&s.detail, "Copy value…").emit_clicked();
+    settle(&s);
+    assert!(s.copied.borrow().is_some());
+    hold.store(true, Ordering::SeqCst);
+    button(&s.detail, "New random value…").emit_clicked();
+    assert!(s.job.borrow().is_some());
+    // Lock only once the request is at the approval dialog; earlier, the
+    // request would find the vault locked and ask for the password again.
+    spin_until(|| asking.load(Ordering::SeqCst));
+    let other = rusthorse::client::Client::new(s.socket.clone());
+    assert!(matches!(
+        other.call(&Request::Lock).unwrap(),
+        Response::Ok { .. }
+    ));
+    let seen = Instant::now() + Duration::from_secs(9);
+    spin_until(|| s.copied.borrow().is_none() || Instant::now() >= seen);
+    assert!(
+        s.copied.borrow().is_none(),
+        "lock not seen during the request"
+    );
+    assert!(s.job.borrow().is_some(), "the request is still waiting");
+    assert_eq!(s.pill.text(), "Locked");
+    assert_eq!(paste(), None);
+    hold.store(false, Ordering::SeqCst);
+    settle(&s);
+    button(&s.window, "Unlock").emit_clicked();
+    settle(&s);
+    spin_until(|| s.job.borrow().is_none() && !s.entries.borrow().is_empty());
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+
+    // A value that arrives after such a lock was seen is not used.
+    hold.store(true, Ordering::SeqCst);
+    button(&s.detail, "Copy value…").emit_clicked();
+    spin_until(|| asking.load(Ordering::SeqCst));
+    s.lock_seen.set(true);
+    hold.store(false, Ordering::SeqCst);
+    settle(&s);
+    assert!(s.copied.borrow().is_none());
+    assert!(s.revealed.borrow().is_none());
+    assert!(
+        s.message.text().contains("neither shown nor copied"),
+        "{}",
+        s.message.text()
+    );
+    assert_eq!(paste(), None);
 
     // A denied delete does not change the list on the next refresh.
     allowed.store(false, Ordering::SeqCst);
@@ -562,10 +665,33 @@ fn desktop_flow() {
     button(&s.detail, "Delete…").emit_clicked();
     settle(&s);
     assert!(s.entries.borrow().is_empty());
+    // A status result that predates a request is not used: an "unlocked"
+    // read before Lock now must not make the manager list again, which
+    // would make the agent ask for the master password.
+    s.poll_status();
+    let stale = s.poll.borrow_mut().take();
+    assert!(stale.is_some());
+    std::thread::sleep(Duration::from_millis(300));
     button(&s.window, "Lock now").emit_clicked();
     settle(&s);
     assert_eq!(s.pill.text(), "Locked");
+    *s.poll.borrow_mut() = stale;
+    spin_until(|| s.poll.borrow().is_none());
+    settle(&s);
+    assert_eq!(s.pill.text(), "Locked");
+    let status = rusthorse::client::Client::new(s.socket.clone())
+        .call(&Request::Status)
+        .unwrap();
+    assert!(matches!(status, Response::Status(i) if i.locked));
+    // Closing wipes a value still on the clipboard.
+    s.put_on_clipboard_for(
+        "Fake copy at exit",
+        "FAKE-copy-at-exit".to_string().into(),
+        Duration::from_secs(20),
+    );
     s.window.close();
     assert!(s.closed.get());
     assert!(s.job.borrow().is_none());
+    assert!(s.copied.borrow().is_none());
+    assert_eq!(paste(), None);
 }

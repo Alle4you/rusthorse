@@ -107,18 +107,24 @@ therefore built around **one paste**, not around a timer:
    other programs can read the clipboard and that it must never be pasted
    into a chat with an AI. Copying from the Show window asks again: that
    approval said "show".
-2. **One paste.** The value is not handed to GTK as a string. A
+2. **One delivery.** The value is not handed to GTK as a string. A
    `GdkContentProvider` of the manager's own answers each request: the first
-   request for text starts a one-second grace period (one paste can make more
-   than one request), and every request after it fails. The manager then
-   clears the clipboard.
-3. **Cleared anyway** after 20 seconds without a paste, on Lock now, on a
-   lock it observes, when the agent becomes unreachable and when the window
-   closes — but only if the clipboard still holds this value: something the
-   user copied afterwards is left alone.
-4. **Never stored.** The provider declares no storable format, so GTK does
-   not hand the value to a clipboard manager (`SAVE_TARGETS`) when the app
-   exits.
+   request for text gets the value, and every later request — from any
+   program, however soon — fails. A program that asks twice for one paste
+   gets nothing the second time. (A first version allowed a one-second
+   grace for such programs; the review showed that two different programs
+   could then both get the value, so it was dropped.)
+3. **Wiped anyway** after 20 seconds without a paste, on Lock now, on a
+   lock it observes, when the agent becomes unreachable, when the window
+   closes and when the application shuts down (signals included). Wiping
+   empties the provider; the manager never claims the clipboard again to
+   clear it, because another program may own it already without GTK knowing
+   yet, and a new claim would destroy what that program copied. Pastes after
+   the wipe get empty content.
+4. **Not left for a clipboard manager.** The provider declares no storable
+   format, but GTK 4.14 on X11 may still offer the clipboard to a clipboard
+   manager (`SAVE_TARGETS`) at exit; what keeps the value from being stored
+   then is that it was wiped before the application shut down.
 5. **Marked as a password** with `x-kde-passwordManagerHint: secret`, which
    Klipper, KDE Connect and some other histories honour. *On X11, GTK 4
    serves only formats whose name contains a slash (verified with GTK 4.14),
@@ -131,8 +137,8 @@ therefore built around **one paste**, not around a timer:
 
 What this does **not** protect against: a program of the session that reads
 the clipboard while the value is there; a history that ignores the hint (on
-X11, all of them) — although such a history uses up the single paste, so the
-human's own paste comes back empty and the banner says what happened; the
+X11, all of them) — although such a history uses up the single delivery, so
+the human's own paste comes back empty and the banner says what happened; the
 program the value is pasted into. On Wayland, other programs cannot read the
 clipboard without focus unless the compositor offers a data-control protocol
 (wlroots, KDE do), which clipboard managers use.

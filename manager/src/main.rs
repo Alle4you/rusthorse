@@ -7,6 +7,7 @@ mod window;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio};
@@ -54,10 +55,38 @@ fn load_style() {
     styles.connect_dark_notify(apply);
 }
 
+/// Set when SIGINT, SIGTERM or SIGHUP arrives; the main loop then quits the
+/// application the normal way, which wipes shown and copied values.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Block the termination signals in every thread (call before any thread
+/// starts) and wait for them on a thread of their own.
+fn watch_signals() -> Result<(), String> {
+    use nix::sys::signal::{SigSet, Signal};
+    let mut set = SigSet::empty();
+    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+        set.add(signal);
+    }
+    set.thread_block().map_err(|e| e.to_string())?;
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            if set.wait().is_ok() {
+                QUIT.store(true, Ordering::SeqCst);
+            }
+        })
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
 fn main() -> std::process::ExitCode {
     // Apply before GTK can hold a revealed value. No child program is started.
     if let Err(e) = rusthorse::agent::harden_process() {
         eprintln!("rusthorse-manager: cannot protect process memory: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    if let Err(e) = watch_signals() {
+        eprintln!("rusthorse-manager: cannot handle termination signals: {e}");
         return std::process::ExitCode::FAILURE;
     }
     let app = adw::Application::builder()
@@ -66,6 +95,25 @@ fn main() -> std::process::ExitCode {
         .build();
     app.connect_startup(|_| load_style());
     let state = Rc::new(RefCell::new(None::<Rc<window::Manager>>));
+    // Wipe a shown or copied value before GTK shuts down — including when a
+    // signal ends the program — so that nothing is left for a clipboard
+    // manager to take at exit.
+    let at_exit = Rc::clone(&state);
+    app.connect_shutdown(move |_| {
+        if let Some(manager) = at_exit.borrow().as_ref() {
+            manager.shutdown();
+        }
+    });
+    let quitting = app.downgrade();
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        if !QUIT.load(Ordering::SeqCst) {
+            return gtk::glib::ControlFlow::Continue;
+        }
+        if let Some(app) = quitting.upgrade() {
+            app.quit();
+        }
+        gtk::glib::ControlFlow::Break
+    });
     let keep = Rc::clone(&state);
     app.connect_activate(move |app| {
         if let Some(manager) = keep.borrow().as_ref() {

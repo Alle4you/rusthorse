@@ -1,23 +1,30 @@
 //! Clipboard content that hands a revealed value to one paste, then nothing.
 //!
 //! The value is never given to GTK as a string. GTK asks this provider for the
-//! bytes each time a program pastes, so the provider can count pastes: the
-//! first request for text starts a short grace period (one paste can make more
-//! than one request), after which every request fails and the manager clears
-//! the clipboard. The provider also offers `x-kde-passwordManagerHint:
-//! secret`, which clipboard histories that honour it (Klipper, KDE Connect,
-//! some others) use to skip the value, and declares nothing storable, so GTK
-//! never hands the value to a clipboard manager when the manager exits.
+//! bytes each time a program pastes, so the provider can count: the first
+//! request for text gets the value, and every later request — from any
+//! program — fails. (A program that asks twice for one paste gets nothing the
+//! second time; it is told the value is gone.)
 //!
-//! On X11, GTK 4 serves only formats whose name contains a slash, so the hint
-//! is announced but cannot be read there: a clipboard history on X11 is not
-//! told. What protects the value there is the single paste: a history that
-//! reads it takes that paste, and the human's own paste comes back empty.
+//! Clearing wipes the value inside the provider rather than claiming the
+//! clipboard again: another program may own the clipboard by then without
+//! GTK knowing yet, and a new claim would destroy what it copied.
+//!
+//! The provider declares nothing storable, but that alone does not keep GTK
+//! from offering the clipboard to a clipboard manager (`SAVE_TARGETS`) when the
+//! application exits: the manager wipes the value before it exits.
+//!
+//! It also offers `x-kde-passwordManagerHint: secret`, which clipboard
+//! histories that honour it (Klipper, KDE Connect, some others) use to skip
+//! the value. On X11, GTK 4 serves only formats whose name contains a slash,
+//! so the hint is announced but cannot be read there: a clipboard history on
+//! X11 is not told. What protects the value there is the single delivery: a
+//! history that reads it takes it, and the human's own paste comes back empty.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gtk::gdk::subclass::prelude::*;
 use gtk::prelude::*;
@@ -25,9 +32,6 @@ use gtk::{gdk, gio, glib};
 use rusthorse::protocol::SecretString;
 use zeroize::Zeroizing;
 
-/// How long requests from the paste that first took the value are still
-/// answered. Some programs ask more than once for one paste.
-pub(crate) const PASTE_GRACE: Duration = Duration::from_secs(1);
 /// How long a copied value stays on the clipboard when nobody pastes it.
 pub(crate) const CLIPBOARD_SECONDS: u64 = 20;
 /// The text formats offered. GTK maps them to the X11 and Wayland targets
@@ -65,7 +69,8 @@ mod imp {
                 .build()
         }
 
-        // Nothing may be stored by a clipboard manager when the app exits.
+        // Declares that nothing may be stored by a clipboard manager. GTK 4
+        // may start SAVE_TARGETS anyway; the value is wiped before exit.
         fn storable_formats(&self) -> gdk::ContentFormats {
             gdk::ContentFormatsBuilder::new().build()
         }
@@ -91,7 +96,7 @@ mod imp {
 
     impl SecretContent {
         /// The bytes for one request, or an error once the value is gone or
-        /// was already taken by an earlier paste.
+        /// was already delivered once.
         pub(super) fn data_for(
             &self,
             mime_type: &str,
@@ -106,20 +111,14 @@ mod imp {
                     "unsupported clipboard format",
                 ));
             }
-            if self
-                .served_at
-                .get()
-                .is_some_and(|first| now.saturating_duration_since(first) > PASTE_GRACE)
-            {
+            if self.served_at.get().is_some() {
                 return Err(gone());
             }
             let value = self.value.borrow();
             let Some(value) = value.as_ref() else {
                 return Err(gone());
             };
-            if self.served_at.get().is_none() {
-                self.served_at.set(Some(now));
-            }
+            self.served_at.set(Some(now));
             Ok(Zeroizing::new(value.as_str().as_bytes().to_vec()))
         }
     }
@@ -180,16 +179,15 @@ mod tests {
         assert!(content.served_at().is_none());
         assert!(imp.data_for("image/png", start).is_err());
         assert!(content.served_at().is_none());
-        // The paste, and a second request from that same paste.
+        // The paste gets the value; any other request fails, however soon
+        // and in whatever text format, even before the manager clears.
         let first = imp.data_for(TEXT, start).expect("first paste");
         assert_eq!(&first[..], b"FAKE-one-paste");
         assert_eq!(content.served_at(), Some(start));
-        assert!(imp.data_for(LEGACY_TEXT, start + PASTE_GRACE).is_ok());
-        // Any later request fails, even before the manager clears.
-        assert!(
-            imp.data_for(TEXT, start + PASTE_GRACE + Duration::from_millis(1))
-                .is_err()
-        );
+        assert!(imp.data_for(TEXT, start).is_err());
+        assert!(imp.data_for(LEGACY_TEXT, start).is_err());
+        // The hint is still answered: it is not the value.
+        assert!(imp.data_for(HINT, start).is_ok());
     }
 
     #[test]
