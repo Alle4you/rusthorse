@@ -1386,6 +1386,36 @@ fn a_stuck_destination_does_not_hold_back_a_broken_pipe() {
 }
 
 #[test]
+fn end_of_input_waits_for_pending_input() {
+    use rusthorse::protocol::{Frame, MAX_DATA_LEN, STDIN, STDOUT, recv_any_before, send_data};
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    // The command starts reading late, so most input is still pending in the
+    // agent when end-of-input arrives.
+    let stream = raw_run(&h, &["sh", "-c", "sleep 1; wc -c"], true);
+    let chunk = vec![b'x'; MAX_DATA_LEN];
+    for _ in 0..3 {
+        send_data(&stream, STDIN, &chunk).expect("send");
+    }
+    send_data(&stream, STDIN, &[]).expect("end of input");
+    let mut out = Vec::new();
+    loop {
+        match recv_any_before(&stream, Some(Instant::now() + Duration::from_secs(20))) {
+            Ok(Frame::Data(STDOUT, data)) => out.extend_from_slice(&data),
+            Ok(Frame::Data(..)) => {}
+            Ok(Frame::Message(..)) => break,
+            Err(e) => panic!("connection failed: {e}"),
+        }
+    }
+    assert_eq!(
+        text(&out).trim(),
+        (3 * MAX_DATA_LEN).to_string(),
+        "input was cut short"
+    );
+}
+
+#[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
