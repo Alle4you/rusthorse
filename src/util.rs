@@ -158,6 +158,8 @@ fn is_invisible_or_layout(c: char) -> bool {
         '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}'
         | '\u{17B4}'..='\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}'
         | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}'
+        // Not Default_Ignorable, but drawn as nothing at all.
+        | '\u{2800}'
         | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
         | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}'
         // Other format characters.
@@ -288,6 +290,7 @@ mod tests {
             "a\\u{a0}b\\u{2002}c\\u{3000}d"
         );
         assert_eq!(visible("a b"), "a b");
+        assert_eq!(visible("a\u{2800}b"), "a\\u{2800}b");
         // Up to two combining marks stay (Vietnamese "ệ"); a pile does not.
         assert_eq!(visible("e\u{323}\u{302}"), "e\u{323}\u{302}");
         assert_eq!(

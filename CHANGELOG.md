@@ -69,11 +69,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   and 4 share. Values are escaped before formatting, so they are shown
   literally. The password prompts are worded more clearly, and the requester
   chain is labelled "unverified".
-- Dialogs show as `\u{…}` escapes every character that would not appear as
-  itself — line and paragraph separators, invisible and format characters,
-  spaces other than the plain one, combining marks stacked more than two
-  deep — and refuse requests too tall to read at once (60 estimated lines),
-  so a long or crafted value cannot push the rest of a dialog out of sight.
+- Dialogs draw only ordinary characters as themselves (ASCII, Latin letters,
+  a little punctuation) and every other one as a `\u{…}` escape, so a value
+  cannot hide, reorder, overlap or impersonate text; requests whose dialog
+  would be too tall to read at once are refused (an estimate in pixels for an
+  11-point font), so a long or crafted value cannot push the rest of a dialog
+  out of sight. `import` batches are sized to fit (24 lines of names).
 
 ### Security
 

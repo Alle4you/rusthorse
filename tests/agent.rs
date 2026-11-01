@@ -1683,7 +1683,7 @@ fn a_request_too_tall_to_read_at_once_is_refused() {
 
 #[test]
 fn the_allow_for_note_counts_toward_the_height_limit() {
-    use rusthorse::ui::{LINE_CHARS, MAX_DIALOG_LINES, REMEMBER_NOTE_LINES, approval_lines};
+    use rusthorse::ui::{REMEMBER_NOTE_HEIGHT, approval_height, metrics};
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
     h.decide(&[Decision::Deny]);
@@ -1693,30 +1693,63 @@ fn the_allow_for_note_counts_toward_the_height_limit() {
         .finish();
     assert_eq!(first.status.code(), Some(125));
     let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
-    let base = approval_lines(&request);
-    let width = request
-        .warnings
-        .iter()
-        .find(|w| w.contains("GIT_SSH_COMMAND"))
-        .expect("warning")
-        .chars()
-        .count();
-    // Grow the warning until the dialog takes exactly the limit minus the
-    // note plus one: it fits on its own, not with the note.
-    let target = MAX_DIALOG_LINES - REMEMBER_NOTE_LINES + 1;
-    let wanted = (width.div_ceil(LINE_CHARS) + target - base - 1) * LINE_CHARS + 1;
-    let value = "x".repeat(1 + wanted - width);
+    // The same request with a longer value, as the agent will build it.
+    let with_value = |value: &str| {
+        let mut grown = request.clone();
+        for warning in &mut grown.warnings {
+            *warning = warning.replace("GIT_SSH_COMMAND=x", &format!("GIT_SSH_COMMAND={value}"));
+        }
+        grown
+    };
+    // The shortest value whose dialog fits on its own but not with the note.
+    let value = (1..4000)
+        .map(|n| "x".repeat(n))
+        .find(|v| approval_height(&with_value(v)) + REMEMBER_NOTE_HEIGHT > metrics::MAX_HEIGHT)
+        .expect("a value that is too tall");
+    assert!(approval_height(&with_value(&value)) <= metrics::MAX_HEIGHT);
     let second = h
         .cmd(&["run", "T", "--", "true"])
         .env("GIT_SSH_COMMAND", &value)
         .finish();
     assert_eq!(second.status.code(), Some(125));
     assert!(
-        text(&second.stderr).contains(&format!("about {} lines", MAX_DIALOG_LINES + 1)),
+        text(&second.stderr).contains("too tall to read at once"),
         "{}",
         text(&second.stderr)
     );
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+    // One character less, and it is asked.
+    h.decide(&[Decision::Deny]);
+    let third = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", &value[1..])
+        .finish();
+    assert_eq!(third.status.code(), Some(125));
+    assert!(
+        text(&third.stderr).contains("denied"),
+        "{}",
+        text(&third.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_value_prompt_too_tall_to_read_at_once_is_refused() {
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    // The new-secret prompt lists the entry's fields: a long URL of wide
+    // characters fits the character limit but not the screen.
+    let url = format!("https://{}", "W".repeat(1800));
+    let out = h.run(&["add", "WIDE", "--url", &url]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("too tall to read at once"),
+        "{}",
+        text(&out.stderr)
+    );
+    // No dialog was shown and nothing was stored.
+    assert!(h.ui.values.lock().unwrap().is_empty());
+    assert!(!text(&h.run(&["list"]).stdout).contains("WIDE"));
 }
 
 #[test]
@@ -1982,7 +2015,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
         .env("RUSTHORSE_SOCKET", &socket)
         .stdin(Stdio::null())
         .finish();
-    fake.join().expect("fake agent");
+    within(TEST_LIMIT, move || fake.join()).expect("fake agent");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("may or may not have run"));
 }
@@ -2047,7 +2080,7 @@ fn a_malformed_result_after_the_request_is_unknown_not_did_not_run() {
         .env("RUSTHORSE_SOCKET", &socket)
         .stdin(Stdio::null())
         .finish();
-    fake.join().expect("fake");
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
 }
 
@@ -2245,10 +2278,11 @@ fn fake_import_agent(
     })
 }
 
-/// Import 60 names (two batches) through the fake agent on `socket`.
+/// Import 30 names (two batches: 24 lines of names fit in one dialog)
+/// through the fake agent on `socket`.
 fn import_two_batches(dir: &Path, socket: &Path) -> std::process::Output {
     let env_file = dir.join("many.env");
-    let lines: String = (0..60).map(|i| format!("NAME_{i:03}=value{i}\n")).collect();
+    let lines: String = (0..30).map(|i| format!("NAME_{i:03}=value{i}\n")).collect();
     std::fs::write(&env_file, lines).expect("write");
     Command::new(env!("CARGO_BIN_EXE_rusthorse"))
         .args(["import", "dotenv", env_file.to_str().expect("utf8")])
@@ -2265,7 +2299,7 @@ fn a_batch_whose_answer_is_lost_is_reported_as_unknown() {
     let socket = dir.path().join("fake.sock");
     let fake = fake_import_agent(&socket, vec![IMPORTED, None]);
     let out = import_two_batches(dir.path(), &socket);
-    fake.join().expect("fake");
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
@@ -2292,7 +2326,7 @@ fn a_batch_the_agent_cannot_confirm_is_reported_as_unknown() {
         ],
     );
     let out = import_two_batches(dir.path(), &socket);
-    fake.join().expect("fake");
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
@@ -2323,7 +2357,7 @@ fn a_batch_the_agent_refuses_or_never_receives_is_reported_as_not_imported() {
         };
         let fake = fake_import_agent(&socket, replies);
         let out = import_two_batches(dir.path(), &socket);
-        fake.join().expect("fake");
+        within(TEST_LIMIT, move || fake.join()).expect("fake");
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{stderr}");
         assert!(
@@ -2350,7 +2384,7 @@ fn a_lost_answer_is_an_unknown_outcome_only_for_requests_with_effects() {
             .env("RUSTHORSE_SOCKET", &socket)
             .stdin(Stdio::null())
             .finish();
-        fake.join().expect("fake");
+        within(TEST_LIMIT, move || fake.join()).expect("fake");
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(expected), "{args:?}: {stderr}");
         assert_eq!(
@@ -2376,7 +2410,7 @@ fn an_unknown_outcome_reported_for_a_change_exits_124() {
         .env("RUSTHORSE_SOCKET", &socket)
         .stdin(Stdio::null())
         .finish();
-    fake.join().expect("fake");
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
 }
 
@@ -2400,7 +2434,7 @@ fn an_unexpected_answer_to_run_is_an_unknown_outcome() {
             .env("RUSTHORSE_SOCKET", &socket)
             .stdin(Stdio::null())
             .finish();
-        fake.join().expect("fake");
+        within(TEST_LIMIT, move || fake.join()).expect("fake");
         assert_eq!(
             out.status.code(),
             Some(124),
@@ -2427,7 +2461,7 @@ fn an_unexpected_answer_to_a_change_is_an_unknown_outcome() {
             .env("RUSTHORSE_SOCKET", &socket)
             .stdin(Stdio::null())
             .finish();
-        fake.join().expect("fake");
+        within(TEST_LIMIT, move || fake.join()).expect("fake");
         assert_eq!(
             out.status.code(),
             Some(expected),
@@ -2472,7 +2506,7 @@ fn an_unknown_outcome_from_the_agent_exits_124() {
         .env("RUSTHORSE_SOCKET", &socket)
         .stdin(Stdio::null())
         .finish();
-    fake.join().expect("fake");
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
     assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
 }
 

@@ -542,7 +542,11 @@ impl Agent {
             self.config.vault.display(),
             peer.describe()
         );
-        if crate::util::visible(&base).chars().count() > MAX_DIALOG_CHARS - 100 {
+        // Room is kept for the "Wrong password" or "Nothing was typed" line.
+        if crate::ui::dialog_text(&base).chars().count() > MAX_DIALOG_CHARS - 100
+            || crate::ui::prompt_height(&base) + 3 * crate::ui::metrics::TEXT
+                > crate::ui::metrics::MAX_HEIGHT
+        {
             return Err(Failure::invalid(
                 "the unlock dialog would be too long to show (vault path or requester chain)",
             ));
@@ -662,17 +666,17 @@ impl Agent {
         }
         // The whole dialog, buttons included, must fit on the screen: a value
         // that wraps over many lines must not push the rest out of sight.
-        let lines = crate::ui::approval_lines(&request)
+        let height = crate::ui::approval_height(&request)
             + if request.can_remember {
-                crate::ui::REMEMBER_NOTE_LINES
+                crate::ui::REMEMBER_NOTE_HEIGHT
             } else {
                 0
             };
-        if lines > crate::ui::MAX_DIALOG_LINES {
+        if height > crate::ui::metrics::MAX_HEIGHT {
             return Err(Failure::invalid(format!(
-                "this request would make a dialog too tall to read at once (about {lines} lines, \
-                 limit {}); split it into smaller requests or shorten what it shows",
-                crate::ui::MAX_DIALOG_LINES
+                "this request would make a dialog too tall to read at once (estimated {height} \
+                 pixels, limit {}); split it into smaller requests or shorten what it shows",
+                crate::ui::metrics::MAX_HEIGHT
             )));
         }
         let decision = {
@@ -723,11 +727,19 @@ impl Agent {
         prompt: Prompt,
         event: AuditEvent,
     ) -> Result<SecretString, Failure> {
-        let length = crate::util::visible(&prompt.message).chars().count();
+        let length = crate::ui::dialog_text(&prompt.message).chars().count();
         if length > MAX_DIALOG_CHARS {
             return Err(Failure::invalid(format!(
                 "this request has too much detail to show in one dialog ({length} characters, \
                  limit {MAX_DIALOG_CHARS})"
+            )));
+        }
+        let height = crate::ui::prompt_height(&prompt.message);
+        if height > crate::ui::metrics::MAX_HEIGHT {
+            return Err(Failure::invalid(format!(
+                "this request would make a dialog too tall to read at once (estimated {height} \
+                 pixels, limit {})",
+                crate::ui::metrics::MAX_HEIGHT
             )));
         }
         let value = {

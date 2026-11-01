@@ -109,7 +109,7 @@ The boundary that matters is between **requesters** and the **agent**.
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
 | P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). | A1 |
 | P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). The one exception is `rusthorse init`, which reads the password of a *new* vault in the CLI (terminal or dialog) before any agent is involved. | A1, A2 (not on X11, L2) |
-| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field), or be too tall to read at once (60 estimated lines), are refused, never truncated; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
+| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field), or be too tall to read at once (estimated for an 11-point font), are refused, never truncated; only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. | A1, A2 |
@@ -223,11 +223,15 @@ pids can be reused, and a socket can be handed to another process, so the
 chain is informative only. A flood of requests can cause approval fatigue.
 Text the requester controls is shown literally: dialogs use formatting, but
 every value is escaped before it is placed in it, so a command line cannot
-make part of itself bold or tiny, and characters that would not show as
-themselves (line separators, invisible characters, unusual spaces, piles of
-combining marks) appear as `\u{…}` escapes. Different characters can still
-look alike (Latin `a` and Cyrillic `а`), and the requester chain is made of
-process names any program can choose — the dialog labels it "unverified".
+make part of itself bold or tiny, and only ordinary characters (ASCII, Latin
+letters, a little punctuation) are drawn as themselves: everything else —
+line separators, invisible and combining characters, other scripts such as
+the Cyrillic `а` that looks like a Latin `a`, emoji — appears as a `\u{…}`
+escape. Requests whose dialog would be too tall to read at once are refused,
+by an estimate made for an 11-point font; larger fonts or a smaller screen
+can still make a dialog taller than the screen. ASCII itself has characters
+some fonts draw alike (`l`, `I`, `1`). The requester chain is made of process
+names any program can choose — the dialog labels it "unverified".
 *Mitigation:* treat unexpected dialogs as a warning sign; deny when in doubt.
 
 ### L10 — The vault can be attacked offline
@@ -611,3 +615,23 @@ tests):
 |---|---|
 | An audit time can trail the answer while other records are being written | **Fixed (documentation).** |
 | Ideas: check the in-memory password after a cancelled `passwd`; back up to symbolic links and to a directory without write permission | **Done:** a change applied only in memory, or a followed link, makes the suite fail. |
+
+Findings of the eighteenth review, of the new approval-dialog layout (Pango
+markup; markup escaping confirmed correct, including zenity's escape
+processing; verdict: not ready until the first finding is fixed):
+
+| Finding | Disposition |
+|---|---|
+| U+2028 and U+2029 passed through unescaped and became real line breaks: a 279-character command made a dialog 1,416 pixels high, able to push the start of a command or the warnings out of sight | **Fixed**, first by escaping them, then for good by the allow-list of the nineteenth review. |
+| The `run` explanation said the secrets go only to that command (the programs it starts receive them too); "nobody sees it" overstated what `--generate` guarantees | **Fixed:** "programs it starts can use them too", "outside any sandbox"; "the value is not returned to the program that asked". |
+| Ideas: show the requester chain as unverified; test the layout with the real renderer | **Done:** "Requested by (unverified)" in every dialog. **Later:** Pango-based tests ([roadmap](roadmap.md)). |
+
+Findings of the nineteenth review (the wording and the separators confirmed
+fixed; verdict: not ready until the first two findings are fixed):
+
+| Finding | Disposition |
+|---|---|
+| The height limit counted characters: with wide ASCII, CJK, fullwidth characters or emoji, dialogs of 1,053 to 1,313 pixels passed it, against the "about 700 pixels" the documentation promised | **Fixed:** dialogs draw only ordinary characters (ASCII, Latin letters, a little punctuation), so widths are known; the height is estimated in pixels for an 11-point font, wrapping word by word, with requester text in warnings measured at the widest character; the limit is 880 pixels, and the documentation states the assumptions instead of a promise. `import` batches are sized in lines. |
+| Combining marks outside the listed blocks (U+08F0) piled up and were drawn hundreds of pixels outside their line | **Fixed:** no combining mark is drawn in a dialog any more; each is a `\u{…}` escape. |
+| U+2800 (blank Braille pattern) is drawn as nothing | **Fixed:** escaped in dialogs and refused in entry names. |
+| Coverage | Reverting each fix makes the suite fail. One mutation survives by design: shrinking the room reserved for the "Allow for" note to the two lines the note needs. Tests that waited on a fake agent without a limit now fail after 60 seconds instead of hanging. |

@@ -265,24 +265,38 @@ than a pipe, because other processes of the same user can open a pipe through
 `/proc/<pid>/fd` but not a socket. Text for the entry dialog has backslashes
 and underscores escaped. The question dialog is laid out with Pango markup —
 a headline, an explanation, one block per detail, the facts in one quieter
-line, the warnings in bold — and every string in it is first made visible
-(control and bidirectional characters shown as `\u{…}`) and then escaped, a
-backslash included, as a character reference, so a value can neither add a
-tag nor be changed by zenity's escape processing; tests check both. "Made
-visible" covers everything that would not show as itself: control
-characters, line and paragraph separators, bidirectional and other invisible
-characters, spaces other than the plain one, and combining marks stacked more
-than two deep. It uses no colour or icon of its own, only options zenity 3
-and 4 share, so it follows the desktop's theme. The password and value prompts stay plain entry dialogs,
-where Enter submits. Only an exit
+line, the warnings in bold. It uses no colour or icon of its own, only
+options zenity 3 and 4 share, so it follows the desktop's theme. The password
+and value prompts stay plain entry dialogs, where Enter submits. Only an exit
 status of 0 with no output (Allow once), or 1 with the exact label of the
-extra button (Allow for N), counts as approval. A request whose dialog text
-would exceed 4000 characters — counting the room reserved for the "Allow
-for" note — or that would be too tall to read at once is refused rather than
-shown truncated. Height is estimated, erring high (60 characters per line,
-every label and gap a full line), and limited to 60 lines, about 700 pixels
-in a typical setup, so that the whole dialog, buttons included, fits on the
-screen and a long value cannot push the rest out of sight.
+extra button (Allow for N), counts as approval.
+
+Dialogs draw only characters whose glyphs are predictable: printable ASCII,
+the letters of Latin-1 and Latin Extended-A (accented letters of European
+languages) except look-alikes of ASCII (`×`, `÷`, `ı`, `ĸ`, `ſ`), and the
+punctuation of Rusthorse's own texts. Every other character — controls, line
+and paragraph separators, invisible and combining characters, other scripts,
+emoji — is shown as a `\u{…}` escape, so nothing a requester sends can hide,
+reorder, overlap or impersonate other text, and what is drawn has a known
+width. Then `&`, `<`, `>`, quotes and the backslash become character
+references (the backslash as `&#92;`, which reads the same whether or not
+zenity processes escape sequences), so a value can neither add a tag nor be
+changed. Tests check both.
+
+A request whose dialog text would exceed 4000 characters — counting the room
+reserved for the "Allow for" note — or whose dialog would be too tall to read
+at once is refused rather than shown truncated. The height is estimated in
+pixels for an 11-point interface font at 96 DPI: details are monospaced (every
+character the same width; one outside ASCII counted twice), warnings, which
+may quote the requester, are measured as if every character were a bold "W",
+and lines are wrapped word by word as Pango does, so text built from words
+just over half a line long is counted as the line per word it really takes.
+The content may take at most 880 pixels: the dialog, its title bar and
+buttons then fit on a 1080-pixel screen under a desktop panel even when the
+estimate is exact, as it nearly is for text built to be wide; for ordinary
+dialogs the estimate is 1.4 to 1.6 times the real height. Larger fonts, a
+higher scale or a smaller screen make dialogs taller than estimated. `import`
+splits large imports into batches whose names take at most 24 lines.
 
 ## Audit log
 

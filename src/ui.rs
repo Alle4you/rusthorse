@@ -18,7 +18,7 @@ use anyhow::{Context, bail};
 use zeroize::Zeroizing;
 
 use crate::protocol::SecretString;
-use crate::util::{format_duration, visible};
+use crate::util::format_duration;
 
 /// A password-style prompt (master password or a new secret value).
 #[derive(Debug, Clone)]
@@ -157,7 +157,10 @@ impl ZenityUi {
         let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
-            .arg(format!("--text={}", entry_label(&prompt.message)))
+            .arg(format!(
+                "--text={}",
+                entry_label(&dialog_lines(&prompt.message))
+            ))
             .arg(format!("--ok-label={}", prompt.confirm));
         let (status, output) = capture_through_socket(cmd)?;
         match status {
@@ -260,20 +263,20 @@ impl Ui for ZenityUi {
 }
 
 /// The text of an approval dialog, without formatting: what the dialog says,
-/// used to measure it. Every value goes through [`visible`] so a requester
-/// cannot inject line breaks or bidirectional overrides.
+/// used to measure it. Every value goes through [`dialog_text`], as in the
+/// dialog itself.
 pub fn approval_text(request: &ApprovalRequest) -> String {
-    let mut text = visible(&request.summary);
+    let mut text = dialog_text(&request.summary);
     if !request.explanation.is_empty() {
         text.push('\n');
-        text.push_str(&visible(&request.explanation));
+        text.push_str(&dialog_text(&request.explanation));
     }
     text.push_str("\n\n");
     for (label, value) in request.details.iter().chain(&request.facts) {
-        text.push_str(&format!("{label}: {}\n", visible(value)));
+        text.push_str(&format!("{label}: {}\n", dialog_text(value)));
     }
     for warning in &request.warnings {
-        text.push_str(&format!("\n⚠ {}", visible(warning)));
+        text.push_str(&format!("\n⚠ {}", dialog_text(warning)));
     }
     text
 }
@@ -281,31 +284,155 @@ pub fn approval_text(request: &ApprovalRequest) -> String {
 /// A small vertical gap between blocks.
 const GAP: &str = "<span size=\"5000\"> </span>\n";
 
-/// Characters per line assumed when estimating a dialog's height: fewer than
-/// fit at the dialog's width with common font sizes, so the estimate errs
-/// high.
-pub const LINE_CHARS: usize = 60;
+/// Whether a character is shown as itself in a dialog. Only characters whose
+/// glyphs have an ordinary width and stay on their own line are: printable
+/// ASCII, the letters of Latin-1 and Latin Extended-A (the accented letters of
+/// European languages) except those that pass for ASCII (`×`, `÷`, `ı`, `ĸ`,
+/// `ſ`), and the punctuation of Rusthorse's own texts.
+fn shown_as_is(c: char) -> bool {
+    match c {
+        '\u{D7}' | '\u{F7}' | '\u{131}' | '\u{138}' | '\u{17F}' => false,
+        ' '..='~' | '\u{C0}'..='\u{17F}' => true,
+        '\u{B7}' | '\u{2013}' | '\u{2014}' | '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}'
+        | '\u{2026}' | '\u{2190}' | '\u{2192}' => true,
+        _ => false,
+    }
+}
 
-/// The most lines an approval dialog may take, by [`approval_lines`]. In a
-/// typical setup that is about 700 pixels, so the whole dialog — what to read
-/// and the buttons — fits on the screen, and a long value cannot push the
-/// rest out of sight.
-pub const MAX_DIALOG_LINES: usize = 60;
+/// Text as dialogs show it: every character that is not an ordinary one
+/// (printable ASCII, the letters of Latin-1 and Latin Extended-A except
+/// look-alikes of ASCII, and a little punctuation) — controls, separators,
+/// invisible and combining characters, other scripts, emoji — becomes a
+/// `\u{…}` escape. What is drawn
+/// is then predictable in width and height: it cannot hide, reorder or
+/// overlap anything, nor pass for other characters.
+pub fn dialog_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if shown_as_is(c) {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out
+}
 
-/// Lines reserved for the "Allow for" note.
-pub const REMEMBER_NOTE_LINES: usize = 1 + REMEMBER_NOTE_MAX.div_ceil(LINE_CHARS);
+/// [`dialog_text`] for a message whose line breaks are its own (requester
+/// values in it are already one line each).
+fn dialog_lines(message: &str) -> String {
+    message
+        .split('\n')
+        .map(dialog_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-/// An estimate, erring high, of the lines [`approval_markup`] takes: every
-/// gap and label counts as a full line, the headline as two, and text wraps
-/// every [`LINE_CHARS`] characters of its visible form.
-pub fn approval_lines(request: &ApprovalRequest) -> usize {
-    let lines = |text: &str| visible(text).chars().count().div_ceil(LINE_CHARS).max(1);
-    let mut total = 2 * lines(&request.summary);
+/// Text metrics for estimating a dialog's height: pixels for an 11-point
+/// interface font at 96 DPI (Mint, Ubuntu and GNOME default to 10 or 11
+/// points), each rounded so that the estimate errs high.
+pub mod metrics {
+    /// Usable width of the text: the dialog is 680 pixels wide, less its icon
+    /// and margins.
+    pub const WIDTH: usize = 560;
+    /// Advance of a monospaced character (0.6 em, 8.8 pixels).
+    pub const MONO: usize = 9;
+    /// Advance of the widest proportional character, a bold "W": used for
+    /// text that may come from the requester.
+    pub const WIDEST: usize = 15;
+    /// Advance assumed for Rusthorse's own sentences and labels (ordinary
+    /// English averages about 7 pixels).
+    pub const PROSE: usize = 9;
+    /// Height of a headline line (x-large).
+    pub const HEADLINE: usize = 28;
+    /// Height of a line of text.
+    pub const TEXT: usize = 19;
+    /// Height of a line of small text.
+    pub const SMALL: usize = 16;
+    /// Height of the gap between blocks.
+    pub const GAP: usize = 9;
+    /// The most an approval dialog's content may take: with an 11-point font,
+    /// the dialog with its title bar and buttons then fits on a screen 1080
+    /// pixels high under a desktop panel, even when the estimate is exact (as
+    /// it nearly is for text built to be wide); for ordinary dialogs it is 1.4
+    /// to 1.6 times the real height.
+    pub const MAX_HEIGHT: usize = 880;
+}
+
+/// Columns per line of text that may come from the requester, at the widest
+/// character's advance.
+const TEXT_COLUMNS: usize = metrics::WIDTH / metrics::WIDEST;
+/// Columns per line of Rusthorse's own sentences.
+const PROSE_COLUMNS: usize = metrics::WIDTH / metrics::PROSE;
+/// Columns per line of Rusthorse's own x-large headlines (1.44 times larger).
+const HEADLINE_COLUMNS: usize = metrics::WIDTH * 100 / (metrics::PROSE * 144);
+/// Columns per line of Rusthorse's own small text (0.83 times as large).
+const SMALL_COLUMNS: usize = metrics::WIDTH * 100 / (metrics::PROSE * 83);
+/// Columns of monospaced text per line.
+pub const MONO_COLUMNS: usize = metrics::WIDTH / metrics::MONO;
+
+/// Height reserved for the "Allow for" note: six lines, a margin over the two
+/// the longest note takes by the estimate (a test checks that it fits).
+pub const REMEMBER_NOTE_HEIGHT: usize = metrics::GAP + 6 * metrics::SMALL;
+
+/// Lines `text` takes when wrapped at `columns`, each character `width`
+/// columns wide. It breaks only after spaces — Pango may break at more
+/// places, which only saves lines — and anywhere in a word longer than a
+/// line, so a text made of words just over half a line long counts one line
+/// per word, as it is drawn.
+fn wrapped_lines(text: &str, columns: usize, width: fn(char) -> usize) -> usize {
+    let mut lines = 1;
+    let mut used = 0;
+    for (i, word) in text.split(' ').enumerate() {
+        let w: usize = word.chars().map(width).sum();
+        let space = usize::from(i > 0);
+        if used + space + w <= columns {
+            used += space + w;
+            continue;
+        }
+        if used > 0 {
+            lines += 1;
+        }
+        if w > columns {
+            let full = (w - 1) / columns;
+            lines += full;
+            used = w - full * columns;
+        } else {
+            used = w;
+        }
+    }
+    lines
+}
+
+/// Lines of proportional text, every character counted as the widest.
+fn text_lines(text: &str, columns: usize) -> usize {
+    wrapped_lines(&dialog_text(text), columns, |_| 1)
+}
+
+/// Lines of monospaced text, as dialogs show it; a character outside ASCII
+/// counts twice, in case the monospaced font lacks it and another, wider font
+/// draws it.
+pub fn mono_lines(text: &str) -> usize {
+    wrapped_lines(&dialog_text(text), MONO_COLUMNS, |c| {
+        if c.is_ascii() { 1 } else { 2 }
+    })
+}
+
+/// An estimate, erring high, of the height in pixels of the content of
+/// [`approval_markup`] without the "Allow for" note (see
+/// [`REMEMBER_NOTE_HEIGHT`]). The headline, explanation, labels and facts are
+/// Rusthorse's own text and measured as ordinary prose; details are
+/// monospaced; warnings may quote the requester and are measured at the
+/// widest character.
+pub fn approval_height(request: &ApprovalRequest) -> usize {
+    use metrics::{GAP, HEADLINE, SMALL, TEXT};
+    let mut height = HEADLINE * text_lines(&request.summary, HEADLINE_COLUMNS);
     if !request.explanation.is_empty() {
-        total += lines(&request.explanation);
+        height += TEXT * text_lines(&request.explanation, PROSE_COLUMNS);
     }
     for (label, value) in &request.details {
-        total += 1 + lines(label) + lines(value);
+        height += GAP + SMALL * text_lines(&label.to_uppercase(), SMALL_COLUMNS);
+        height += TEXT * mono_lines(value);
     }
     if !request.facts.is_empty() {
         let facts: Vec<String> = request
@@ -313,12 +440,22 @@ pub fn approval_lines(request: &ApprovalRequest) -> usize {
             .iter()
             .map(|(label, value)| format!("{label}: {value}"))
             .collect();
-        total += 1 + lines(&facts.join(" · "));
+        height += GAP + TEXT * text_lines(&facts.join(" · "), PROSE_COLUMNS);
     }
     for warning in &request.warnings {
-        total += 1 + lines(warning);
+        // "WW" stands for the "⚠" sign and its spaces, which are drawn as
+        // they are, not escaped.
+        height += GAP + TEXT * text_lines(&format!("WW {warning}"), TEXT_COLUMNS);
     }
-    total
+    height
+}
+
+/// An estimate, erring high, of the height in pixels of a prompt's message.
+pub fn prompt_height(message: &str) -> usize {
+    message
+        .split('\n')
+        .map(|line| metrics::TEXT * text_lines(line, TEXT_COLUMNS))
+        .sum()
 }
 
 /// The approval dialog as Pango markup: the headline, the explanation, one
@@ -373,16 +510,16 @@ pub fn approval_markup(request: &ApprovalRequest, note: Option<&str>) -> String 
     out
 }
 
-/// Text to place in Pango markup: [`visible`] first (control and format
-/// characters become `\u{…}`), then `&`, `<`, `>`, quotes and backslashes
-/// become character references, so the text can neither open a tag nor end
-/// one. A backslash is written `&#92;` rather than doubled: zenity 3 passes
+/// Text to place in Pango markup: [`dialog_text`] first (anything but
+/// ordinary characters becomes `\u{…}`), then `&`, `<`, `>`, quotes and
+/// backslashes become character references, so the text can neither open a
+/// tag nor end one. A backslash is written `&#92;` rather than doubled: zenity 3 passes
 /// markup through `g_strcompress` (which turns `\n` into a line break) before
 /// parsing it, and other versions may not; a reference reads the same either
 /// way, so the dialog shows exactly the value.
 pub fn markup_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in visible(text).chars() {
+    for c in dialog_text(text).chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -585,6 +722,8 @@ mod tests {
             r"printf 'a\nb' \\ end",
             "quote \" and ' and > and <b>bold</b>",
             "line\nbreak \u{202E}reversed",
+            // Characters `visible` keeps but dialogs must not draw.
+            "p\u{430}ypal \u{6F22}\u{8F0}\u{8F0}\u{8F0} \u{2800}",
         ];
         for value in hostile {
             let request = ApprovalRequest {
@@ -601,7 +740,7 @@ mod tests {
             };
             let markup = approval_markup(&request, Some(value));
             let text = shown(&markup);
-            let seen = visible(value);
+            let seen = dialog_text(value);
             // Every value is shown exactly, as text, everywhere it appears.
             assert_eq!(text.matches(&seen).count(), 7, "{markup}");
             assert!(text.contains(&format!("Headline {seen}")));
@@ -628,9 +767,9 @@ mod tests {
         assert!(markup.contains("&#92;u{2028}"));
         // Shown as escapes, the value is long: the estimate counts its lines.
         assert!(
-            approval_lines(&request) > 10,
+            approval_height(&request) > 8 * metrics::TEXT,
             "{}",
-            approval_lines(&request)
+            approval_height(&request)
         );
     }
 
@@ -664,12 +803,107 @@ mod tests {
             ],
             can_remember: true,
         };
-        // The longest command line a run request may have (1000 characters)
-        // still fits, with the "Allow for" note.
-        let longest = approval_lines(&request("x".repeat(1000))) + REMEMBER_NOTE_LINES;
-        assert!(longest <= MAX_DIALOG_LINES, "{longest}");
-        let short = approval_lines(&request("true".into())) + REMEMBER_NOTE_LINES;
-        assert!(short <= 40, "{short}");
+        // A long command line (800 of the 1000 characters a run request may
+        // have) fits with the "Allow for" note, whether it is made of
+        // ordinary words or is one long word.
+        let words: String =
+            "curl -sS -H 'Authorization: Bearer $TOKEN' https://api.example.com/v1/items "
+                .repeat(11)
+                .chars()
+                .take(800)
+                .collect();
+        for command in [words, "x".repeat(800)] {
+            let height = approval_height(&request(command)) + REMEMBER_NOTE_HEIGHT;
+            assert!(height <= metrics::MAX_HEIGHT, "{height}");
+        }
+        // A short one leaves room for 15 more lines of command.
+        let short = approval_height(&request("true".into())) + REMEMBER_NOTE_HEIGHT;
+        assert!(short + 15 * metrics::TEXT <= metrics::MAX_HEIGHT, "{short}");
+    }
+
+    #[test]
+    fn only_ordinary_characters_are_shown_as_themselves() {
+        assert_eq!(
+            dialog_text("ls -la ~/Documents/ação"),
+            "ls -la ~/Documents/ação"
+        );
+        assert_eq!(dialog_text("A ← B → C — “D” …"), "A ← B → C — “D” …");
+        for (raw, shown) in [
+            ("\u{2028}", "\\u{2028}"),                           // line separator
+            ("\u{8F0}", "\\u{8f0}"),                             // combining mark of any block
+            ("e\u{301}", "e\\u{301}"),                           // even a single one
+            ("\u{2800}", "\\u{2800}"),                           // blank Braille pattern
+            ("\u{6F22}", "\\u{6f22}"),                           // CJK, drawn double width
+            ("\u{FF37}", "\\u{ff37}"),                           // fullwidth W
+            ("\u{1F600}", "\\u{1f600}"),                         // emoji
+            ("p\u{430}ypal", "p\\u{430}ypal"),                   // Cyrillic a, a look-alike
+            ("\u{D7}\u{131}\u{17F}", "\\u{d7}\\u{131}\\u{17f}"), // ×, ı, ſ
+            ("\u{A0}\u{AD}", "\\u{a0}\\u{ad}"),                  // no-break space, soft hyphen
+            ("\u{7F}\u{85}", "\\u{7f}\\u{85}"),                  // controls
+        ] {
+            assert_eq!(dialog_text(raw), shown, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn wrapping_counts_the_lines_wasted_by_half_line_words() {
+        // Words one column over half a line: one word per line.
+        let half = "x".repeat(MONO_COLUMNS / 2 + 1);
+        let text = [half.as_str(); 10].join(" ");
+        assert_eq!(wrapped_lines(&text, MONO_COLUMNS, |_| 1), 10);
+        // A word longer than a line is broken anywhere.
+        let long = "x".repeat(MONO_COLUMNS * 3 + 1);
+        assert_eq!(wrapped_lines(&long, MONO_COLUMNS, |_| 1), 4);
+        assert_eq!(wrapped_lines("a b c", MONO_COLUMNS, |_| 1), 1);
+        // Characters outside ASCII count twice in monospaced text.
+        let wide = "é".repeat(MONO_COLUMNS / 2 + 1);
+        assert_eq!(mono_lines(&wide), 2);
+    }
+
+    #[test]
+    fn warnings_are_measured_at_the_widest_character() {
+        // A warning can quote the requester (an environment variable's
+        // value), so it is measured as if every character were a bold "W".
+        let request = |warning: String| ApprovalRequest {
+            title: "t".into(),
+            summary: "s".into(),
+            explanation: String::new(),
+            details: Vec::new(),
+            facts: Vec::new(),
+            warnings: vec![warning],
+            can_remember: false,
+        };
+        // One "W" fits on the sign's line; ten lines of them, one word too
+        // long for it, start on the next line.
+        let one = approval_height(&request("W".into()));
+        let ten = approval_height(&request("W".repeat(TEXT_COLUMNS * 10)));
+        assert_eq!(ten - one, 10 * metrics::TEXT);
+    }
+
+    #[test]
+    fn the_longest_remember_note_fits_its_reserved_height() {
+        let duration = Duration::from_secs(359_999);
+        let label = format!("Allow for {}", format_duration(duration));
+        let note = remember_note(&label, duration);
+        let lines = text_lines(note.trim(), SMALL_COLUMNS);
+        assert!(
+            metrics::GAP + lines * metrics::SMALL <= REMEMBER_NOTE_HEIGHT,
+            "{lines} lines"
+        );
+    }
+
+    #[test]
+    fn prompts_are_shown_and_measured_as_dialogs_show_them() {
+        let message = "Entry \"\u{6F22}\".\n\nRequested by: x";
+        assert_eq!(
+            dialog_lines(message),
+            "Entry \"\\u{6f22}\".\n\nRequested by: x"
+        );
+        assert_eq!(prompt_height(message), 3 * metrics::TEXT);
+        assert_eq!(
+            prompt_height(&"W".repeat(TEXT_COLUMNS * 2)),
+            2 * metrics::TEXT
+        );
     }
 
     #[test]

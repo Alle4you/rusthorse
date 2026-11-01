@@ -85,6 +85,11 @@ these lines:
 | **Requested by (unverified)** | Is it the AI's shell, or something unexpected? These are process names, which any program can choose, so they inform but do not prove who asked. |
 | **Warnings** | `NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND` and similar can make the program run other code. Deny unless you know why they are set. |
 
+A `\u{…}` in a dialog is one character of the request that Rusthorse does not
+draw as itself — a line break, an invisible or combining character, a letter
+of another script, an emoji. `\u{a}` is a line break; anything unexpected
+there deserves a closer look before you allow it.
+
 Be especially careful with:
 
 - **Shell one-liners** (`sh -c '…'`, `bash -c '…'`). Everything inside runs

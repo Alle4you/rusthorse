@@ -930,9 +930,10 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
 
 /// Most entries sent to the agent in one batch (each batch is one approval).
 const IMPORT_BATCH: usize = 50;
-/// Most characters of entry names in one batch, so that the approval dialog
-/// can list all of them.
-const IMPORT_BATCH_CHARS: usize = 2000;
+/// Most lines the entry names of one batch may take in the approval dialog,
+/// counting each name as if it started a line, so that the dialog lists all
+/// of them and still fits on the screen (see `ui::approval_height`).
+const IMPORT_BATCH_LINES: usize = 24;
 
 fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
     let (pairs, tags, replace) = match command {
@@ -1013,16 +1014,16 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         .collect();
     // Split into batches small enough for one dialog each.
     let mut batches: Vec<Vec<ImportedEntry>> = Vec::new();
-    let mut chars = 0;
+    let mut lines = 0;
     for item in entries {
-        let len = item.entry.name.chars().count() + 2;
+        let cost = rusthorse::ui::mono_lines(&format!("{}, ", item.entry.name));
         match batches.last_mut() {
-            Some(batch) if batch.len() < IMPORT_BATCH && chars + len <= IMPORT_BATCH_CHARS => {
-                chars += len;
+            Some(batch) if batch.len() < IMPORT_BATCH && lines + cost <= IMPORT_BATCH_LINES => {
+                lines += cost;
                 batch.push(item);
             }
             _ => {
-                chars = len;
+                lines = cost;
                 batches.push(vec![item]);
             }
         }
