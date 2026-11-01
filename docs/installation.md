@@ -38,13 +38,22 @@ Both put the binary at `~/.cargo/bin/rusthorse`. Check it with
 
 AI agents usually run commands in non-interactive shells, which on many
 distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds
-`~/.cargo/bin` to `PATH`. If `command -v rusthorse` finds nothing in the AI's
-own shell (ask it to run that), link the binary into a directory on the
-default `PATH`:
+`~/.cargo/bin` to `PATH`. Ask the AI to run `command -v rusthorse` and
+`echo "$PATH"` in its own shell. If it finds no `rusthorse`:
 
-```sh
-ln -s ~/.cargo/bin/rusthorse ~/.local/bin/rusthorse
-```
+- If that `PATH` contains `~/.local/bin`, link the binary there (`ln -s`
+  refuses to replace an existing file):
+
+  ```sh
+  mkdir -p ~/.local/bin
+  ln -s ~/.cargo/bin/rusthorse ~/.local/bin/rusthorse
+  ```
+
+  On Debian and Ubuntu, `~/.profile` adds `~/.local/bin` to `PATH` only if
+  the directory exists when you log in, so a directory you just created takes
+  effect at your next login.
+- Otherwise, give the AI the absolute path, `~/.cargo/bin/rusthorse`, in its
+  instructions file.
 
 To build without the Secret Service importer (and its D-Bus dependencies):
 

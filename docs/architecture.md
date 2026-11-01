@@ -273,8 +273,8 @@ for" note — is refused rather than shown truncated.
 
 Each decision appends one JSON object to `audit.jsonl`: time, action, outcome,
 entry names, requester chain and, for `run`, the command line and directory.
-The time is taken when the record is written, so an approval is dated when the
-human answered. Values are never logged. If a record cannot be written, approval-gated
+The time is taken from the system clock when the record is written, so an
+approval is dated just after the human answered. Values are never logged. If a record cannot be written, approval-gated
 requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 
 ## Code map

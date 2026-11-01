@@ -20,8 +20,9 @@ use crate::util::ensure_private_dir;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEvent {
     /// When the record was written, as an RFC 3339 timestamp (local time
-    /// with offset): for an approval, when the human answered, not when the
-    /// request arrived. [`AuditLog::record`] sets it.
+    /// with offset) from the system clock: for an approval, just after the
+    /// human answered, not when the request arrived. [`AuditLog::record`]
+    /// sets it.
     pub time: String,
     /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...
     pub action: String,
@@ -103,7 +104,7 @@ impl AuditLog {
     /// built when a request arrives and recorded once its outcome is known —
     /// after a dialog that may stay open for minutes — so the time it was
     /// built would misdate the decision. Stamping under the lock also keeps
-    /// the file in time order.
+    /// the times in file order — unless the system clock is set back.
     pub fn record(&self, event: &AuditEvent) -> io::Result<()> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let event = AuditEvent {
