@@ -60,6 +60,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   with an empty field asks again instead of counting as a wrong password, and
   an unlock where nothing was typed is cancelled (exit 4), not failed. Every
   cancelled or unanswered `passwd` dialog is now audited.
+- `backup` to a file that exists says so and asks for a new name, instead of
+  "File exists (os error 17)".
 
 ### Security
 

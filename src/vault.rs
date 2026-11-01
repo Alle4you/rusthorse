@@ -626,7 +626,17 @@ impl Vault {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(dest)?;
+            .open(dest)
+            .map_err(|e| {
+                VaultError::Invalid(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!(
+                        "{} already exists; a backup never replaces a file, so choose a new name",
+                        dest.display()
+                    )
+                } else {
+                    format!("cannot create the backup file {}: {e}", dest.display())
+                })
+            })?;
         let written = (|| -> Result<(), VaultError> {
             file.write_all(&bytes)?;
             file.sync_all()?;
@@ -1143,6 +1153,29 @@ mod tests {
         let problem = vault.take_cleanup_error().expect("the failure is reported");
         assert!(problem.contains("vault.kdbx.bak"), "{problem}");
         assert!(Vault::open(&path, secret("another passphrase")).is_ok());
+    }
+
+    #[test]
+    fn a_backup_never_replaces_a_file_and_says_what_to_do() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        let mut vault = Vault::create(
+            &path,
+            SecretString::new("correct horse".into()),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("create");
+        let taken = dir.path().join("taken.kdbx");
+        fs::write(&taken, b"keep me").expect("write");
+        let err = vault.backup_to(&taken).expect_err("replaced").to_string();
+        assert!(
+            err.contains("already exists") && err.contains("choose a new name"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&taken).expect("read"), b"keep me");
+        let nowhere = dir.path().join("no-such-dir").join("backup.kdbx");
+        let err = vault.backup_to(&nowhere).expect_err("created").to_string();
+        assert!(err.starts_with("cannot create the backup file"), "{err}");
     }
 
     #[test]
