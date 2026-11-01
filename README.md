@@ -189,16 +189,17 @@ limitation.
 - [Threat model](docs/threat-model.md) — what is protected, what is not, and why
 - [Protocol](docs/protocol.md) — the agent socket protocol, for client authors
 - [Architecture decision records](docs/adr/README.md)
+- [Roadmap](docs/roadmap.md) — what comes next, and why
 
 ## Roadmap
 
-- SSH agent: SSH keys stored in the vault, each signature approved, private
-  key never leaving the agent.
-- Local API proxy: clients call `http://127.0.0.1:…`, the agent adds the
-  credential header, so the key never enters the client process at all.
-- Browser integration through native messaging.
-- A small GTK interface for browsing and editing entries.
-- Packaged releases (`.deb`, static binaries) with signed checksums.
+The main direction is a **credential broker**: instead of the secret, an
+approved command receives a short-lived token that only works through
+Rusthorse, and the agent uses the real credential on its behalf — an HTTP
+proxy for APIs, an `ssh-agent` for SSH keys, then database connectors. The
+key never enters the client process at all. Also planned: an in-process
+interface instead of zenity, locking on screen lock and suspend, packaged
+releases. Details, status and reasons are in [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
 
