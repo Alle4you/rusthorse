@@ -1662,6 +1662,64 @@ fn every_unanswered_passwd_dialog_is_recorded_once_and_changes_nothing() {
 }
 
 #[test]
+fn a_request_too_tall_to_read_at_once_is_refused() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    // Line breaks in an environment value are shown as escapes: 600 of them
+    // are 3000 characters, under the character limit, but far more lines
+    // than fit on the screen.
+    let out = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", "\n".repeat(600))
+        .finish();
+    assert_eq!(out.status.code(), Some(125));
+    assert!(
+        text(&out.stderr).contains("too tall to read at once"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn the_allow_for_note_counts_toward_the_height_limit() {
+    use rusthorse::ui::{LINE_CHARS, MAX_DIALOG_LINES, REMEMBER_NOTE_LINES, approval_lines};
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::Deny]);
+    let first = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", "x")
+        .finish();
+    assert_eq!(first.status.code(), Some(125));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let base = approval_lines(&request);
+    let width = request
+        .warnings
+        .iter()
+        .find(|w| w.contains("GIT_SSH_COMMAND"))
+        .expect("warning")
+        .chars()
+        .count();
+    // Grow the warning until the dialog takes exactly the limit minus the
+    // note plus one: it fits on its own, not with the note.
+    let target = MAX_DIALOG_LINES - REMEMBER_NOTE_LINES + 1;
+    let wanted = (width.div_ceil(LINE_CHARS) + target - base - 1) * LINE_CHARS + 1;
+    let value = "x".repeat(1 + wanted - width);
+    let second = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", &value)
+        .finish();
+    assert_eq!(second.status.code(), Some(125));
+    assert!(
+        text(&second.stderr).contains(&format!("about {} lines", MAX_DIALOG_LINES + 1)),
+        "{}",
+        text(&second.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn a_wrong_or_mismatched_password_changes_nothing() {
     let h = Harness::new();
     assert!(h.run(&["unlock"]).status.success());

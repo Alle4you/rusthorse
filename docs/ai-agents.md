@@ -82,7 +82,7 @@ these lines:
 | **Program** | Is this the real tool (`/usr/bin/gh`), or something in a project or temporary directory? |
 | **Directory** | Is the agent working where I think it is? |
 | **Secrets** | Does this command need *these* secrets? An API key for a model has no business in `git push`. |
-| **Requested by** | Is it the AI's shell, or something unexpected? |
+| **Requested by (unverified)** | Is it the AI's shell, or something unexpected? These are process names, which any program can choose, so they inform but do not prove who asked. |
 | **Warnings** | `NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND` and similar can make the program run other code. Deny unless you know why they are set. |
 
 Be especially careful with:

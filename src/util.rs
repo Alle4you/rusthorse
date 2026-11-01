@@ -122,13 +122,23 @@ pub fn shell_join<S: AsRef<str>>(argv: &[S]) -> String {
         .join(" ")
 }
 
-/// Make text safe to show in a dialog: control characters (including newlines
-/// and Unicode bidirectional overrides) become visible escapes so that a
-/// requester cannot forge extra lines or reorder what the human reads.
+/// How many combining marks in a row are shown as they are; more are escaped.
+/// Two cover real text (Vietnamese stacks two); more only pile up into marks
+/// that cover the lines above and below.
+const MAX_COMBINING_MARKS: usize = 2;
+
+/// Make text safe to show in a dialog: every character that would not appear
+/// as itself becomes a visible `\u{…}` escape, so that a requester cannot
+/// forge extra lines, reorder, hide or blur what the human reads. That is
+/// control characters (including newlines), line and paragraph separators,
+/// bidirectional controls, invisible characters, spaces other than the plain
+/// space, and combining marks stacked more than two deep.
 pub fn visible(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    let mut marks = 0;
     for c in text.chars() {
-        if c.is_control() || is_format_char(c) {
+        marks = if is_combining_mark(c) { marks + 1 } else { 0 };
+        if c.is_control() || is_invisible_or_layout(c) || marks > MAX_COMBINING_MARKS {
             out.extend(c.escape_unicode());
         } else {
             out.push(c);
@@ -137,15 +147,40 @@ pub fn visible(text: &str) -> String {
     out
 }
 
-/// Unicode "format" characters that change how text is displayed without being
-/// visible themselves (bidi overrides and isolates, zero-width characters).
-fn is_format_char(c: char) -> bool {
+/// Characters that are not shown as themselves: Unicode's
+/// Default_Ignorable_Code_Point set (zero-width characters, bidirectional
+/// controls, variation selectors, tags, fillers), the other format (Cf)
+/// characters, the line and paragraph separators, and spaces that look like
+/// a plain space but are not one.
+fn is_invisible_or_layout(c: char) -> bool {
     matches!(c,
-        '\u{200B}'..='\u{200F}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{2069}'
-        | '\u{FEFF}'
+        // Default_Ignorable_Code_Point (Unicode 15).
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}'
+        | '\u{17B4}'..='\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}'
+        // Other format characters.
+        | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        // Line and paragraph separators: real line breaks for the renderer.
+        | '\u{2028}' | '\u{2029}'
+        // Spaces other than U+0020.
+        | '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}'
+        | '\u{3000}'
+    )
+}
+
+/// Combining marks of the blocks where they are commonly stacked.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036F}' | '\u{0483}'..='\u{0489}' | '\u{0591}'..='\u{05BD}'
+        | '\u{05BF}' | '\u{05C1}'..='\u{05C2}' | '\u{05C4}'..='\u{05C5}' | '\u{05C7}'
+        | '\u{0610}'..='\u{061A}' | '\u{064B}'..='\u{065F}' | '\u{0670}'
+        | '\u{06D6}'..='\u{06DC}' | '\u{06DF}'..='\u{06E4}' | '\u{06E7}'..='\u{06E8}'
+        | '\u{06EA}'..='\u{06ED}' | '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}'
+        | '\u{20D0}'..='\u{20FF}' | '\u{FE20}'..='\u{FE2F}'
     )
 }
 
@@ -236,6 +271,29 @@ mod tests {
         assert_eq!(visible("a\nb"), "a\\u{a}b");
         assert_eq!(visible("x\u{202E}y"), "x\\u{202e}y");
         assert_eq!(visible("plain ção"), "plain ção");
+    }
+
+    #[test]
+    fn visible_escapes_what_would_not_show_as_itself() {
+        // Line and paragraph separators would be real line breaks.
+        assert_eq!(visible("a\u{2028}b\u{2029}c"), "a\\u{2028}b\\u{2029}c");
+        // Invisible characters: variation selector, tag, soft hyphen, filler.
+        assert_eq!(
+            visible("a\u{FE0F}b\u{E0041}c\u{AD}d\u{3164}e"),
+            "a\\u{fe0f}b\\u{e0041}c\\u{ad}d\\u{3164}e"
+        );
+        // Spaces that look like a plain one.
+        assert_eq!(
+            visible("a\u{A0}b\u{2002}c\u{3000}d"),
+            "a\\u{a0}b\\u{2002}c\\u{3000}d"
+        );
+        assert_eq!(visible("a b"), "a b");
+        // Up to two combining marks stay (Vietnamese "ệ"); a pile does not.
+        assert_eq!(visible("e\u{323}\u{302}"), "e\u{323}\u{302}");
+        assert_eq!(
+            visible("e\u{301}\u{301}\u{301}\u{301}x\u{301}"),
+            "e\u{301}\u{301}\\u{301}\\u{301}x\u{301}"
+        );
     }
 
     #[test]

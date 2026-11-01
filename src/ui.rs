@@ -281,6 +281,46 @@ pub fn approval_text(request: &ApprovalRequest) -> String {
 /// A small vertical gap between blocks.
 const GAP: &str = "<span size=\"5000\"> </span>\n";
 
+/// Characters per line assumed when estimating a dialog's height: fewer than
+/// fit at the dialog's width with common font sizes, so the estimate errs
+/// high.
+pub const LINE_CHARS: usize = 60;
+
+/// The most lines an approval dialog may take, by [`approval_lines`]. In a
+/// typical setup that is about 700 pixels, so the whole dialog — what to read
+/// and the buttons — fits on the screen, and a long value cannot push the
+/// rest out of sight.
+pub const MAX_DIALOG_LINES: usize = 60;
+
+/// Lines reserved for the "Allow for" note.
+pub const REMEMBER_NOTE_LINES: usize = 1 + REMEMBER_NOTE_MAX.div_ceil(LINE_CHARS);
+
+/// An estimate, erring high, of the lines [`approval_markup`] takes: every
+/// gap and label counts as a full line, the headline as two, and text wraps
+/// every [`LINE_CHARS`] characters of its visible form.
+pub fn approval_lines(request: &ApprovalRequest) -> usize {
+    let lines = |text: &str| visible(text).chars().count().div_ceil(LINE_CHARS).max(1);
+    let mut total = 2 * lines(&request.summary);
+    if !request.explanation.is_empty() {
+        total += lines(&request.explanation);
+    }
+    for (label, value) in &request.details {
+        total += 1 + lines(label) + lines(value);
+    }
+    if !request.facts.is_empty() {
+        let facts: Vec<String> = request
+            .facts
+            .iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect();
+        total += 1 + lines(&facts.join(" · "));
+    }
+    for warning in &request.warnings {
+        total += 1 + lines(warning);
+    }
+    total
+}
+
 /// The approval dialog as Pango markup: the headline, the explanation, one
 /// block per detail (a small label over a monospaced value), the facts in one
 /// quieter line, the warnings in bold and the "Allow for" note, if any.
@@ -567,6 +607,69 @@ mod tests {
             assert!(text.contains(&format!("Headline {seen}")));
             assert!(text.contains(&format!("⚠  {seen}")));
         }
+    }
+
+    #[test]
+    fn a_line_separator_cannot_stretch_the_dialog() {
+        let request = ApprovalRequest {
+            title: "t".into(),
+            summary: "Run a command with your secrets?".into(),
+            explanation: String::new(),
+            details: vec![(
+                "Command".into(),
+                format!("printf '{}'", "\u{2028}".repeat(60)),
+            )],
+            facts: Vec::new(),
+            warnings: Vec::new(),
+            can_remember: false,
+        };
+        let markup = approval_markup(&request, None);
+        assert!(!markup.contains('\u{2028}'));
+        assert!(markup.contains("&#92;u{2028}"));
+        // Shown as escapes, the value is long: the estimate counts its lines.
+        assert!(
+            approval_lines(&request) > 10,
+            "{}",
+            approval_lines(&request)
+        );
+    }
+
+    #[test]
+    fn a_typical_run_dialog_leaves_room_for_a_long_command() {
+        let chain = "rusthorse[3564435] ← codex[3564163] ← claude[2728718] ← bash[2728357] \
+                     ← gnome-terminal-[2616696] ← systemd[1231]";
+        let request = |command: String| ApprovalRequest {
+            title: "t".into(),
+            summary: "Run a command with your secrets?".into(),
+            explanation: "Rusthorse runs it as you, outside any sandbox, with the secrets in \
+                          its environment; programs it starts can use them too. Read the \
+                          command before you allow it."
+                .into(),
+            details: vec![
+                ("Command".into(), command),
+                (
+                    "Secrets".into(),
+                    "OPENAI_API_KEY ← OPENAI_API_KEY (2a8f40e5)".into(),
+                ),
+                ("Program".into(), "/usr/bin/dash (sh)".into()),
+                ("Directory".into(), "/home/someone/dev/project".into()),
+                ("Requested by (unverified)".into(), chain.into()),
+            ],
+            facts: vec![
+                ("Input".into(), "none (/dev/null)".into()),
+                ("Output".into(), "secret values are redacted".into()),
+            ],
+            warnings: vec![
+                "These variables can change what the program executes: GIT_SSH_COMMAND=ssh".into(),
+            ],
+            can_remember: true,
+        };
+        // The longest command line a run request may have (1000 characters)
+        // still fits, with the "Allow for" note.
+        let longest = approval_lines(&request("x".repeat(1000))) + REMEMBER_NOTE_LINES;
+        assert!(longest <= MAX_DIALOG_LINES, "{longest}");
+        let short = approval_lines(&request("true".into())) + REMEMBER_NOTE_LINES;
+        assert!(short <= 40, "{short}");
     }
 
     #[test]

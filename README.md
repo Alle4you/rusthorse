@@ -18,17 +18,26 @@ $ rusthorse add OPENAI_API_KEY --url https://api.openai.com --tag ai
 OPENAI_API_KEY added                       # you typed the value in a dialog
 
 $ rusthorse run OPENAI_API_KEY -- python summarize.py
-┌ Rusthorse — use a secret ────────────────────────────────────────┐
-│ Run this command with the secrets below in its environment?      │
-│ Command:      python summarize.py                                │
-│ Program:      /home/me/project/.venv/bin/python → /usr/bin/python3.12 │
-│ Directory:    /home/me/project                                   │
-│ Secrets:      OPENAI_API_KEY ← OPENAI_API_KEY                    │
-│ Output:       secret values are redacted                         │
-│ Runs:         as you, outside any sandbox the requester may be in│
-│ Requested by: rusthorse[8812] ← bash[8790] ← claude[4120]        │
-│                                       [ Deny ]  [ Allow once ]   │
-└──────────────────────────────────────────────────────────────────┘
+┌ Rusthorse — use a secret ────────────────────────────────────────────┐
+│ Run a command with your secrets?                                     │
+│ Rusthorse runs it as you, outside any sandbox, with the secrets in   │
+│ its environment; programs it starts can use them too. Read the       │
+│ command before you allow it.                                         │
+│                                                                      │
+│ COMMAND                                                              │
+│ python summarize.py                                                  │
+│ SECRETS                                                              │
+│ OPENAI_API_KEY ← OPENAI_API_KEY (2a8f40e5)                           │
+│ PROGRAM                                                              │
+│ /home/me/project/.venv/bin/python → /usr/bin/python3.12              │
+│ DIRECTORY                                                            │
+│ /home/me/project                                                     │
+│ REQUESTED BY (UNVERIFIED)                                            │
+│ rusthorse[8812] ← bash[8790] ← claude[4120]                          │
+│                                                                      │
+│ Input: none (/dev/null) · Output: secret values are redacted         │
+│                                           [ Deny ]  [ Allow once ]   │
+└──────────────────────────────────────────────────────────────────────┘
 Summary written to out.md
 ```
 

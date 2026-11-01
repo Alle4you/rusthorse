@@ -538,7 +538,7 @@ impl Agent {
             state.generation
         };
         let base = format!(
-            "Type the master password to unlock the Rusthorse vault.\n\nVault: {}\nRequested by: {}",
+            "Type the master password to unlock the Rusthorse vault.\n\nVault: {}\nRequested by (unverified): {}",
             self.config.vault.display(),
             peer.describe()
         );
@@ -660,6 +660,21 @@ impl Agent {
                  limit {MAX_DIALOG_CHARS}); split it into smaller requests"
             )));
         }
+        // The whole dialog, buttons included, must fit on the screen: a value
+        // that wraps over many lines must not push the rest out of sight.
+        let lines = crate::ui::approval_lines(&request)
+            + if request.can_remember {
+                crate::ui::REMEMBER_NOTE_LINES
+            } else {
+                0
+            };
+        if lines > crate::ui::MAX_DIALOG_LINES {
+            return Err(Failure::invalid(format!(
+                "this request would make a dialog too tall to read at once (about {lines} lines, \
+                 limit {}); split it into smaller requests or shorten what it shows",
+                crate::ui::MAX_DIALOG_LINES
+            )));
+        }
         let decision = {
             let _dialog = self.dialog()?;
             self.ui.approve(&request)?
@@ -766,14 +781,14 @@ impl Agent {
                 let request = ApprovalRequest {
                     title: "Rusthorse — generate a secret".into(),
                     summary: format!("{verb} an entry with a generated value?"),
-                    explanation: "Rusthorse creates a random value and stores it. Nobody sees it, \
-                                  not even the program that asked."
+                    explanation: "Rusthorse creates a random value and stores it. The value is \
+                                  not returned to the program that asked."
                         .into(),
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
                         ("Value".into(), describe_spec(spec)),
-                        ("Requested by".into(), peer.describe()),
+                        ("Requested by (unverified)".into(), peer.describe()),
                     ],
                     facts: Vec::new(),
                     warnings: if exists {
@@ -788,7 +803,7 @@ impl Agent {
             }
             (None, None) => {
                 let message = format!(
-                    "Type the secret value for the entry \"{}\"{}.\n\nFields: {}\nRequested by: {}",
+                    "Type the secret value for the entry \"{}\"{}.\n\nFields: {}\nRequested by (unverified): {}",
                     util::visible(&entry.name),
                     if exists {
                         " (it replaces the current value)"
@@ -815,7 +830,7 @@ impl Agent {
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
-                        ("Requested by".into(), peer.describe()),
+                        ("Requested by (unverified)".into(), peer.describe()),
                     ],
                     facts: Vec::new(),
                     warnings: if exists {
@@ -886,7 +901,7 @@ impl Agent {
             };
             details.push((label.into(), list_names(&existing)));
         }
-        details.push(("Requested by".into(), peer.describe()));
+        details.push(("Requested by (unverified)".into(), peer.describe()));
         let request = ApprovalRequest {
             title: "Rusthorse — import secrets".into(),
             summary: format!("Import {} secrets?", entries.len()),
@@ -942,7 +957,7 @@ impl Agent {
         {
             let mut details = vec![("Entry".into(), current.identity())];
             details.extend(describe_changes(&changes));
-            details.push(("Requested by".into(), peer.describe()));
+            details.push(("Requested by (unverified)".into(), peer.describe()));
             let request = ApprovalRequest {
                 title: "Rusthorse — change an entry".into(),
                 summary: "Change an entry?".into(),
@@ -963,7 +978,7 @@ impl Agent {
                 let prompt = Prompt {
                     title: "Rusthorse — new value".into(),
                     message: format!(
-                        "Type the new secret value for the entry \"{}\".\n\nRequested by: {}",
+                        "Type the new secret value for the entry \"{}\".\n\nRequested by (unverified): {}",
                         util::visible(&current.identity()),
                         peer.describe()
                     ),
@@ -993,7 +1008,7 @@ impl Agent {
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Group".into(), info.group.clone().unwrap_or_else(|| "(root)".into())),
-                ("Requested by".into(), peer.describe()),
+                ("Requested by (unverified)".into(), peer.describe()),
             ],
             facts: Vec::new(),
             warnings: vec!["This cannot be undone (the previous file is kept as vault.kdbx.bak until the next save).".into()],
@@ -1019,7 +1034,10 @@ impl Agent {
         let ask = |message: &str| -> Result<SecretString, Failure> {
             let prompt = Prompt {
                 title: "Rusthorse — change the master password".into(),
-                message: format!("{message}\n\nRequested by: {}", peer.describe()),
+                message: format!(
+                    "{message}\n\nRequested by (unverified): {}",
+                    peer.describe()
+                ),
                 confirm: "Next".into(),
             };
             let answer = {
@@ -1104,7 +1122,7 @@ impl Agent {
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Reveals".into(), what.into()),
-                ("Requested by".into(), peer.describe()),
+                ("Requested by (unverified)".into(), peer.describe()),
             ],
             facts: Vec::new(),
             warnings: vec![format!(
@@ -1289,8 +1307,9 @@ impl Agent {
         let request = ApprovalRequest {
             title: "Rusthorse — use a secret".into(),
             summary: "Run a command with your secrets?".into(),
-            explanation: "Read the command before you allow it. The secrets go only to this \
-                          command, in its environment."
+            explanation: "Rusthorse runs it as you, outside any sandbox, with the secrets in its \
+                          environment; programs it starts can use them too. Read the command \
+                          before you allow it."
                 .into(),
             details: vec![
                 ("Command".into(), command_line),
@@ -1305,7 +1324,7 @@ impl Agent {
                 ),
                 ("Program".into(), program_text),
                 ("Directory".into(), run.cwd.clone()),
-                ("Requested by".into(), peer.describe()),
+                ("Requested by (unverified)".into(), peer.describe()),
             ],
             facts: vec![
                 ("Input".into(), input.into()),
@@ -1316,10 +1335,6 @@ impl Agent {
                     } else {
                         "not redacted".into()
                     },
-                ),
-                (
-                    "Runs".into(),
-                    "as you, outside any sandbox the requester may be in".into(),
                 ),
             ],
             warnings,

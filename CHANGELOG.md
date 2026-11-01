@@ -67,7 +67,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   quieter line and warnings in bold. They follow the desktop's light or dark
   theme (no colours or icons of their own) and use only options that zenity 3
   and 4 share. Values are escaped before formatting, so they are shown
-  literally. The password prompts are worded more clearly.
+  literally. The password prompts are worded more clearly, and the requester
+  chain is labelled "unverified".
+- Dialogs show as `\u{…}` escapes every character that would not appear as
+  itself — line and paragraph separators, invisible and format characters,
+  spaces other than the plain one, combining marks stacked more than two
+  deep — and refuse requests too tall to read at once (60 estimated lines),
+  so a long or crafted value cannot push the rest of a dialog out of sight.
 
 ### Security
 

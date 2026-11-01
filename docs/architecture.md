@@ -268,14 +268,21 @@ a headline, an explanation, one block per detail, the facts in one quieter
 line, the warnings in bold — and every string in it is first made visible
 (control and bidirectional characters shown as `\u{…}`) and then escaped, a
 backslash included, as a character reference, so a value can neither add a
-tag nor be changed by zenity's escape processing; tests check both. It uses
-no colour or icon of its own, only options zenity 3 and 4 share, so it follows
-the desktop's theme. The password and value prompts stay plain entry dialogs,
+tag nor be changed by zenity's escape processing; tests check both. "Made
+visible" covers everything that would not show as itself: control
+characters, line and paragraph separators, bidirectional and other invisible
+characters, spaces other than the plain one, and combining marks stacked more
+than two deep. It uses no colour or icon of its own, only options zenity 3
+and 4 share, so it follows the desktop's theme. The password and value prompts stay plain entry dialogs,
 where Enter submits. Only an exit
 status of 0 with no output (Allow once), or 1 with the exact label of the
 extra button (Allow for N), counts as approval. A request whose dialog text
 would exceed 4000 characters — counting the room reserved for the "Allow
-for" note — is refused rather than shown truncated.
+for" note — or that would be too tall to read at once is refused rather than
+shown truncated. Height is estimated, erring high (60 characters per line,
+every label and gap a full line), and limited to 60 lines, about 700 pixels
+in a typical setup, so that the whole dialog, buttons included, fits on the
+screen and a long value cannot push the rest out of sight.
 
 ## Audit log
 
