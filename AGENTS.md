@@ -20,8 +20,10 @@ Read before changing anything: [README.md](README.md),
 
 - **Repository content is in English**: code, comments, CLI messages, docs,
   commit messages. (The maintainer may write to you in Portuguese.)
-- **Commit locally only.** Never push, tag, publish or open a pull request
-  without the maintainer's explicit approval.
+- **Commit locally only.** Never push, tag, publish, or open an issue or a
+  pull request without the maintainer's explicit approval.
+- **Security problems** follow [SECURITY.md](SECURITY.md). Never publish vault
+  files, audit logs or command lines that may contain secrets.
 - **Never touch the maintainer's real vault or agent.** Do not open the vault
   file (default `~/.local/share/rusthorse/vault.kdbx`) or its `.bak`, do not
   connect to the running agent's socket (`$XDG_RUNTIME_DIR/rusthorse/`), do
@@ -64,11 +66,14 @@ deprecated in newer releases whose replacements 1.89 lacks (for example
 
 Breaking one of these is a security bug, whatever the tests say.
 
-1. **Only the agent handles secret values.** The CLI holds one only when the
-   user supplied it (`--stdin`) or asked for it (`reveal`).
-2. **Never** log, print, audit or put in an error message a secret value, the
-   master password or notes. Keep secrets in `Zeroizing` types; never `Debug`
-   a structure that contains one.
+1. **Only the agent handles secrets taken from the vault.** The CLI holds a
+   secret only when the user supplies one — `init` (the new master password),
+   `add --stdin`, `import` (values read from a `.env` file or the Secret
+   Service, sent to the agent) — or asked for one: `reveal`, after approval.
+2. **Never** log, audit or put in an error message a secret value, the master
+   password or notes; the only place a value is printed is `reveal`'s output.
+   Keep secrets in `Zeroizing` types; never `Debug` a structure that contains
+   one.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
 4. **Dialogs are shown by the agent**, never by the client. Default button
@@ -80,17 +85,21 @@ Breaking one of these is a security bug, whatever the tests say.
    `\u{…}`. Never truncate what the human approves: refuse a request whose
    dialog is too long or too tall (`MAX_DIALOG_CHARS`, `MAX_DETAIL_CHARS`,
    `ui::metrics::MAX_HEIGHT`).
-6. **Dialogs work on any desktop**: pass only zenity options that zenity 3
-   and 4 both have (no `--icon-name`), and use no colours or icons of our own.
+6. **Dialogs stay portable**: pass only zenity options that zenity 3 and 4
+   both have (no `--icon-name`), and use no colours or icons of our own, so
+   they follow the desktop's theme. Verified on zenity 3.44, dark and light.
 7. **Error contract** (protocol 3): every error other than `outcome_unknown`
    means the vault file was not changed and no command was started. Clients
    treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
    outcome unknown (any request with effects), `125` `run` did not start, `4`
-   denied, cancelled or timed out, `1` other errors.
+   an agent dialog was denied, cancelled or not answered, `1` other errors.
+   A command started by `run` can exit with 124 or 125 itself; a `rusthorse:`
+   message tells them apart.
 8. **Protocol changes**: removing or changing the meaning of a field or error
    code — including what an error guarantees — or changing framing bumps
    `PROTOCOL_VERSION` ([docs/protocol.md](docs/protocol.md#compatibility)).
-   Unknown optional fields are left out, never sent as `null`.
+   A field added to an existing message is optional and left out when there
+   is no value: older clients may not accept `null` for it.
 9. **`unsafe` is denied crate-wide.** If unavoidable: the smallest possible
    function, a `// SAFETY:` comment, and say so in the commit message.
 10. **New dependencies need a reason** in the commit message.
@@ -100,8 +109,10 @@ Breaking one of these is a security bug, whatever the tests say.
 1. **Understand first**: read the code and the docs it affects.
 2. **Test every behaviour change.** A policy change gets an end-to-end test in
    `tests/agent.rs` showing the allowed and the denied path.
-3. **Prove each fix with a mutation check**: revert the fix, see a test fail,
-   restore it. A fix no test catches is not done.
+3. **Prove each fix with a mutation check**, on a temporary copy of the
+   repository: revert the fix, see a test fail. A fix no test catches is not
+   done; a surviving mutation that is harmless by design is recorded as such
+   in the review history.
 4. **Update the docs in the same commit** — see the table below.
 5. **Run the checks.**
 6. **Get an independent review** at each checkpoint (the maintainer uses a
@@ -144,14 +155,13 @@ not guaranteed.
 
 ## Trying it by hand
 
-- After changing the agent, reinstall and restart it, then check:
-  `cargo install --locked --path . && systemctl --user restart
-  rusthorse-agent && rusthorse doctor`. `doctor` fails while the agent still
-  runs a replaced binary.
-- Restarting the agent locks the vault.
-- To check a dialog visually (maintainer present), show the real dialog and
-  capture only its window; check a dark and a light theme
-  (`GTK_THEME=Adwaita`).
+Only when the maintainer asks for it. Install as in
+[docs/installation.md](docs/installation.md); after changing the agent,
+restart it (`systemctl --user restart rusthorse-agent`, which locks the vault)
+and run `rusthorse doctor`, which fails while the agent still runs a replaced
+binary. To check a dialog's look, show the real dialog with the maintainer
+present and capture only its window, in a dark and a light theme
+(`GTK_THEME=Adwaita`).
 
 ## Where things are
 

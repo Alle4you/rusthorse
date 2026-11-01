@@ -35,16 +35,20 @@ the real credential on the client's behalf.
    - a destination (host and port, or a database or SSH target);
    - optionally methods and paths (`GET` only, `/v1/models` only);
    - an expiry (minutes) and a maximum number of uses;
-   - the approved command: it dies with the command's process group unless
-     the human approved a longer lifetime.
+   - the approved command: it is revoked when the command ends, unless the
+     human approved a longer lifetime; while it runs, the broker can also
+     require each connection to come from one of the command's own processes
+     (peer credentials), so that a copy of the token is useless elsewhere.
 2. **The broker checks the token on every use** and refuses anything outside
    its scope. `rusthorse lock` revokes every token at once.
 3. **The broker listens on a private Unix socket** (mode `0600`, same-user
    peer check, as the agent's socket does today). A loopback TCP port is
    offered only to clients that cannot use a Unix socket, and still requires
    the token.
-4. **Every use is audited**: the token, the entry, and what was done with it
-   (`POST api.openai.com/v1/chat/completions`), not only "a command ran".
+4. **Every use is audited** under the grant's public identifier — never the
+   token itself, which is a bearer credential — with the entry and what was
+   done (`POST api.openai.com/v1/chat/completions`), not only "a command
+   ran".
 5. **The dialog says what the token allows**: "This command may call
    **api.openai.com** for 10 minutes", instead of "this command receives the
    key".
@@ -73,11 +77,12 @@ acting as a proxy over plain HTTP locally and injecting headers, with TLS to
 the upstream (its `forceSSL`, on by default since 2.0).
 
 It deliberately performs **no client authentication**: any process that can
-reach its port gets an authenticated session, so it relies on network
-isolation (a sidecar in a pod). On a desktop, where every program of the user
-could reach a local port, that is not enough. Rusthorse adds what is missing
-there: a human approval per use and tokens that are scoped, short-lived and
-tied to the approved command.
+reach its listener gets an authenticated session, so access to the listener
+must be isolated (in its deployments, a sidecar sharing a pod's network
+namespace). On a desktop, where every program of the user can reach a local
+port, that is not enough. Rusthorse adds what is missing there: a human
+approval per use and tokens that are scoped, short-lived and revoked with the
+approved command.
 
 ### Limits
 
@@ -92,10 +97,26 @@ tied to the approved command.
   program, a signing key used offline — still need `run`, which stays as the
   general fallback.
 
+### Questions the ADR must answer
+
+- **Revocation of open sessions**: does revoking or expiring a token end
+  database sessions and HTTP streams already open, or only refuse new ones?
+- **Counting uses atomically**, so that concurrent requests cannot exceed the
+  limit.
+- **HTTP routing**: redirects (never followed with the credential unless the
+  new destination is in scope, checked at every hop), path normalisation,
+  duplicate headers, the destination resolved and pinned by the broker.
+- **Binding to the command**: whether to require peer credentials from the
+  command's process group, and what happens with programs that hand
+  connections to helpers.
+- **SSH**: binding signatures to a destination (OpenSSH's session binding and
+  destination constraints), since the basic agent protocol does not say what a
+  signature is for.
+
 ### Steps
 
-1. ADR and threat-model update (token format, scope, lifetime, revocation,
-   audit, dialog wording).
+1. ADR and threat-model update (token format, grant identifier, scope,
+   lifetime, revocation, audit, dialog wording, the questions above).
 2. HTTP connector with provider presets; `rusthorse run --broker` (name to be
    decided) chooses the broker over environment injection.
 3. `ssh-agent`.

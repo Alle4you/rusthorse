@@ -73,8 +73,9 @@ And check the following by hand:
 - Keep secret material in `Zeroizing` types where practical, and do not
   `Debug`-print structures that contain it.
 - Anything a requester controls that appears in a dialog must go through
-  `util::visible`, and a request whose dialog would not show everything must
-  be refused — never truncate what the human approves.
+  `ui::dialog_text` (in markup, `ui::markup_text`), and a request whose dialog
+  would be too long or too tall must be refused — never truncate what the
+  human approves. `util::visible` is for validating names, not for dialogs.
 - Approval-gated actions must record an audit event *before* acting and fail
   closed if they cannot.
 - `unsafe` code is denied crate-wide. If it is unavoidable, confine it to the
