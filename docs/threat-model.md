@@ -160,6 +160,12 @@ The default button is **Deny** and dialogs time out, which only helps against
 accidents. This is the most important limitation on X11 desktops such as
 Cinnamon and MATE.
 
+Wayland does not close every path: dialogs expose their buttons through the
+accessibility API (AT-SPI) so that screen readers work, and a program of the
+same user that can reach the accessibility bus can activate them on X11 and
+Wayland alike. zenity's GTK 3 dialogs do so today, and so will the dialog
+program of [ADR 0006](adr/0006-own-dialog-program.md).
+
 ### L3 — The environment of a running approved command is readable
 
 While an approved command runs, any process of the same user can read

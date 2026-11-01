@@ -90,6 +90,8 @@ Breaking one of these is a security bug, whatever the tests say.
 6. **Dialogs stay portable**: pass only zenity options that zenity 3 and 4
    both have (no `--icon-name`), and use no colours or icons of our own, so
    they follow the desktop's theme. Verified on zenity 3.44, dark and light.
+   The planned dialog program ([ADR 0006](docs/adr/0006-own-dialog-program.md))
+   uses libadwaita's styles and only the theme's standard icons.
 7. **Error contract** (protocol 3): every error other than `outcome_unknown`
    means the vault file was not changed and no command was started. Clients
    treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
