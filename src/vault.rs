@@ -34,6 +34,9 @@ pub const FIELD_HOST: &str = "Host";
 /// Custom KDBX field holding the port.
 pub const FIELD_PORT: &str = "Port";
 
+/// Shown instead of a title that the KeePass file marks as protected.
+pub const PROTECTED_TITLE: &str = "[protected title]";
+
 /// Vault files larger than this are refused before anything is decrypted.
 pub const MAX_VAULT_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -158,12 +161,20 @@ impl Fingerprint {
     }
 }
 
+/// A test hook run during a save.
+#[cfg(test)]
+type SaveHook = Box<dyn FnOnce(&Path) + Send>;
+
 /// An unlocked vault.
 pub struct Vault {
     db: Database,
     path: PathBuf,
     password: SecretString,
     fingerprint: Option<Fingerprint>,
+    /// Test hook: runs after the new file is written, before it replaces the
+    /// old one (simulates another program saving at that moment).
+    #[cfg(test)]
+    before_rename: Option<SaveHook>,
 }
 
 impl std::fmt::Debug for Vault {
@@ -194,6 +205,8 @@ impl Vault {
             path: path.to_path_buf(),
             password,
             fingerprint: None,
+            #[cfg(test)]
+            before_rename: None,
         };
         vault.write_file(false)?;
         Ok(vault)
@@ -228,6 +241,8 @@ impl Vault {
             path: path.to_path_buf(),
             password,
             fingerprint: Some(fingerprint),
+            #[cfg(test)]
+            before_rename: None,
         })
     }
 
@@ -289,6 +304,10 @@ impl Vault {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = self.before_rename.take() {
+            hook(&self.path);
+        }
         // Check again right before replacing the file: serializing and the
         // KDF take a while, and another program may have saved meanwhile.
         // This narrows the window; it cannot close it against writers that do
@@ -362,7 +381,12 @@ impl Vault {
                 if self.in_recycle_bin(group) {
                     return None;
                 }
-                let title = e.get_title().unwrap_or_default().to_string();
+                // A protected title is treated as secret: it is neither shown
+                // nor matched by name (the entry is still reachable by UUID).
+                let title = match e.fields.get(fields::TITLE) {
+                    Some(v) if !v.is_protected() => v.get().clone(),
+                    _ => String::new(),
+                };
                 Some((e.id(), title, self.group_path(group)))
             })
             .collect()
@@ -373,10 +397,15 @@ impl Vault {
     /// path of another entry — is ambiguous.
     pub fn find(&self, name: &str) -> Result<EntryId, VaultError> {
         let entries = self.entries();
+        // An entry's UUID always identifies it unambiguously.
+        if let Some((id, _, _)) = entries.iter().find(|(id, _, _)| id.to_string() == name) {
+            return Ok(*id);
+        }
         let matches: Vec<&(EntryId, String, Vec<String>)> = entries
             .iter()
             .filter(|(_, title, group)| {
-                title == name || (name.contains('/') && display_path(group, title) == name)
+                !title.is_empty()
+                    && (title == name || (name.contains('/') && display_path(group, title) == name))
             })
             .collect();
         match matches.as_slice() {
@@ -421,6 +450,14 @@ impl Vault {
         let url = text(fields::URL);
         let host = text(FIELD_HOST);
         let port = text(FIELD_PORT).and_then(|p| p.trim().parse().ok());
+        let name = match entry.fields.get(fields::TITLE) {
+            Some(v) if v.is_protected() => {
+                protected_fields.insert(0, fields::TITLE.to_string());
+                PROTECTED_TITLE.to_string()
+            }
+            Some(v) => v.get().clone(),
+            None => String::new(),
+        };
         let group = self.group_path(entry.parent().id());
         let mut other_fields: Vec<String> = entry
             .fields
@@ -431,7 +468,7 @@ impl Vault {
         other_fields.sort();
         EntryInfo {
             id: id.to_string(),
-            name: entry.get_title().unwrap_or_default().to_string(),
+            name,
             group: (!group.is_empty()).then(|| group.join("/")),
             fields: EntryFields {
                 username,
@@ -574,6 +611,22 @@ impl Vault {
         }
         e.times.last_modification = Some(Times::now());
         Ok(())
+    }
+
+    /// Run `f`, undoing every change it made to the database if it fails, so
+    /// that a batch is applied completely or not at all.
+    pub fn transaction<R, E>(
+        &mut self,
+        f: impl FnOnce(&mut Vault) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let before = self.db.clone();
+        match f(self) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                self.db = before;
+                Err(e)
+            }
+        }
     }
 
     /// Delete an entry permanently, recording the deletion (KeePass
@@ -861,6 +914,28 @@ mod tests {
     }
 
     #[test]
+    fn a_save_by_another_program_during_our_save_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        vault
+            .add(&entry("ours"), &secret("abcd"), false)
+            .expect("add");
+        vault.before_rename = Some(Box::new(|path: &Path| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let bytes = fs::read(path).expect("read");
+            fs::write(path, bytes).expect("another program saves");
+        }));
+        assert!(matches!(vault.save(), Err(VaultError::ChangedOnDisk)));
+        // Our temporary file was cleaned up.
+        let leftovers = fs::read_dir(path.parent().expect("dir"))
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
     fn names_are_validated() {
         assert!(validate_name("GitHub token").is_ok());
         assert!(validate_name("").is_err());
@@ -936,6 +1011,55 @@ mod tests {
         assert!(matches!(
             Vault::open(&path, secret("x")),
             Err(VaultError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn protected_titles_are_hidden_and_only_reachable_by_uuid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault
+            .add(&entry("visible"), &secret("abcd"), false)
+            .expect("add");
+        let id = vault.find("visible").expect("find");
+        vault
+            .db
+            .entry_mut(id)
+            .expect("entry")
+            .set_protected(fields::TITLE, "SECRET-TITLE");
+        let info = vault.info(id);
+        assert_eq!(info.name, PROTECTED_TITLE);
+        assert_eq!(
+            info.protected_fields.first().map(String::as_str),
+            Some("Title")
+        );
+        assert!(
+            !serde_json::to_string(&vault.list())
+                .expect("json")
+                .contains("SECRET-TITLE")
+        );
+        assert!(matches!(
+            vault.find("SECRET-TITLE"),
+            Err(VaultError::NotFound(_))
+        ));
+        assert_eq!(vault.find(&id.to_string()).expect("by uuid"), id);
+    }
+
+    #[test]
+    fn failed_transactions_leave_no_trace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let result: Result<(), VaultError> = vault.transaction(|v| {
+            v.add(&entry("PARTIAL"), &secret("abcd"), false)?;
+            let mut bad = entry("INVALID");
+            bad.fields.url = Some("https://x\nAllow".into());
+            v.add(&bad, &secret("abcd"), false)?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            vault.find("PARTIAL"),
+            Err(VaultError::NotFound(_))
         ));
     }
 

@@ -212,6 +212,10 @@ struct RunArgs {
     /// Pass secret values through to the output unredacted.
     #[arg(long)]
     no_redact: bool,
+    /// Forward this terminal's standard input to the command. By default the
+    /// command reads /dev/null (with --no-redact it always gets stdin).
+    #[arg(long)]
+    stdin: bool,
     /// Secrets to expose: ENTRY (variable named like the entry) or VAR=ENTRY.
     #[arg(required = true, value_name = "SECRET")]
     secrets: Vec<String>,
@@ -402,6 +406,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         socket,
         audit_log: args.audit_log.unwrap_or_else(paths::audit_log),
         idle_timeout: args.idle_timeout,
+        request_timeout: Duration::from_secs(10),
     };
     let ui = ZenityUi {
         remember_for: args.remember,
@@ -688,6 +693,7 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             cwd,
             env,
             redact: !args.no_redact,
+            forward_stdin: args.stdin,
         };
         match client.run(request)? {
             Response::Exited {

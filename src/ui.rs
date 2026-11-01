@@ -117,31 +117,13 @@ impl ZenityUi {
         Ok(cmd)
     }
 
-    /// Run zenity and collect what it prints. Its stdout is one end of a
-    /// socket pair, not a pipe: another process of the same user can open a
-    /// pipe through `/proc/<pid>/fd/1` and race us for the typed password, but
-    /// opening a socket that way fails (`ENXIO`).
-    fn run(&self, mut cmd: Command) -> anyhow::Result<(Option<i32>, Zeroizing<Vec<u8>>)> {
-        let (mut ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
-        cmd.stdout(Stdio::from(OwnedFd::from(theirs)));
-        let mut child = cmd.spawn().context("cannot run zenity")?;
-        // Dropping the command closes our copy of the child's end, so that
-        // reading below sees end-of-file when zenity exits.
-        drop(cmd);
-        let mut output = Zeroizing::new(Vec::with_capacity(4096));
-        let read = ours.read_to_end(&mut output);
-        let status = child.wait().context("cannot wait for zenity")?;
-        read.context("cannot read zenity's answer")?;
-        Ok((status.code(), output))
-    }
-
     fn hidden_entry(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>> {
         let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
             .arg(format!("--text={}", entry_label(&prompt.message)))
             .arg(format!("--ok-label={}", prompt.confirm));
-        let (status, output) = self.run(cmd)?;
+        let (status, output) = capture_through_socket(cmd)?;
         match status {
             Some(0) => {
                 let mut value = String::from_utf8(output.to_vec())
@@ -155,6 +137,46 @@ impl ZenityUi {
             Some(1) | Some(ZENITY_TIMEOUT) => Ok(None),
             other => bail!("zenity failed (exit status {other:?})"),
         }
+    }
+}
+
+/// Run a dialog program and collect what it prints. Its stdout is one end of
+/// a socket pair, not a pipe: another process of the same user can open a
+/// pipe through `/proc/<pid>/fd/1` and race us for the typed password, but
+/// opening a socket that way fails (`ENXIO`).
+pub fn capture_through_socket(
+    mut cmd: Command,
+) -> anyhow::Result<(Option<i32>, Zeroizing<Vec<u8>>)> {
+    let (mut ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
+    cmd.stdout(Stdio::from(OwnedFd::from(theirs)));
+    let spawned = cmd.spawn();
+    // Dropping the command closes our copy of the child's end, so that
+    // reading below sees end-of-file when the child exits.
+    drop(cmd);
+    let mut child = spawned.context("cannot run the dialog program")?;
+    let mut output = Zeroizing::new(Vec::with_capacity(4096));
+    let read = ours.read_to_end(&mut output);
+    let status = child.wait().context("cannot wait for the dialog program")?;
+    read.context("cannot read the dialog's answer")?;
+    Ok((status.code(), output))
+}
+
+/// Interpret zenity's answer to a question dialog. Only two exact outcomes
+/// allow anything: status 0 with no output ("Allow once"), and status 1 with
+/// the exact label of the extra button when one was offered. Everything else
+/// — Deny, closing the window, a timeout, an unexpected status or output — is
+/// a denial.
+pub fn decision_from(
+    status: Option<i32>,
+    output: &[u8],
+    remember: Option<(&str, Duration)>,
+) -> Decision {
+    let printed = String::from_utf8_lossy(output);
+    let printed = printed.trim_end_matches('\n');
+    match (status, remember) {
+        (Some(0), _) if printed.is_empty() => Decision::AllowOnce,
+        (Some(1), Some((label, duration))) if printed == label => Decision::AllowFor(duration),
+        _ => Decision::Deny,
     }
 }
 
@@ -199,18 +221,9 @@ impl Ui for ZenityUi {
         if offer_remember {
             cmd.arg(format!("--extra-button={remember_label}"));
         }
-        let (status, output) = self.run(cmd)?;
-        let printed = String::from_utf8_lossy(&output).trim().to_string();
-        // Only two exact outcomes allow anything; everything else — Deny,
-        // closing the window, a timeout, an unexpected status or output —
-        // is a denial.
-        Ok(match status {
-            Some(0) if printed.is_empty() => Decision::AllowOnce,
-            Some(1) if offer_remember && printed == remember_label => {
-                Decision::AllowFor(self.remember_for)
-            }
-            _ => Decision::Deny,
-        })
+        let (status, output) = capture_through_socket(cmd)?;
+        let remember = offer_remember.then_some((remember_label.as_str(), self.remember_for));
+        Ok(decision_from(status, &output, remember))
     }
 }
 
@@ -264,6 +277,52 @@ fn dialog_env() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_output_arrives_through_a_socket() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "readlink /proc/self/fd/1"]);
+        let (status, output) = capture_through_socket(cmd).expect("run");
+        assert_eq!(status, Some(0));
+        let target = String::from_utf8_lossy(&output);
+        assert!(target.starts_with("socket:"), "fd 1 was {target}");
+    }
+
+    #[test]
+    fn a_missing_dialog_program_is_an_error() {
+        let cmd = Command::new("/nonexistent/zenity");
+        assert!(capture_through_socket(cmd).is_err());
+    }
+
+    #[test]
+    fn only_exact_zenity_results_approve() {
+        let ten = Duration::from_secs(600);
+        let remember = Some(("Allow for 10m", ten));
+        assert_eq!(decision_from(Some(0), b"", None), Decision::AllowOnce);
+        assert_eq!(decision_from(Some(0), b"", remember), Decision::AllowOnce);
+        assert_eq!(
+            decision_from(Some(1), b"Allow for 10m\n", remember),
+            Decision::AllowFor(ten)
+        );
+        // Extra button not offered, or a different label: deny.
+        assert_eq!(
+            decision_from(Some(1), b"Allow for 10m\n", None),
+            Decision::Deny
+        );
+        assert_eq!(
+            decision_from(Some(1), b"Allow for 1h\n", remember),
+            Decision::Deny
+        );
+        // Deny, timeout, crash, unexpected output.
+        assert_eq!(decision_from(Some(1), b"", remember), Decision::Deny);
+        assert_eq!(decision_from(Some(5), b"", remember), Decision::Deny);
+        assert_eq!(decision_from(None, b"", remember), Decision::Deny);
+        assert_eq!(
+            decision_from(Some(0), b"surprise", remember),
+            Decision::Deny
+        );
+        assert_eq!(decision_from(Some(255), b"", remember), Decision::Deny);
+    }
 
     #[test]
     fn entry_labels_are_escaped_for_zenity() {

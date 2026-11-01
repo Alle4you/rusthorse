@@ -27,10 +27,15 @@ struct ScriptedUi {
     last_approval: Mutex<Option<ApprovalRequest>>,
     /// Runs (once) while the "human" is looking at the next approval dialog.
     on_approve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs (once) while the "human" is typing the next master password.
+    on_password: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Ui for ScriptedUi {
     fn master_password(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+        if let Some(hook) = self.on_password.lock().unwrap().take() {
+            hook();
+        }
         let next = self.passwords.lock().unwrap().pop_front();
         Ok(next
             .unwrap_or(Some(PASSWORD.to_string()))
@@ -81,10 +86,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
-        Harness::with_idle_timeout(Duration::ZERO)
+        Harness::with_timeouts(Duration::ZERO, Duration::from_secs(10))
     }
 
     fn with_idle_timeout(idle_timeout: Duration) -> Harness {
+        Harness::with_timeouts(idle_timeout, Duration::from_secs(10))
+    }
+
+    fn with_timeouts(idle_timeout: Duration, request_timeout: Duration) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
         Vault::create(
@@ -101,6 +110,7 @@ impl Harness {
             socket: socket.clone(),
             audit_log: audit.clone(),
             idle_timeout,
+            request_timeout,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -163,6 +173,16 @@ impl Harness {
         args.extend_from_slice(extra);
         let out = self.run(&args);
         assert!(out.status.success(), "add failed: {}", text(&out.stderr));
+    }
+
+    fn vault_path(&self) -> PathBuf {
+        self.dir.path().join("vault.kdbx")
+    }
+
+    fn call(&self, request: &rusthorse::protocol::Request) -> rusthorse::protocol::Response {
+        rusthorse::client::Client::new(self.socket.clone())
+            .call(request)
+            .expect("call")
     }
 
     fn audit_text(&self) -> String {
@@ -254,7 +274,9 @@ fn run_injects_secret_and_redacts_output() {
         "{details:?}"
     );
     assert!(
-        details.iter().any(|d| d == "Secrets: API_KEY ← API_KEY"),
+        details
+            .iter()
+            .any(|d| d.starts_with("Secrets: API_KEY ← API_KEY (")),
         "{details:?}"
     );
     assert!(
@@ -511,6 +533,233 @@ fn a_writable_stdin_is_not_an_unredacted_way_out() {
 }
 
 #[test]
+fn a_writable_stdin_is_not_a_way_out_with_forwarding_either() {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let h = Harness::new();
+    h.add_secret("T", "leak-through-stdin", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (mut ours, theirs) = UnixStream::pair().expect("pair");
+    let out = h
+        .cmd(&[
+            "run",
+            "--stdin",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            "printf %s \"$T\" >&0; echo done",
+        ])
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .output()
+        .expect("run");
+    assert!(text(&out.stdout).contains("done"));
+    ours.set_nonblocking(true).expect("nonblocking");
+    let mut received = Vec::new();
+    let _ = ours.read_to_end(&mut received);
+    assert!(!String::from_utf8_lossy(&received).contains("leak-through-stdin"));
+}
+
+#[test]
+fn input_is_not_consumed_unless_forwarding_is_requested() {
+    use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+
+    // Default: the command reads /dev/null and the caller's input stays put.
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(b"NEXT_COMMAND\n").expect("write");
+    let out = h
+        .cmd(&["run", "T", "--", "cat"])
+        .stdin(Stdio::from(OwnedFd::from(reader.try_clone().expect("dup"))))
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "", "cat must see an empty input");
+    drop(writer);
+    let mut left = String::new();
+    let mut reader = reader;
+    reader.read_to_string(&mut left).expect("read");
+    assert_eq!(left, "NEXT_COMMAND\n", "the caller's input was consumed");
+
+    // With --stdin the input is forwarded.
+    let out = h.run_stdin(&["run", "--stdin", "T", "--", "cat"], "hello\n");
+    assert_eq!(text(&out.stdout), "hello\n");
+}
+
+#[test]
+fn background_processes_do_not_outlive_the_command() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("bg.pid");
+    let script = format!("sleep 30 & echo $! > {}", pidfile.display());
+    let started = Instant::now();
+    let out = h.run(&["run", "T", "--", "sh", "-c", &script]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let pid = wait_for_pid(&pidfile);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the background process kept running"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_lock_while_the_password_is_typed_keeps_the_vault_locked() {
+    let h = Harness::new();
+    let socket = h.socket.clone();
+    *h.ui.on_password.lock().unwrap() = Some(Box::new(move || {
+        rusthorse::client::Client::new(socket)
+            .call(&rusthorse::protocol::Request::Lock)
+            .expect("lock");
+    }));
+    let out = h.run(&["unlock"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("locked while the password"));
+    let status: serde_json::Value =
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
+    assert_eq!(status["locked"], true);
+}
+
+#[test]
+fn an_unwritable_audit_log_keeps_the_vault_locked() {
+    let h = Harness::new();
+    std::fs::create_dir_all(&h.audit).expect("block the audit path with a directory");
+    let out = h.run(&["unlock"]);
+    assert!(!out.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
+    assert_eq!(status["locked"], true);
+    assert!(!h.run(&["list"]).status.success());
+}
+
+#[test]
+fn a_failed_import_changes_nothing_in_memory_or_on_disk() {
+    use rusthorse::protocol::{EntryFields, ImportedEntry, NewEntry, Request, Response};
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    h.decide(&[Decision::AllowOnce]);
+    let item = |name: &str, url: Option<&str>| ImportedEntry {
+        entry: NewEntry {
+            name: name.into(),
+            fields: EntryFields {
+                url: url.map(Into::into),
+                ..EntryFields::default()
+            },
+            ..NewEntry::default()
+        },
+        value: SecretString::new("abcd1234".into()),
+    };
+    let response = h.call(&Request::Import {
+        entries: vec![
+            item("PARTIAL", None),
+            item("INVALID", Some("https://x\nAllow once")),
+        ],
+        replace: false,
+    });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(!text(&h.run(&["list"]).stdout).contains("PARTIAL"));
+    // A later, unrelated change must not persist the failed batch either.
+    h.add_secret("LATER", "efgh5678", &[]);
+    let on_disk = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+    assert!(on_disk.find("PARTIAL").is_err());
+    assert!(on_disk.find("LATER").is_ok());
+}
+
+#[test]
+fn a_different_oldpwd_is_a_different_request() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowFor(Duration::from_secs(60)), Decision::Deny]);
+    let first = h
+        .cmd(&["run", "T", "--", "printenv", "OLDPWD"])
+        .env("OLDPWD", "/first")
+        .output()
+        .expect("run");
+    assert_eq!(text(&first.stdout).trim(), "/first");
+    let second = h
+        .cmd(&["run", "T", "--", "printenv", "OLDPWD"])
+        .env("OLDPWD", "/second")
+        .output()
+        .expect("run");
+    assert_eq!(
+        second.status.code(),
+        Some(125),
+        "a changed environment was not asked about"
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn dialogs_identify_entries_by_path_and_uuid() {
+    let h = Harness::new();
+    h.add_secret("API_KEY", "abcdefgh", &["--group", "Production"]);
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["run", "T=Production/API_KEY", "--", "true"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let secrets = request
+        .details
+        .iter()
+        .find(|(k, _)| k == "Secrets")
+        .map(|(_, v)| v.clone())
+        .expect("secrets line");
+    assert!(secrets.starts_with("T ← Production/API_KEY ("), "{secrets}");
+    assert!(secrets.ends_with(')') && secrets.len() > "T ← Production/API_KEY ()".len() + 7);
+}
+
+#[test]
+fn requests_too_long_for_one_dialog_are_refused() {
+    let h = Harness::new();
+    let env_file = h.dir.path().join("many.env");
+    let lines: String = (0..60)
+        .map(|i| format!("A_VERY_LONG_VARIABLE_NAME_FOR_TESTING_THE_DIALOG_LIMIT_NUMBER_{i:03}_XXXXXXXX=value{i}\n"))
+        .collect();
+    std::fs::write(&env_file, lines).expect("write");
+    assert!(h.run(&["unlock"]).status.success());
+    let out = h.run(&["import", "dotenv", env_file.to_str().expect("utf8")]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("too much detail"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_slow_client_is_disconnected_at_the_deadline() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let h = Harness::with_timeouts(Duration::ZERO, Duration::from_millis(500));
+    let mut stream = UnixStream::connect(&h.socket).expect("connect");
+    let body = br#"{"type":"status"}"#;
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(body);
+    for byte in frame {
+        std::thread::sleep(Duration::from_millis(100));
+        if stream.write_all(&[byte]).is_err() {
+            break;
+        }
+    }
+    let answer: std::io::Result<rusthorse::protocol::Response> =
+        rusthorse::protocol::read_message(&stream);
+    assert!(
+        answer.is_err(),
+        "a request dripped over {} ms was served",
+        100 * 21
+    );
+}
+
+#[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
@@ -601,6 +850,20 @@ fn read_only_requests_do_not_keep_the_vault_unlocked() {
         }
     }
     panic!("polling `list` kept the vault unlocked past the idle timeout");
+}
+
+/// Whether a process exists and is not a zombie.
+fn alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let state = stat
+                .rfind(')')
+                .and_then(|i| stat.get(i + 2..i + 3))
+                .unwrap_or("Z");
+            state != "Z" && state != "X"
+        }
+        Err(_) => false,
+    }
 }
 
 fn wait_for_pid(path: &Path) -> u32 {

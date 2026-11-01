@@ -7,12 +7,13 @@
 //!
 //! The full specification, with examples, is in `docs/protocol.md`.
 
-use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use nix::errno::Errno;
-use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -242,6 +243,19 @@ pub struct EntryInfo {
     pub modified: Option<String>,
 }
 
+impl EntryInfo {
+    /// How dialogs and the audit log identify the entry: its full path and
+    /// the start of its UUID, e.g. `Production/API_KEY (8d2f6c1e)`. Two entries
+    /// with the same title in different groups never look the same.
+    pub fn identity(&self) -> String {
+        let short: String = self.id.chars().take(8).collect();
+        match &self.group {
+            Some(group) => format!("{group}/{} ({short})", self.name),
+            None => format!("{} ({short})", self.name),
+        }
+    }
+}
+
 /// Exposes an entry's password to a command as an environment variable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
@@ -264,6 +278,11 @@ pub struct RunRequest {
     pub env: Vec<(String, String)>,
     /// Replace secret values in the command's output with `[REDACTED:<entry>]`.
     pub redact: bool,
+    /// With `redact`, forward the client's stdin to the command (otherwise
+    /// the command reads `/dev/null`). Without `redact`, the command always
+    /// gets the client's stdin directly.
+    #[serde(default)]
+    pub forward_stdin: bool,
 }
 
 /// The agent's answer to a [`Request`].
@@ -424,13 +443,40 @@ pub fn send_frame<T: Serialize>(
 
 /// Read one frame. Returns its body and any file descriptors attached to it.
 pub fn recv_frame(stream: &UnixStream) -> io::Result<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)> {
+    recv_frame_before(stream, None)
+}
+
+/// Read one frame, failing with [`io::ErrorKind::TimedOut`] if the whole
+/// frame has not arrived by `deadline`. (A per-read timeout would let a client
+/// that sends one byte at a time hold the connection indefinitely.)
+pub fn recv_frame_before(
+    stream: &UnixStream,
+    deadline: Option<Instant>,
+) -> io::Result<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)> {
+    let arm = || -> io::Result<()> {
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the request did not arrive in time",
+                ));
+            }
+            stream.set_read_timeout(Some(left))?;
+        }
+        Ok(())
+    };
     let mut header = [0u8; 4];
-    let (got, fds) = recv_with_fds(stream, &mut header)?;
+    arm()?;
+    let (mut got, fds) = recv_with_fds(stream, &mut header)?;
     if got == 0 {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     let mut reader = stream;
-    reader.read_exact(&mut header[got..])?;
+    while got < header.len() {
+        arm()?;
+        got += read_some(&mut reader, &mut header[got..])?;
+    }
     let len = u32::from_be_bytes(header) as usize;
     if len > MAX_FRAME_LEN {
         return Err(io::Error::new(
@@ -439,8 +485,33 @@ pub fn recv_frame(stream: &UnixStream) -> io::Result<(Zeroizing<Vec<u8>>, Vec<Ow
         ));
     }
     let mut body = Zeroizing::new(vec![0u8; len]);
-    reader.read_exact(&mut body)?;
+    let mut filled = 0;
+    while filled < len {
+        arm()?;
+        filled += read_some(&mut reader, &mut body[filled..])?;
+    }
+    if deadline.is_some() {
+        stream.set_read_timeout(None)?;
+    }
     Ok((body, fds))
+}
+
+/// One `read`, treating end-of-file as an error and retrying on `EINTR`.
+fn read_some(reader: &mut &UnixStream, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the request did not arrive in time",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Read one frame and decode it, closing any attached file descriptors.
@@ -449,46 +520,72 @@ pub fn read_message<T: DeserializeOwned>(stream: &UnixStream) -> io::Result<T> {
     serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// `recvmsg` into `buf`, taking ownership of any `SCM_RIGHTS` descriptors.
+/// `recvmsg` into `buf`, taking ownership of every `SCM_RIGHTS` descriptor
+/// the kernel installed — including when the message was truncated
+/// (`MSG_CTRUNC`), which happens not only when the control buffer is too
+/// small but also when the process hits its open-file limit part-way. The
+/// control messages are parsed directly because `nix` refuses to iterate a
+/// truncated buffer, which would leave the installed descriptors open.
 #[allow(unsafe_code)]
 fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    use nix::libc;
     use std::os::fd::FromRawFd;
 
-    // Room for as many descriptors as the kernel will ever attach to one
-    // message (SCM_MAX_FD), so that it never truncates: truncated messages
-    // would leave descriptors installed in our table that `cmsgs()` does not
-    // hand back, leaking them. The count is validated by the caller.
-    let mut cmsg_space = nix::cmsg_space!([RawFd; SCM_MAX_FD]);
+    const FD_SIZE: usize = std::mem::size_of::<RawFd>();
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE((SCM_MAX_FD * FD_SIZE) as u32) } as usize;
+    let mut control = vec![0u8; space];
     loop {
-        let mut iov = [IoSliceMut::new(buf)];
-        let msg = match recvmsg::<()>(
-            stream.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_space),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        ) {
-            Ok(msg) => msg,
-            Err(Errno::EINTR) => continue,
-            Err(e) => return Err(e.into()),
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
         };
+        // SAFETY: an all-zero msghdr is a valid (empty) value.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len() as _;
+        // SAFETY: every pointer in `msg` refers to a live buffer of the
+        // stated length for the duration of the call.
+        let received =
+            unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if received < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+
         let mut fds = Vec::new();
-        for cmsg in msg.cmsgs()? {
-            if let ControlMessageOwned::ScmRights(raw) = cmsg {
-                for fd in raw {
-                    // SAFETY: the kernel just installed `fd` in our descriptor
-                    // table for this message; nothing else owns it yet.
-                    fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+        // SAFETY: the CMSG_* macros walk the control buffer the kernel just
+        // filled, within `msg_controllen`; each SCM_RIGHTS payload holds
+        // descriptors that the kernel installed in our table for this
+        // message and that nothing else owns yet.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(cmsg);
+                    let header = data as usize - cmsg as usize;
+                    let count = ((*cmsg).cmsg_len as usize).saturating_sub(header) / FD_SIZE;
+                    for i in 0..count {
+                        let fd = std::ptr::read_unaligned(data.cast::<RawFd>().add(i));
+                        fds.push(OwnedFd::from_raw_fd(fd));
+                    }
                 }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
         }
-        if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
-            // Some descriptors were discarded by the kernel; refuse the frame.
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            // `fds` is dropped here: everything that did arrive is closed.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "too many file descriptors attached to the request",
+                "file descriptors attached to the request were truncated",
             ));
         }
-        return Ok((msg.bytes, fds));
+        return Ok((received as usize, fds));
     }
 }
 
@@ -543,6 +640,82 @@ mod tests {
         let (_, fds) = recv_frame(&b).expect("recv");
         // All eight arrive as OwnedFd (closed on drop), none is left behind.
         assert_eq!(fds.len(), 8);
+    }
+
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd").expect("fd dir").count()
+    }
+
+    /// Runs in a child process (the test re-executes itself) because it
+    /// lowers RLIMIT_NOFILE, which would disturb other tests running in
+    /// parallel threads.
+    #[test]
+    fn descriptors_are_not_leaked_when_the_fd_limit_is_hit() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        use std::os::fd::AsRawFd;
+        if std::env::var_os("RUSTHORSE_FD_LIMIT_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("exe"))
+                .args([
+                    "protocol::tests::descriptors_are_not_leaked_when_the_fd_limit_is_hit",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env("RUSTHORSE_FD_LIMIT_CHILD", "1")
+                .status()
+                .expect("re-run");
+            assert!(status.success(), "the isolated run failed");
+            return;
+        }
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        let pipes: Vec<(OwnedFd, OwnedFd)> = (0..60)
+            .map(|_| nix::unistd::pipe().expect("pipe"))
+            .collect();
+        let raw: Vec<RawFd> = pipes.iter().map(|(r, _)| r.as_raw_fd()).collect();
+        let body = br#"{"type":"status"}"#;
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body);
+        sendmsg::<()>(
+            a.as_raw_fd(),
+            &[IoSlice::new(&frame)],
+            &[ControlMessage::ScmRights(&raw)],
+            MsgFlags::empty(),
+            None,
+        )
+        .expect("sendmsg");
+        drop(pipes); // the 60 descriptors now exist only in the socket queue
+        let before = open_fd_count();
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("getrlimit");
+        // Room for about 20 more descriptors: the kernel installs some, then
+        // truncates.
+        setrlimit(Resource::RLIMIT_NOFILE, before as u64 + 20, hard).expect("setrlimit");
+        let result = recv_frame(&b);
+        setrlimit(Resource::RLIMIT_NOFILE, soft, hard).expect("restore");
+        let err = result.expect_err("a truncated message must be refused");
+        // Make sure the scenario really happened (the kernel truncated).
+        assert!(
+            err.to_string().contains("truncated"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(open_fd_count(), before, "descriptors leaked");
+    }
+
+    #[test]
+    fn a_slow_drip_cannot_outlive_the_deadline() {
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        let writer = std::thread::spawn(move || {
+            let mut a = &a;
+            for byte in [0u8, 0, 0, 2, b'{', b'}'] {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                if a.write_all(&[byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        let deadline = Instant::now() + std::time::Duration::from_millis(400);
+        let err = recv_frame_before(&b, Some(deadline)).expect_err("must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        drop(b);
+        let _ = writer.join();
     }
 
     #[test]

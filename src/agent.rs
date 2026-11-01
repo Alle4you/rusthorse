@@ -20,6 +20,7 @@
 //! the program, cleans the environment, spawns the command as its own child
 //! and filters its output, so what the human approves is what runs.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -34,8 +35,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::{Pid, getuid};
 
 use crate::audit::{AuditEvent, AuditLog};
@@ -62,8 +65,10 @@ const MAX_CONNECTIONS: usize = 64;
 /// Requests that may wait for the human at the same time; more are refused.
 const MAX_WAITING_FOR_DIALOG: usize = 8;
 
-/// How long a client has to send its request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest text an approval or prompt dialog may contain. Requests whose
+/// dialog would be longer are refused: the human must be able to read all of
+/// it.
+const MAX_DIALOG_CHARS: usize = 4000;
 
 /// Longest text the approval dialog shows for one detail. Longer requests are
 /// refused instead of truncated: the human must see everything they approve.
@@ -83,6 +88,8 @@ pub struct AgentConfig {
     pub audit_log: PathBuf,
     /// Lock after this much inactivity (zero = never).
     pub idle_timeout: Duration,
+    /// How long a client has to send its whole request (10 s in production).
+    pub request_timeout: Duration,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -331,9 +338,8 @@ impl Agent {
             // Another user (only possible if the socket directory was opened up).
             return Ok(());
         }
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
-        let (body, fds) = protocol::recv_frame(stream)?;
-        stream.set_read_timeout(None)?;
+        let deadline = Instant::now() + self.config.request_timeout;
+        let (body, fds) = protocol::recv_frame_before(stream, Some(deadline))?;
         let request: Request = match serde_json::from_slice(&body) {
             Ok(request) => request,
             Err(e) => {
@@ -429,10 +435,26 @@ impl Agent {
         Ok(self.state().generation)
     }
 
+    /// Run `f` on the vault only if its generation is still `generation`,
+    /// checked under the same lock — so that what `f` reads is exactly what
+    /// the human approved.
+    fn with_vault_at<R>(
+        &self,
+        generation: u64,
+        f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
+    ) -> Result<R, Failure> {
+        let mut state = self.state();
+        if state.generation != generation {
+            return Err(locked_meanwhile());
+        }
+        let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
+        f(vault)
+    }
+
     /// Apply an approved change and save it, but only if nothing happened to
-    /// the vault since `generation`. `f` must not leave partial changes when
-    /// it fails. If saving fails, the vault is locked so that memory never
-    /// holds changes that are not on disk.
+    /// the vault since `generation`. The change is a transaction: if `f`
+    /// fails, everything it did is rolled back. If saving fails, the vault is
+    /// locked so that memory never holds changes that are not on disk.
     fn commit<R>(
         &self,
         generation: u64,
@@ -443,7 +465,7 @@ impl Agent {
             return Err(locked_meanwhile());
         }
         let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
-        let result = f(vault)?;
+        let result = vault.transaction(f)?;
         if let Err(e) = vault.save() {
             state.lock();
             let mut failure = Failure::from(e);
@@ -465,9 +487,13 @@ impl Agent {
             return Err(VaultError::Missing(self.config.vault.clone()).into());
         }
         let _dialog = self.dialog()?;
-        if self.state().vault.is_some() {
-            return Ok(());
-        }
+        let started = {
+            let state = self.state();
+            if state.vault.is_some() {
+                return Ok(());
+            }
+            state.generation
+        };
         let base = format!(
             "Unlock the Rusthorse vault\n{}\n\nRequested by: {}",
             self.config.vault.display(),
@@ -486,13 +512,25 @@ impl Agent {
             };
             match Vault::open(&self.config.vault, password) {
                 Ok(vault) => {
-                    {
-                        let mut state = self.state();
-                        state.vault = Some(vault);
-                        state.last_used = Instant::now();
-                        state.generation += 1;
+                    let mut state = self.state();
+                    if state.generation != started {
+                        // `lock` was requested while the password was typed.
+                        drop(state);
+                        drop(vault);
+                        let _ = self
+                            .audit
+                            .record(&AuditEvent::new("unlock", peer).outcome("cancelled_by_lock"));
+                        return Err(Failure::new(
+                            ErrorCode::Locked,
+                            "the vault was locked while the password was being entered",
+                        ));
                     }
+                    // Record first: if the audit log cannot be written, the
+                    // vault stays locked.
                     self.record(AuditEvent::new("unlock", peer).outcome("unlocked"))?;
+                    state.vault = Some(vault);
+                    state.last_used = Instant::now();
+                    state.generation += 1;
                     return Ok(());
                 }
                 Err(VaultError::WrongPassword) => {
@@ -528,6 +566,13 @@ impl Agent {
                 self.touch();
                 return Ok(());
             }
+        }
+        let length = crate::ui::approval_text(&request).chars().count();
+        if length > MAX_DIALOG_CHARS {
+            return Err(Failure::invalid(format!(
+                "this request has too much detail to show in one dialog ({length} characters, \
+                 limit {MAX_DIALOG_CHARS}); split it into smaller requests"
+            )));
         }
         let decision = {
             let _dialog = self.dialog()?;
@@ -570,6 +615,13 @@ impl Agent {
         prompt: Prompt,
         event: AuditEvent,
     ) -> Result<SecretString, Failure> {
+        let length = crate::util::visible(&prompt.message).chars().count();
+        if length > MAX_DIALOG_CHARS {
+            return Err(Failure::invalid(format!(
+                "this request has too much detail to show in one dialog ({length} characters, \
+                 limit {MAX_DIALOG_CHARS})"
+            )));
+        }
         let value = {
             let _dialog = self.dialog()?;
             self.ui.secret_value(&prompt)?
@@ -740,16 +792,16 @@ impl Agent {
         }
         let generation = self.generation(peer)?;
         let current = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
-        let event = AuditEvent::new("edit", peer).entries(vec![current.name.clone()]);
+        let event = AuditEvent::new("edit", peer).entries(vec![current.identity()]);
 
         let prompt_for_value = matches!(changes.value, Some(ValueChange::Prompt));
         if changes.touches_metadata() || matches!(changes.value, Some(ValueChange::Provided(_))) {
-            let mut details = vec![("Entry".into(), current.name.clone())];
+            let mut details = vec![("Entry".into(), current.identity())];
             details.extend(describe_changes(&changes));
             details.push(("Requested by".into(), peer.describe()));
             let request = ApprovalRequest {
                 title: "Rusthorse — change an entry".into(),
-                summary: format!("Change the entry \"{}\"?", current.name),
+                summary: format!("Change the entry \"{}\"?", current.identity()),
                 details,
                 warnings: Vec::new(),
                 can_remember: false,
@@ -763,7 +815,7 @@ impl Agent {
                     title: "Rusthorse — new value".into(),
                     message: format!(
                         "New value for \"{}\"\nType the secret value, or Cancel.\n\nRequested by: {}",
-                        util::visible(&current.name),
+                        util::visible(&current.identity()),
                         peer.describe()
                     ),
                     confirm: "Save".into(),
@@ -773,7 +825,7 @@ impl Agent {
             _ => None,
         };
         self.commit(generation, |v| {
-            let id = v.find(name)?;
+            let id = v.find(&current.id)?;
             v.edit(id, &changes, new_value.as_ref())?;
             Ok(ok(format!(
                 "{} updated",
@@ -787,9 +839,9 @@ impl Agent {
         let info = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
         let request = ApprovalRequest {
             title: "Rusthorse — delete an entry".into(),
-            summary: format!("Permanently delete the entry \"{}\"?", info.name),
+            summary: format!("Permanently delete the entry \"{}\"?", info.identity()),
             details: vec![
-                ("Entry".into(), info.name.clone()),
+                ("Entry".into(), info.identity()),
                 ("Group".into(), info.group.clone().unwrap_or_else(|| "(root)".into())),
                 ("Requested by".into(), peer.describe()),
             ],
@@ -799,10 +851,10 @@ impl Agent {
         self.approve(
             request,
             None,
-            AuditEvent::new("remove", peer).entries(vec![info.name.clone()]),
+            AuditEvent::new("remove", peer).entries(vec![info.identity()]),
         )?;
         self.commit(generation, |v| {
-            let id = v.find(name)?;
+            let id = v.find(&info.id)?;
             v.remove(id);
             Ok(ok(format!("{} deleted", info.name)))
         })
@@ -824,10 +876,10 @@ impl Agent {
             title: "Rusthorse — reveal a secret".into(),
             summary: format!(
                 "REVEAL the value of \"{}\" to the requesting process?",
-                info.name
+                info.identity()
             ),
             details: vec![
-                ("Entry".into(), info.name.clone()),
+                ("Entry".into(), info.identity()),
                 ("Requested by".into(), peer.describe()),
             ],
             warnings: vec![
@@ -838,13 +890,10 @@ impl Agent {
         self.approve(
             request,
             None,
-            AuditEvent::new("reveal", peer).entries(vec![info.name.clone()]),
+            AuditEvent::new("reveal", peer).entries(vec![info.identity()]),
         )?;
-        if self.state().generation != generation {
-            return Err(locked_meanwhile());
-        }
-        self.with_vault(peer, |v| {
-            let id = v.find(name)?;
+        self.with_vault_at(generation, |v| {
+            let id = v.find(&info.id)?;
             let value = v
                 .secret(id)
                 .ok_or_else(|| Failure::new(ErrorCode::NotFound, format!("{name} has no value")))?;
@@ -891,6 +940,7 @@ impl Agent {
         let path_var = run
             .env
             .iter()
+            .rev()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_str());
         let program =
@@ -899,7 +949,14 @@ impl Agent {
             .map_err(|e| Failure::invalid(format!("{}: {e}", program.canonical.display())))?;
         let cwd_id = file_id(&cwd).map_err(|e| Failure::invalid(format!("{}: {e}", run.cwd)))?;
         let secret_vars: Vec<&str> = run.bindings.iter().map(|b| b.var.as_str()).collect();
-        let env = exec::prepare_env(&run.env, &secret_vars);
+        let prepared = exec::prepare_env(&run.env, &secret_vars);
+        // The environment the command will actually get (a later duplicate
+        // wins, as with `Command::envs`), in a canonical order.
+        let effective_env: BTreeMap<&str, &str> = prepared
+            .vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         // The human must be able to read everything that decides what runs.
         let command_line = shell_join(&run.argv);
@@ -917,17 +974,10 @@ impl Agent {
                 )));
             }
         }
-        for (name, value) in &env.risky {
-            if value.chars().count() > MAX_DETAIL_CHARS / 4 {
-                return Err(Failure::invalid(format!(
-                    "{name} is too long to show in an approval dialog; unset it or shorten it"
-                )));
-            }
-        }
 
         // Every entry must exist (and have a value) before the human is asked.
         let generation = self.generation(peer)?;
-        let entries: Vec<(String, String)> = self.with_vault(peer, |v| {
+        let entries: Vec<(String, String, String)> = self.with_vault_at(generation, |v| {
             run.bindings
                 .iter()
                 .map(|b| {
@@ -938,23 +988,28 @@ impl Agent {
                             format!("{} has no value", b.entry),
                         ));
                     }
-                    Ok((id.to_string(), v.info(id).name))
+                    let info = v.info(id);
+                    Ok((info.id.clone(), info.identity(), info.name))
                 })
                 .collect()
         })?;
-        let entry_names: Vec<String> = entries.iter().map(|(_, name)| name.clone()).collect();
+        let identities: Vec<String> = entries
+            .iter()
+            .map(|(_, identity, _)| identity.clone())
+            .collect();
 
         let mut warnings = Vec::new();
-        if !env.removed.is_empty() {
+        if !prepared.removed.is_empty() {
             warnings.push(format!(
                 "Removed from the environment: {}",
-                env.removed.join(", ")
+                prepared.removed.join(", ")
             ));
         }
-        if !env.risky.is_empty() {
+        if !prepared.risky.is_empty() {
             warnings.push(format!(
                 "These variables can change what the program executes: {}",
-                env.risky
+                prepared
+                    .risky
                     .iter()
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
@@ -967,6 +1022,11 @@ impl Agent {
                     .into(),
             );
         }
+        let input = match (run.redact, run.forward_stdin) {
+            (false, _) => "the requester's own standard input",
+            (true, true) => "forwarded from the requester",
+            (true, false) => "none (/dev/null)",
+        };
         let request = ApprovalRequest {
             title: "Rusthorse — use a secret".into(),
             summary: "Run this command with the secrets below in its environment?".into(),
@@ -978,11 +1038,12 @@ impl Agent {
                     "Secrets".into(),
                     run.bindings
                         .iter()
-                        .zip(&entry_names)
-                        .map(|(b, name)| format!("{} ← {name}", b.var))
+                        .zip(&identities)
+                        .map(|(b, identity)| format!("{} ← {identity}", b.var))
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
+                ("Input".into(), input.into()),
                 (
                     "Output".into(),
                     if run.redact {
@@ -1002,36 +1063,29 @@ impl Agent {
         };
         // A remembered approval covers exactly this: the same entries (by
         // UUID) in the same vault generation, command line, program, working
-        // directory, redaction and environment. Variables that change on
-        // every invocation without affecting the program are left out.
-        let key_env: Vec<&(String, String)> = env
-            .vars
-            .iter()
-            .filter(|(k, _)| k != "_" && k != "OLDPWD")
-            .collect();
+        // directory, input and output handling, and effective environment.
+        let entry_ids: Vec<&str> = entries.iter().map(|(id, _, _)| id.as_str()).collect();
         let key = serde_json::to_string(&(
             generation,
             &run.bindings,
-            &entries,
+            &entry_ids,
             &run.argv,
             program.canonical.display().to_string(),
             &run.cwd,
             run.redact,
-            key_env,
+            run.forward_stdin,
+            &effective_env,
         ))
         .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
-        self.approve(request, Some(key), run_event(peer, &run, &entry_names))?;
+        self.approve(request, Some(key), run_event(peer, &run, &identities))?;
 
-        // The answer may have taken a while: make sure nothing that the
-        // dialog showed has changed since.
-        if self.state().generation != generation {
-            return Err(locked_meanwhile());
-        }
+        // The answer may have taken a while: make sure the program and the
+        // directory were not replaced meanwhile...
         if file_id(&program.canonical).ok() != Some(program_id)
             || file_id(&cwd).ok() != Some(cwd_id)
         {
             let _ = self.audit.record(
-                &run_event(peer, &run, &entry_names)
+                &run_event(peer, &run, &identities)
                     .outcome("aborted")
                     .detail("program or directory replaced after approval"),
             );
@@ -1039,17 +1093,16 @@ impl Agent {
                 "the program or the working directory was replaced after you approved; nothing was run",
             ));
         }
-
-        // Fetch the values only now, after approval.
-        let secrets: Vec<(String, String, SecretString)> = self.with_vault(peer, |v| {
+        // ...and read the values under the same lock that checks that the
+        // vault did not change (no edit, lock or reload since the dialog).
+        // From this point on the approval is consumed: a later `lock` does
+        // not stop the command.
+        let secrets: Vec<(String, String, SecretString)> = self.with_vault_at(generation, |v| {
             run.bindings
                 .iter()
                 .zip(&entries)
-                .map(|(b, (id, name))| {
-                    let found = v.find(&b.entry)?;
-                    if found.to_string() != *id {
-                        return Err(locked_meanwhile());
-                    }
+                .map(|(b, (id, _, name))| {
+                    let found = v.find(id)?;
                     let value = v.secret(found).ok_or_else(|| {
                         Failure::new(ErrorCode::NotFound, format!("{name} has no value"))
                     })?;
@@ -1064,23 +1117,26 @@ impl Agent {
             .args(&run.argv[1..])
             .current_dir(&cwd)
             .env_clear()
-            .envs(env.vars.iter().map(|(k, v)| (k, v)))
+            .envs(effective_env.iter())
             .process_group(0);
         for (var, _, value) in &secrets {
             command.env(var, value.as_str());
         }
-        // With redaction, the command gets only pipes owned by the agent. The
-        // client's own descriptors never reach it: a descriptor passed as
-        // "stdin" may be writable (a socket or a terminal), which would be an
-        // unfiltered way back to the client.
+        // With redaction, the command gets only descriptors owned by the
+        // agent: a descriptor passed as "stdin" may be writable (a socket or a
+        // terminal), which would be an unfiltered way back to the client. Its
+        // input is /dev/null unless forwarding was requested.
         let mut client_stdin = None;
         let mut destinations = None;
         if run.redact {
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            client_stdin = Some(stdin);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if run.forward_stdin {
+                command.stdin(Stdio::piped());
+                client_stdin = Some(stdin);
+            } else {
+                command.stdin(Stdio::null());
+                drop(stdin);
+            }
             destinations = Some((stdout, stderr));
         } else {
             command
@@ -1095,10 +1151,13 @@ impl Agent {
             )
         })?;
         drop(command);
-        let pgid = Pid::from_raw(child.id() as i32);
-        let done = Arc::new(AtomicBool::new(false));
+        let pid = Pid::from_raw(child.id() as i32);
+        // While the leader is not reaped its pid — and so the process group
+        // id — cannot be reused, which makes signalling the group safe.
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
 
-        let mut pumps = Vec::new();
+        let mut workers = Vec::new();
         if let Some((out_dest, err_dest)) = destinations {
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
@@ -1106,36 +1165,49 @@ impl Agent {
                 .collect();
             let make = || Redactor::new(labels.iter().map(|(l, s)| (l.as_str(), s.as_slice())));
             if let Some(out) = child.stdout.take() {
-                let redactor = make();
-                pumps.push(thread::spawn(move || pump(out, out_dest, redactor)));
+                let (redactor, stop) = (make(), Arc::clone(&stop));
+                workers.push(thread::spawn(move || pump(out, out_dest, redactor, stop)));
             }
             if let Some(err) = child.stderr.take() {
-                let redactor = make();
-                pumps.push(thread::spawn(move || pump(err, err_dest, redactor)));
+                let (redactor, stop) = (make(), Arc::clone(&stop));
+                workers.push(thread::spawn(move || pump(err, err_dest, redactor, stop)));
             }
             for (_, mut bytes) in labels {
                 zeroize::Zeroize::zeroize(&mut bytes);
             }
         }
         if let (Some(from), Some(to)) = (client_stdin, child.stdin.take()) {
-            // Not joined: it ends when the client's input ends, when the
-            // command closes its input, or shortly after the command exits.
-            let done = Arc::clone(&done);
-            thread::spawn(move || pump_stdin(from, to, done));
+            let stop = Arc::clone(&stop);
+            workers.push(thread::spawn(move || pump_stdin(from, to, stop)));
         }
         drop(secrets);
 
         let watcher = stream.try_clone().ok().map(|s| {
-            let done = Arc::clone(&done);
-            thread::spawn(move || watch_client(s, pgid, done))
+            let finished = Arc::clone(&finished);
+            thread::spawn(move || watch_client(s, pid, finished))
         });
-        let status = child.wait();
-        done.store(true, Ordering::SeqCst);
-        for pump in pumps {
-            let _ = pump.join();
+
+        // Wait for the leader to exit without reaping it.
+        let waited = loop {
+            match waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {
+                Err(Errno::EINTR) => continue,
+                other => break other,
+            }
+        };
+        // The command has ended: nothing it started may keep running with the
+        // secrets, and no worker may outlive the request.
+        terminate_group(pid);
+        stop.store(true, Ordering::SeqCst);
+        for worker in workers {
+            let _ = worker.join();
         }
+        finished.store(true, Ordering::SeqCst);
         if let Some(watcher) = watcher {
             let _ = watcher.join();
+        }
+        let status = child.wait();
+        if let Err(e) = waited {
+            return Err(Failure::new(ErrorCode::Internal, e.to_string()));
         }
         let status = status.map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
         let detail = match (status.code(), status.signal()) {
@@ -1144,7 +1216,7 @@ impl Agent {
             _ => "unknown exit status".into(),
         };
         let _ = self.audit.record(
-            &run_event(peer, &run, &entry_names)
+            &run_event(peer, &run, &identities)
                 .outcome("exited")
                 .detail(detail),
         );
@@ -1162,30 +1234,111 @@ fn file_id(path: &Path) -> io::Result<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
+/// Whether any live (non-zombie) process is in process group `pgid`.
+fn group_alive(pgid: Pid) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            return false;
+        };
+        // "pid (comm) state ppid pgrp ..."
+        let Some(rest) = stat.rfind(')').and_then(|i| stat.get(i + 1..)) else {
+            return false;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("Z");
+        let _ppid = fields.next();
+        let pgrp: i32 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        pgrp == pgid.as_raw() && state != "Z" && state != "X"
+    })
+}
+
+/// Terminate every remaining process of the group: SIGTERM, then SIGKILL
+/// after [`KILL_GRACE`]. Processes that moved to another session or group
+/// (`setsid`) escape this (threat model L17).
+fn terminate_group(pgid: Pid) {
+    if !group_alive(pgid) {
+        return;
+    }
+    let _ = killpg(pgid, Signal::SIGTERM);
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = killpg(pgid, Signal::SIGKILL);
+}
+
 /// Forward the client's input to the command's stdin pipe until either side
-/// ends or the command exits.
-fn pump_stdin(from: OwnedFd, mut to: std::process::ChildStdin, done: Arc<AtomicBool>) {
+/// ends or the command has finished. Our end of the pipe is non-blocking (it
+/// is not shared with anyone), so a command that stops reading cannot block
+/// the worker forever.
+fn pump_stdin(from: OwnedFd, to: std::process::ChildStdin, stop: Arc<AtomicBool>) {
     let mut from = File::from(from);
+    let mut to = File::from(OwnedFd::from(to));
+    if fcntl(&to, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
+        return;
+    }
     let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
-    while !done.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) {
         let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(100u16)) {
             Ok(0) | Err(Errno::EINTR) => continue,
-            Ok(_) => match from.read(&mut buf) {
-                Ok(0) => return,
-                Ok(n) => {
-                    if to.write_all(&buf[..n]).is_err() {
-                        return;
-                    }
-                }
-                Err(e)
-                    if e.kind() == io::ErrorKind::Interrupted
-                        || e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => return,
-            },
+            Ok(_) => {}
             Err(_) => return,
         }
+        // Checked again right before reading, so that input typed after the
+        // command finished is left for whoever reads the terminal next.
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let n = match from.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == io::ErrorKind::Interrupted
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        if write_all_until(&mut to, &buf[..n], &stop).is_err() {
+            return;
+        }
     }
+}
+
+/// Write everything to a descriptor, waiting for it to become writable but
+/// giving up when `stop` is set.
+fn write_all_until(file: &mut File, mut data: &[u8], stop: &AtomicBool) -> io::Result<()> {
+    while !data.is_empty() {
+        match file.write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::SeqCst) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let mut fds = [PollFd::new(file.as_fd(), PollFlags::POLLOUT)];
+                match poll(&mut fds, PollTimeout::from(100u16)) {
+                    Ok(_) | Err(Errno::EINTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -1285,17 +1438,33 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
     out
 }
 
-/// Copy a child's output to the client's descriptor, redacting secrets.
-fn pump(mut from: impl Read, to: OwnedFd, mut redactor: Redactor) {
+/// Copy a command's output to the client's descriptor, redacting secrets.
+/// Ends at end-of-file, or shortly after `stop` is set (a descendant that
+/// escaped the process group may keep the pipe open forever).
+fn pump<R: Read + AsFd>(mut from: R, to: OwnedFd, mut redactor: Redactor, stop: Arc<AtomicBool>) {
     let mut to = File::from(to);
     let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
+    let mut drain_until: Option<Instant> = None;
     loop {
+        if stop.load(Ordering::SeqCst) {
+            let until =
+                *drain_until.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+            if Instant::now() >= until {
+                break;
+            }
+        }
+        let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(100u16)) {
+            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(_) => break,
+        }
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let out = redactor.push(&buf[..n]);
-                if write_all_blocking(&mut to, &out).is_err() {
-                    // The reader went away. Dropping `from` gives the child
+                if write_all_until(&mut to, &out, &stop).is_err() {
+                    // The reader went away. Dropping `from` gives the command
                     // SIGPIPE on its next write, as with a normal pipe.
                     return;
                 }
@@ -1304,48 +1473,20 @@ fn pump(mut from: impl Read, to: OwnedFd, mut redactor: Redactor) {
             Err(_) => break,
         }
     }
-    let _ = write_all_blocking(&mut to, &redactor.finish());
+    let _ = write_all_until(&mut to, &redactor.finish(), &stop);
 }
 
-/// `write_all` that also copes with descriptors in non-blocking mode (the
-/// client's stdout may be a non-blocking pipe set up by its own parent).
-fn write_all_blocking(file: &mut File, mut data: &[u8]) -> io::Result<()> {
-    while !data.is_empty() {
-        match file.write(data) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let mut fds = [PollFd::new(file.as_fd(), PollFlags::POLLOUT)];
-                match poll(&mut fds, PollTimeout::from(1000u16)) {
-                    Ok(_) | Err(Errno::EINTR) => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// Kill the command's process group if the client disconnects before it ends.
-fn watch_client(stream: UnixStream, pgid: Pid, done: Arc<AtomicBool>) {
+/// Terminate the command's process group if the client disconnects before
+/// the request has finished.
+fn watch_client(stream: UnixStream, pgid: Pid, finished: Arc<AtomicBool>) {
     let mut buf = [0u8; 64];
-    while !done.load(Ordering::SeqCst) {
+    while !finished.load(Ordering::SeqCst) {
         let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(200u16)) {
             Ok(0) | Err(Errno::EINTR) => continue,
             Ok(_) => match (&stream).read(&mut buf) {
                 Ok(0) | Err(_) => {
-                    let _ = killpg(pgid, Signal::SIGTERM);
-                    let deadline = Instant::now() + KILL_GRACE;
-                    while Instant::now() < deadline {
-                        if done.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    let _ = killpg(pgid, Signal::SIGKILL);
+                    terminate_group(pgid);
                     return;
                 }
                 Ok(_) => {}
