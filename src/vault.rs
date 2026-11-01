@@ -526,6 +526,45 @@ impl Vault {
         infos
     }
 
+    /// The entry's notes, if it has any.
+    pub fn notes(&self, id: EntryId) -> Option<SecretString> {
+        let entry = self.db.entry(id)?;
+        entry
+            .get(fields::NOTES)
+            .filter(|n| !n.is_empty())
+            .map(|n| SecretString::new(n.to_string()))
+    }
+
+    /// Copy the vault file, as it is on disk (encrypted), to `dest`, which
+    /// must not exist; then decrypt the copy with the current master password
+    /// to prove it is a usable backup. Returns the number of entries in it.
+    pub fn backup_to(&self, dest: &Path) -> Result<usize, VaultError> {
+        let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
+        if current != self.fingerprint {
+            return Err(VaultError::ChangedOnDisk);
+        }
+        let bytes = fs::read(&self.path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dest)?;
+        let written = (|| -> Result<(), VaultError> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
+                File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(dest);
+            return Err(e);
+        }
+        let copy = Vault::open(dest, self.password.clone())?;
+        Ok(copy.entries().len())
+    }
+
     /// The entry's password, if it has a non-empty one.
     pub fn secret(&self, id: EntryId) -> Option<SecretString> {
         let entry = self.db.entry(id)?;

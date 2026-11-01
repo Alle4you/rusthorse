@@ -136,37 +136,103 @@ rusthorse audit
 
 ## Migrating existing secrets
 
-From a `.env` file (one approval for the whole file):
+Migrate in four steps, and keep the originals until the last one is done.
+
+1. **Back up** the new vault (see below), so that you can go back.
+2. **Preview** what would be imported — names only, and which ones already
+   exist; no secret is read:
+
+   ```sh
+   rusthorse import dotenv ~/project/.env --prefix MYAPP_ --dry-run
+   rusthorse import secret-service -a service=myapp --name-from key --dry-run
+   ```
+
+   The Secret Service form selects items by attribute. For example, items
+   stored with `secret-tool store --label=... service myapp key token` are
+   matched by `-a service=myapp`, and `--name-from key` names each entry
+   after its `key` attribute.
+3. **Import**, tagging the result so it is easy to find:
+
+   ```sh
+   rusthorse import secret-service -a service=myapp --name-from key --tag migrated
+   ```
+
+   The importer reads the items in the `rusthorse` process and sends them to
+   the agent in batches small enough for one approval dialog each (at most 50
+   names per batch).
+4. **Verify each entry by using it**, not just by listing it: run a real,
+   harmless command with it — an API call that only reads, a login check —
+   for example `rusthorse run OPENAI_API_KEY -- curl -fsS -o /dev/null
+   -H "Authorization: Bearer $OPENAI_API_KEY" https://api.openai.com/v1/models`
+   (inside `sh -c '…'` so that the variable is expanded by the command).
+   Only when every entry has worked, delete the originals with the tool that
+   created them, and update scripts that used the old tool.
+
+## Backups and restore
+
+The vault is a single, encrypted file. Make an independent copy with:
 
 ```sh
-rusthorse import dotenv ~/project/.env --prefix MYAPP_ --tag myapp
+rusthorse backup ~/Backups/rusthorse-$(date +%F).kdbx
 ```
 
-From GNOME Keyring or KWallet, selecting items by attribute. For example,
-items stored with `secret-tool store --label=... service myapp key token`:
+The agent copies the file and then decrypts the copy with the current master
+password, so a backup it reports as written is known to open. Keep backups
+somewhere other than the vault's directory. `vault.kdbx.bak`, next to the
+vault, only holds the version before the last save and is replaced on every
+save — it is not a backup.
+
+To **restore**:
 
 ```sh
-rusthorse import secret-service -a service=myapp --name-from key
+systemctl --user stop rusthorse-agent
+cp ~/.local/share/rusthorse/vault.kdbx ~/.local/share/rusthorse/vault.kdbx.before-restore
+cp ~/Backups/rusthorse-2026-11-01.kdbx ~/.local/share/rusthorse/vault.kdbx
+chmod 600 ~/.local/share/rusthorse/vault.kdbx
+systemctl --user start rusthorse-agent
+rusthorse unlock && rusthorse list
 ```
 
-The importer reads the items in the `rusthorse` process and sends them to the
-agent as a single batch for you to approve. After checking the result with
-`rusthorse list`, delete the originals with the tool that created them.
+A backup keeps the master password it was made with: after `rusthorse
+passwd`, older backups still open with the old password.
 
-## Backups
+## Changing the master password
 
-The vault is a single file. Back it up like any other file (it is encrypted).
-Each save also keeps the previous version next to it as `vault.kdbx.bak`.
+`rusthorse passwd` asks for the current password and the new one (twice) in
+the agent's dialogs and re-encrypts the vault. It deletes `vault.kdbx.bak`,
+which was encrypted with the old password; it cannot change copies made
+elsewhere. Changing the password in KeePassXC also works — follow the next
+section.
+
+## Editing the vault in KeePassXC
+
+The vault is a normal KeePass file, but only one program should write it at a
+time:
+
+1. `rusthorse lock` (or `systemctl --user stop rusthorse-agent`).
+2. Open, edit and save the file in KeePassXC, then **close the database** in
+   KeePassXC.
+3. Use Rusthorse again; the next unlock reads the file KeePassXC wrote.
+
+Fields, groups, tags, attachments and history that Rusthorse does not
+manage are kept when Rusthorse saves (a test runs Rusthorse's edits on a file
+written by KeePassXC 2.7.12 and checks that every untouched entry is
+identical).
 
 ## Upgrading
 
+Install a specific release, then restart the agent so that both sides run
+the same version:
+
 ```sh
-cargo install --locked --git https://github.com/Alle4you/rusthorse --force
+cargo install --locked --git https://github.com/Alle4you/rusthorse --tag v0.1.0 --force
 systemctl --user restart rusthorse-agent
+rusthorse doctor
 ```
 
-Read [CHANGELOG.md](../CHANGELOG.md) first: protocol changes require the
-agent and the CLI to be the same version.
+Commands refuse to talk to an agent that speaks another protocol version and
+say how to restart it. Read [CHANGELOG.md](../CHANGELOG.md) before
+upgrading.
 
 ## File locations
 

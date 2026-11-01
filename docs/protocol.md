@@ -48,9 +48,13 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   1 MiB on each output channel beyond what the client has acknowledged with
   credit frames, and the client grants credit as it writes data out. The
   client sends at most 1 MiB of input beyond what the agent has acknowledged;
-  sending more cancels the request. Because input waiting for the command is
-  buffered within that window, the agent keeps reading the connection — and
-  sees credit frames, closes and violations — at all times.
+  sending more cancels the request. The client starts with no stdin credit:
+  the agent grants the whole window when the command starts, so input given
+  to a request that is denied or fails is never read. Input waiting for the
+  command is buffered within the window, so the agent keeps reading the
+  connection; its stdin acknowledgements are written by a separate thread, so
+  a client that does not read them cannot stop the agent from noticing closes
+  and violations.
 - A `run` request **without redaction** carries exactly three file
   descriptors — the client's stdin, stdout and stderr, in that order — as
   `SCM_RIGHTS` ancillary data on the **first byte** of the frame (send the
@@ -91,8 +95,9 @@ Every request is an object with a `type` field.
 | `import` | `entries` (array of `{entry, value}`), `replace` (bool) | `ok` |
 | `edit` | `name`, `changes` ([EntryChanges](#entrychanges)) | `ok` |
 | `remove` | `name` | `ok` |
-| `reveal` | `name` | `secret` |
+| `reveal` | `name`, `notes` (bool, optional) | `secret` |
 | `change_password` | — | `ok` |
+| `backup` | `path` (absolute, must not exist) | `ok` |
 | `run` | see [Run](#run) | `exited` |
 
 Any request can also be answered with an [`error`](#errors).

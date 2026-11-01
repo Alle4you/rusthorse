@@ -117,10 +117,20 @@ pub enum Request {
     /// Change the master password. The agent asks for the current one and
     /// the new one (twice) in its own dialogs.
     ChangePassword,
-    /// Return an entry's password to the client (requires approval).
+    /// Return an entry's password — or its notes — to the client (requires
+    /// approval).
     Reveal {
         /// Entry name or `Group/Name` path.
         name: String,
+        /// Return the notes instead of the password.
+        #[serde(default)]
+        notes: bool,
+    },
+    /// Copy the (encrypted) vault file to `path` and check that the copy
+    /// opens with the current master password.
+    Backup {
+        /// Absolute destination path; must not exist.
+        path: String,
     },
     /// Run a command with secrets in its environment (requires approval).
     Run(RunRequest),
@@ -908,8 +918,15 @@ mod tests {
 
     #[test]
     fn request_json_shape_is_stable() {
-        let json = serde_json::to_value(Request::Reveal { name: "x".into() }).expect("json");
-        assert_eq!(json, serde_json::json!({"type": "reveal", "name": "x"}));
+        let json = serde_json::to_value(Request::Reveal {
+            name: "x".into(),
+            notes: false,
+        })
+        .expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "reveal", "name": "x", "notes": false})
+        );
         let resp = serde_json::to_value(Response::Error {
             code: ErrorCode::Denied,
             message: "no".into(),

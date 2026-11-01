@@ -754,6 +754,37 @@ fn dialogs_identify_entries_by_path_and_uuid() {
 
 #[test]
 fn requests_too_long_for_one_dialog_are_refused() {
+    use rusthorse::protocol::{EntryFields, ImportedEntry, NewEntry, Request, Response};
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    // Sent directly (the CLI would split it): 60 long names in one batch.
+    let entries = (0..60)
+        .map(|i| ImportedEntry {
+            entry: NewEntry {
+                name: format!(
+                    "A_VERY_LONG_VARIABLE_NAME_FOR_TESTING_THE_DIALOG_LIMIT_NUMBER_{i:03}_XXXXXXXX"
+                ),
+                fields: EntryFields::default(),
+                ..NewEntry::default()
+            },
+            value: SecretString::new(format!("value{i}")),
+        })
+        .collect();
+    let response = h.call(&Request::Import {
+        entries,
+        replace: false,
+    });
+    match response {
+        Response::Error { message, .. } => {
+            assert!(message.contains("too much detail"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn large_imports_are_split_into_readable_batches() {
     let h = Harness::new();
     let env_file = h.dir.path().join("many.env");
     let lines: String = (0..60)
@@ -761,14 +792,32 @@ fn requests_too_long_for_one_dialog_are_refused() {
         .collect();
     std::fs::write(&env_file, lines).expect("write");
     assert!(h.run(&["unlock"]).status.success());
-    let out = h.run(&["import", "dotenv", env_file.to_str().expect("utf8")]);
-    assert!(!out.status.success());
-    assert!(
-        text(&out.stderr).contains("too much detail"),
-        "{}",
-        text(&out.stderr)
+    // Dry run: names and their status, nothing imported, nothing asked.
+    let out = h.run(&[
+        "import",
+        "dotenv",
+        env_file.to_str().expect("utf8"),
+        "--dry-run",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("new"))
+            .count(),
+        60
     );
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    // Real run: several batches, one approval each, everything imported.
+    h.decide(&[Decision::AllowOnce; 10]);
+    let out = h.run(&["import", "dotenv", env_file.to_str().expect("utf8")]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(h.ui.approvals_asked.load(Ordering::SeqCst) >= 2);
+    let listing = text(&h.run(&["list"]).stdout);
+    assert_eq!(
+        listing.lines().filter(|l| l.contains("_XXXXXXXX")).count(),
+        60
+    );
 }
 
 #[test]
@@ -1568,6 +1617,136 @@ fn generate_completions_and_doctor_work_offline() {
     let report = text(&out.stdout);
     assert!(report.contains("agent 0.1.0 is running"), "{report}");
     assert!(report.contains("the vault is KDBX 4."), "{report}");
+}
+
+#[test]
+fn a_client_that_never_reads_acknowledgements_can_still_cancel() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("cat.pid");
+    let script = format!("echo $$ > {}; exec cat >/dev/null", pidfile.display());
+    let stream = raw_run(&h, &["sh", "-c", &script], true);
+    let pid = wait_for_pid(&pidfile);
+    // Thousands of one-byte input frames; every one is acknowledged with a
+    // credit frame that this client never reads, so the agent's sends back
+    // block quickly. The agent must keep reading regardless.
+    let sender = stream.try_clone().expect("clone");
+    within(Duration::from_secs(20), move || {
+        for _ in 0..5000 {
+            rusthorse::protocol::send_data(&sender, rusthorse::protocol::STDIN, b"x")
+                .expect("the agent stopped reading the connection");
+        }
+    });
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    wait_until_dead(pid, "the agent stopped watching the connection");
+    drop(stream);
+}
+
+#[test]
+fn input_is_not_read_before_the_command_starts() {
+    use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::Deny]);
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(b"KEEP ME\n").expect("write");
+    let out = h
+        .cmd(&["run", "--stdin", "T", "--", "cat"])
+        .stdin(Stdio::from(OwnedFd::from(reader.try_clone().expect("dup"))))
+        .finish();
+    assert_eq!(out.status.code(), Some(125));
+    drop(writer);
+    let mut left = String::new();
+    let mut reader = reader;
+    reader.read_to_string(&mut left).expect("read");
+    assert_eq!(left, "KEEP ME\n", "input was consumed by a denied request");
+}
+
+#[test]
+fn notes_can_be_revealed_with_approval() {
+    let h = Harness::new();
+    h.add_secret("router", "abcdefgh", &["--notes", "console on J3"]);
+    h.decide(&[Decision::Deny, Decision::AllowOnce]);
+    assert_eq!(
+        h.run(&["reveal", "router", "--notes"]).status.code(),
+        Some(4)
+    );
+    let out = h.run(&["reveal", "router", "--notes"]);
+    assert_eq!(text(&out.stdout).trim(), "console on J3");
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(request.summary.contains("REVEAL the notes"));
+}
+
+#[test]
+fn backups_are_written_and_verified() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    let dest = h.dir.path().join("backups").join("copy.kdbx");
+    std::fs::create_dir(dest.parent().expect("dir")).expect("mkdir");
+    let out = h.run(&["backup", dest.to_str().expect("utf8")]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("verified"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&dest).expect("meta").permissions().mode() & 0o777,
+        0o600
+    );
+    let copy = Vault::open(&dest, SecretString::new(PASSWORD.into())).expect("the copy opens");
+    assert!(copy.find("T").is_ok());
+    // Never overwrites.
+    assert!(
+        !h.run(&["backup", dest.to_str().expect("utf8")])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn a_lost_connection_after_the_request_is_reported_as_unknown() {
+    use rusthorse::protocol::{
+        PROTOCOL_VERSION, Request, Response, StatusInfo, recv_frame, send_frame,
+    };
+    use std::os::unix::net::UnixListener;
+    // A fake agent: answers the version check, accepts the run request and
+    // then drops the connection without a result.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let fake = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().expect("accept");
+            let (body, _fds) = recv_frame(&stream).expect("request");
+            let request: Request = serde_json::from_slice(&body).expect("json");
+            if matches!(request, Request::Status) {
+                let status = Response::Status(StatusInfo {
+                    protocol_version: PROTOCOL_VERSION,
+                    agent_version: "fake".into(),
+                    vault: "/nonexistent".into(),
+                    vault_exists: true,
+                    locked: false,
+                    idle_timeout_secs: 0,
+                    locks_in_secs: None,
+                    remembered_approvals: 0,
+                });
+                send_frame(&stream, &status, &[]).expect("status");
+            } else {
+                assert!(matches!(request, Request::Run(_)));
+                drop(stream); // gone, after the request arrived
+            }
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake agent");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("may or may not have run"));
 }
 
 #[test]

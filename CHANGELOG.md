@@ -31,6 +31,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   browser), `list --search`, `doctor` and `completions`.
 - Commands check that the agent speaks the same protocol version and explain
   how to restart it after an upgrade.
+- `backup DEST` (verified copy), `reveal --notes`, `import --dry-run` and
+  automatic import batches.
+- `run` exits with 124 when the connection is lost after the request was
+  sent (outcome unknown), keeping 125 for "did not run".
 
 ### Security
 

@@ -312,7 +312,9 @@ after the call returns. If another process reads the same input at the same
 moment — between that `poll` and the `read` — the reader stays blocked in
 `read` and may later consume input meant for someone else; interrupting it
 would require changing file flags shared with the caller. Without `--stdin`
-(the default), the requester's input is never read.
+(the default), the requester's input is never read. With `--stdin`,
+nothing is read before the command has started: a denied request leaves the
+input untouched.
 
 ## 8. Running AI agents in isolation
 
@@ -369,6 +371,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Fourth review: verification of the third round (AI-assisted, Codex). | See the fourth table. |
 | 2026-10-31 | Fifth review: verification of the new I/O design (AI-assisted, Codex). | See the fifth table. |
 | 2026-10-31 | Sixth review: verification of flow control and cancellation (AI-assisted, Codex). | See the sixth table. |
+| 2026-11-01 | Seventh review: verification and readiness for a first real use (AI-assisted, Codex). | See the seventh table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -459,4 +462,20 @@ N12 and N18 were confirmed fixed):
 | N22 — a destination blocked forever kept `run_with` from returning after the other destination failed | **Fixed:** after a failure, writers are awaited for at most half a second; one still blocked in its destination is left detached (documented on `run_with`). |
 | N7 / N19 — a concurrent reader of the same input between `poll` and `read` leaves the input reader blocked | **Documented** (L18): cannot be interrupted without changing flags shared with the caller. |
 | The client trusts the agent's credit window (its queues are unbounded) | **Accepted:** the agent is part of the trusted computing base (§4). |
-| Coverage | A mutation run after this round reverted each of 32 fixes in turn. 30 made the suite fail (one only after a new test for end-of-input with pending input was added). Two are *equivalent* under the current design and cannot be caught: the lock-free client cancellation (sends can no longer block now that stdin is flow-controlled) and requesting `POLLRDHUP` (the watcher always reads the socket, so a half-close arrives as end-of-file and cancels anyway). Both are kept as defence in depth. |
+| Coverage | A mutation run after this round reverted each of 32 fixes in turn. 30 made the suite fail (one only after a new test for end-of-input with pending input was added). Two are not caught by the suite: the lock-free client cancellation and requesting `POLLRDHUP`. The second is redundant while the watcher always reads the socket (a half-close then arrives as end-of-file and cancels). The first was described here as equivalent because "sends can no longer block"; the seventh review showed that a client's sends *can* still block transiently (for example while the approval dialog is open), so it is a coverage gap kept as defence in depth, not a proven equivalence. |
+
+Findings of the seventh review (N20–N22 confirmed fixed), and the readiness
+gaps it listed:
+
+| Finding | Disposition |
+|---|---|
+| N23 — the watcher wrote stdin acknowledgements to the socket itself; a client that never read them blocked that write, and the watcher stopped noticing half-closes and violations | **Fixed:** acknowledgements are written by a separate thread (released by cancellation); the watcher never writes to the socket. |
+| Input read before approval | **Fixed:** the client starts with no stdin credit; the agent grants it when the command starts. |
+| "125 means the command did not run" was not always true | **Fixed:** 124 now means the connection was lost after the request was sent (outcome unknown); 125 is kept for refusals and failures before the command ran. |
+| Migration could only be checked with `list` | **Fixed:** `import --dry-run`, batching, and a documented procedure that verifies each entry by using it. |
+| No verified backup or restore procedure | **Fixed:** `rusthorse backup` (verified copy) and a restore procedure. |
+| Master password change, KeePassXC coexistence | **Fixed:** `rusthorse passwd`; documented KeePassXC procedure; a test runs Rusthorse's edits on a KeePassXC 2.7.12 file and checks untouched entries are identical. |
+| Notes could be stored but not read | **Fixed:** `reveal --notes` (approval). |
+| Search, `open`, generated values, `doctor`, completions, protocol-version check | **Done.** |
+| Clipboard, lock on screen lock or suspend, man page, packages | **Later** (clipboard deliberately omitted on X11; see the roadmap). |
+| CI never ran; no rehearsal on the real desktop | **Open:** runs once the repository is published; the desktop rehearsal is the owner's first test. |

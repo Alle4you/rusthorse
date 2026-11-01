@@ -20,8 +20,12 @@ use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
 use rusthorse::{audit, import, paths};
 
-/// Exit status for `run` when Rusthorse itself fails (as `env`/`docker run` do).
+/// Exit status for `run` when Rusthorse refused or failed and the command
+/// did not run (as `env` and `docker run` do).
 const EXIT_RUN_FAILURE: u8 = 125;
+/// Exit status for `run` when the connection to the agent was lost after the
+/// request was sent: the command may or may not have run.
+const EXIT_RUN_UNKNOWN: u8 = 124;
 /// Exit status when the human denied or cancelled the request.
 const EXIT_DENIED: u8 = 4;
 
@@ -100,6 +104,14 @@ enum Command {
     Reveal {
         /// Entry name or Group/Name path.
         name: String,
+        /// Print the entry's notes instead of its value.
+        #[arg(long)]
+        notes: bool,
+    },
+    /// Copy the encrypted vault to a file and verify that the copy opens.
+    Backup {
+        /// Destination file (must not exist).
+        dest: PathBuf,
     },
     /// Open an entry's URL (its access link) in the default browser.
     Open {
@@ -320,6 +332,9 @@ enum ImportCommand {
         /// Overwrite existing entries.
         #[arg(long)]
         replace: bool,
+        /// Only list what would be imported, and which names already exist.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Import items from GNOME Keyring / KWallet (freedesktop Secret Service).
     #[cfg(feature = "secret-service")]
@@ -341,6 +356,10 @@ enum ImportCommand {
         /// Overwrite existing entries.
         #[arg(long)]
         replace: bool,
+        /// Only list what would be imported, and which names already exist;
+        /// no secret is read.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -386,7 +405,7 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             | Command::Completions { .. }
     );
     if talks_to_agent {
-        ensure_compatible(client)?;
+        client.check_compatible()?;
     }
     match command {
         Command::Init { vault } => init(vault.unwrap_or_else(paths::vault)).map(|_| 0),
@@ -412,29 +431,19 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
         Command::Add(args) => add(client, args),
         Command::Edit(args) => edit(client, args),
         Command::Remove { name } => simple(client, &Request::Remove { name }),
-        Command::Reveal { name } => reveal(client, name),
+        Command::Reveal { name, notes } => reveal(client, name, notes),
+        Command::Backup { dest } => {
+            let dest = std::env::current_dir()?.join(dest);
+            let path = dest
+                .to_str()
+                .context("the backup path is not valid UTF-8")?
+                .to_string();
+            simple(client, &Request::Backup { path })
+        }
         Command::Run(args) => run(client, args),
         Command::Import(cmd) => import_cmd(client, cmd),
         Command::Audit { lines, json } => show_audit(lines, json),
     }
-}
-
-/// Refuse to talk to an agent that speaks another protocol version (for
-/// example after upgrading the binary without restarting the agent).
-fn ensure_compatible(client: &Client) -> anyhow::Result<()> {
-    if let Response::Status(info) = client.call(&Request::Status)?
-        && info.protocol_version != rusthorse::protocol::PROTOCOL_VERSION
-    {
-        bail!(
-            "the running agent speaks protocol {} (version {}) but this rusthorse speaks {} \
-             (version {}); restart the agent: `systemctl --user restart rusthorse-agent`",
-            info.protocol_version,
-            info.agent_version,
-            rusthorse::protocol::PROTOCOL_VERSION,
-            env!("CARGO_PKG_VERSION")
-        );
-    }
-    Ok(())
 }
 
 /// Turn an error response into an error (with the right exit status).
@@ -794,8 +803,8 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
     )
 }
 
-fn reveal(client: &Client, name: String) -> anyhow::Result<u8> {
-    let Response::Secret { value } = check(client.call(&Request::Reveal { name })?)? else {
+fn reveal(client: &Client, name: String, notes: bool) -> anyhow::Result<u8> {
+    let Response::Secret { value } = check(client.call(&Request::Reveal { name, notes })?)? else {
         bail!("unexpected response");
     };
     println!("{}", value.as_str());
@@ -864,10 +873,22 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
         Ok(code) => Ok(code),
         Err(e) => {
             eprintln!("rusthorse: {e:#}");
-            Ok(EXIT_RUN_FAILURE)
+            if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                .is_some()
+            {
+                Ok(EXIT_RUN_UNKNOWN)
+            } else {
+                Ok(EXIT_RUN_FAILURE)
+            }
         }
     }
 }
+
+/// Most entries sent to the agent in one batch (each batch is one approval).
+const IMPORT_BATCH: usize = 50;
+/// Most characters of entry names in one batch, so that the approval dialog
+/// can list all of them.
+const IMPORT_BATCH_CHARS: usize = 2000;
 
 fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
     let (pairs, tags, replace) = match command {
@@ -876,6 +897,7 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             prefix,
             tags,
             replace,
+            dry_run,
         } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
@@ -885,6 +907,10 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                 .into_iter()
                 .map(|(name, value)| (format!("{prefix}{name}"), value))
                 .collect();
+            if dry_run {
+                let names = pairs.iter().map(|(n, _)| n.clone()).collect();
+                return import_preview(client, names, replace);
+            }
             (pairs, tags, replace)
         }
         #[cfg(feature = "secret-service")]
@@ -893,6 +919,7 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             name_from,
             tags,
             replace,
+            dry_run,
         } => {
             let attributes = attributes
                 .iter()
@@ -902,6 +929,10 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                         .with_context(|| format!("{a:?}: expected KEY=VALUE"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            if dry_run {
+                let names = import::list_secret_service(&attributes, name_from.as_deref())?;
+                return import_preview(client, names, replace);
+            }
             let pairs = import::read_secret_service(&attributes, name_from.as_deref())?;
             (pairs, tags, replace)
         }
@@ -909,7 +940,7 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
     if pairs.is_empty() {
         bail!("nothing found to import");
     }
-    let entries = pairs
+    let entries: Vec<ImportedEntry> = pairs
         .into_iter()
         .map(|(name, value)| ImportedEntry {
             entry: NewEntry {
@@ -923,7 +954,82 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             value,
         })
         .collect();
-    simple(client, &Request::Import { entries, replace })
+    // Split into batches small enough for one dialog each.
+    let mut batches: Vec<Vec<ImportedEntry>> = Vec::new();
+    let mut chars = 0;
+    for item in entries {
+        let len = item.entry.name.chars().count() + 2;
+        match batches.last_mut() {
+            Some(batch) if batch.len() < IMPORT_BATCH && chars + len <= IMPORT_BATCH_CHARS => {
+                chars += len;
+                batch.push(item);
+            }
+            _ => {
+                chars = len;
+                batches.push(vec![item]);
+            }
+        }
+    }
+    let total = batches.len();
+    for (i, batch) in batches.into_iter().enumerate() {
+        if total > 1 {
+            eprintln!("batch {} of {total} ({} entries):", i + 1, batch.len());
+        }
+        let status = simple(
+            client,
+            &Request::Import {
+                entries: batch,
+                replace,
+            },
+        )?;
+        if status != 0 {
+            return Ok(status);
+        }
+    }
+    Ok(0)
+}
+
+/// Show what an import would do, without reading any secret value.
+fn import_preview(client: &Client, names: Vec<String>, replace: bool) -> anyhow::Result<u8> {
+    if names.is_empty() {
+        bail!("nothing found to import");
+    }
+    let Response::Entries { entries } = check(client.call(&Request::List)?)? else {
+        bail!("unexpected response");
+    };
+    let existing: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.name.as_str()).collect();
+    let mut new = 0;
+    for name in &names {
+        let (mark, note) = if existing.contains(name.as_str()) {
+            (
+                "exists",
+                if replace {
+                    "will be replaced"
+                } else {
+                    "will be skipped"
+                },
+            )
+        } else if rusthorse::vault::validate_name(name).is_err() {
+            ("invalid", "cannot be imported (name not allowed)")
+        } else {
+            new += 1;
+            ("new", "")
+        };
+        println!(
+            "{mark:<8} {name}{}",
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!("  ({note})")
+            }
+        );
+    }
+    eprintln!(
+        "{} found, {new} new; nothing was imported (dry run)",
+        names.len()
+    );
+    Ok(0)
 }
 
 fn open(client: &Client, name: String) -> anyhow::Result<u8> {

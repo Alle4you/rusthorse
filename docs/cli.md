@@ -26,6 +26,7 @@ terminal.
 | `1` | Error (agent not running, entry not found, invalid input, …). |
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
+| `124` | `run` only: the connection to the agent was lost after the request was sent; the command may or may not have run. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141 when the output of `rusthorse run` itself was closed). |
 
@@ -217,7 +218,8 @@ gets the caller's descriptors directly (including stdin).
 
 If the output of `rusthorse run` is closed early (for example
 `rusthorse run … | head`), it stops the command and exits with status 141,
-like a program killed by `SIGPIPE`.
+like a program killed by `SIGPIPE`. With `--stdin`, input is read only once
+the command has started, so a denied request never consumes it.
 
 When the command exits, anything it left running in its process group (for
 example `sleep 30 &`) is terminated; if `rusthorse run` is interrupted before
@@ -244,15 +246,26 @@ Exit status: the command's, or `125` if it did not run.
 ## `rusthorse reveal`
 
 ```
-rusthorse reveal NAME
+rusthorse reveal NAME [--notes]
 ```
 
-Prints the value on standard output. Requires approval every time (it is
+Prints the value (or, with `--notes`, the entry's notes) on standard output. Requires approval every time (it is
 never remembered). Meant for humans; automation and AI agents should use
 `run`.
 
 There is deliberately no `copy` command: on X11 every program of your user
 can read the clipboard, including the AI agent the value is being kept from.
+
+## `rusthorse backup`
+
+```
+rusthorse backup DEST
+```
+
+Copies the encrypted vault file to `DEST` (which must not exist; mode `0600`)
+and then decrypts the copy with the current master password to prove it
+opens. See [installation.md](installation.md#backups-and-restore) for
+restoring.
 
 ## `rusthorse open`
 
@@ -288,24 +301,29 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 ## `rusthorse import dotenv`
 
 ```
-rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace]
+rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
 Imports `NAME=value` lines (optional `export`, `#` comments, quoted values).
-`--prefix` is upper-cased and prepended to each name. One approval covers the
-whole batch; existing entries are skipped unless `--replace` is given.
+`--prefix` is upper-cased and prepended to each name. Existing entries are
+skipped unless `--replace` is given. Entries are sent in batches of at most 50
+(fewer if the names are long), one approval each. `--dry-run` lists the names
+and whether each is new, exists or is not allowed, and imports nothing.
 
 ## `rusthorse import secret-service`
 
 ```
 rusthorse import secret-service --attribute KEY=VALUE... [--name-from ATTR]
-                                [--tag TAG]... [--replace]
+                                [--tag TAG]... [--replace] [--dry-run]
 ```
 
 Imports items from the freedesktop Secret Service (GNOME Keyring, KWallet)
 whose attributes match all `--attribute` filters. The entry name comes from
 the attribute named by `--name-from`, or from the item label. The desktop
-keyring may ask you to unlock it. One approval covers the whole batch.
+keyring may ask you to unlock it. Batches and `--dry-run` work as for
+`import dotenv`; a dry run reads only the items' attributes, never their
+secrets. See [installation.md](installation.md#migrating-existing-secrets)
+for a safe migration procedure.
 
 Not available in builds without the default `secret-service` feature.
 

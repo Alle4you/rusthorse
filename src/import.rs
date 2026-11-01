@@ -37,6 +37,43 @@ pub fn parse_dotenv(text: &str) -> Vec<(String, SecretString)> {
     pairs
 }
 
+/// Names of the Secret Service items matching `attributes`, without reading
+/// any secret (attributes are not secret, so locked items need no unlock).
+#[cfg(feature = "secret-service")]
+pub fn list_secret_service(
+    attributes: &[(String, String)],
+    name_from: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+    use secret_service::EncryptionType;
+    use secret_service::blocking::SecretService;
+    use std::collections::HashMap;
+
+    let service = SecretService::connect(EncryptionType::Dh)
+        .context("cannot connect to the Secret Service (is GNOME Keyring or KWallet running?)")?;
+    let filter: HashMap<&str, &str> = attributes
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let found = service
+        .search_items(filter)
+        .context("Secret Service search failed")?;
+    let mut names = Vec::new();
+    for item in found.unlocked.iter().chain(found.locked.iter()) {
+        let name = match name_from {
+            Some(attr) => item
+                .get_attributes()?
+                .get(attr)
+                .cloned()
+                .with_context(|| format!("an item has no {attr:?} attribute"))?,
+            None => item.get_label()?,
+        };
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Read items from the freedesktop Secret Service (GNOME Keyring, KWallet, …)
 /// whose attributes match all of `attributes`. Each item's name comes from the
 /// attribute `name_from`, or from its label when `name_from` is `None`.

@@ -142,7 +142,8 @@ what Rusthorse can and cannot protect against when the requester is an AI.
 | `edit NAME …` | Change fields, tags, name or value | yes |
 | `remove NAME` | Delete an entry | yes |
 | `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
-| `reveal NAME` | Print a value (for humans; avoid in automation) | yes (never remembered) |
+| `reveal NAME [--notes]` | Print a value or the notes (for humans; avoid in automation) | yes (never remembered) |
+| `backup DEST` | Copy the encrypted vault and verify the copy opens | — |
 | `open NAME` | Open the entry's URL (access link) in the browser | — |
 | `passwd` | Change the master password | the dialogs themselves |
 | `generate` | Print a random value (nothing stored) | — |

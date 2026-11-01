@@ -17,6 +17,25 @@ use zeroize::Zeroizing;
 
 use crate::protocol::{self, Frame, Request, Response, RunRequest};
 
+/// The request reached the agent but the connection failed before its result
+/// arrived: the command may or may not have run. Callers should not simply
+/// retry an operation that is not idempotent.
+#[derive(Debug)]
+pub struct OutcomeUnknown(pub String);
+
+impl std::fmt::Display for OutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lost the connection to the agent after the request was sent ({}); \
+             the command may or may not have run",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for OutcomeUnknown {}
+
 /// Signal number reported when the client's own output is closed while it is
 /// relaying a run (the shell convention for a broken pipe, 128 + 13).
 const SIGPIPE: i32 = 13;
@@ -49,9 +68,11 @@ struct InputCredit {
 }
 
 impl InputCredit {
+    /// No credit at first: the agent grants the window once the command has
+    /// started, so no input is read for a request that is denied or fails.
     fn new() -> Self {
         Self {
-            available: Mutex::new(protocol::INITIAL_CREDIT),
+            available: Mutex::new(0),
             changed: Condvar::new(),
         }
     }
@@ -111,6 +132,24 @@ impl Client {
         })
     }
 
+    /// Check that the agent speaks this build's protocol version (for
+    /// example after upgrading the binary without restarting the agent).
+    pub fn check_compatible(&self) -> anyhow::Result<()> {
+        if let Response::Status(info) = self.call(&Request::Status)?
+            && info.protocol_version != protocol::PROTOCOL_VERSION
+        {
+            bail!(
+                "the running agent speaks protocol {} (version {}) but this rusthorse speaks {} \
+                 (version {}); restart the agent: `systemctl --user restart rusthorse-agent`",
+                info.protocol_version,
+                info.agent_version,
+                protocol::PROTOCOL_VERSION,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        Ok(())
+    }
+
     /// Send one request and wait for the response.
     pub fn call(&self, request: &Request) -> anyhow::Result<Response> {
         let stream = self.connect()?;
@@ -132,7 +171,8 @@ impl Client {
             let fds = [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
             protocol::send_frame(&stream, &Request::Run(request), &fds)
                 .context("cannot send the request")?;
-            return protocol::read_message(&stream).context("the agent closed the connection");
+            return protocol::read_message(&stream)
+                .map_err(|e| anyhow::Error::new(OutcomeUnknown(e.to_string())));
         }
         let input = if request.forward_stdin {
             Some(
@@ -238,9 +278,7 @@ impl Client {
                 Ok(Frame::Message(body, _fds)) => {
                     break serde_json::from_slice::<Response>(&body).context("malformed response");
                 }
-                Err(e) => {
-                    break Err(anyhow::Error::from(e).context("the agent closed the connection"));
-                }
+                Err(e) => break Err(anyhow::Error::new(OutcomeUnknown(e.to_string()))),
             }
         };
         drop(queues);

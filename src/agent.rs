@@ -395,7 +395,8 @@ impl Agent {
             Request::Import { entries, replace } => self.import(peer, entries, replace),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
-            Request::Reveal { name } => self.reveal(peer, &name),
+            Request::Reveal { name, notes } => self.reveal(peer, &name, notes),
+            Request::Backup { path } => self.backup(peer, &path),
             Request::Run(_) => Err(Failure::invalid("run requests carry file descriptors")),
         }
     }
@@ -966,14 +967,16 @@ impl Agent {
         })
     }
 
-    fn reveal(&self, peer: &Peer, name: &str) -> Result<Response, Failure> {
+    fn reveal(&self, peer: &Peer, name: &str, notes: bool) -> Result<Response, Failure> {
+        let what = if notes { "notes" } else { "value" };
+        let read = |v: &Vault, id| if notes { v.notes(id) } else { v.secret(id) };
         let generation = self.generation(peer)?;
         let info = self.with_vault(peer, |v| {
             let id = v.find(name)?;
-            if v.secret(id).is_none() {
+            if read(v, id).is_none() {
                 return Err(Failure::new(
                     ErrorCode::NotFound,
-                    format!("{name} has no value"),
+                    format!("{name} has no {what}"),
                 ));
             }
             Ok(v.info(id))
@@ -981,30 +984,50 @@ impl Agent {
         let request = ApprovalRequest {
             title: "Rusthorse — reveal a secret".into(),
             summary: format!(
-                "REVEAL the value of \"{}\" to the requesting process?",
+                "REVEAL the {what} of \"{}\" to the requesting process?",
                 info.identity()
             ),
             details: vec![
                 ("Entry".into(), info.identity()),
+                ("Reveals".into(), what.into()),
                 ("Requested by".into(), peer.describe()),
             ],
-            warnings: vec![
-                "The value will be printed by the requesting process. If an AI agent asked, it will see the secret and it may end up in its logs.".into(),
-            ],
+            warnings: vec![format!(
+                "The {what} will be printed by the requesting process. If an AI agent asked, it will see it and it may end up in its logs."
+            )],
             can_remember: false,
         };
-        self.approve(
-            request,
-            None,
-            AuditEvent::new("reveal", peer).entries(vec![info.identity()]),
-        )?;
+        let event = AuditEvent::new("reveal", peer)
+            .entries(vec![info.identity()])
+            .detail(what);
+        self.approve(request, None, event)?;
         self.with_vault_at(generation, |v| {
             let id = v.find(&info.id)?;
-            let value = v
-                .secret(id)
-                .ok_or_else(|| Failure::new(ErrorCode::NotFound, format!("{name} has no value")))?;
+            let value = read(v, id).ok_or_else(|| {
+                Failure::new(ErrorCode::NotFound, format!("{name} has no {what}"))
+            })?;
             Ok(Response::Secret { value })
         })
+    }
+
+    /// Copy the encrypted vault file to `path` and verify that the copy
+    /// opens. The copy is as protected as the vault itself, so no approval
+    /// is asked; the action is audited.
+    fn backup(&self, peer: &Peer, path: &str) -> Result<Response, Failure> {
+        let dest = PathBuf::from(path);
+        if !dest.is_absolute() {
+            return Err(Failure::invalid("the backup path must be absolute"));
+        }
+        let count = self.with_vault(peer, |v| Ok(v.backup_to(&dest)?))?;
+        self.record(
+            AuditEvent::new("backup", peer)
+                .outcome("written")
+                .detail(format!("{} ({count} entries)", dest.display())),
+        )?;
+        Ok(ok(format!(
+            "backup written to {} and verified: it opens with the current master password and holds {count} entries",
+            dest.display()
+        )))
     }
 
     fn run(
@@ -1316,10 +1339,24 @@ impl Agent {
         let child_stdin = child.stdin.take();
         drop(secrets);
 
+        // With forwarding, the client may send input only once the command
+        // has started: its whole stdin window is granted now, so input given
+        // to a denied or failed request is never read.
+        let forwarding = run.redact && run.forward_stdin;
+        let acks = Arc::new(InputAcks::new(if forwarding {
+            protocol::INITIAL_CREDIT
+        } else {
+            0
+        }));
+        let ack_writer = forwarding.then(|| {
+            let (acks, writer) = (Arc::clone(&acks), Arc::clone(&writer));
+            let (finished, abort) = (Arc::clone(&finished), Arc::clone(&abort));
+            thread::spawn(move || acks.run(&writer, &finished, &abort))
+        });
         let watcher = stream.try_clone().ok().map(|s| {
             let watch = Watch {
                 stream: s,
-                writer: Arc::clone(&writer),
+                acks: Arc::clone(&acks),
                 pgid: pid,
                 child_stdin,
                 forward_stdin: run.redact && run.forward_stdin,
@@ -1350,8 +1387,12 @@ impl Agent {
             let _ = pump.join();
         }
         finished.store(true, Ordering::SeqCst);
+        acks.wake();
         if let Some(watcher) = watcher {
             let _ = watcher.join();
+        }
+        if let Some(ack_writer) = ack_writer {
+            let _ = ack_writer.join();
         }
         let status = child.wait();
         if let Err(e) = waited {
@@ -1714,6 +1755,64 @@ fn poll_raw(fds: &mut [nix::libc::pollfd], timeout_ms: i32) -> io::Result<usize>
     }
 }
 
+/// Stdin credit to send back to the client, written by its own thread so
+/// that the watcher never writes to the socket (a client that does not read
+/// would block that write, and the watcher must keep watching).
+struct InputAcks {
+    owed: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl InputAcks {
+    fn new(initial: usize) -> Self {
+        Self {
+            owed: Mutex::new(initial),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn add(&self, amount: usize) {
+        let mut owed = self.owed.lock().unwrap_or_else(|p| p.into_inner());
+        *owed = owed.saturating_add(amount);
+        self.changed.notify_all();
+    }
+
+    fn wake(&self) {
+        self.changed.notify_all();
+    }
+
+    /// Send owed credit, aggregated, until the request ends or is aborted.
+    /// A send blocked by a client that does not read is released when the
+    /// watcher cancels the request (it shuts the socket down).
+    fn run(&self, writer: &Mutex<UnixStream>, stop: &AtomicBool, abort: &AtomicBool) {
+        loop {
+            let amount = {
+                let mut owed = self.owed.lock().unwrap_or_else(|p| p.into_inner());
+                while *owed == 0 {
+                    if stop.load(Ordering::SeqCst) || abort.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    owed = self
+                        .changed
+                        .wait_timeout(owed, Duration::from_millis(100))
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+                let amount = (*owed).min(u32::MAX as usize);
+                *owed -= amount;
+                amount
+            };
+            if abort.load(Ordering::SeqCst) {
+                return;
+            }
+            let stream = writer.lock().unwrap_or_else(|p| p.into_inner());
+            if protocol::send_credit(&stream, protocol::STDIN, amount as u32).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// The connection's side of a running command: forwards input frames to the
 /// command's stdin, applies credit frames, and cancels the request when the
 /// client goes away or breaks the protocol.
@@ -1723,7 +1822,7 @@ fn poll_raw(fds: &mut [nix::libc::pollfd], timeout_ms: i32) -> io::Result<usize>
 /// never stuck behind input (which could deadlock with output credit).
 struct Watch {
     stream: UnixStream,
-    writer: Arc<Mutex<UnixStream>>,
+    acks: Arc<InputAcks>,
     pgid: Pid,
     child_stdin: Option<std::process::ChildStdin>,
     forward_stdin: bool,
@@ -1740,6 +1839,7 @@ impl Watch {
         self.abort.store(true, Ordering::SeqCst);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         self.credits.wake();
+        self.acks.wake();
         terminate_group(self.pgid);
     }
 
@@ -1778,8 +1878,7 @@ impl Watch {
                     revents: 0,
                 });
             }
-            let timeout = if owed > 0 { 20 } else { 200 };
-            match poll_raw(&mut fds, timeout) {
+            match poll_raw(&mut fds, 200) {
                 Ok(_) => {}
                 Err(_) => return self.cancel(),
             }
@@ -1852,18 +1951,12 @@ impl Watch {
             if end_of_input && pending.is_empty() {
                 stdin = None; // the command sees end-of-file
             }
-            // Acknowledge delivered input — but never wait for the send lock:
-            // an output worker may hold it while the client is slow, and this
-            // thread must keep watching the connection.
-            if owed > 0
-                && let Ok(writer) = self.writer.try_lock()
-            {
-                let amount = owed.min(u32::MAX as usize);
-                if protocol::send_credit(&writer, protocol::STDIN, amount as u32).is_err() {
-                    drop(writer);
-                    return self.cancel();
-                }
-                owed -= amount;
+            // Acknowledge delivered input through the acknowledgement writer:
+            // this thread never writes to the socket, so a client that does
+            // not read cannot stop it from watching the connection.
+            if owed > 0 {
+                self.acks.add(owed);
+                owed = 0;
             }
         }
     }
