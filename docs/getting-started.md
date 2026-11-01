@@ -62,8 +62,11 @@ rusthorse show core-router
 rusthorse open core-router        # opens https://192.168.1.1/ in your browser
 ```
 
-The first command that needs the vault asks for the master password. After 15
-minutes without an approved use, the vault locks itself again.
+The first command that needs the vault asks for the master password, in a
+dialog with a text field (title "Rusthorse — unlock vault"): type it there and
+click **Unlock**. This is not an approval dialog — those show a command and
+**Allow once** / **Deny**. After 15 minutes without an approved use, the vault
+locks itself again.
 
 ## 4. Use a secret
 

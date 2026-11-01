@@ -15,7 +15,7 @@ use rusthorse::protocol::{
     Binding, EntryChanges, EntryFields, EntryInfo, ErrorCode, Field, ImportedEntry, NewEntry,
     Request, Response, RunRequest, SecretString, ValueChange,
 };
-use rusthorse::ui::{Prompt, Ui, ZenityUi};
+use rusthorse::ui::{Prompt, Typed, Ui, ZenityUi};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
 use rusthorse::{audit, import, paths};
@@ -512,12 +512,15 @@ fn new_master_password() -> anyhow::Result<SecretString> {
             timeout: Duration::from_secs(300),
         };
         let ask = |message: &str| -> anyhow::Result<SecretString> {
-            ui.master_password(&Prompt {
+            match ui.master_password(&Prompt {
                 title: "Rusthorse — new vault".into(),
                 message: message.into(),
                 confirm: "OK".into(),
-            })?
-            .context("cancelled")
+            })? {
+                Typed::Value(value) => Ok(value),
+                Typed::Cancelled => bail!("cancelled"),
+                Typed::TimedOut => bail!("nobody answered the dialog in time"),
+            }
         };
         (
             ask(

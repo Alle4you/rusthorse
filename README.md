@@ -121,7 +121,8 @@ never try to read them. For example, in `CLAUDE.md` or `AGENTS.md`:
 - Use a secret with `rusthorse run NAME -- command` (or `VAR=NAME`); the human
   approves each use in a dialog. Never ask for or print secret values, never
   use `rusthorse reveal`, never write secrets to files.
-- If a command is denied, stop and ask the human; do not retry variations.
+- If a command is denied, or nobody answers the dialog in time, stop and ask the
+  human; do not retry variations.
 ```
 
 [docs/ai-agents.md](docs/ai-agents.md) covers patterns, approval hygiene and

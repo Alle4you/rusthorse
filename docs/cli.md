@@ -95,8 +95,12 @@ runs (with a note if it was replaced since the agent started).
 ## `rusthorse unlock` / `rusthorse lock`
 
 `unlock` makes the agent ask for the master password now (it also asks
-whenever a request needs the vault). `lock` discards the decrypted vault and
-all remembered approvals immediately.
+whenever a request needs the vault). The dialog has a text field: type the
+password there and click **Unlock**. You get three attempts; clicking Unlock
+with the field empty asks again without counting as a wrong password, and if
+nothing is ever typed the unlock counts as cancelled. Wrong passwords are
+recorded in the audit log; after three attempts the request fails. `lock`
+discards the decrypted vault and all remembered approvals immediately.
 
 ## `rusthorse list`
 

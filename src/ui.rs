@@ -47,20 +47,34 @@ pub struct ApprovalRequest {
 /// The human's answer to an [`ApprovalRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// Refuse (also the result of closing the dialog or a timeout).
+    /// Refuse (also the result of closing the dialog).
     Deny,
+    /// Nobody answered before the dialog's timeout: a denial, reported as
+    /// such so that "nobody looked" is not mistaken for "the human said no".
+    TimedOut,
     /// Allow this one request.
     AllowOnce,
     /// Allow this request and identical ones for the given duration.
     AllowFor(Duration),
 }
 
+/// The human's answer to a dialog that asks them to type something.
+#[derive(Debug)]
+pub enum Typed {
+    /// They confirmed what they typed — possibly nothing.
+    Value(SecretString),
+    /// They cancelled or closed the dialog.
+    Cancelled,
+    /// Nobody answered before the dialog's timeout.
+    TimedOut,
+}
+
 /// Something that can ask the human questions.
 pub trait Ui: Send + Sync {
-    /// Ask for the master password. `Ok(None)` means cancelled.
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>>;
-    /// Ask for a secret value to store. `Ok(None)` means cancelled.
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>>;
+    /// Ask for the master password.
+    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed>;
+    /// Ask for a secret value to store.
+    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed>;
     /// Ask whether to allow a request.
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision>;
 }
@@ -130,7 +144,7 @@ impl ZenityUi {
         Ok(cmd)
     }
 
-    fn hidden_entry(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn hidden_entry(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
         let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
@@ -145,9 +159,10 @@ impl ZenityUi {
                 if value.ends_with('\n') {
                     value.pop();
                 }
-                Ok(Some(value))
+                Ok(Typed::Value(value))
             }
-            Some(1) | Some(ZENITY_TIMEOUT) => Ok(None),
+            Some(1) => Ok(Typed::Cancelled),
+            Some(ZENITY_TIMEOUT) => Ok(Typed::TimedOut),
             other => bail!("zenity failed (exit status {other:?})"),
         }
     }
@@ -178,7 +193,7 @@ pub fn capture_through_socket(
 /// allow anything: status 0 with no output ("Allow once"), and status 1 with
 /// the exact label of the extra button when one was offered. Everything else
 /// — Deny, closing the window, a timeout, an unexpected status or output — is
-/// a denial.
+/// a denial; a timeout is told apart as [`Decision::TimedOut`].
 pub fn decision_from(
     status: Option<i32>,
     output: &[u8],
@@ -189,6 +204,7 @@ pub fn decision_from(
     match (status, remember) {
         (Some(0), _) if printed.is_empty() => Decision::AllowOnce,
         (Some(1), Some((label, duration))) if printed == label => Decision::AllowFor(duration),
+        (Some(ZENITY_TIMEOUT), _) => Decision::TimedOut,
         _ => Decision::Deny,
     }
 }
@@ -203,11 +219,11 @@ fn entry_label(text: &str) -> String {
 }
 
 impl Ui for ZenityUi {
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
         self.hidden_entry(prompt)
     }
 
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
         self.hidden_entry(prompt)
     }
 
@@ -333,7 +349,12 @@ mod tests {
         );
         // Deny, timeout, crash, unexpected output.
         assert_eq!(decision_from(Some(1), b"", remember), Decision::Deny);
-        assert_eq!(decision_from(Some(5), b"", remember), Decision::Deny);
+        assert_eq!(decision_from(Some(5), b"", remember), Decision::TimedOut);
+        assert_eq!(decision_from(Some(5), b"", None), Decision::TimedOut);
+        assert_eq!(
+            decision_from(Some(5), b"Allow for 10m\n", remember),
+            Decision::TimedOut
+        );
         assert_eq!(decision_from(None, b"", remember), Decision::Deny);
         assert_eq!(
             decision_from(Some(0), b"surprise", remember),

@@ -122,7 +122,8 @@ Any KDBX4 file protected by a password works. Point the agent at it with
 `RUSTHORSE_VAULT` (see above). Notes:
 
 - Key files and hardware keys (YubiKey challenge-response) are not supported
-  yet.
+  yet, and neither is a database without a password: Rusthorse always asks for
+  one and does not try an empty password.
 - Entries are looked up by title. If two entries share a title, use the
   `Group/Title` path.
 - If KeePassXC (or a sync tool) changes the file while the agent has it

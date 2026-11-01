@@ -25,7 +25,8 @@ pub struct AuditEvent {
     pub time: String,
     /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...
     pub action: String,
-    /// How it ended: `allowed_once`, `allowed_remembered`, `denied`, ...
+    /// How it ended: `allowed_once`, `allowed_remembered`, `denied`,
+    /// `timed_out` (nobody answered the dialog), `cancelled`, ...
     pub outcome: String,
     /// Entries involved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

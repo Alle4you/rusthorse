@@ -53,6 +53,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   be synced to disk. Every other error means nothing was changed.
 - Audit records are dated when they are written: an approval or denial
   carries the time the human answered, not the time the request arrived.
+- A dialog nobody answered is reported and audited as `timed_out` ("nobody
+  answered … in time"), no longer as a denial or cancellation by the human;
+  exit statuses are unchanged.
+- The unlock dialog starts with "Type the master password"; clicking Unlock
+  with an empty field asks again instead of counting as a wrong password, and
+  an unlock where nothing was typed is cancelled (exit 4), not failed. Every
+  cancelled or unanswered `passwd` dialog is now audited.
 
 ### Security
 

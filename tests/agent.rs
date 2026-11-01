@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use rusthorse::agent::{Agent, AgentConfig};
 use rusthorse::protocol::SecretString;
-use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Ui};
+use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
 
 const PASSWORD: &str = "correct horse battery";
@@ -29,22 +29,39 @@ struct ScriptedUi {
     on_approve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs (once) while the "human" is typing the next master password.
     on_password: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The text of every master-password dialog shown.
+    password_prompts: Mutex<Vec<String>>,
+    /// How many of the next master-password dialogs nobody answers.
+    password_timeouts: Mutex<usize>,
+}
+
+/// `Some(text)` is typed and confirmed; `None` cancels.
+fn typed(answer: Option<String>) -> Typed {
+    answer.map_or(Typed::Cancelled, |v| Typed::Value(SecretString::new(v)))
 }
 
 impl Ui for ScriptedUi {
-    fn master_password(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
+        self.password_prompts
+            .lock()
+            .unwrap()
+            .push(prompt.message.clone());
         if let Some(hook) = self.on_password.lock().unwrap().take() {
             hook();
         }
+        {
+            let mut timeouts = self.password_timeouts.lock().unwrap();
+            if *timeouts > 0 {
+                *timeouts -= 1;
+                return Ok(Typed::TimedOut);
+            }
+        }
         let next = self.passwords.lock().unwrap().pop_front();
-        Ok(next
-            .unwrap_or(Some(PASSWORD.to_string()))
-            .map(SecretString::new))
+        Ok(typed(next.unwrap_or(Some(PASSWORD.to_string()))))
     }
 
-    fn secret_value(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
-        let next = self.values.lock().unwrap().pop_front().flatten();
-        Ok(next.map(SecretString::new))
+    fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        Ok(typed(self.values.lock().unwrap().pop_front().flatten()))
     }
 
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
@@ -66,10 +83,10 @@ impl Ui for ScriptedUi {
 struct SharedUi(Arc<ScriptedUi>);
 
 impl Ui for SharedUi {
-    fn master_password(&self, p: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn master_password(&self, p: &Prompt) -> anyhow::Result<Typed> {
         self.0.master_password(p)
     }
-    fn secret_value(&self, p: &Prompt) -> anyhow::Result<Option<SecretString>> {
+    fn secret_value(&self, p: &Prompt) -> anyhow::Result<Typed> {
         self.0.secret_value(p)
     }
     fn approve(&self, r: &ApprovalRequest) -> anyhow::Result<Decision> {
@@ -452,6 +469,103 @@ fn cancelled_unlock_is_reported() {
     h.ui.passwords.lock().unwrap().push_back(None);
     let out = h.run(&["list"]);
     assert_eq!(out.status.code(), Some(4));
+}
+
+#[test]
+fn the_unlock_dialog_says_to_type_the_master_password() {
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    let prompts = h.ui.password_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].starts_with("Type the master password"),
+        "{}",
+        prompts[0]
+    );
+}
+
+#[test]
+fn an_empty_master_password_is_asked_again_not_counted_as_wrong() {
+    // The first real test: a person took the password dialog for an
+    // approval and clicked Unlock with nothing typed.
+    let h = Harness::new();
+    h.ui.passwords
+        .lock()
+        .unwrap()
+        .extend([Some(String::new()), Some(PASSWORD.to_string())]);
+    let out = h.run(&["unlock"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let prompts = h.ui.password_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        prompts[1].starts_with("Nothing was typed (attempt 1 of 3)"),
+        "{}",
+        prompts[1]
+    );
+    let audit = h.audit_text();
+    assert!(!audit.contains("wrong_password"), "{audit}");
+    assert!(audit.contains("\"outcome\":\"unlocked\""));
+}
+
+#[test]
+fn an_unlock_with_nothing_ever_typed_is_cancelled_not_wrong() {
+    let h = Harness::new();
+    h.ui.passwords.lock().unwrap().extend([
+        Some(String::new()),
+        Some(String::new()),
+        Some(String::new()),
+    ]);
+    let out = h.run(&["list"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("no master password was typed"));
+    let audit = h.audit_text();
+    assert!(!audit.contains("wrong_password"), "{audit}");
+    assert!(audit.contains("\"outcome\":\"cancelled\",\"requester\""));
+    assert!(audit.contains("no password was typed"));
+    // A wrong guess among empty attempts is still reported as wrong.
+    h.ui.passwords.lock().unwrap().extend([
+        Some(String::new()),
+        Some("not it".to_string()),
+        Some(String::new()),
+    ]);
+    let out = h.run(&["list"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("wrong master password"));
+}
+
+#[test]
+fn unanswered_dialogs_are_reported_as_timed_out() {
+    let h = Harness::new();
+    *h.ui.password_timeouts.lock().unwrap() = 1;
+    let out = h.run(&["list"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out.stderr).contains("nobody answered the unlock dialog in time"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(h.audit_text().contains("\"outcome\":\"timed_out\""));
+
+    h.add_secret("TOKEN", "never-printed", &[]);
+    h.decide(&[Decision::TimedOut]);
+    let out = h.run(&["run", "TOKEN", "--", "/bin/echo", "ran"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert!(!text(&out.stdout).contains("ran"));
+    assert!(
+        text(&out.stderr).contains("nobody answered the approval dialog in time"),
+        "{}",
+        text(&out.stderr)
+    );
+    let last = h
+        .audit_text()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        last.contains("\"action\":\"run\",\"outcome\":\"timed_out\""),
+        "{last}"
+    );
 }
 
 #[test]

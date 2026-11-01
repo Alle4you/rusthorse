@@ -49,7 +49,8 @@ from the vault straight into the approved program.
    - Exit status 125 with a `rusthorse:` message means Rusthorse refused or
      failed before the command started — including when the agent is not
      running or is out of date — so the command did not run; if it was
-     denied, stop and ask the human instead of retrying a variation. Exit status 124 means the
+     denied — or nobody answered the dialog in time — stop and ask the human
+     instead of retrying a variation. Exit status 124 means the
      outcome is unknown (the connection was lost after the request was sent,
      or the agent could not confirm the result): the command may or may not
      have run, so check before repeating anything that is not idempotent.

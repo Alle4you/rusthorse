@@ -49,7 +49,7 @@ use crate::protocol::{
     SecretString, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
-use crate::ui::{ApprovalRequest, Decision, Prompt, Ui};
+use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
 use crate::vault::{Vault, VaultError};
 
@@ -538,7 +538,7 @@ impl Agent {
             state.generation
         };
         let base = format!(
-            "Unlock the Rusthorse vault\n{}\n\nRequested by: {}",
+            "Type the master password to unlock the Rusthorse vault\n{}\n\nRequested by: {}",
             self.config.vault.display(),
             peer.describe()
         );
@@ -548,16 +548,38 @@ impl Agent {
             ));
         }
         let mut message = base.clone();
+        let mut tried = false;
         for attempt in 1..=UNLOCK_ATTEMPTS {
             let prompt = Prompt {
                 title: "Rusthorse — unlock vault".into(),
                 message: message.clone(),
                 confirm: "Unlock".into(),
             };
-            let Some(password) = self.ui.master_password(&prompt)? else {
-                self.record(AuditEvent::new("unlock", peer).outcome("cancelled"))?;
-                return Err(Failure::new(ErrorCode::Cancelled, "unlock cancelled"));
+            let password = match self.ui.master_password(&prompt)? {
+                Typed::Value(password) => password,
+                Typed::Cancelled => {
+                    self.record(AuditEvent::new("unlock", peer).outcome("cancelled"))?;
+                    return Err(Failure::new(ErrorCode::Cancelled, "unlock cancelled"));
+                }
+                Typed::TimedOut => {
+                    self.record(AuditEvent::new("unlock", peer).outcome("timed_out"))?;
+                    return Err(Failure::new(
+                        ErrorCode::Cancelled,
+                        "nobody answered the unlock dialog in time",
+                    ));
+                }
             };
+            // Clicking Unlock with an empty field is not a guess at the
+            // password (Rusthorse vaults always have one): ask again without
+            // calling it wrong.
+            if password.is_empty() {
+                message = format!(
+                    "Nothing was typed (attempt {attempt} of {UNLOCK_ATTEMPTS}). Type the \
+                     master password, then click Unlock.\n\n{base}"
+                );
+                continue;
+            }
+            tried = true;
             match Vault::open(&self.config.vault, password) {
                 Ok(vault) => {
                     let mut state = self.state();
@@ -589,6 +611,17 @@ impl Agent {
                 }
                 Err(e) => return Err(e.into()),
             }
+        }
+        if !tried {
+            self.record(
+                AuditEvent::new("unlock", peer)
+                    .outcome("cancelled")
+                    .detail("no password was typed"),
+            )?;
+            return Err(Failure::new(
+                ErrorCode::Cancelled,
+                "unlock cancelled: no master password was typed",
+            ));
         }
         Err(Failure::new(
             ErrorCode::UnlockFailed,
@@ -636,6 +669,13 @@ impl Agent {
                 self.record(event.outcome("denied"))?;
                 Err(Failure::new(ErrorCode::Denied, "the request was denied"))
             }
+            Decision::TimedOut => {
+                self.record(event.outcome("timed_out"))?;
+                Err(Failure::new(
+                    ErrorCode::Denied,
+                    "nobody answered the approval dialog in time; the request was denied",
+                ))
+            }
             Decision::AllowOnce => {
                 self.record(event.outcome("allowed_once"))?;
                 self.touch();
@@ -680,15 +720,22 @@ impl Agent {
             self.ui.secret_value(&prompt)?
         };
         match value {
-            Some(v) if !v.is_empty() => {
+            Typed::Value(v) if !v.is_empty() => {
                 self.record(event.outcome("value_entered"))?;
                 Ok(v)
             }
-            Some(_) => Err(Failure::invalid("empty value; nothing stored")),
-            None => {
+            Typed::Value(_) => Err(Failure::invalid("empty value; nothing stored")),
+            Typed::Cancelled => {
                 let _ = peer;
                 self.record(event.outcome("cancelled"))?;
                 Err(Failure::new(ErrorCode::Cancelled, "cancelled"))
+            }
+            Typed::TimedOut => {
+                self.record(event.outcome("timed_out"))?;
+                Err(Failure::new(
+                    ErrorCode::Cancelled,
+                    "nobody answered the dialog in time",
+                ))
             }
         }
     }
@@ -972,15 +1019,20 @@ impl Agent {
                 let _dialog = self.dialog()?;
                 self.ui.master_password(&prompt)?
             };
-            answer.ok_or_else(|| Failure::new(ErrorCode::Cancelled, "cancelled"))
+            // Any dialog of the three that is not answered ends the change,
+            // and is recorded as such.
+            let (outcome, failure) = match answer {
+                Typed::Value(value) => return Ok(value),
+                Typed::Cancelled => ("cancelled", Failure::new(ErrorCode::Cancelled, "cancelled")),
+                Typed::TimedOut => (
+                    "timed_out",
+                    Failure::new(ErrorCode::Cancelled, "nobody answered the dialog in time"),
+                ),
+            };
+            self.record(event.clone().outcome(outcome))?;
+            Err(failure)
         };
-        let current = match ask("Type the CURRENT master password.") {
-            Ok(v) => v,
-            Err(f) => {
-                self.record(event.outcome("cancelled"))?;
-                return Err(f);
-            }
-        };
+        let current = ask("Type the CURRENT master password.")?;
         let matches = self.with_vault_at(generation, |v| Ok(v.password_matches(&current)))?;
         if !matches {
             self.record(event.outcome("wrong_password"))?;
@@ -2065,10 +2117,10 @@ mod tests {
     struct NoDialogs;
 
     impl Ui for NoDialogs {
-        fn master_password(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
             unreachable!("no dialog expected")
         }
-        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
             unreachable!("no dialog expected")
         }
         fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
