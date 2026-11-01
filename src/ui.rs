@@ -92,6 +92,19 @@ const DIALOG_ENV: [&str; 9] = [
     "LC_MESSAGES",
 ];
 
+/// Room the agent reserves in a dialog for the note explaining "Allow for …"
+/// (see [`remember_note`]).
+pub const REMEMBER_NOTE_MAX: usize = 240;
+
+/// The note shown next to the "Allow for …" button.
+pub fn remember_note(label: &str, duration: Duration) -> String {
+    format!(
+        "\n\n“{label}” lets identical requests run without asking for {} — even if \
+         they read different input or files. Prefer “Allow once”.",
+        format_duration(duration)
+    )
+}
+
 /// Exit status zenity uses for a timeout.
 const ZENITY_TIMEOUT: i32 = 5;
 
@@ -204,11 +217,7 @@ impl Ui for ZenityUi {
 
         let mut text = approval_text(request);
         if offer_remember {
-            text.push_str(&format!(
-                "\n\n“{remember_label}” lets identical requests run without asking for {} — \
-                 even if they read different input or files. Prefer “Allow once”.",
-                format_duration(self.remember_for)
-            ));
+            text.push_str(&remember_note(&remember_label, self.remember_for));
         }
         let mut cmd = self.command(&request.title)?;
         cmd.arg("--question")
@@ -331,6 +340,20 @@ mod tests {
             Decision::Deny
         );
         assert_eq!(decision_from(Some(255), b"", remember), Decision::Deny);
+    }
+
+    #[test]
+    fn the_remember_note_fits_its_reserved_room() {
+        let label = format!(
+            "Allow for {}",
+            format_duration(Duration::from_secs(359_999))
+        );
+        let note = remember_note(&label, Duration::from_secs(359_999));
+        assert!(
+            note.chars().count() <= REMEMBER_NOTE_MAX,
+            "{}",
+            note.chars().count()
+        );
     }
 
     #[test]

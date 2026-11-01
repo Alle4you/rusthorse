@@ -38,6 +38,7 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::socket::MsgFlags;
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::{Pid, getuid};
 
@@ -499,6 +500,11 @@ impl Agent {
             self.config.vault.display(),
             peer.describe()
         );
+        if crate::util::visible(&base).chars().count() > MAX_DIALOG_CHARS - 100 {
+            return Err(Failure::invalid(
+                "the unlock dialog would be too long to show (vault path or requester chain)",
+            ));
+        }
         let mut message = base.clone();
         for attempt in 1..=UNLOCK_ATTEMPTS {
             let prompt = Prompt {
@@ -567,7 +573,12 @@ impl Agent {
                 return Ok(());
             }
         }
-        let length = crate::ui::approval_text(&request).chars().count();
+        let length = crate::ui::approval_text(&request).chars().count()
+            + if request.can_remember {
+                crate::ui::REMEMBER_NOTE_MAX
+            } else {
+                0
+            };
         if length > MAX_DIALOG_CHARS {
             return Err(Failure::invalid(format!(
                 "this request has too much detail to show in one dialog ({length} characters, \
@@ -1154,37 +1165,47 @@ impl Agent {
         let pid = Pid::from_raw(child.id() as i32);
         // While the leader is not reaped its pid — and so the process group
         // id — cannot be reused, which makes signalling the group safe.
-        let stop = Arc::new(AtomicBool::new(false));
+        //
+        // `leader_done`: the command exited and the rest of its group was
+        // terminated; output workers forward what is left, then stop.
+        // `abort`: the client went away; every worker stops at once.
+        let leader_done = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
 
-        let mut workers = Vec::new();
+        let mut pumps = Vec::new();
         if let Some((out_dest, err_dest)) = destinations {
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
                 .map(|(_, entry, value)| (entry.clone(), value.as_bytes().to_vec()))
                 .collect();
             let make = || Redactor::new(labels.iter().map(|(l, s)| (l.as_str(), s.as_slice())));
-            if let Some(out) = child.stdout.take() {
-                let (redactor, stop) = (make(), Arc::clone(&stop));
-                workers.push(thread::spawn(move || pump(out, out_dest, redactor, stop)));
-            }
-            if let Some(err) = child.stderr.take() {
-                let (redactor, stop) = (make(), Arc::clone(&stop));
-                workers.push(thread::spawn(move || pump(err, err_dest, redactor, stop)));
+            for (from, to) in [
+                (child.stdout.take().map(OwnedFd::from), out_dest),
+                (child.stderr.take().map(OwnedFd::from), err_dest),
+            ] {
+                if let Some(from) = from {
+                    let redactor = make();
+                    let (done, abort) = (Arc::clone(&leader_done), Arc::clone(&abort));
+                    pumps.push(thread::spawn(move || pump(from, to, redactor, done, abort)));
+                }
             }
             for (_, mut bytes) in labels {
                 zeroize::Zeroize::zeroize(&mut bytes);
             }
         }
-        if let (Some(from), Some(to)) = (client_stdin, child.stdin.take()) {
-            let stop = Arc::clone(&stop);
-            workers.push(thread::spawn(move || pump_stdin(from, to, stop)));
-        }
+        let input_worker = match (client_stdin, child.stdin.take()) {
+            (Some(from), Some(to)) => {
+                let (done, abort) = (Arc::clone(&leader_done), Arc::clone(&abort));
+                Some(thread::spawn(move || pump_stdin(from, to, done, abort)))
+            }
+            _ => None,
+        };
         drop(secrets);
 
         let watcher = stream.try_clone().ok().map(|s| {
-            let finished = Arc::clone(&finished);
-            thread::spawn(move || watch_client(s, pid, finished))
+            let (abort, finished) = (Arc::clone(&abort), Arc::clone(&finished));
+            thread::spawn(move || watch_client(s, pid, abort, finished))
         });
 
         // Wait for the leader to exit without reaping it.
@@ -1195,11 +1216,21 @@ impl Agent {
             }
         };
         // The command has ended: nothing it started may keep running with the
-        // secrets, and no worker may outlive the request.
+        // secrets.
         terminate_group(pid);
-        stop.store(true, Ordering::SeqCst);
-        for worker in workers {
-            let _ = worker.join();
+        leader_done.store(true, Ordering::SeqCst);
+        // Output workers hold the secrets (in their redactors). They finish
+        // when the remaining output is delivered, or at once if the client
+        // disconnects; a client that stays connected without reading keeps
+        // them waiting, exactly as a pipeline would (threat model L19).
+        for pump in pumps {
+            let _ = pump.join();
+        }
+        // The input worker holds no secrets. It normally ends within 100 ms;
+        // if another reader drained the client's input between `poll` and
+        // `read`, it stays blocked in `read` and is left to end on its own.
+        if let Some(worker) = input_worker {
+            join_within(worker, Duration::from_secs(1));
         }
         finished.store(true, Ordering::SeqCst);
         if let Some(watcher) = watcher {
@@ -1234,29 +1265,49 @@ fn file_id(path: &Path) -> io::Result<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// Whether any live (non-zombie) process is in process group `pgid`.
+/// Whether any live (non-zombie) process may be in process group `pgid`.
+/// `/proc` is parsed as bytes (process names need not be UTF-8), and anything
+/// that cannot be inspected counts as alive: a false "dead" would skip the
+/// signals.
 fn group_alive(pgid: Pid) -> bool {
+    use std::os::unix::ffi::OsStrExt;
     let Ok(dir) = std::fs::read_dir("/proc") else {
-        return false;
+        return true;
     };
-    dir.filter_map(Result::ok).any(|entry| {
+    for entry in dir.flatten() {
         let name = entry.file_name();
-        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
-            return false;
+        if name.is_empty() || !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
         }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            return false;
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // The process ended while we were looking.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
         };
-        // "pid (comm) state ppid pgrp ..."
-        let Some(rest) = stat.rfind(')').and_then(|i| stat.get(i + 1..)) else {
-            return false;
-        };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next().unwrap_or("Z");
-        let _ppid = fields.next();
-        let pgrp: i32 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        pgrp == pgid.as_raw() && state != "Z" && state != "X"
-    })
+        match parse_stat_group(&stat) {
+            Some((state, pgrp)) => {
+                if pgrp == pgid.as_raw() && state != b'Z' && state != b'X' {
+                    return true;
+                }
+            }
+            None => return true,
+        }
+    }
+    false
+}
+
+/// The state letter and process group from a `/proc/<pid>/stat` line:
+/// `pid (comm) state ppid pgrp ...`, where `comm` may contain any byte,
+/// including spaces and parentheses.
+fn parse_stat_group(stat: &[u8]) -> Option<(u8, i32)> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let rest = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
+    let mut fields = rest.split_ascii_whitespace();
+    let state = *fields.next()?.as_bytes().first()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
 }
 
 /// Terminate every remaining process of the group: SIGTERM, then SIGKILL
@@ -1277,18 +1328,105 @@ fn terminate_group(pgid: Pid) {
     let _ = killpg(pgid, Signal::SIGKILL);
 }
 
+/// Wait up to `limit` for a thread; after that, leave it running detached.
+fn join_within(handle: thread::JoinHandle<()>, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = handle.join();
+}
+
+/// Largest write that `poll` guarantees not to block on a pipe.
+const PIPE_BUF: usize = 4096;
+
+/// A descriptor received from the client, written in a way that never blocks
+/// indefinitely and can be abandoned when the client goes away. Its file
+/// status flags are shared with the client, so `O_NONBLOCK` is never set on
+/// it; instead sockets are written with `MSG_DONTWAIT`, and anything else in
+/// chunks of at most `PIPE_BUF` bytes once `poll` reports it writable (which
+/// cannot block on a pipe).
+struct ClientOutput {
+    file: File,
+    socket: bool,
+}
+
+impl ClientOutput {
+    fn new(fd: OwnedFd) -> Self {
+        use nix::sys::stat::{SFlag, fstat};
+        let socket = fstat(&fd)
+            .map(|st| SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFSOCK)
+            .unwrap_or(false);
+        Self {
+            file: File::from(fd),
+            socket,
+        }
+    }
+
+    fn write_all(&mut self, mut data: &[u8], abort: &AtomicBool) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        while !data.is_empty() {
+            if abort.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let mut fds = [PollFd::new(self.file.as_fd(), PollFlags::POLLOUT)];
+            match poll(&mut fds, PollTimeout::from(100u16)) {
+                Ok(0) | Err(Errno::EINTR) => continue,
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let chunk = &data[..data.len().min(PIPE_BUF)];
+            let written = if self.socket {
+                match nix::sys::socket::send(
+                    self.file.as_raw_fd(),
+                    chunk,
+                    MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+                ) {
+                    Ok(n) => n,
+                    Err(Errno::EAGAIN | Errno::EINTR) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                match self.file.write(chunk) {
+                    Ok(n) => n,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            data = &data[written..];
+        }
+        Ok(())
+    }
+}
+
 /// Forward the client's input to the command's stdin pipe until either side
-/// ends or the command has finished. Our end of the pipe is non-blocking (it
-/// is not shared with anyone), so a command that stops reading cannot block
-/// the worker forever.
-fn pump_stdin(from: OwnedFd, to: std::process::ChildStdin, stop: Arc<AtomicBool>) {
+/// ends, the command has finished or the client went away. Our end of the
+/// pipe is non-blocking (it is not shared with anyone).
+fn pump_stdin(
+    from: OwnedFd,
+    to: std::process::ChildStdin,
+    leader_done: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+) {
+    let stopped = || leader_done.load(Ordering::SeqCst) || abort.load(Ordering::SeqCst);
     let mut from = File::from(from);
     let mut to = File::from(OwnedFd::from(to));
     if fcntl(&to, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
         return;
     }
     let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
-    while !stop.load(Ordering::SeqCst) {
+    while !stopped() {
         let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(100u16)) {
             Ok(0) | Err(Errno::EINTR) => continue,
@@ -1297,7 +1435,7 @@ fn pump_stdin(from: OwnedFd, to: std::process::ChildStdin, stop: Arc<AtomicBool>
         }
         // Checked again right before reading, so that input typed after the
         // command finished is left for whoever reads the terminal next.
-        if stop.load(Ordering::SeqCst) {
+        if stopped() {
             return;
         }
         let n = match from.read(&mut buf) {
@@ -1311,34 +1449,23 @@ fn pump_stdin(from: OwnedFd, to: std::process::ChildStdin, stop: Arc<AtomicBool>
             }
             Err(_) => return,
         };
-        if write_all_until(&mut to, &buf[..n], &stop).is_err() {
-            return;
-        }
-    }
-}
-
-/// Write everything to a descriptor, waiting for it to become writable but
-/// giving up when `stop` is set.
-fn write_all_until(file: &mut File, mut data: &[u8], stop: &AtomicBool) -> io::Result<()> {
-    while !data.is_empty() {
-        match file.write(data) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if stop.load(Ordering::SeqCst) {
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                let mut fds = [PollFd::new(file.as_fd(), PollFlags::POLLOUT)];
-                match poll(&mut fds, PollTimeout::from(100u16)) {
-                    Ok(_) | Err(Errno::EINTR) => {}
-                    Err(e) => return Err(e.into()),
-                }
+        let mut data = &buf[..n];
+        while !data.is_empty() {
+            if stopped() {
+                return;
             }
-            Err(e) => return Err(e),
+            match to.write(data) {
+                Ok(0) => return,
+                Ok(written) => data = &data[written..],
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let mut fds = [PollFd::new(to.as_fd(), PollFlags::POLLOUT)];
+                    let _ = poll(&mut fds, PollTimeout::from(100u16));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
         }
     }
-    Ok(())
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -1439,31 +1566,44 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
 }
 
 /// Copy a command's output to the client's descriptor, redacting secrets.
-/// Ends at end-of-file, or shortly after `stop` is set (a descendant that
-/// escaped the process group may keep the pipe open forever).
-fn pump<R: Read + AsFd>(mut from: R, to: OwnedFd, mut redactor: Redactor, stop: Arc<AtomicBool>) {
-    let mut to = File::from(to);
+/// Ends at end-of-file; once the command is done, also when the pipe stays
+/// quiet for 500 ms (only a descendant that escaped the process group can
+/// still hold it open); and at once when the client disconnects.
+fn pump(
+    from: OwnedFd,
+    to: OwnedFd,
+    mut redactor: Redactor,
+    leader_done: Arc<AtomicBool>,
+    abort: Arc<AtomicBool>,
+) {
+    let mut from = File::from(from);
+    let mut to = ClientOutput::new(to);
     let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
-    let mut drain_until: Option<Instant> = None;
+    let mut quiet_since: Option<Instant> = None;
     loop {
-        if stop.load(Ordering::SeqCst) {
-            let until =
-                *drain_until.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
-            if Instant::now() >= until {
-                break;
-            }
+        if abort.load(Ordering::SeqCst) {
+            return;
         }
         let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
         match poll(&mut fds, PollTimeout::from(100u16)) {
-            Ok(0) | Err(Errno::EINTR) => continue,
+            Ok(0) | Err(Errno::EINTR) => {
+                if leader_done.load(Ordering::SeqCst) {
+                    let since = *quiet_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(500) {
+                        break;
+                    }
+                }
+                continue;
+            }
             Ok(_) => {}
             Err(_) => break,
         }
+        quiet_since = None;
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let out = redactor.push(&buf[..n]);
-                if write_all_until(&mut to, &out, &stop).is_err() {
+                if to.write_all(&out, &abort).is_err() {
                     // The reader went away. Dropping `from` gives the command
                     // SIGPIPE on its next write, as with a normal pipe.
                     return;
@@ -1473,12 +1613,12 @@ fn pump<R: Read + AsFd>(mut from: R, to: OwnedFd, mut redactor: Redactor, stop: 
             Err(_) => break,
         }
     }
-    let _ = write_all_until(&mut to, &redactor.finish(), &stop);
+    let _ = to.write_all(&redactor.finish(), &abort);
 }
 
-/// Terminate the command's process group if the client disconnects before
-/// the request has finished.
-fn watch_client(stream: UnixStream, pgid: Pid, finished: Arc<AtomicBool>) {
+/// Terminate the command's process group and stop all workers if the client
+/// disconnects before the request has finished.
+fn watch_client(stream: UnixStream, pgid: Pid, abort: Arc<AtomicBool>, finished: Arc<AtomicBool>) {
     let mut buf = [0u8; 64];
     while !finished.load(Ordering::SeqCst) {
         let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
@@ -1486,6 +1626,7 @@ fn watch_client(stream: UnixStream, pgid: Pid, finished: Arc<AtomicBool>) {
             Ok(0) | Err(Errno::EINTR) => continue,
             Ok(_) => match (&stream).read(&mut buf) {
                 Ok(0) | Err(_) => {
+                    abort.store(true, Ordering::SeqCst);
                     terminate_group(pgid);
                     return;
                 }
@@ -1509,4 +1650,26 @@ pub fn harden_process() -> anyhow::Result<()> {
 pub fn parent_process_name() -> Option<String> {
     let chain = crate::peer::process_chain(std::process::id() as i32);
     chain.get(1).map(|p| p.name.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_lines_with_odd_process_names_parse() {
+        assert_eq!(
+            parse_stat_group(b"42 (sleep) S 1 42 42 0"),
+            Some((b'S', 42))
+        );
+        assert_eq!(
+            parse_stat_group(b"42 (\xff\xfe) S 1 77 77 0"),
+            Some((b'S', 77))
+        );
+        assert_eq!(
+            parse_stat_group(b"42 (a) b) (c) Z 1 9 9 0"),
+            Some((b'Z', 9))
+        );
+        assert_eq!(parse_stat_group(b"garbage"), None);
+    }
 }

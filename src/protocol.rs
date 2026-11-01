@@ -7,13 +7,11 @@
 //!
 //! The full specification, with examples, is in `docs/protocol.md`.
 
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-use nix::errno::Errno;
-use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -417,27 +415,67 @@ pub fn send_frame<T: Serialize>(
     frame.extend_from_slice(&body);
 
     let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
-    let cmsgs: Vec<ControlMessage<'_>> = if raw.is_empty() {
-        Vec::new()
+    send_raw(stream, &frame, &raw)
+}
+
+/// Send `data`, attaching `fds` as `SCM_RIGHTS` to its first byte; the rest
+/// is written as plain data. (Not `nix::sys::socket::sendmsg`: it builds the
+/// control message in a byte buffer, which is not guaranteed to be aligned
+/// for `cmsghdr`.)
+#[allow(unsafe_code)]
+fn send_raw(stream: &UnixStream, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    use nix::libc;
+
+    const FD_SIZE: usize = std::mem::size_of::<RawFd>();
+    let payload = fds.len() * FD_SIZE;
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = if fds.is_empty() {
+        0
     } else {
-        vec![ControlMessage::ScmRights(&raw)]
+        (unsafe { libc::CMSG_SPACE(payload as u32) }) as usize
     };
+    // u64-backed so that the buffer is aligned for `cmsghdr`.
+    let mut control = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
     let sent = loop {
-        match sendmsg::<()>(
-            stream.as_raw_fd(),
-            &[IoSlice::new(&frame)],
-            &cmsgs,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        ) {
-            Ok(n) => break n,
-            Err(Errno::EINTR) => continue,
-            Err(e) => return Err(e.into()),
+        let mut iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+        // SAFETY: an all-zero msghdr is a valid (empty) value.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if space > 0 {
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            // SAFETY: the control buffer is `space` bytes, aligned for
+            // `cmsghdr`, and CMSG_SPACE(payload) guarantees room for one
+            // header followed by `payload` bytes of data.
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as _;
+                let dest = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                for (i, fd) in fds.iter().enumerate() {
+                    std::ptr::write_unaligned(dest.add(i), *fd);
+                }
+            }
+        }
+        // SAFETY: every pointer in `msg` refers to a live buffer of the
+        // stated length for the duration of the call.
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if n >= 0 {
+            break n as usize;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
         }
     };
     // The descriptors travel with the first byte; the rest is plain data.
     let mut writer = stream;
-    writer.write_all(&frame[sent..])?;
+    writer.write_all(&data[sent..])?;
     writer.flush()
 }
 
@@ -534,7 +572,9 @@ fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<
     const FD_SIZE: usize = std::mem::size_of::<RawFd>();
     // SAFETY: CMSG_SPACE only computes a size.
     let space = unsafe { libc::CMSG_SPACE((SCM_MAX_FD * FD_SIZE) as u32) } as usize;
-    let mut control = vec![0u8; space];
+    // Backed by u64 so that the buffer is aligned for `cmsghdr` (a Vec<u8>
+    // only guarantees byte alignment, and the headers are read in place).
+    let mut control = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
     loop {
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
@@ -545,7 +585,7 @@ fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len() as _;
+        msg.msg_controllen = space as _;
         // SAFETY: every pointer in `msg` refers to a live buffer of the
         // stated length for the duration of the call.
         let received =
@@ -629,14 +669,7 @@ mod tests {
         let body = br#"{"type":"status"}"#;
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
-        sendmsg::<()>(
-            a.as_raw_fd(),
-            &[IoSlice::new(&frame)],
-            &[ControlMessage::ScmRights(&raw)],
-            MsgFlags::empty(),
-            None,
-        )
-        .expect("sendmsg");
+        send_raw(&a, &frame, &raw).expect("sendmsg");
         let (_, fds) = recv_frame(&b).expect("recv");
         // All eight arrive as OwnedFd (closed on drop), none is left behind.
         assert_eq!(fds.len(), 8);
@@ -674,14 +707,7 @@ mod tests {
         let body = br#"{"type":"status"}"#;
         let mut frame = (body.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
-        sendmsg::<()>(
-            a.as_raw_fd(),
-            &[IoSlice::new(&frame)],
-            &[ControlMessage::ScmRights(&raw)],
-            MsgFlags::empty(),
-            None,
-        )
-        .expect("sendmsg");
+        send_raw(&a, &frame, &raw).expect("sendmsg");
         drop(pipes); // the 60 descriptors now exist only in the socket queue
         let before = open_fd_count();
         let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("getrlimit");

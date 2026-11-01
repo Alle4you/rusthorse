@@ -87,12 +87,15 @@ pub fn process_chain(pid: i32) -> Vec<ProcessInfo> {
 
 /// Parse the command name and parent pid out of `/proc/<pid>/stat`.
 fn read_stat(pid: i32) -> Option<(String, i32)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Format: "pid (comm) state ppid ..."; comm may itself contain ')' or spaces.
-    let open = stat.find('(')?;
-    let close = stat.rfind(')')?;
-    let name = stat.get(open + 1..close)?.to_string();
-    let mut rest = stat.get(close + 1..)?.split_whitespace();
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "pid (comm) state ppid ..."; comm may contain any byte,
+    // including ')' and spaces, and need not be UTF-8.
+    let open = stat.iter().position(|&b| b == b'(')?;
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let name = String::from_utf8_lossy(stat.get(open + 1..close)?).into_owned();
+    let mut rest = std::str::from_utf8(stat.get(close + 1..)?)
+        .ok()?
+        .split_whitespace();
     let _state = rest.next()?;
     let parent = rest.next()?.parse().ok()?;
     Some((name, parent))

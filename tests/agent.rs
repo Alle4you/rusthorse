@@ -792,6 +792,135 @@ fn a_slow_client_is_disconnected_at_the_deadline() {
 }
 
 #[test]
+fn a_different_underscore_variable_is_a_different_request() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowFor(Duration::from_secs(60)), Decision::Deny]);
+    let first = h
+        .cmd(&["run", "T", "--", "printenv", "_"])
+        .env("_", "/first")
+        .finish();
+    assert!(first.status.success(), "{}", text(&first.stderr));
+    let second = h
+        .cmd(&["run", "T", "--", "printenv", "_"])
+        .env("_", "/second")
+        .finish();
+    assert_eq!(second.status.code(), Some(125));
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn processes_with_non_utf8_names_are_terminated_too() {
+    let h = Harness::new();
+    // The scenario is real: a program run through a link named "\xff" gets
+    // a process name that is not valid UTF-8.
+    let probe = h.dir.path().join("probe");
+    std::fs::create_dir(&probe).expect("mkdir");
+    let mut sanity = Command::new("sh")
+        .args(["-c", "n=$(printf '\\377'); ln -s \"$(command -v sh)\" \"./$n\"; exec \"./$n\" -c 'sleep 30; :'"])
+        .current_dir(&probe)
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(300));
+    let comm = std::fs::read(format!("/proc/{}/comm", sanity.id())).expect("comm");
+    let _ = sanity.kill();
+    let _ = sanity.wait();
+    assert!(
+        std::str::from_utf8(&comm).is_err(),
+        "expected a non-UTF-8 name, got {comm:?}"
+    );
+
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("odd.pid");
+    let script = format!(
+        "n=$(printf '\\377'); ln -s \"$(command -v sh)\" \"./$n\"; \"./$n\" -c 'sleep 30; :' & echo $! > {}",
+        pidfile.display()
+    );
+    let out = h.run(&["run", "T", "--", "sh", "-c", &script]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let pid = wait_for_pid(&pidfile);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "a process with a non-UTF-8 name survived"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_client_that_stops_reading_releases_the_request_when_it_leaves() {
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    nix::fcntl::fcntl(&writer, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).expect("pipe size");
+    // 32 KiB fits in the agent's own pipe, so the command exits; it does not
+    // fit in the client's 4 KiB pipe, which nobody reads.
+    let mut client = h
+        .cmd(&[
+            "run",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            "head -c 32768 /dev/zero | tr '\\000' x",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        client.try_wait().expect("try_wait").is_none(),
+        "output must not be dropped while the client is connected"
+    );
+    client.kill().expect("kill client");
+    let _ = client.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.audit_text().contains("\"outcome\":\"exited\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the request stayed blocked after the client left"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(reader);
+}
+
+#[test]
+fn the_dialog_limit_counts_the_remember_note() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    // Measure the dialog for a request with one short risky variable.
+    h.decide(&[Decision::Deny]);
+    let first = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", "x")
+        .finish();
+    assert_eq!(first.status.code(), Some(125));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let base = rusthorse::ui::approval_text(&request).chars().count();
+    // Grow it to 3900 characters: under the 4000 limit on its own, over it
+    // once the room for the "Allow for …" note is counted.
+    let value = "x".repeat(1 + 3900 - base);
+    let second = h
+        .cmd(&["run", "T", "--", "true"])
+        .env("GIT_SSH_COMMAND", &value)
+        .finish();
+    assert_eq!(second.status.code(), Some(125));
+    assert!(
+        text(&second.stderr).contains("too much detail"),
+        "{}",
+        text(&second.stderr)
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
@@ -884,15 +1013,18 @@ fn read_only_requests_do_not_keep_the_vault_unlocked() {
     panic!("polling `list` kept the vault unlocked past the idle timeout");
 }
 
-/// Whether a process exists and is not a zombie.
+/// Whether a process exists and is not a zombie. Uses `kill(pid, 0)` and the
+/// raw bytes of `/proc/<pid>/stat`, independently of the agent's own
+/// `/proc` parsing.
 fn alive(pid: u32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    if nix::sys::signal::kill(pid, None).is_err() {
+        return false;
+    }
+    match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => {
-            let state = stat
-                .rfind(')')
-                .and_then(|i| stat.get(i + 2..i + 3))
-                .unwrap_or("Z");
-            state != "Z" && state != "X"
+            let close = stat.iter().rposition(|&b| b == b')').unwrap_or(0);
+            !matches!(stat.get(close + 2), Some(b'Z' | b'X'))
         }
         Err(_) => false,
     }
