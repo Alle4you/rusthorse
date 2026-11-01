@@ -19,7 +19,9 @@ use crate::util::ensure_private_dir;
 /// One audit record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEvent {
-    /// RFC 3339 timestamp (local time with offset).
+    /// When the record was written, as an RFC 3339 timestamp (local time
+    /// with offset): for an approval, when the human answered, not when the
+    /// request arrived. [`AuditLog::record`] sets it.
     pub time: String,
     /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...
     pub action: String,
@@ -45,7 +47,7 @@ impl AuditEvent {
     /// A new record for `action` by `peer`, with an empty outcome.
     pub fn new(action: &str, peer: &Peer) -> Self {
         Self {
-            time: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+            time: now(),
             action: action.to_string(),
             outcome: String::new(),
             entries: Vec::new(),
@@ -96,9 +98,17 @@ impl AuditLog {
         &self.path
     }
 
-    /// Append one record.
+    /// Append one record, stamped with the current time. An event is often
+    /// built when a request arrives and recorded once its outcome is known —
+    /// after a dialog that may stay open for minutes — so the time it was
+    /// built would misdate the decision. Stamping under the lock also keeps
+    /// the file in time order.
     pub fn record(&self, event: &AuditEvent) -> io::Result<()> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let event = AuditEvent {
+            time: now(),
+            ..event.clone()
+        };
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             ensure_private_dir(dir)?;
         }
@@ -107,12 +117,17 @@ impl AuditLog {
             .append(true)
             .mode(0o600)
             .open(&self.path)?;
-        let mut line = serde_json::to_vec(event).map_err(io::Error::other)?;
+        let mut line = serde_json::to_vec(&event).map_err(io::Error::other)?;
         line.push(b'\n');
         file.write_all(&line)?;
         // The record of a decision must survive a crash right after it.
         file.sync_data()
     }
+}
+
+/// The current local time as an RFC 3339 timestamp, to the second.
+fn now() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
 /// The last `count` records of the log at `path` (oldest first).
@@ -162,5 +177,19 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_record_is_dated_when_it_is_written_not_when_it_was_built() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = AuditLog::new(dir.path().join("audit.jsonl"));
+        // An event built long ago, e.g. when a request whose dialog stayed
+        // open arrived.
+        let mut event = AuditEvent::new("run", &Peer::agent());
+        event.time = "2000-01-01T00:00:00+00:00".into();
+        log.record(&event.outcome("allowed_once")).expect("record");
+        let written = &tail(log.path(), 1).expect("tail")[0];
+        let year: i32 = written.time[..4].parse().expect("year");
+        assert!(year >= 2025, "dated {}", written.time);
     }
 }

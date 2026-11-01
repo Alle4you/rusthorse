@@ -51,6 +51,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - New error code `outcome_unknown` (exit 124) when the agent cannot determine
   the result of a command it started, or a change was written but could not
   be synced to disk. Every other error means nothing was changed.
+- Audit records are dated when they are written: an approval or denial
+  carries the time the human answered, not the time the request arrived.
 
 ### Security
 
