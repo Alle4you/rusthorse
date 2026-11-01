@@ -416,6 +416,9 @@ impl Agent {
         let locked = state.vault.is_none();
         let idle = self.config.idle_timeout;
         let executable = std::fs::read_link("/proc/self/exe").ok();
+        // `/proc/self/exe` itself always leads to the running file, even once
+        // its name points elsewhere or nowhere.
+        let running = util::file_identity(Path::new("/proc/self/exe")).ok();
         StatusInfo {
             protocol_version: protocol::PROTOCOL_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -431,11 +434,10 @@ impl Agent {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            // `/proc/self/exe` itself always leads to the running file, even
-            // once its name points elsewhere or nowhere.
-            agent_executable_replaced: executable.as_deref().is_some_and(|path| {
-                util::replaced(path, util::file_identity(Path::new("/proc/self/exe")).ok())
-            }),
+            agent_executable_id: running,
+            agent_executable_replaced: executable
+                .as_deref()
+                .and_then(|path| util::replaced(path, running)),
         }
     }
 

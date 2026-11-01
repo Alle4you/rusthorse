@@ -1742,7 +1742,8 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     locks_in_secs: None,
                     remembered_approvals: 0,
                     agent_executable: String::new(),
-                    agent_executable_replaced: false,
+                    agent_executable_id: None,
+                    agent_executable_replaced: None,
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -1792,7 +1793,8 @@ fn fake_agent(
                     locks_in_secs: None,
                     remembered_approvals: 0,
                     agent_executable: String::new(),
-                    agent_executable_replaced: false,
+                    agent_executable_id: None,
+                    agent_executable_replaced: None,
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -1985,7 +1987,8 @@ fn fake_import_agent(
                         locks_in_secs: None,
                         remembered_approvals: 0,
                         agent_executable: String::new(),
-                        agent_executable_replaced: false,
+                        agent_executable_id: None,
+                        agent_executable_replaced: None,
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }
@@ -2214,7 +2217,11 @@ fn status_names_the_agents_program_file() {
     // The harness agent runs inside this test binary.
     let ours = std::fs::read_link("/proc/self/exe").expect("exe");
     assert_eq!(info.agent_executable, ours.display().to_string());
-    assert!(!info.agent_executable_replaced);
+    assert_eq!(info.agent_executable_replaced, Some(false));
+    assert_eq!(
+        info.agent_executable_id,
+        rusthorse::util::file_identity(std::path::Path::new("/proc/self/exe")).ok()
+    );
 }
 
 #[test]

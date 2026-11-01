@@ -11,7 +11,7 @@ Protocol version: **3** (`PROTOCOL_VERSION` in
 |---|---|
 | 1 | First design: descriptors passed for every `run`. Never released. |
 | 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
-| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_replaced`. |
+| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -218,17 +218,22 @@ All fields are optional; omitted fields are left unchanged.
   "locks_in_secs": 812,
   "remembered_approvals": 1,
   "agent_executable": "/home/me/.cargo/bin/rusthorse",
+  "agent_executable_id": [66306, 1835012],
   "agent_executable_replaced": false
 }
 ```
 
 `locks_in_secs` is omitted when the vault is locked or auto-lock is off.
 `agent_executable` is the program file the agent runs, as the kernel reports
-it (`/proc/self/exe`). `agent_executable_replaced` says whether that name no
-longer leads to the running file — it was replaced or removed after the agent
-started, as an upgrade without a restart does. It is judged by file identity
-(device and inode), not by the ` (deleted)` the kernel appends to the name,
-which a real file name could also end with.
+it (`/proc/self/exe`), and `agent_executable_id` its device and inode, read
+through `/proc/self/exe` itself, so a client can compare it with its own
+without relying on names (the same name can lead to different files in
+different mount namespaces). `agent_executable_replaced` says whether that
+name no longer leads to the running file — it was replaced or removed after
+the agent started, as an upgrade without a restart does — judged by file
+identity, not by the ` (deleted)` the kernel appends to the name, which a
+real file name could also end with; it is `null` when the agent cannot tell
+(for example, no permission to examine the path).
 Clients should check `protocol_version` and refuse to continue on a mismatch.
 
 ### EntryInfo

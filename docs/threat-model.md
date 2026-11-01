@@ -551,3 +551,13 @@ ready for the first real test):
 | "The agent runs this build" claimed more than a comparison of path strings shows (symlinks, renamed files, `cargo run`) | **Fixed:** the two files are compared by device and inode, and the message says "the same program file". That is not proof of the same source code if a file is rewritten in place, which installers do not do. |
 | Ideas: a build identifier in `status`; tests for symlinks and renames in the diagnosis | **Later:** a build identifier needs the build to embed one (a build script); the identity checks have unit tests with a file named like the kernel's marker, a replaced file and a removed one. |
 | Coverage | Reverting each fix of this round makes the suite fail. |
+
+Findings of the thirteenth review (the name-suffix false positive and the
+"same build" overclaim confirmed fixed, including a path reused by a new
+file; no new finding of medium or higher severity; verdict: ready for the
+first real test):
+
+| Finding | Disposition |
+|---|---|
+| A path the agent could not examine (no permission, an I/O error) was reported as replaced | **Fixed:** only a missing path or a different identity counts as replaced; otherwise the answer is "cannot tell" (`null`), never a failure. |
+| `doctor` looked up the agent's path in its own mount namespace, where the same name can lead to another file, and could report "the same program file" for different files | **Fixed:** the agent reports the device and inode of the file it runs, read through its own `/proc/self/exe`, and `doctor` compares that with its own. |

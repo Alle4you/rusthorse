@@ -40,10 +40,24 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
-/// Whether `path` no longer names the file whose identity is `running`: it was
-/// replaced or removed. An unknown identity (`None`) is never "replaced".
-pub fn replaced(path: &Path, running: Option<(u64, u64)>) -> bool {
-    running.is_some_and(|running| file_identity(path).map_or(true, |now| now != running))
+/// Whether `path` no longer names the file whose identity is `running`:
+/// `Some(true)` if it names another file or nothing, `Some(false)` if it still
+/// names that file, and `None` if that cannot be told — the identity is
+/// unknown, or the path cannot be examined (no permission, an I/O error).
+pub fn replaced(path: &Path, running: Option<(u64, u64)>) -> Option<bool> {
+    let running = running?;
+    match file_identity(path) {
+        Ok(now) => Some(now != running),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(true)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Whether `name` is a portable environment variable name (`[A-Za-z_][A-Za-z0-9_]*`).
@@ -155,17 +169,34 @@ mod tests {
         let path = dir.path().join("agent (deleted)");
         std::fs::write(&path, b"one").expect("write");
         let running = file_identity(&path).ok();
-        assert!(!replaced(&path, running));
+        assert_eq!(replaced(&path, running), Some(false));
         // Replaced by another file under the same name.
         let new = dir.path().join("new");
         std::fs::write(&new, b"two").expect("write");
         std::fs::rename(&new, &path).expect("rename");
-        assert!(replaced(&path, running));
+        assert_eq!(replaced(&path, running), Some(true));
         // Removed.
         std::fs::remove_file(&path).expect("remove");
-        assert!(replaced(&path, running));
+        assert_eq!(replaced(&path, running), Some(true));
         // Unknown identity: no claim.
-        assert!(!replaced(&path, None));
+        assert_eq!(replaced(&path, None), None);
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_examined_is_not_called_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("closed");
+        std::fs::create_dir(&closed).expect("mkdir");
+        let path = closed.join("agent");
+        std::fs::write(&path, b"one").expect("write");
+        let running = file_identity(&path).ok();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let examinable = std::fs::metadata(&path).is_ok(); // root ignores the mode
+        let verdict = replaced(&path, running);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        if !examinable {
+            assert_eq!(verdict, None, "no permission is not a replacement");
+        }
     }
 
     #[test]

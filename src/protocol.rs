@@ -24,7 +24,8 @@ use zeroize::Zeroizing;
 ///
 /// 3: every error other than `outcome_unknown` is definite (the vault file
 /// was not changed and no command was started), which clients rely on;
-/// `status.agent_executable`, `status.agent_executable_replaced`.
+/// `status.agent_executable`, `status.agent_executable_id`,
+/// `status.agent_executable_replaced`.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed;
@@ -457,10 +458,16 @@ pub struct StatusInfo {
     /// started (an upgrade without a restart).
     #[serde(default)]
     pub agent_executable: String,
+    /// Device and inode of the file the agent runs, read through
+    /// `/proc/self/exe`, so that a client can compare it with its own
+    /// without relying on names (which differ between mount namespaces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_executable_id: Option<(u64, u64)>,
     /// Whether the agent's program file was replaced or removed after it
-    /// started, judged by file identity (device and inode), not by name.
+    /// started, judged by file identity, not by name; `None` when the agent
+    /// cannot tell (for example, no permission to examine the path).
     #[serde(default)]
-    pub agent_executable_replaced: bool,
+    pub agent_executable_replaced: Option<bool>,
 }
 
 /// Why a request failed.

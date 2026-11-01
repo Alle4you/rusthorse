@@ -352,9 +352,11 @@ rusthorse doctor
 
 Checks the installation without touching any secret: the agent is running,
 speaks the same protocol version and runs the same program file as this
-`rusthorse` — compared by device and inode, not by name, so this says "same
-file", not "same source code" (an agent still running a file that was since
-replaced or removed is an error: restart it; a different file is a warning) —
+`rusthorse` — compared by the device and inode the agent reads through its
+own `/proc/self/exe`, not by name, so this says "same file", not "same source
+code" (an agent still running a file that was since replaced or removed is an
+error: restart it; a different file, or one that cannot be compared, is a
+warning) —
 the systemd service is enabled, zenity
 is installed, the session type (X11 is reported as a warning — see the threat
 model), Yama `ptrace_scope`, the vault's format and permissions, and the
