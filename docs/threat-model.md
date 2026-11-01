@@ -245,7 +245,12 @@ Any process of your user can lock the vault, keep dialogs coming (one at a
 time, at most eight waiting), or stop the agent. Opening a crafted vault file
 with extreme KDF parameters can make unlocking very slow (files over 128 MiB
 are refused, but KDF parameters are not yet bounded). These are annoyances,
-not disclosures.
+not disclosures. Under extreme resource exhaustion — the agent cannot create
+the threads that relay a command's output after the command has started —
+the request fails without an answer (the client reports exit 124, outcome
+unknown) and the command is left to finish on its own (it gets `SIGPIPE` if
+it writes output, and stays a zombie until the agent restarts); the agent
+itself keeps serving other requests.
 
 ### L13 — The audit log is not tamper-proof
 
