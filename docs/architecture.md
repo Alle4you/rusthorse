@@ -92,21 +92,26 @@ sequenceDiagram
     end
     A->>A: audit record (fail closed)
     A->>A: re-check: same vault generation? same program and directory inodes? same entries?
-    A->>X: spawn with env + secrets; stdin, stdout, stderr = agent-owned pipes
+    A->>X: spawn with env + secrets; stdout, stderr = agent-owned pipes;<br/>stdin = /dev/null (or a pipe with --stdin)
     loop while running
-        C-->>A: caller's input (fd 0), forwarded to the command's stdin pipe
+        opt run --stdin
+            C-->>A: caller's input (fd 0), forwarded to the command's stdin pipe
+        end
         X-->>A: output
         A-->>C: redacted output, written to the caller's fds 1 and 2
     end
-    X-->>A: exit status
+    X-->>A: exit (not yet reaped)
+    A->>A: terminate what is left of its process group, join all workers, reap
     A->>A: audit record (exit status)
     A-->>C: Exited{code, signal}
     C->>C: exit with the same status
 ```
 
-If the caller disconnects (for example it is killed or interrupted) before
-the command finishes, the agent sends `SIGTERM` to the command's process group
-and `SIGKILL` three seconds later.
+When the command exits, and also if the caller disconnects (for example it is
+killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
+left of the command's process group and `SIGKILL` three seconds later. The
+leader is reaped only afterwards, so its process group id cannot be reused by
+an unrelated process while it is being signalled.
 
 ## Policy
 
@@ -136,17 +141,20 @@ names.
 
 The agent keeps a *generation* counter, incremented on every unlock, lock and
 saved change. Every approval-gated request records the generation before it
-asks the human and acts only if it is unchanged afterwards, so a lock, edit or
+asks the human and acts only if it is unchanged afterwards — checked under the
+same lock that reads the values or applies the change — so a lock, edit or
 removal that happens while a dialog is open cancels the request instead of
-acting on stale information.
+acting on stale information. An unlock records the generation before showing
+the password dialog and is cancelled if a `lock` arrived meanwhile.
 
 ### Remembered approvals
 
 Off by default ([ADR 0005](adr/0005-remembered-approvals-opt-in.md)). With
 `--remember DURATION`, "Allow for DURATION" stores, in memory only, a key made
 of the vault generation, the bindings and entry UUIDs, the exact command line,
-canonical program path, working directory, redaction flag and the complete
-environment (except `_` and `OLDPWD`). A later request is approved without a
+canonical program path, working directory, redaction and stdin-forwarding
+flags and the complete effective environment (sorted by name, as the command
+receives it). A later request is approved without a
 dialog only if its key is identical and the time has not expired; any change
 to the vault therefore invalidates it. Requests whose details are too long to
 display in full are refused outright.
@@ -202,8 +210,10 @@ program (KeePassXC, a sync client) changed the file, the save is refused with
 `vault_changed` instead of silently discarding those changes; locking and
 unlocking reloads the file. The two checks narrow the window but are not an
 atomic compare-and-swap, so only one program should write the vault at a time
-(threat model L15). If a save fails, the agent locks the vault so that memory
-never holds changes that are not on disk.
+(threat model L15). Every change is a transaction on an in-memory copy: if any
+part of it fails (one invalid entry in an import, say), all of it is rolled
+back. If the save itself fails, the agent locks the vault so that memory never
+holds changes that are not on disk.
 
 Deleted entries are recorded in the KDBX `DeletedObjects` list, so that
 merging with an older copy does not bring them back. Vault files larger than
@@ -229,7 +239,8 @@ than a pipe, because other processes of the same user can open a pipe through
 `/proc/<pid>/fd` but not a socket. Text for the entry dialog has backslashes
 and underscores escaped; the question dialog uses `--no-markup`. Only an exit
 status of 0 with no output (Allow once), or 1 with the exact label of the
-extra button (Allow for N), counts as approval.
+extra button (Allow for N), counts as approval. A request whose dialog text
+would exceed 4000 characters is refused rather than shown truncated.
 
 ## Audit log
 

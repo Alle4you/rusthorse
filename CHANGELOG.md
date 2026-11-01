@@ -59,4 +59,21 @@ Changes from the adversarial review of 2026-10-31 (details in
 - Request timeouts and limits on connections and pending dialogs.
 - Audit records are `fsync`ed.
 
+From the second review (of the code after those fixes):
+
+- Approved changes are transactions, rolled back if any part fails.
+- The vault generation is checked under the same lock that reads values; a
+  lock during the password prompt cancels the unlock; unlocking is audited
+  before it takes effect.
+- The remembered-approval key covers the whole effective environment.
+- Protected titles are hidden; dialogs and the audit log show
+  `Group/Title (uuid)`; entries can be addressed by UUID.
+- Descriptors are never leaked, even when the open-file limit truncates a
+  message.
+- `run` gives the command `/dev/null` as input unless `--stdin` is passed;
+  forwarding never blocks and stops when the command ends.
+- Background processes left in the command's process group are terminated
+  when it exits.
+- Whole-dialog length limit; a real deadline for receiving requests.
+
 [Unreleased]: https://github.com/Alle4you/rusthorse/commits/main

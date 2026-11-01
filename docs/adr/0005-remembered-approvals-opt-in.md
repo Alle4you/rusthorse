@@ -30,9 +30,11 @@ decision per use.
   who want it enable it explicitly with a duration.
 - When enabled, the key binds the vault *generation* (bumped on every unlock,
   lock and saved change), the entries by UUID, the exact command line, the
-  canonical program path, the directory, the redaction setting and the
-  **complete** environment (except `_` and `OLDPWD`, which change on every
-  invocation without affecting the program).
+  canonical program path, the directory, the redaction and stdin-forwarding
+  settings and the **complete** effective environment, in canonical order.
+  (A first version left out `_` and `OLDPWD` as "noise"; the second review
+  showed that both are visible to the program — `cd -` uses `OLDPWD` — so
+  nothing is left out.)
 - The dialog explains, next to the button, that it lets identical requests
   run without asking even if they read different input or files.
 - `reveal`, `add --stdin`, `import`, `edit` and `remove` are never remembered,

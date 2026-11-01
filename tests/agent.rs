@@ -134,7 +134,7 @@ impl Harness {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        self.cmd(args).output().expect("run rusthorse")
+        self.cmd(args).finish()
     }
 
     fn run_stdin(&self, args: &[&str], input: &str) -> Output {
@@ -152,7 +152,7 @@ impl Harness {
             .expect("stdin")
             .write_all(input.as_bytes())
             .expect("write");
-        child.wait_with_output().expect("wait")
+        within(TEST_LIMIT, move || child.wait_with_output().expect("wait"))
     }
 
     fn decide(&self, decisions: &[Decision]) {
@@ -187,6 +187,44 @@ impl Harness {
 
     fn audit_text(&self) -> String {
         std::fs::read_to_string(&self.audit).unwrap_or_default()
+    }
+}
+
+/// No single rusthorse invocation in these tests should take this long; a
+/// hang is reported as a failure instead of blocking the whole suite.
+const TEST_LIMIT: Duration = Duration::from_secs(60);
+
+/// Run `f` on a thread and fail the test if it does not finish in time.
+fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("did not finish within {limit:?} (hang?)"))
+}
+
+/// `Command::output` with [`TEST_LIMIT`]; a hung child is killed.
+trait Finish {
+    fn finish(&mut self) -> Output;
+}
+
+impl Finish for Command {
+    fn finish(&mut self) -> Output {
+        self.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = self.spawn().expect("spawn rusthorse");
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        match rx.recv_timeout(TEST_LIMIT) {
+            Ok(output) => output.expect("wait"),
+            Err(_) => {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                panic!("rusthorse did not finish within {TEST_LIMIT:?} (hang?)");
+            }
+        }
     }
 }
 
@@ -338,8 +376,7 @@ fn loader_variables_are_stripped() {
             "echo ${LD_LIBRARY_PATH-unset}",
         ])
         .env("LD_LIBRARY_PATH", "/nonexistent-rusthorse-test")
-        .output()
-        .expect("run");
+        .finish();
     assert_eq!(text(&out.stdout).trim(), "unset");
     let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
     assert!(
@@ -520,8 +557,7 @@ fn a_writable_stdin_is_not_an_unredacted_way_out() {
             "printf %s \"$T\" >&0; echo done",
         ])
         .stdin(Stdio::from(OwnedFd::from(theirs)))
-        .output()
-        .expect("run");
+        .finish();
     assert!(text(&out.stdout).contains("done"));
     ours.set_nonblocking(true).expect("nonblocking");
     let mut received = Vec::new();
@@ -552,8 +588,7 @@ fn a_writable_stdin_is_not_a_way_out_with_forwarding_either() {
             "printf %s \"$T\" >&0; echo done",
         ])
         .stdin(Stdio::from(OwnedFd::from(theirs)))
-        .output()
-        .expect("run");
+        .finish();
     assert!(text(&out.stdout).contains("done"));
     ours.set_nonblocking(true).expect("nonblocking");
     let mut received = Vec::new();
@@ -575,8 +610,7 @@ fn input_is_not_consumed_unless_forwarding_is_requested() {
     let out = h
         .cmd(&["run", "T", "--", "cat"])
         .stdin(Stdio::from(OwnedFd::from(reader.try_clone().expect("dup"))))
-        .output()
-        .expect("run");
+        .finish();
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "", "cat must see an empty input");
     drop(writer);
@@ -682,14 +716,12 @@ fn a_different_oldpwd_is_a_different_request() {
     let first = h
         .cmd(&["run", "T", "--", "printenv", "OLDPWD"])
         .env("OLDPWD", "/first")
-        .output()
-        .expect("run");
+        .finish();
     assert_eq!(text(&first.stdout).trim(), "/first");
     let second = h
         .cmd(&["run", "T", "--", "printenv", "OLDPWD"])
         .env("OLDPWD", "/second")
-        .output()
-        .expect("run");
+        .finish();
     assert_eq!(
         second.status.code(),
         Some(125),

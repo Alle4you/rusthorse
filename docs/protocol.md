@@ -30,7 +30,8 @@ Protocol version: **1** (`PROTOCOL_VERSION` in
   the **first byte** of the frame (send the whole frame with one `sendmsg`
   call; if it is short, write the rest normally). Any other request that
   carries descriptors is rejected with `invalid_request`.
-- The request must arrive within 10 seconds of connecting. The agent handles
+- The whole request must arrive within 10 seconds of connecting (a deadline,
+  not a per-read timeout). The agent handles
   at most 64 connections at a time and refuses (with `denied`) requests when
   8 are already waiting for the human.
 - While a `run` request is in progress, the client must keep the connection
@@ -57,7 +58,7 @@ Every request is an object with a `type` field.
 
 Any request can also be answered with an [`error`](#errors).
 
-`name` is an entry title, or a `Group/Sub/Title` path.
+`name` is an entry title, a `Group/Sub/Title` path, or the entry's UUID.
 
 ### Examples
 
@@ -112,7 +113,8 @@ All fields are optional; omitted fields are left unchanged.
   "argv": ["python", "app.py"],
   "cwd": "/home/me/project",
   "env": [["PATH", "/home/me/project/.venv/bin:/usr/bin:/bin"], ["HOME", "/home/me"]],
-  "redact": true
+  "redact": true,
+  "forward_stdin": false
 }
 ```
 
@@ -125,9 +127,11 @@ All fields are optional; omitted fields are left unchanged.
   name starts with `LD_` and those that a binding overrides.
 - Command lines, paths and environment must be valid UTF-8. The command line,
   the resolved program path and `cwd` must each fit in 1000 characters.
-- With `redact: true`, the agent reads the client's stdin descriptor and
-  forwards it to the command; it writes only to the stdout and stderr
-  descriptors.
+- With `redact: true`, the command's stdin is `/dev/null` unless
+  `forward_stdin` is `true` (optional, default `false`), in which case the
+  agent reads the client's stdin descriptor and forwards it. The agent only
+  writes to the stdout and stderr descriptors. With `redact: false`, the three
+  descriptors are given to the command as they are.
 
 ## Responses
 

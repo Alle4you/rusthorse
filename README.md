@@ -72,11 +72,14 @@ and keeps the value out of the agent's reach in the common case.
   trust; see the threat model.)
 - **Output redaction.** Secret values printed by the command are replaced with
   `[REDACTED:<entry>]` before they reach the caller; the command only ever
-  sees pipes owned by the agent.
+  sees pipes owned by the agent, reads `/dev/null` unless you pass `--stdin`,
+  and anything it leaves running in the background is stopped when it exits.
 - **The master password never touches the client.** The agent asks for it in
-  its own dialog and locks itself after 15 minutes of inactivity.
+  its own dialog (only `rusthorse init` reads the password of a new vault
+  itself) and locks itself after 15 minutes without an approved use.
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
-  (without values). If the log cannot be written, the request is refused.
+  (without values). If the log cannot be written, the vault stays locked and
+  approval-gated requests are refused.
 - **Migration.** Import from `.env` files and from GNOME Keyring / KWallet.
 
 ## Quick start

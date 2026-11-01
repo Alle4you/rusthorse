@@ -38,7 +38,8 @@ An entry name is the KeePass title. Names must be unique, at most 128
 characters, without `/`, without leading or trailing spaces and without
 control or invisible formatting characters. Where a command takes a `NAME`, a
 `Group/Sub/Name` path also works, which is only needed when a database edited
-elsewhere has two entries with the same title. If a name matches more than
+elsewhere has two entries with the same title, and so does the entry's UUID
+(shown by `show` and in dialogs). If a name matches more than
 one entry in any way (for example a title containing `/` that looks like the
 path of another entry), the command fails with an "ambiguous" error listing
 the paths.
@@ -57,7 +58,8 @@ rusthorse init [--vault PATH]
 ```
 
 Asks for the master password twice (in the terminal, or in dialogs without a
-terminal). Fails if the file exists. New vaults use Argon2id with 64 MiB and
+terminal) — the only time the CLI itself handles a master password. Fails if
+the file exists. New vaults use Argon2id with 64 MiB and
 20 passes (about 0.7 s per unlock on a desktop CPU).
 
 ## `rusthorse agent`
@@ -168,7 +170,7 @@ previous file is still available as `vault.kdbx.bak`.
 ## `rusthorse run`
 
 ```
-rusthorse run [--no-redact] SECRET... -- COMMAND [ARG]...
+rusthorse run [--no-redact] [--stdin] SECRET... -- COMMAND [ARG]...
 ```
 
 Runs `COMMAND` with secrets in its environment. Each `SECRET` is either
@@ -180,6 +182,7 @@ variable name) or `VAR=NAME`. Requires approval; the dialog shows:
 - which secret goes into which variable;
 - whether output is redacted;
 - who is asking (the process chain, e.g. `bash ← claude`);
+- what the command reads as input (nothing, or your forwarded input);
 - that the command runs as you, outside any sandbox the requester is in;
 - warnings about removed variables (`LD_*`) and variables that can make the
   program run other code (`NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND`, …).
@@ -193,17 +196,22 @@ that the entries are the same (by UUID) and that the program file and the
 directory were not replaced; otherwise nothing runs. The agent then starts the
 command itself, in the requested directory, with your environment minus
 `LD_*` variables plus the secrets. Unless `--no-redact` is given, the command's
-standard input, output and error are pipes owned by the agent: your input is
-forwarded to it, and every occurrence of a secret value (4 characters or
-longer) in its output is replaced with `[REDACTED:<entry>]`. Programs
-therefore see pipes rather than a terminal. With `--no-redact`, the command
-gets the caller's descriptors directly. If `rusthorse run` is interrupted, the
-command's process group gets `SIGTERM` and, 3 seconds later, `SIGKILL`.
+standard output and error are pipes owned by the agent, and every occurrence
+of a secret value (4 characters or longer) in them is replaced with
+`[REDACTED:<entry>]`; its standard input is `/dev/null`, unless `--stdin`
+asks the agent to forward yours. Programs therefore see pipes rather than a
+terminal. With `--no-redact`, the command gets the caller's descriptors
+directly (including stdin).
+
+When the command exits, anything it left running in its process group (for
+example `sleep 30 &`) is terminated; if `rusthorse run` is interrupted before
+that, the whole group is terminated too — `SIGTERM`, then `SIGKILL` 3 seconds
+later.
 
 If the agent runs with `--remember`, the dialog also offers "Allow for …",
 which lets **identical** requests (same vault state, entries, command line,
-program, directory, redaction and environment) run without asking for that
-long. It does not cover what the command reads, so use it only for commands
+program, directory, input and output handling, and the complete environment)
+run without asking for that long. It does not cover what the command reads, so use it only for commands
 whose input you control.
 
 Examples:

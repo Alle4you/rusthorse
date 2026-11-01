@@ -29,10 +29,10 @@ The agent executes approved commands itself:
   variables, flags variables that can inject code, shows all of it in the
   approval dialog, and only then reads the secret values.
 - The agent spawns the command as its own child, in a new process group.
-  With redaction (the default) the command's stdin, stdout and stderr are
-  pipes owned by the agent: the agent forwards the client's input and filters
-  the output for secret values before writing it to the client's
-  descriptors. The client's descriptors themselves never reach the command,
+  With redaction (the default) the command's stdout and stderr are pipes
+  owned by the agent, which filters them for secret values before writing to
+  the client's descriptors; its stdin is `/dev/null`, or an agent-owned pipe
+  fed from the client's input with `run --stdin`. The client's descriptors themselves never reach the command,
   since a descriptor passed as "stdin" may be writable.
 - After the human answers, the agent checks that the vault generation, the
   entries (by UUID) and the program's and directory's inodes are unchanged

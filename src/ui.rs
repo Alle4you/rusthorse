@@ -280,9 +280,18 @@ mod tests {
 
     #[test]
     fn dialog_output_arrives_through_a_socket() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "readlink /proc/self/fd/1"]);
-        let (status, output) = capture_through_socket(cmd).expect("run");
+        // On a thread with a deadline: a broken capture (one that keeps a
+        // copy of the child's end open) would wait forever for end-of-file.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "readlink /proc/self/fd/1"]);
+            let _ = tx.send(capture_through_socket(cmd).map(|(s, o)| (s, o.to_vec())));
+        });
+        let (status, output) = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("capture hung")
+            .expect("run");
         assert_eq!(status, Some(0));
         let target = String::from_utf8_lossy(&output);
         assert!(target.starts_with("socket:"), "fd 1 was {target}");

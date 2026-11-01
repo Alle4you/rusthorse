@@ -52,6 +52,8 @@ from the vault straight into the approved program.
    - To store a new secret, run `rusthorse add NAME [--url …] [--username …]`;
      the human types the value in a dialog. Do not pipe values into
      `rusthorse add --stdin`.
+   - Commands run by `rusthorse run` read no input unless you add `--stdin`,
+     and background processes they start are stopped when they exit.
    ```
 
 3. Keep `rusthorse agent` running under systemd (see

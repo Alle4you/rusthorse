@@ -103,19 +103,20 @@ The boundary that matters is between **requesters** and the **agent**.
 
 | # | Property | Mechanism | Holds against |
 |---|---|---|---|
-| P1 | A requester never receives a secret value, notes or a protected field without an approval for that specific request. | Only `reveal` returns a value, after a non-rememberable approval. `list`/`show` return metadata only, and withhold any field the KDBX file marks as protected (reporting only its name). | A1, A2 |
-| P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, re-checks the program's and directory's inode after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. *File contents* are not pinned (L4). | A1, A2 |
-| P3 | An approval is acted on only if nothing changed while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change; an approval whose generation is stale is discarded, and the entries are re-checked by UUID before their values are read. | A1, A2 |
+| P1 | A requester never receives a secret value, notes or a protected field without an approval for that specific request. | Only `reveal` returns a value, after a non-rememberable approval. `list`/`show` return metadata only, and withhold any field the KDBX file marks as protected — including a protected title, which is shown as `[protected title]` and matched only by UUID — reporting only the field's name. | A1, A2 |
+| P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap in the instant between that check and the start of the program, and changes to file *contents*, are not prevented (L4). | A1, A2 |
+| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. Reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
-| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdin, stdout and stderr are pipes owned by the agent; output is filtered before being written to the requester's descriptors, and the requester's own descriptors never reach the command (a writable "stdin" cannot be used as a way back). Exact-match only (L5). | A1 |
-| P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). | A1, A2 (not on X11, L2) |
-| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); details too long to show in full are refused, never truncated; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
+| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent and filtered before being written to the requester's descriptors; its stdin is `/dev/null`, or an agent-owned pipe with `run --stdin`. The requester's own descriptors never reach the command, so a writable "stdin" cannot be used as a way back. Exact-match only (L5). | A1 |
+| P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). The one exception is `rusthorse init`, which reads the password of a *new* vault in the CLI (terminal or dialog) before any agent is involved. | A1, A2 (not on X11, L2) |
+| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field) are refused, never truncated; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. | A1, A2, A6 (window) |
-| P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` (inherited by dialogs and commands). | A1, A2 |
+| P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
-| P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record; approval-gated actions fail closed if it cannot be written. | A1 (detection; L13) |
-| P13 | The agent stays available under request floods. | Requests must arrive within 10 s; at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
+| P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. | A1 (detection; L13) |
+| P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
+| P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. | Accidents |
 
 ### Who starts the agent
 
@@ -171,9 +172,11 @@ of the environment altogether.
 
 If you approve `python deploy.py`, the secret goes to whatever `deploy.py`
 contains when it runs — and an AI agent can edit that file, even between your
-answer and the start of the command. Rusthorse pins the program *path* and
-inode and the working directory's inode, which stops one file being swapped
-for another, but not a file being rewritten in place, nor the scripts,
+answer and the start of the command. Rusthorse checks the identity (device and
+inode) of the program and of the working directory again after you answer,
+which catches a file swapped for another while the dialog was open. It does
+not pin them — a swap in the instant between that check and the start is
+still possible — and it does not notice a file rewritten in place, nor the scripts,
 modules, configuration files (`~/.gitconfig`, `.curlrc`, `.npmrc`) and
 plugins the program loads. The same applies to `sh -c '…'` and interpreters
 with inline code. The agent removes `LD_*` variables and warns about a list
@@ -270,12 +273,21 @@ not inside whatever sandbox (container, seccomp policy, network restrictions)
 the requester runs in. Approving a command from a sandboxed AI agent grants
 that command your full access. The dialog states this.
 
-### L17 — Descendants can outlive a cancelled command
+### L17 — Descendants that leave the process group outlive the command
 
-If the requester disconnects, the command's process group is terminated, but a
-descendant that started a new session (`setsid`) escapes the signal and keeps
-the secret in its environment. Stopping the agent's systemd service kills all
-of them (cgroup). *Planned:* one cgroup per command.
+When the command exits — or the requester disconnects first — every remaining
+process in its process group is terminated (SIGTERM, then SIGKILL after 3
+seconds), so background jobs started by the command do not keep the secret.
+A descendant that started a new session or group (`setsid`, `setpgid`)
+escapes this and keeps the secret in its environment; stopping the agent's
+systemd service kills all of them (cgroup). *Planned:* one cgroup per command.
+
+### L18 — Forwarded input races the end of the command
+
+With `run --stdin`, the agent forwards the requester's input while the command
+runs. Input typed in the instant the command finishes may be read and lost
+instead of reaching the next program that reads the terminal. Without
+`--stdin` (the default), the requester's input is never read.
 
 ## 8. Running AI agents in isolation
 
@@ -327,6 +339,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 |---|---|---|
 | 2026-10-31 | Initial threat model, written with the first implementation. | — |
 | 2026-10-31 | Adversarial design and code review (AI-assisted, Codex). | See below. |
+| 2026-10-31 | Second review of the code and of the fixes (AI-assisted, Codex). | See the second table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -350,3 +363,20 @@ Findings of the 2026-10-31 review and what was done:
 | Lock, edit or removal while a dialog is open | **Fixed:** generation check before acting (P3). |
 | Approved commands run outside the requester's sandbox | **Documented** (L16) and stated in the dialog. |
 | Protocol had no limits on slow clients or floods | **Fixed:** timeouts and caps (P13). |
+
+Findings of the second review (of the code after the fixes above):
+
+| Finding | Disposition |
+|---|---|
+| N1 — a failing import left part of the batch in memory, saved later by an unrelated change | **Fixed:** changes are transactions, rolled back on failure (P14). |
+| N2 — the generation check and the read of values were not atomic; a `lock` during the password prompt was undone by the pending unlock | **Fixed:** checked under the same lock; unlock cancelled by a lock (P3). |
+| N3 — `OLDPWD` and `_` were left out of the approval key but passed to the command | **Fixed:** the key is the whole effective environment in canonical order. |
+| N4 — a protected `Title` was disclosed | **Fixed:** shown as `[protected title]`, matched only by UUID (P1). |
+| N5 — two entries with the same title in different groups looked identical in dialogs | **Fixed:** entries are shown as `Group/Title (uuid)` in dialogs and the audit log (P7). |
+| N6 — descriptors still leaked when the open-file limit truncated a message | **Fixed:** the control buffer is parsed directly and every installed descriptor is owned and closed. |
+| N7 — stdin forwarding consumed input after the command ended and could block | **Fixed:** stdin is `/dev/null` unless `--stdin`; forwarding stops before reading and never blocks; residual race documented (L18). |
+| N8 — descendants in the same process group survived | **Fixed:** the group is terminated when the command ends or the client disconnects; `setsid` escapes documented (L17). |
+| N9 — an unwritable audit log failed the unlock but left the vault open | **Fixed:** recorded before publishing (P12). |
+| N10 — per-field limits did not bound the whole dialog | **Fixed:** whole-dialog limit (P7). |
+| N11 — the request timeout was per read, so a slow drip could exceed it | **Fixed:** a deadline for the whole request (P13). |
+| Tests did not fail when several fixes were reverted | **Fixed:** new tests for each fix. A mutation run then reverted each of the 15 fixes in turn; the test suite failed every time (tests now have deadlines, so a regression that hangs fails instead of blocking). |
