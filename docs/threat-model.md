@@ -816,4 +816,4 @@ and what was done:
 Each fix was reverted in a copy of the tree to see a test fail (3 of 3;
 the documentation fixes have no test).
 
-**Awaiting:** verification of these fixes (Codex).
+Verification (Codex, 2026-11-01): **ready to keep trying with fake entries.** Two low points followed and were fixed: the tests of an older agent now pin protocol 3 (and the version may not go below 4, checked at compile time), and the remaining texts that called protocol 3 current were corrected.

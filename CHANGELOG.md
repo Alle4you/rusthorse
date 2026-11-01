@@ -65,12 +65,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
-- **Protocol 4.** `reveal` takes an optional `purpose`; see Added. Upgrade the
-  agent together with its clients and restart it: clients refuse an agent of
-  another protocol version.
-
-- Protocol version 3 (data frames and credits, new requests, definite
-  errors); clients refuse an agent that speaks another version.
+- **Protocol 4** (versions 2 and 3 existed only during development): data
+  frames and credits, new requests, definite errors, and `reveal.purpose`
+  (see Added). Upgrade the agent together with its clients and restart it:
+  clients refuse an agent that speaks another version.
 - `passwd` reports when the old-password backup could not be deleted.
 - `doctor` checks the files the agent actually uses, and notices an agent
   still running a build that an upgrade replaced; `status` shows the agent's

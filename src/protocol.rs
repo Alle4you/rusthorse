@@ -28,10 +28,11 @@ use zeroize::Zeroizing;
 /// `status.agent_executable_replaced`.
 pub const PROTOCOL_VERSION: u32 = 4;
 
-// Clients trust that errors other than `outcome_unknown` mean nothing changed;
-// agents of version 2 and earlier do not guarantee it, so the version must
-// never go back below 3 (N31).
-const _: () = assert!(PROTOCOL_VERSION >= 3);
+// Clients trust that errors other than `outcome_unknown` mean nothing changed
+// (version 3 and later, N31), and that an approval for `reveal.purpose` says
+// what the manager does (version 4; builds that reported 3 promised a single
+// paste for `copy`). The version must never go back below 4.
+const _: () = assert!(PROTOCOL_VERSION >= 4);
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;

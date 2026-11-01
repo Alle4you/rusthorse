@@ -321,7 +321,8 @@ mod tests {
                     let Response::Status(mut info) = status() else {
                         unreachable!()
                     };
-                    info.protocol_version = protocol::PROTOCOL_VERSION - 1;
+                    // Protocol 3: its `copy` dialog promised a single paste.
+                    info.protocol_version = 3;
                     protocol::send_frame(&s, &Response::Status(info), &[]).expect("answer");
                     listener.set_nonblocking(true).expect("nonblocking");
                     thread::sleep(Duration::from_millis(100));

@@ -2202,8 +2202,8 @@ fn a_missing_or_old_agent_means_did_not_run() {
     assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
     // An agent speaking an older protocol.
     let socket = dir.path().join("old.sock");
-    // The previous version: it lacks the definite-error guarantee (N31).
-    let fake = fake_agent(&socket, rusthorse::protocol::PROTOCOL_VERSION - 1, None, 2);
+    // Protocol 3: its dialogs for `reveal.purpose` say something else.
+    let fake = fake_agent(&socket, 3, None, 2);
     let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
         .args(["run", "T", "--", "true"])
         .env("RUSTHORSE_SOCKET", &socket)
