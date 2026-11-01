@@ -213,7 +213,8 @@ the new password in its own dialogs. The manager never receives them.
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |
 | "Incompatible agent protocol" | The agent and the manager come from different versions. Upgrade both and restart the agent yourself. |
 | "Restart needed" on the Status page | The agent's program file was replaced after it started (an upgrade). Restart the service before using dialogs. |
-| Your paste comes back empty | See [Copy a value](#copy-a-value--for-one-paste): another program took the value first. |
+| Your paste comes back empty | See [Copy a value](#copy-a-value--for-one-paste) for the possible causes. |
+| "The vault was locked while the agent was asking you, so the value was neither shown nor copied" | The manager saw the vault locked while a Show or Copy was waiting — for example, the vault locked itself just before you clicked and the agent asked for the master password first. For safety, a value that arrives after a lock is dropped. Your approval was used up; click Show or Copy again. |
 
 ## Security notes
 

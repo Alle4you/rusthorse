@@ -780,4 +780,10 @@ confirmed fixed; new findings and what was done:
 
 Each fix was reverted in a copy of the tree to see a test fail (3 of 3).
 
-**Awaiting:** verification of these fixes (Codex).
+Verification of those fixes (Codex, AI-assisted, 2026-11-01): **ready for the
+maintainer to try with fake entries.** Both findings confirmed fixed; the
+three targeted mutations fail their tests; a late `Ok` after a lock, an
+approved unlock during a check that saw the lock, and repeated refreshes
+behave. One conservative effect, by design and now in the guide: when a Show
+or Copy has to unlock the vault first, a check during the password dialog
+sees the vault locked and the approved value is dropped; asking again works.
