@@ -9,6 +9,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ## [Unreleased]
 
+- Propose ADR 0007 for a visual manager that remains an agent client; preserve
+  the approved reference prototype and Abrigo app icon.
+
 ### Added
 
 - `rusthorse-dialog`, Rusthorse's own dialog program (GTK 4 and libadwaita,

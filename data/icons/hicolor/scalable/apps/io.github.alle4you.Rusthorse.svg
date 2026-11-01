@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Rusthorse">
+<rect x="6.75" y="6.75" width="114.5" height="114.5" rx="28" fill="#f5eee1" stroke="#c9bba8" stroke-width="1.5"/>
+<path d="M31 97V57C31 38.8 45.8 24 64 24S97 38.8 97 57V97H76V57A12 12 0 0 0 52 57V97Z" fill="#34322f"/>
+<circle cx="64" cy="81" r="8" fill="#e76836"/>
+</svg>

@@ -387,3 +387,12 @@ The reasoning behind the main choices is recorded as
 - [ADR 0003](adr/0003-agent-side-dialogs.md) — approvals are dialogs shown by the agent
 - [ADR 0004](adr/0004-native-distribution.md) — native binary and systemd, no Flatpak
 - [ADR 0005](adr/0005-remembered-approvals-opt-in.md) — remembered approvals are opt-in
+
+## Visual manager design
+
+[ADR 0007](adr/0007-visual-manager.md) proposes `rusthorse-manager`, a separate
+GTK 4 client. It uses the existing agent requests and never opens the vault.
+Metadata forms do not authorize changes; the agent still shows approvals.
+Show is an explicit, approved reveal into the manager; secret clipboard Copy
+is excluded. The first milestone and later settings, grants/history, import
+and restoration work are distinguished in the ADR and roadmap.

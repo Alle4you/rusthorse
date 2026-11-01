@@ -693,3 +693,19 @@ ready, then ready for the owner to try it); and of its first installation:
 | First installation: `cargo install` under umask 002 left the program group-writable, the agent refused it, and no dialog could be shown | **Fixed:** the installation guide runs `chmod go-w`, and the agent's and `doctor`'s messages give the command. A first fix that accepted the user's "private group" was withdrawn: users sharing a group as their primary group are not listed among its members. |
 | Lesser points: typed text that JSON escaping made too large for an answer frame, height limits applied to dialogs that scroll, a race between the height check and the choice of program, bytes after the request accepted, a test that took a crash for a denial, `doctor` checking a path in its own mount namespace, a suggested command without shell quoting | **Fixed**, except the namespace point, which is documented. |
 | Coverage | Reverting each fix makes the suite fail; widget tests for resizing, scaling and accessibility actions are not written yet ([roadmap](roadmap.md)). |
+
+### ADR 0007 and manager milestone 1 — awaiting independent review
+
+This is implementation planning, not an additional review round or approval.
+The maintainer will obtain Claude's independent review. Self-identified risks:
+
+- Approved Show adds GTK/accessibility/display copies of secrets; zeroization
+  is best effort, and X11 still exposes windows. No secret clipboard Copy.
+- Closing a client during a change does not undo it; lost or unexpected
+  replies must be uncertain outcomes, without automatic retries.
+- Metadata forms must preserve protected fields and target stable UUIDs.
+- Status polling observes locks after a delay; no push notification exists.
+- A plain lock is not exclusive access for KeePassXC; automated handoff waits
+  for maintenance mode. Screen/suspend locking is not implemented by M1.
+
+See [ADR 0007](adr/0007-visual-manager.md) for milestones and boundaries.

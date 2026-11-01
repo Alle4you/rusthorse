@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rusthorse Manager — prototype</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjggMTI4IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlJ1c3Rob3JzZSI+CjxyZWN0IHg9IjYuNzUiIHk9IjYuNzUiIHdpZHRoPSIxMTQuNSIgaGVpZ2h0PSIxMTQuNSIgcng9IjI4IiBmaWxsPSIjZjVlZWUxIiBzdHJva2U9IiNjOWJiYTgiIHN0cm9rZS13aWR0aD0iMS41Ii8+CjxwYXRoIGQ9Ik0zMSA5N1Y1N0MzMSAzOC44IDQ1LjggMjQgNjQgMjRTOTcgMzguOCA5NyA1N1Y5N0g3NlY1N0ExMiAxMiAwIDAgMCA1MiA1N1Y5N1oiIGZpbGw9IiMzNDMyMmYiLz4KPGNpcmNsZSBjeD0iNjQiIGN5PSI4MSIgcj0iOCIgZmlsbD0iI2U3NjgzNiIvPgo8L3N2Zz4=">
+<style>
+:root {
+  --accent: #f37a2c; --accent-fg: #ffffff;
+  --radius: 12px;
+  font-family: "Cantarell", "Ubuntu", "Noto Sans", system-ui, sans-serif;
+  font-size: 14px;
+}
+[data-theme="dark"] {
+  --page: #111214; --window: #242424; --view: #1e1e1e; --header: #2e2e2e; --sidebar: #2a2a2a;
+  --card: rgba(255,255,255,0.07); --card-hover: rgba(255,255,255,0.11); --border: rgba(255,255,255,0.10);
+  --fg: #ffffff; --dim: rgba(255,255,255,0.55); --row-sel: rgba(255,255,255,0.10);
+  --warning: #f8e45c; --error: #ff7b63; --success: #8ff0a4; --button: rgba(255,255,255,0.10);
+  --shadow: 0 20px 60px rgba(0,0,0,0.6); --mono-bg: rgba(255,255,255,0.06);
+}
+[data-theme="light"] {
+  --page: #d8dade; --window: #fafafa; --view: #ffffff; --header: #ebebeb; --sidebar: #f0f0f0;
+  --card: #ffffff; --card-hover: #f4f4f4; --border: rgba(0,0,0,0.10);
+  --fg: rgba(0,0,0,0.82); --dim: rgba(0,0,0,0.55); --row-sel: rgba(0,0,0,0.07);
+  --warning: #9c6e03; --error: #c01c28; --success: #1b8553; --button: rgba(0,0,0,0.07);
+  --shadow: 0 20px 60px rgba(0,0,0,0.25); --mono-bg: rgba(0,0,0,0.05);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--fg); min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 18px 16px 40px; }
+.proto-bar { width: min(1240px, 100%); display: flex; gap: 10px; align-items: center; margin-bottom: 12px; color: #c9c9c9; font-size: 13px; flex-wrap: wrap; }
+[data-theme="light"] .proto-bar { color: #333; }
+.proto-bar b { color: var(--accent); }
+.proto-bar button { margin-left: auto; }
+.window { width: min(1240px, 100%); height: 780px; background: var(--window); border-radius: var(--radius); box-shadow: var(--shadow); display: grid; grid-template-columns: 230px 1fr; overflow: hidden; border: 1px solid var(--border); }
+/* Sidebar */
+.sidebar { background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--border); min-width: 0; }
+.sidebar .head { height: 50px; display: flex; align-items: center; justify-content: center; font-weight: 700; gap: 8px; }
+.lockpill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px; background: var(--card); color: var(--dim); }
+.lockpill.unlocked { background: color-mix(in srgb, var(--success) 22%, transparent); color: var(--success); }
+.nav { padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+.nav button { all: unset; display: flex; align-items: center; gap: 12px; padding: 9px 12px; border-radius: 8px; cursor: pointer; color: var(--fg); }
+.nav button:hover { background: var(--card-hover); }
+.nav button.active { background: var(--row-sel); font-weight: 700; }
+.nav .count { margin-left: auto; font-size: 12px; color: var(--dim); }
+.sidebar .foot { margin-top: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.sidebar .foot small { color: var(--dim); text-align: center; }
+svg.icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* Main */
+.main { display: flex; flex-direction: column; min-width: 0; background: var(--view); }
+.header { height: 50px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 12px; background: var(--header); border-bottom: 1px solid var(--border); }
+.header .title { font-weight: 700; flex: 1; text-align: center; }
+.header .title small { display: block; font-weight: 400; color: var(--dim); font-size: 11px; }
+.content { flex: 1; overflow: auto; min-height: 0; }
+button.btn { font: inherit; border: none; background: var(--button); color: var(--fg); padding: 7px 14px; border-radius: 8px; cursor: pointer; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+button.btn:hover { filter: brightness(1.15); }
+button.btn.flat { background: transparent; }
+button.btn.flat:hover { background: var(--card-hover); }
+button.btn.accent { background: var(--accent); color: var(--accent-fg); }
+button.btn.danger { color: var(--error); }
+button.btn.small { padding: 4px 10px; font-size: 12px; }
+button.btn.icon-only { padding: 7px; }
+/* Entries: list + detail */
+.split { display: grid; grid-template-columns: 340px 1fr; height: 100%; }
+.list { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.list .tools { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border); }
+.search { display: flex; align-items: center; gap: 8px; background: var(--card); border-radius: 8px; padding: 7px 10px; }
+.search input { all: unset; flex: 1; color: var(--fg); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 3px 10px; border-radius: 99px; background: var(--card); cursor: pointer; color: var(--fg); border: none; font-family: inherit; }
+.chip.on { background: var(--accent); color: var(--accent-fg); font-weight: 700; }
+.rows { overflow: auto; flex: 1; padding: 6px; }
+.row { display: flex; gap: 12px; align-items: center; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
+.row:hover { background: var(--card-hover); }
+.row.sel { background: var(--row-sel); }
+.avatar { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; font-weight: 800; font-size: 13px; color: #fff; flex: none; }
+.row .t { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .s { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .mid { min-width: 0; flex: 1; }
+.group-label { font-size: 11px; font-weight: 700; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; padding: 10px 10px 4px; }
+.detail { overflow: auto; padding: 22px 28px 40px; }
+.detail h2 { margin: 0; font-size: 22px; }
+.detail .sub { color: var(--dim); margin: 4px 0 18px; }
+.boxed { background: var(--card); border-radius: var(--radius); overflow: hidden; margin-bottom: 18px; }
+.boxed .item { display: flex; align-items: center; gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--border); min-height: 48px; }
+.boxed .item:last-child { border-bottom: none; }
+.boxed .item .k { width: 120px; color: var(--dim); flex: none; }
+.boxed .item .v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.boxed .item .v.mono, .mono { font-family: "DejaVu Sans Mono", "Ubuntu Mono", ui-monospace, monospace; font-size: 13px; }
+.section-title { font-weight: 700; margin: 6px 0 8px; }
+.section-note { color: var(--dim); font-size: 12px; margin: -2px 0 10px; }
+.tag { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--card-hover); margin-right: 4px; }
+.dots { letter-spacing: 3px; }
+.code { background: var(--mono-bg); border-radius: 8px; padding: 10px 12px; display: flex; align-items: center; gap: 10px; }
+.code .mono { flex: 1; overflow-wrap: anywhere; }
+a.link { color: var(--accent); text-decoration: none; }
+.badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 99px; }
+.badge.ok { color: var(--success); background: color-mix(in srgb, var(--success) 16%, transparent); }
+.badge.no { color: var(--error); background: color-mix(in srgb, var(--error) 16%, transparent); }
+.badge.warn { color: var(--warning); background: color-mix(in srgb, var(--warning) 16%, transparent); }
+.badge.dim { color: var(--dim); background: var(--card-hover); }
+.pad { padding: 22px 28px 40px; max-width: 920px; margin: 0 auto; }
+.pad h2 { margin: 0 0 4px; font-size: 22px; }
+.pad .lead { color: var(--dim); margin: 0 0 18px; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--dim); font-weight: 700; font-size: 12px; padding: 8px 12px; }
+td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; font-size: 13px; }
+.switch { width: 42px; height: 24px; border-radius: 99px; background: var(--button); position: relative; cursor: pointer; flex: none; border: none; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+.switch.on { background: var(--accent); }
+.switch.on::after { left: 21px; }
+select { font: inherit; background: var(--button); color: var(--fg); border: none; border-radius: 8px; padding: 6px 10px; }
+select option { background: var(--window); }
+.empty { color: var(--dim); text-align: center; padding: 40px 0; }
+.logo { display: inline-block; flex: none; }
+.hero { display: flex; gap: 18px; align-items: center; margin-bottom: 22px; }
+.hero p { margin: 4px 0 0; color: var(--dim); }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 22px; }
+.step { background: var(--card); border-radius: var(--radius); padding: 14px 16px; }
+.step .n { width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-weight: 800; margin-bottom: 8px; }
+.step b { display: block; margin-bottom: 4px; }
+.step span { color: var(--dim); font-size: 13px; }
+details { background: var(--card); border-radius: 10px; margin-bottom: 8px; padding: 0 16px; }
+details summary { cursor: pointer; padding: 12px 0; font-weight: 700; list-style: none; }
+details summary::before { content: "›"; display: inline-block; margin-right: 10px; transition: transform .15s; color: var(--dim); }
+details[open] summary::before { transform: rotate(90deg); }
+details p { margin: 0 0 12px; color: var(--dim); }
+kbd { font-family: inherit; font-size: 12px; background: var(--button); border-radius: 5px; padding: 2px 7px; border-bottom: 2px solid var(--border); }
+.about { text-align: center; padding: 26px 24px 8px; }
+.about h3 { margin: 12px 0 2px; font-size: 22px; }
+.about .ver { color: var(--dim); }
+.about p { color: var(--dim); margin: 12px auto; max-width: 380px; }
+@media (max-width: 860px) { .steps { grid-template-columns: 1fr; } }
+/* Dialog (the agent's approval, as rusthorse-dialog shows it) */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none; align-items: center; justify-content: center; z-index: 10; padding: 16px; }
+.overlay.show { display: flex; }
+.dialog { width: min(600px, 100%); background: var(--window); border-radius: var(--radius); box-shadow: var(--shadow); border: 1px solid var(--border); overflow: hidden; }
+.dialog .dh { text-align: center; padding: 10px; background: var(--header); }
+.dialog .dh b { display: block; } .dialog .dh small { color: var(--dim); }
+.dialog .db { padding: 16px 24px 8px; }
+.dialog .db h3 { margin: 4px 0 6px; font-size: 20px; }
+.dialog .db p { color: var(--dim); margin: 0 0 14px; }
+.dialog .df { display: flex; gap: 10px; padding: 12px 24px 18px; }
+.dialog .df .grow { flex: 1; }
+.form .item input, .form .item textarea { all: unset; flex: 1; color: var(--fg); min-width: 0; }
+.form .item textarea { min-height: 40px; }
+.toast { position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%); background: #3a3a3a; color: #fff; padding: 10px 18px; border-radius: 99px; box-shadow: var(--shadow); display: none; z-index: 20; font-weight: 700; }
+.toast.show { display: block; }
+.revealed { color: var(--warning); }
+.callout { border-radius: var(--radius); padding: 12px 16px; background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--fg); margin-bottom: 18px; display: flex; gap: 10px; }
+.callout svg { color: var(--warning); margin-top: 2px; }
+@media (max-width: 860px) {
+  .window { grid-template-columns: 1fr; height: auto; }
+  .sidebar { display: none; }
+  .split { grid-template-columns: 1fr; }
+  .list { border-right: none; max-height: 340px; }
+}
+</style>
+</head>
+<body>
+<div class="proto-bar">
+  <span><b>Prototype</b> of Rusthorse Manager — fake data, nothing is saved. The final app uses GTK 4 + libadwaita.</span>
+  <button class="btn small" id="theme">Theme: dark / light</button>
+</div>
+
+<div class="window">
+  <aside class="sidebar">
+    <div class="head"><span id="sidelogo"></span>Rusthorse <span class="lockpill unlocked" id="lockpill">Unlocked</span></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="foot">
+      <button class="btn" id="lockbtn"><svg class="icon" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>Lock now</button>
+      <small id="autolock">Locks itself in 14 min</small>
+    </div>
+  </aside>
+  <section class="main">
+    <div class="header">
+      <span id="hleft"></span>
+      <div class="title" id="htitle"></div>
+      <span id="hright"></span>
+    </div>
+    <div class="content" id="content"></div>
+  </section>
+</div>
+
+<div class="overlay" id="overlay"><div class="dialog" id="dialog"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const ICONS = {
+  key: '<path d="M14 10a4 4 0 1 1-1.2-2.8L21 15v3h-3v-2h-2v-2h-2.2"/><circle cx="9.5" cy="9.5" r="1"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 8v4l3 2"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  pulse: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  dice: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1"/><circle cx="15.5" cy="15.5" r="1"/><circle cx="15.5" cy="8.5" r="1"/><circle cx="8.5" cy="15.5" r="1"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16v4z"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  warn: '<path d="M12 3 2 21h20L12 3z"/><path d="M12 10v5M12 18h.01"/>',
+  ok: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+  ext: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+  archive: '<rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/>',
+  down: '<path d="M12 4v12M6 10l6 6 6-6M4 20h16"/>',
+  up: '<path d="M12 20V8M6 14l6-6 6 6M4 4h16"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6V14M12 17.5h.01"/>',
+};
+const LOGO_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" role=\"img\" aria-label=\"Rusthorse\">\n<rect x=\"6.75\" y=\"6.75\" width=\"114.5\" height=\"114.5\" rx=\"28\" fill=\"#f5eee1\" stroke=\"#c9bba8\" stroke-width=\"1.5\"/>\n<path d=\"M31 97V57C31 38.8 45.8 24 64 24S97 38.8 97 57V97H76V57A12 12 0 0 0 52 57V97Z\" fill=\"#34322f\"/>\n<circle cx=\"64\" cy=\"81\" r=\"8\" fill=\"#e76836\"/>\n</svg>";
+let logoSeq = 0;
+const logoImg = (size) => `<span class="logo" style="width:${size}px;height:${size}px">${((n) => LOGO_SVG.replace(/rh-([ghm])\b/g, `rh-$1-${n}`))(++logoSeq).replace('<svg ', `<svg width="${size}" height="${size}" `)}</span>`;
+const icon = (n) => `<svg class="icon" viewBox="0 0 24 24">${ICONS[n]}</svg>`;
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const COLORS = ['#3584e4','#2ec27e','#e66100','#9141ac','#c64600','#1c71d8','#26a269','#a51d2d'];
+let entries = [
+  { id: 'a1', name: 'OPENAI_API_KEY', group: 'AI', user: '', url: 'https://platform.openai.com', host: '', port: '', tags: ['ai'], notes: false, modified: 'today 09:12', value: 'sk-test-FAKE-0b9a…', uses: 7 },
+  { id: 'a2', name: 'ANTHROPIC_API_KEY', group: 'AI', user: '', url: 'https://console.anthropic.com', host: '', port: '', tags: ['ai'], notes: false, modified: 'yesterday', value: 'sk-ant-FAKE-…', uses: 3 },
+  { id: 'd1', name: 'GITHUB_TOKEN', group: 'Dev', user: 'demo', url: 'https://github.com', host: '', port: '', tags: ['dev'], notes: false, modified: 'Oct 31', value: 'ghp_FAKE…', uses: 12 },
+  { id: 'n1', name: 'core-router', group: 'Network', user: 'admin', url: 'https://192.168.1.1/', host: '192.168.1.1', port: '443', tags: ['network'], notes: true, modified: 'Oct 31', value: 'fake-router-pass', uses: 1 },
+  { id: 'n2', name: 'firewall-api', group: 'Network', user: 'api-readonly', url: 'https://192.168.1.99/', host: '192.168.1.99', port: '443', tags: ['network','api'], notes: true, modified: 'Oct 28', value: 'fake-firewall-token', uses: 4 },
+  { id: 'l1', name: 'lab-ssh', group: 'Lab', user: 'pi', url: 'ssh://pi@192.168.1.50', host: '192.168.1.50', port: '22', tags: ['lab'], notes: false, modified: 'Oct 30', value: 'fake-pi-pass', uses: 0 },
+];
+let grants = [
+  { cmd: "pytest tests/integration -q", secrets: 'OPENAI_API_KEY → OPENAI_API_KEY', by: 'rusthorse ← bash ← claude', left: 11*60+42 },
+  { cmd: "gh pr list --limit 20", secrets: 'GH_TOKEN → GITHUB_TOKEN', by: 'rusthorse ← bash ← codex', left: 4*60+5 },
+];
+const history = [
+  { t: '15:52:26', action: 'run', outcome: 'allowed_once', entry: 'OPENAI_API_KEY', detail: "sh -c 'echo \"length=…\" # this line is long…'", by: 'claude' },
+  { t: '15:52:26', action: 'run', outcome: 'exited', entry: 'OPENAI_API_KEY', detail: 'exit code 0', by: 'claude' },
+  { t: '15:43:38', action: 'unlock', outcome: 'unlocked', entry: '', detail: '', by: 'claude' },
+  { t: '15:31:02', action: 'reveal', outcome: 'denied', entry: 'core-router', detail: 'value', by: 'codex' },
+  { t: '15:20:47', action: 'run', outcome: 'timed_out', entry: 'GITHUB_TOKEN', detail: 'gh repo list', by: 'codex' },
+  { t: '14:05:13', action: 'add', outcome: 'value_entered', entry: 'firewall-api', detail: '', by: 'manager' },
+  { t: '12:51:51', action: 'lock', outcome: 'idle_timeout', entry: '', detail: '', by: 'agent' },
+];
+const settings = { remember: '0', idle: '15', dialog: '2', screenlock: true, suspend: true };
+let section = 'entries', group = 'All', query = '', selected = 'a1', revealTimer = null;
+
+const nav = document.getElementById('nav');
+const SECTIONS = [
+  ['entries', 'Entries', 'key'], ['grants', 'Remembered approvals', 'clock'],
+  ['history', 'History', 'history'], ['data', 'Import & backup', 'archive'], ['settings', 'Settings', 'gear'], ['status', 'Status', 'pulse'], ['help', 'Help', 'help'],
+];
+function renderNav() {
+  nav.innerHTML = SECTIONS.map(([id, label, ic]) => {
+    const count = id === 'entries' ? entries.length : id === 'grants' ? grants.length : '';
+    return `<button class="${section === id ? 'active' : ''}" data-s="${id}">${icon(ic)}${label}<span class="count">${count}</span></button>`;
+  }).join('');
+  nav.querySelectorAll('button').forEach(b => b.onclick = () => { section = b.dataset.s; render(); });
+}
+function header(title, sub, left = '', right = '') {
+  document.getElementById('htitle').innerHTML = `${esc(title)}${sub ? `<small>${esc(sub)}</small>` : ''}`;
+  document.getElementById('hleft').innerHTML = left;
+  document.getElementById('hright').innerHTML = right;
+}
+const content = document.getElementById('content');
+
+function avatar(e) {
+  const c = COLORS[[...e.name].reduce((a, ch) => a + ch.charCodeAt(0), 0) % COLORS.length];
+  return `<div class="avatar" style="background:${c}">${esc(e.name.replace(/[^A-Za-z]/g, '').slice(0, 2).toUpperCase())}</div>`;
+}
+function renderEntries() {
+  header('Entries', `${entries.length} in ${new Set(entries.map(e => e.group)).size} groups`,
+    `<button class="btn flat icon-only" title="Edit in KeePassXC" id="kpx">${icon('ext')}</button>`,
+    `<button class="btn accent" id="add">${icon('plus')}Add</button>`);
+  const groups = ['All', ...new Set(entries.map(e => e.group))];
+  const shown = entries.filter(e => (group === 'All' || e.group === group) &&
+    (e.name + e.user + e.url + e.host + e.tags.join(' ')).toLowerCase().includes(query.toLowerCase()));
+  const byGroup = {};
+  shown.forEach(e => (byGroup[e.group] ||= []).push(e));
+  const list = Object.keys(byGroup).sort().map(g => `<div class="group-label">${esc(g)}</div>` +
+    byGroup[g].map(e => `<div class="row ${e.id === selected ? 'sel' : ''}" data-id="${e.id}">${avatar(e)}
+      <div class="mid"><div class="t">${esc(e.name)}</div><div class="s">${esc([e.user, e.host || e.url].filter(Boolean).join(' · ') || 'no login')}</div></div></div>`).join('')).join('')
+    || '<div class="empty">No entry matches.</div>';
+  const e = entries.find(x => x.id === selected) || shown[0];
+  content.innerHTML = `<div class="split">
+    <div class="list"><div class="tools">
+      <div class="search">${icon('search')}<input id="q" placeholder="Search names, logins, hosts, tags" value="${esc(query)}"></div>
+      <div class="chips">${groups.map(g => `<button class="chip ${g === group ? 'on' : ''}" data-g="${esc(g)}">${esc(g)}</button>`).join('')}</div>
+    </div><div class="rows">${list}</div></div>
+    <div class="detail">${e ? detail(e) : '<div class="empty">Select an entry.</div>'}</div></div>`;
+  const q = document.getElementById('q');
+  q.oninput = () => { query = q.value; renderEntries(); const n = document.getElementById('q'); n.focus(); n.setSelectionRange(query.length, query.length); };
+  content.querySelectorAll('.chip').forEach(c => c.onclick = () => { group = c.dataset.g; renderEntries(); });
+  content.querySelectorAll('.row').forEach(r => r.onclick = () => { selected = r.dataset.id; clearReveal(); renderEntries(); });
+  document.getElementById('add').onclick = () => editForm(null);
+  document.getElementById('kpx').onclick = keepassxc;
+  if (e) wireDetail(e);
+}
+function detail(e) {
+  const field = (k, v, mono = false) => v ? `<div class="item"><div class="k">${k}</div><div class="v ${mono ? 'mono' : ''}">${v}</div></div>` : '';
+  return `<h2>${esc(e.name)}</h2>
+    <div class="sub">${esc(e.group)} · modified ${esc(e.modified)} · used ${e.uses} time${e.uses === 1 ? '' : 's'} by commands</div>
+    <div class="boxed">
+      ${field('Username', esc(e.user), true)}
+      ${field('URL', e.url ? `<a class="link" href="#" onclick="return false">${esc(e.url)}</a>` : '')}
+      ${field('Host', esc(e.host), true)}
+      ${field('Port', esc(e.port), true)}
+      ${field('Tags', e.tags.map(t => `<span class="tag">${esc(t)}</span>`).join(''))}
+      <div class="item"><div class="k">Value</div><div class="v mono" id="val"><span class="dots">••••••••••••</span></div>
+        <button class="btn small" id="show">${icon('eye')}Show</button>
+        <button class="btn small" id="copy">${icon('copy')}Copy</button></div>
+      ${e.notes ? `<div class="item"><div class="k">Notes</div><div class="v" style="color:var(--dim)">Hidden</div><button class="btn small" id="shownotes">${icon('eye')}Show</button></div>` : ''}
+    </div>
+    <div class="section-note">Showing or copying a value goes through the agent's approval dialog, as for any program. A shown value hides again after 30 seconds; a copied one is cleared from the clipboard.</div>
+    <div class="section-title">Use it from a command or an AI agent</div>
+    <div class="code"><span class="mono">rusthorse run ${esc(e.name)} -- your-command</span><button class="btn small" id="snip">${icon('copy')}Copy</button></div>
+    <div style="display:flex; gap:10px; margin-top:22px; flex-wrap:wrap">
+      <button class="btn" id="edit">${icon('edit')}Edit</button>
+      <button class="btn" id="gen">${icon('dice')}New random value</button>
+      <span style="flex:1"></span>
+      <button class="btn danger" id="del">${icon('trash')}Delete</button>
+    </div>`;
+}
+function clearReveal() { if (revealTimer) clearInterval(revealTimer); revealTimer = null; }
+function wireDetail(e) {
+  document.getElementById('show').onclick = () => approve('Reveal the value of an entry?',
+    'The program that asked receives the value in clear text and can do anything with it.',
+    [['Entry', `${e.group}/${e.name}`], ['Reveals', 'value'], ['Requested by', 'rusthorse-manager ← cinnamon']],
+    'The value will be shown in the Rusthorse manager.', () => {
+      let left = 30; const v = document.getElementById('val');
+      const paint = () => v.innerHTML = `<span class="revealed">${esc(e.value)}</span> <span style="color:var(--dim)">· hides in ${left}s</span>`;
+      paint(); clearReveal(); revealTimer = setInterval(() => { left--; if (left <= 0) { clearReveal(); v.innerHTML = '<span class="dots">••••••••••••</span>'; } else paint(); }, 1000);
+    });
+  document.getElementById('copy').onclick = () => approve('Copy the value of an entry?',
+    'The value is placed on the clipboard for 30 seconds. On X11, any program of yours can read the clipboard.',
+    [['Entry', `${e.group}/${e.name}`], ['Requested by', 'rusthorse-manager ← cinnamon']], null,
+    () => toast('Copied — the clipboard is cleared in 30 s'));
+  const sn = document.getElementById('shownotes');
+  if (sn) sn.onclick = () => approve('Reveal the notes of an entry?', 'The notes are shown in the Rusthorse manager.',
+    [['Entry', `${e.group}/${e.name}`], ['Reveals', 'notes']], null, () => toast('Notes: "Rack 2, console on J3" (fake)'));
+  document.getElementById('snip').onclick = () => toast('Command copied — it contains no secret');
+  document.getElementById('edit').onclick = () => editForm(e);
+  document.getElementById('gen').onclick = () => approve('Replace an entry with a generated value?',
+    'Rusthorse creates a random value and stores it. The value is not returned to the program that asked.',
+    [['Entry', `${e.group}/${e.name}`], ['Value', '32 random characters (letters, digits, symbols)']],
+    'The current value will be overwritten.', () => toast('New value generated and saved'));
+  document.getElementById('del').onclick = () => approve('Delete an entry?', 'The entry and its history are removed from the vault.',
+    [['Entry', `${e.group}/${e.name}`]], 'This cannot be undone (keep a backup).', () => {
+      entries = entries.filter(x => x.id !== e.id); selected = entries[0]?.id; renderNav(); renderEntries(); toast('Entry deleted');
+    });
+}
+function editForm(e) {
+  const isNew = !e; e = e || { name: '', group: group === 'All' ? 'AI' : group, user: '', url: '', host: '', port: '', tags: [] };
+  const row = (k, id, v, ph = '') => `<div class="item"><div class="k">${k}</div><input id="${id}" value="${esc(v)}" placeholder="${esc(ph)}"></div>`;
+  openDialog(`<div class="dh"><b>${isNew ? 'New entry' : 'Edit entry'}</b><small>Rusthorse</small></div>
+    <div class="db form">
+      <div class="boxed">
+        ${row('Name', 'f_name', e.name, 'OPENAI_API_KEY or core-router')}
+        ${row('Group', 'f_group', e.group, 'AI, Network, …')}
+        ${row('Username', 'f_user', e.user)}
+        ${row('URL', 'f_url', e.url, 'https://…')}
+        ${row('Host', 'f_host', e.host, 'IP or name')}
+        ${row('Port', 'f_port', e.port)}
+        ${row('Tags', 'f_tags', e.tags.join(', '), 'comma separated')}
+      </div>
+      ${isNew ? `<div class="boxed"><div class="item"><div class="k">Value</div><div class="v" style="color:var(--dim)">Typed in the agent's own password dialog after Save — or</div><button class="btn small" id="f_gen">${icon('dice')}Generate</button></div></div>` : ''}
+    </div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="save">${isNew ? 'Save and type the value' : 'Save'}</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('save').onclick = () => {
+    const v = (id) => document.getElementById(id).value.trim();
+    const data = { name: v('f_name') || 'NEW_ENTRY', group: v('f_group') || 'General', user: v('f_user'), url: v('f_url'), host: v('f_host'), port: v('f_port'),
+      tags: v('f_tags').split(',').map(s => s.trim()).filter(Boolean) };
+    closeDialog();
+    if (isNew) {
+      const id = 'n' + Date.now(); entries.push({ id, ...data, notes: false, modified: 'now', value: 'fake-new-value', uses: 0 });
+      selected = id; renderNav(); renderEntries(); toast('Saved — the agent asks for the value in its own dialog');
+    } else { Object.assign(e, data, { modified: 'now' }); renderEntries(); toast('Changes saved'); }
+  };
+}
+function keepassxc() {
+  openDialog(`<div class="dh"><b>Edit in KeePassXC</b><small>Rusthorse</small></div>
+    <div class="db"><h3>Edit the vault in KeePassXC</h3>
+    <p>For what this manager does not do — attachments, history, custom fields. Rusthorse locks the vault first so that only one program writes it, then opens it in KeePassXC.</p>
+    <div class="boxed">
+      <div class="item">1.&nbsp; The agent locks the vault (remembered approvals are forgotten).</div>
+      <div class="item">2.&nbsp; KeePassXC opens ~/.local/share/rusthorse/vault.kdbx.</div>
+      <div class="item">3.&nbsp; Save and close the database in KeePassXC; the next use unlocks the edited file.</div>
+    </div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Lock and open KeePassXC</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { closeDialog(); setLocked(true); toast('Locked — KeePassXC is open'); };
+}
+
+function renderGrants() {
+  header('Remembered approvals', 'identical requests that run without asking', '',
+    grants.length ? `<button class="btn danger" id="revall">Revoke all</button>` : '');
+  content.innerHTML = `<div class="pad">
+    ${settings.remember === '0' ? `<div class="callout">${icon('warn')}<div>"Allow for" is off in Settings, so no new approval is remembered. These are examples.</div></div>` : ''}
+    <p class="lead">While one is active, the same command, with the same secrets, program, directory and environment, runs without a dialog — even if it reads different input or files.</p>
+    ${grants.length ? `<div class="boxed">${grants.map((g, i) => `<div class="item" style="align-items:flex-start">
+        <div class="v"><div class="mono" style="font-weight:700">${esc(g.cmd)}</div>
+        <div style="color:var(--dim); font-size:12px; margin-top:4px">${esc(g.secrets)} · requested by ${esc(g.by)} (unverified)</div></div>
+        <span class="badge warn" id="left${i}">${fmt(g.left)}</span>
+        <button class="btn small danger" data-i="${i}">Revoke</button></div>`).join('')}</div>`
+      : '<div class="empty">Nothing is remembered. Every request asks.</div>'}
+  </div>`;
+  content.querySelectorAll('[data-i]').forEach(b => b.onclick = () => { grants.splice(+b.dataset.i, 1); renderNav(); renderGrants(); toast('Revoked'); });
+  const ra = document.getElementById('revall'); if (ra) ra.onclick = () => { grants = []; renderNav(); renderGrants(); toast('All revoked'); };
+}
+const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} left`;
+setInterval(() => { grants.forEach(g => g.left = Math.max(0, g.left - 1)); grants.forEach((g, i) => { const el = document.getElementById('left' + i); if (el) el.textContent = fmt(g.left); }); }, 1000);
+
+let hfilter = 'All';
+function renderHistory() {
+  header('History', 'the audit log: every decision the agent made');
+  const kinds = { allowed_once: 'ok', exited: 'dim', unlocked: 'ok', denied: 'no', timed_out: 'warn', value_entered: 'ok', idle_timeout: 'dim' };
+  const filters = ['All', 'Allowed', 'Denied', 'Timed out', 'Unlock and lock'];
+  const match = (h) => hfilter === 'All' || (hfilter === 'Allowed' && h.outcome.startsWith('allowed')) || (hfilter === 'Denied' && h.outcome === 'denied')
+    || (hfilter === 'Timed out' && h.outcome === 'timed_out') || (hfilter === 'Unlock and lock' && ['unlock', 'lock'].includes(h.action));
+  content.innerHTML = `<div class="pad">
+    <div class="chips" style="margin-bottom:14px">${filters.map(f => `<button class="chip ${f === hfilter ? 'on' : ''}" data-f="${f}">${f}</button>`).join('')}</div>
+    <div class="boxed"><table><tr><th>Time</th><th>Action</th><th>Outcome</th><th>Entry</th><th>Detail</th><th>By (unverified)</th></tr>
+    ${history.filter(match).map(h => `<tr><td class="mono">${h.t}</td><td>${h.action}</td><td><span class="badge ${kinds[h.outcome] || 'dim'}">${h.outcome.replace('_', ' ')}</span></td>
+      <td class="mono">${esc(h.entry)}</td><td class="mono" style="color:var(--dim)">${esc(h.detail)}</td><td>${esc(h.by)}</td></tr>`).join('')}</table></div>
+    <div class="section-note">Values never appear here. Times are when you answered, not when the request arrived.</div></div>`;
+  content.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { hfilter = b.dataset.f; renderHistory(); });
+}
+
+function renderSettings() {
+  header('Settings', 'saved in ~/.config/rusthorse/agent.toml');
+  const sel = (id, opts) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${v}" ${settings[id] === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+  const sw = (id) => `<button class="switch ${settings[id] ? 'on' : ''}" id="${id}"></button>`;
+  const item = (title, sub, control) => `<div class="item"><div class="v"><div>${title}</div>${sub ? `<div style="color:var(--dim); font-size:12px; margin-top:2px">${sub}</div>` : ''}</div>${control}</div>`;
+  content.innerHTML = `<div class="pad">
+    <div class="section-title">Approvals</div>
+    <div class="boxed">
+      ${item('"Allow for" button', 'Lets identical requests run without asking for this long — even if they read different input or files. Prefer "Allow once".',
+        sel('remember', [['0', 'Off'], ['5', '5 minutes'], ['15', '15 minutes'], ['60', '1 hour']]))}
+      ${item('Dialogs wait', 'An unanswered dialog is denied after this long.', sel('dialog', [['1', '1 minute'], ['2', '2 minutes'], ['5', '5 minutes']]))}
+    </div>
+    <div class="section-title">Locking</div>
+    <div class="boxed">
+      ${item('Lock after inactivity', 'Without an approved use for this long, the vault locks itself.', sel('idle', [['5', '5 minutes'], ['15', '15 minutes'], ['30', '30 minutes'], ['60', '1 hour'], ['0', 'Never']]))}
+      ${item('Lock when the screen locks', '', sw('screenlock'))}
+      ${item('Lock before suspend', '', sw('suspend'))}
+    </div>
+    <div class="section-title">Vault</div>
+    <div class="boxed">
+      ${item('File', '<span class="mono">~/.local/share/rusthorse/vault.kdbx</span> · KeePass KDBX 4.1, Argon2id', `<button class="btn small" id="kp2">${icon('ext')}KeePassXC</button>`)}
+      ${item('Master password', 'Change it in the agent\'s own dialogs.', '<button class="btn small" id="pw">Change…</button>')}
+      ${item('Backups and restore', 'Last backup: today 10:24, verified.', '<button class="btn small" id="bk">Open…</button>')}
+    </div>
+    <div class="section-note">Changes apply when saved; the agent re-reads its settings, and changing "Allow for" forgets what is remembered.</div></div>`;
+  ['remember', 'dialog', 'idle'].forEach(id => document.getElementById(id).onchange = (ev) => { settings[id] = ev.target.value; toast('Saved'); updateAutolock(); });
+  ['screenlock', 'suspend'].forEach(id => document.getElementById(id).onclick = () => { settings[id] = !settings[id]; renderSettings(); toast('Saved'); });
+  document.getElementById('kp2').onclick = keepassxc;
+  document.getElementById('pw').onclick = () => toast('The agent asks for the current and the new password in its own dialogs');
+  document.getElementById('bk').onclick = () => { section = 'data'; render(); };
+}
+
+const backups = [
+  { file: '~/Backups/rusthorse-2026-11-01.kdbx', when: 'today 10:24', entries: 6, size: '3.1 KB' },
+  { file: '~/Backups/rusthorse-2026-10-31.kdbx', when: 'yesterday 21:40', entries: 4, size: '2.6 KB' },
+];
+const KEYRING = ['ANTHROPIC_API_KEY','DDNS_HOST','DDNS_KEY','DDNS_USER','EXAMPLE_API_KEY','EXAMPLE_TOKEN',
+  'OPENAI_API_KEY','ROUTER_ADMIN'];
+function renderData() {
+  header('Import & backup', 'copies of the vault, and secrets from elsewhere');
+  const source = (id, title, sub, extra = '') => `<div class="item" style="cursor:pointer" data-src="${id}"><div class="v"><div style="font-weight:700">${title} ${extra}</div>
+    <div style="color:var(--dim); font-size:12px; margin-top:2px">${sub}</div></div>${id === 'kdbx' ? '' : '<span style="color:var(--dim)">›</span>'}</div>`;
+  content.innerHTML = `<div class="pad">
+    <div class="section-title">Backups</div>
+    <div class="section-note">A backup is an encrypted copy of the vault, checked by opening it. It keeps the master password it was made with.</div>
+    <div class="boxed">
+      ${backups.map((b, i) => `<div class="item"><span class="badge ok">verified</span><div class="v"><div class="mono">${esc(b.file)}</div>
+        <div style="color:var(--dim); font-size:12px; margin-top:2px">${esc(b.when)} · ${b.entries} entries · ${b.size}</div></div>
+        <button class="btn small" data-restore="${i}">${icon('up')}Restore…</button></div>`).join('')}
+    </div>
+    <div style="display:flex; gap:10px; margin-bottom:26px; flex-wrap:wrap">
+      <button class="btn accent" id="bknow">${icon('down')}Back up now…</button>
+      <button class="btn" id="rsfile">${icon('up')}Restore from a file…</button>
+    </div>
+    <div class="section-title">Import entries</div>
+    <div class="section-note">Adds entries to this vault. You see the names first — new, or already there — and approve the import in the agent's dialog; values are never shown.</div>
+    <div class="boxed">
+      ${source('env', 'From a .env file', 'NAME=value lines, for example a project\'s .env')}
+      ${source('keyring', 'From GNOME Keyring or KWallet', 'Items of the desktop keyring chosen by attribute, such as those of segredo')}
+      ${source('kdbx', 'From another KeePass file', 'Merge entries from a KDBX file', '<span class="badge dim">planned</span>')}
+    </div></div>`;
+  content.querySelectorAll('[data-restore]').forEach(b => b.onclick = () => restore(backups[+b.dataset.restore]));
+  document.getElementById('rsfile').onclick = () => restore({ file: '~/Downloads/vault-copy.kdbx', when: 'Oct 20', entries: '?', size: '3.0 KB' });
+  document.getElementById('bknow').onclick = backupNow;
+  content.querySelectorAll('[data-src]').forEach(r => r.onclick = () => { if (r.dataset.src === 'env') importEnv(); if (r.dataset.src === 'keyring') importKeyring(); });
+}
+function backupNow() {
+  openDialog(`<div class="dh"><b>Back up the vault</b><small>Rusthorse</small></div>
+    <div class="db form"><p>The copy is written, then opened to prove it works. It needs no approval: it is encrypted, like the vault.</p>
+    <div class="boxed"><div class="item"><div class="k">Save as</div><input id="bkpath" value="~/Backups/rusthorse-2026-11-01-1612.kdbx"></div></div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Back up</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { const f = document.getElementById('bkpath').value; closeDialog();
+    backups.unshift({ file: f, when: 'now', entries: entries.length, size: '3.2 KB' }); renderData(); toast(`Backup written and verified: ${entries.length} entries`); };
+}
+function restore(b) {
+  openDialog(`<div class="dh"><b>Restore a backup</b><small>Rusthorse</small></div>
+    <div class="db"><h3>Replace the vault with this backup?</h3>
+    <p>Everything in the vault is replaced by the backup's content. Nothing is lost: the current vault is kept next to it.</p>
+    <div class="boxed">
+      <div class="item"><div class="k">Backup</div><div class="v mono">${esc(b.file)}</div></div>
+      <div class="item"><div class="k">Made</div><div class="v">${esc(b.when)} · ${b.entries} entries</div></div>
+      <div class="item"><div class="k">Current vault</div><div class="v mono">kept as vault.kdbx.before-restore</div></div>
+    </div>
+    <div class="callout">${icon('warn')}<div>The vault locks and remembered approvals are forgotten. Unlocking afterwards asks for the backup's master password — the one it was made with.</div></div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Lock and restore…</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { closeDialog();
+    approve('Replace the vault with a backup?', 'The backup is checked with its master password first; the current vault is kept as vault.kdbx.before-restore.',
+      [['Backup', b.file], ['Replaces', '~/.local/share/rusthorse/vault.kdbx (6 entries)']], 'Every program that uses the vault will see the backup\'s entries.',
+      () => { setLocked(true); grants = []; renderNav(); toast('Restored — unlock with the backup\'s master password'); }); };
+}
+function preview(title, names, existing, onImport) {
+  const fresh = names.filter(n => !existing.includes(n));
+  openDialog(`<div class="dh"><b>${esc(title)}</b><small>Rusthorse</small></div>
+    <div class="db"><h3>${fresh.length} new, ${names.length - fresh.length} already in the vault</h3>
+    <p>Only names are read so far. Values are read and sent to the agent when you import, and you approve the batch in its dialog.</p>
+    <div class="boxed" style="max-height:300px; overflow:auto">${names.map(n => `<div class="item" style="min-height:38px; padding:7px 16px">
+      <span class="badge ${existing.includes(n) ? 'dim' : 'ok'}">${existing.includes(n) ? 'exists' : 'new'}</span><div class="v mono">${esc(n)}</div></div>`).join('')}</div>
+    <div class="boxed"><div class="item"><div class="k">Existing ones</div><div class="v">Skipped</div><select><option>Skip</option><option>Replace</option></select></div>
+      <div class="item"><div class="k">Add tag</div><div class="v"><span class="tag">migrated</span></div></div></div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Import ${fresh.length} entries…</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { closeDialog(); approve(`Import ${fresh.length} secrets?`,
+    'The program that asked supplied these names and values. Check the names before you allow it.',
+    [['New entries', fresh.slice(0, 6).join(', ') + (fresh.length > 6 ? `, … (${fresh.length})` : '')], ['Already exist (skipped)', names.filter(n => existing.includes(n)).join(', ') || '(none)']], null,
+    () => { onImport(fresh); }); };
+}
+function importEnv() {
+  openDialog(`<div class="dh"><b>Import from a .env file</b><small>Rusthorse</small></div>
+    <div class="db form"><div class="boxed">
+      <div class="item"><div class="k">File</div><input value="~/dev/site2rss/.env"></div>
+      <div class="item"><div class="k">Name prefix</div><input placeholder="optional, e.g. SITE2RSS_"></div>
+      <div class="item"><div class="k">Group</div><input value="Imported"></div></div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Preview…</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { closeDialog(); preview('Import from a .env file', ['OPENAI_API_KEY', 'DATABASE_URL', 'SESSION_SECRET'], entries.map(e => e.name),
+    (fresh) => done(fresh, 'Imported')); };
+}
+function importKeyring() {
+  openDialog(`<div class="dh"><b>Import from GNOME Keyring or KWallet</b><small>Rusthorse</small></div>
+    <div class="db form"><p>Choose the items by their attributes. Reading names does not unlock anything; reading values may ask the keyring.</p>
+    <div class="boxed">
+      <div class="item"><div class="k">Attribute</div><input value="aplicacao = segredo"></div>
+      <div class="item"><div class="k">Name from</div><input value="the attribute nome"></div>
+      <div class="item"><div class="k">Group</div><input value="Keyring"></div></div></div>
+    <div class="df"><button class="btn" id="cancel">Cancel</button><span class="grow"></span><button class="btn accent" id="go">Preview…</button></div>`);
+  document.getElementById('cancel').onclick = closeDialog;
+  document.getElementById('go').onclick = () => { closeDialog(); preview('Import from GNOME Keyring', KEYRING, entries.map(e => e.name),
+    (fresh) => done(fresh, 'Keyring')); };
+}
+function done(names, grp) {
+  names.forEach((n, i) => entries.push({ id: 'i' + Date.now() + i, name: n, group: grp, user: '', url: '', host: '', port: '', tags: ['migrated'], notes: false, modified: 'now', value: 'fake-imported', uses: 0 }));
+  renderNav(); toast(`Imported ${names.length} entries into ${grp} — the originals are untouched`);
+}
+
+function renderHelp() {
+  header('Help', 'how Rusthorse works and how to use it', '', `<button class="btn flat" id="about2">About</button>`);
+  const snippet = `## Secrets
+- Secrets are managed by Rusthorse. \`rusthorse list --json\` shows what exists
+  (names, usernames, URLs, hosts, ports, tags — never values).
+- To use a secret, run the command through Rusthorse:
+  \`rusthorse run NAME -- command args\` or \`rusthorse run VAR=NAME -- …\`.
+  The human approves each use in a dialog.
+- Never ask the human for a secret value, never print or echo secrets,
+  and never use \`rusthorse reveal\`.
+- Exit status 125 with a \`rusthorse:\` message: it did not run. If it was
+  denied, or nobody answered, stop and ask the human.`;
+  const lines = [['Command', 'Is this what I expected the agent to do now? Does it send data anywhere (curl, ssh, git push)?'],
+    ['Secrets', 'Does this command need these secrets?'], ['Program', 'Is it the real tool, or something in a project or temporary directory?'],
+    ['Directory', 'Is the agent working where I think it is?'], ['Requested by (unverified)', 'Is it the AI\'s shell, or something unexpected? Process names prove nothing.'],
+    ['Warnings', 'Variables like GIT_SSH_COMMAND can make the program run other code. Deny unless you know why they are set.']];
+  const keys = [['Ctrl', 'F', 'Search entries'], ['Ctrl', 'N', 'New entry'], ['Ctrl', 'L', 'Lock the vault'], ['Ctrl', ',', 'Settings'], ['', 'F1', 'Help'], ['', 'Esc', 'Close a dialog']];
+  content.innerHTML = `<div class="pad">
+    <div class="hero">${logoImg(64)}<div><h2 style="margin:0">Rusthorse</h2>
+      <p>Keeps your secrets in a KeePass vault on this computer and lets programs — AI agents above all — use them without ever seeing them. You decide every use.</p></div></div>
+    <div class="section-title">How it works</div>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><b>A program asks</b><span>An AI agent runs <span class="mono">rusthorse run OPENAI_API_KEY -- …</span>. It names the secret, never sees it.</span></div>
+      <div class="step"><div class="n">2</div><b>You decide</b><span>A dialog shows the command, the secrets, the program and who asked. Deny is the default.</span></div>
+      <div class="step"><div class="n">3</div><b>The agent runs it</b><span>The secret goes into the command's environment; any copy of it in the output shows as [REDACTED].</span></div>
+    </div>
+    <div class="section-title">Reading an approval dialog</div>
+    <div class="boxed">${lines.map(([k, v]) => `<div class="item"><div class="k" style="width:170px">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('')}</div>
+    <div class="section-title">Use it with an AI agent</div>
+    <div class="section-note">Paste this into the agent's instructions file (CLAUDE.md, AGENTS.md, …).</div>
+    <div class="code" style="align-items:flex-start"><pre class="mono" style="margin:0; white-space:pre-wrap; flex:1">${esc(snippet)}</pre><button class="btn small" id="cpsnip">${icon('copy')}Copy</button></div>
+    <div class="section-title" style="margin-top:22px">Keyboard shortcuts</div>
+    <div class="boxed">${keys.map(([m, k, t]) => `<div class="item"><div class="v">${esc(t)}</div><span>${m ? `<kbd>${m}</kbd> + ` : ''}<kbd>${esc(k)}</kbd></span></div>`).join('')}</div>
+    <div class="section-title">Good to know</div>
+    <details><summary>Rusthorse is not a sandbox</summary><p>It keeps secrets out of an AI agent's sight — its context, output and logs. Approving a command trusts everything that command does: read <span class="mono">sh -c</span> lines and scripts the agent just edited before you allow them.</p></details>
+    <details><summary>On X11, other programs can click "Allow"</summary><p>Any program of yours can synthesize input or read the screen on X11. A Wayland session closes most of that. See the threat model, L2.</p></details>
+    <details><summary>There is no password recovery</summary><p>If you forget the master password, the vault cannot be opened. Keep backups (Import &amp; backup); each one opens with the master password it was made with.</p></details>
+    <div class="section-title" style="margin-top:22px">Troubleshooting</div>
+    <details><summary>No dialog appears</summary><p>Open Status: the agent must be running, and "Dialogs" must say rusthorse-dialog or zenity. A program that can be modified by others is refused — run the chmod command Status shows.</p></details>
+    <details><summary>The AI says "rusthorse: command not found"</summary><p>Its shell may not have ~/.cargo/bin on its PATH. Link the program into ~/.local/bin, or give the AI the full path.</p></details>
+    <details><summary>"nobody answered the dialog in time"</summary><p>The dialog closed by itself (Settings → Dialogs wait). Nothing ran; ask the AI to try again when you are at the desk.</p></details>
+    <div style="display:flex; gap:10px; margin-top:22px; flex-wrap:wrap">
+      <button class="btn" id="docs">${icon('ext')}Documentation</button>
+      <button class="btn" id="sec">${icon('ext')}Report a security problem</button>
+      <span style="flex:1"></span>
+      <button class="btn" id="about">About Rusthorse</button>
+    </div></div>`;
+  document.getElementById('cpsnip').onclick = () => toast('Copied — paste it into CLAUDE.md or AGENTS.md');
+  document.getElementById('docs').onclick = () => toast('Opens docs/getting-started.md in the browser');
+  document.getElementById('sec').onclick = () => toast('Opens SECURITY.md: report privately, never in a public issue');
+  document.getElementById('about').onclick = about;
+  document.getElementById('about2').onclick = about;
+}
+function about() {
+  openDialog(`<div class="dh"><b>About</b><small>Rusthorse</small></div>
+    <div class="about">${logoImg(96)}<h3>Rusthorse</h3><div class="ver">0.1.0</div>
+      <p>A local secrets vault that lets AI agents use credentials without seeing them.</p>
+      <div class="boxed" style="text-align:left">
+        <div class="item"><div class="k">Vault format</div><div class="v">KeePass KDBX 4 — opens in KeePassXC</div></div>
+        <div class="item"><div class="k">Built with</div><div class="v">Rust · GTK 4 · libadwaita</div></div>
+        <div class="item"><div class="k">License</div><div class="v">GNU GPL, version 3 or later</div></div>
+        <div class="item"><div class="k">Source</div><div class="v"><a class="link" href="#" onclick="return false">github.com/Alle4you/rusthorse</a></div></div>
+      </div></div>
+    <div class="df"><span class="grow"></span><button class="btn" id="close">Close</button></div>`);
+  document.getElementById('close').onclick = closeDialog;
+}
+
+function renderStatus() {
+  header('Status', 'what rusthorse doctor checks');
+  const checks = [
+    ['ok', 'rusthorse 0.1.0 (protocol 3)'], ['ok', 'The agent is running (systemd user service)'],
+    ['ok', 'The agent runs the same program file as this manager'], ['ok', 'Dialogs: rusthorse-dialog 0.1.0'],
+    ['warn', 'X11 session: any program of yours can click "Allow" or read keystrokes (threat model L2)'],
+    ['ok', 'Yama ptrace_scope = 1'], ['ok', 'The vault is private (600) and KDBX 4.1'], ['ok', 'The socket directory is private (700)'],
+  ];
+  content.innerHTML = `<div class="pad">
+    <div class="boxed">${checks.map(([k, t]) => `<div class="item"><span class="badge ${k === 'ok' ? 'ok' : 'warn'}">${k === 'ok' ? 'ok' : 'warn'}</span><div class="v">${esc(t)}</div></div>`).join('')}</div>
+    <div class="section-note">The X11 warning is not an error: it is the most important limitation to understand. A Wayland session closes most of it.</div></div>`;
+}
+
+function approve(title, explanation, rows, warning, onAllow) {
+  openDialog(`<div class="dh"><b>Rusthorse</b><small>Approval required — shown by the agent, not by the manager</small></div>
+    <div class="db"><h3>${esc(title)}</h3><p>${esc(explanation)}</p>
+    ${warning ? `<div class="callout">${icon('warn')}<div>${esc(warning)}</div></div>` : ''}
+    <div class="boxed">${rows.map(([k, v]) => `<div class="item"><div class="k">${esc(k)}</div><div class="v mono">${esc(v)}</div></div>`).join('')}
+      <div class="item"><div class="k">Requested by<br><small>unverified</small></div><div class="v mono">rusthorse-manager[4242] ← cinnamon[1890]</div></div></div></div>
+    <div class="df"><button class="btn" id="deny">Deny</button><span class="grow"></span><button class="btn" id="allow">Allow once</button></div>`);
+  document.getElementById('deny').onclick = () => { closeDialog(); toast('Denied'); };
+  document.getElementById('allow').onclick = () => { closeDialog(); onAllow(); };
+  document.getElementById('deny').focus();
+}
+function openDialog(html) { document.getElementById('dialog').innerHTML = html; document.getElementById('overlay').classList.add('show'); }
+function closeDialog() { document.getElementById('overlay').classList.remove('show'); }
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') return closeDialog();
+  if (document.getElementById('overlay').classList.contains('show')) return;
+  const go = (s) => { ev.preventDefault(); section = s; render(); };
+  if (ev.key === 'F1') return go('help');
+  if (ev.ctrlKey && ev.key === ',') return go('settings');
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'l') { ev.preventDefault(); return document.getElementById('lockbtn').click(); }
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'n') { ev.preventDefault(); section = 'entries'; render(); return editForm(null); }
+  if (ev.ctrlKey && ev.key.toLowerCase() === 'f') { ev.preventDefault(); section = 'entries'; render(); return document.getElementById('q').focus(); }
+});
+let toastTimer; function toast(t) { const el = document.getElementById('toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2600); }
+
+let locked = false;
+function setLocked(v) { locked = v; const p = document.getElementById('lockpill'); p.textContent = v ? 'Locked' : 'Unlocked'; p.classList.toggle('unlocked', !v); updateAutolock(); }
+function updateAutolock() { document.getElementById('autolock').textContent = locked ? 'The next use asks for the master password' : settings.idle === '0' ? 'Never locks by itself' : `Locks itself in ${settings.idle - 1} min`; }
+document.getElementById('lockbtn').onclick = () => { setLocked(true); grants = []; renderNav(); render(); toast('Locked — remembered approvals forgotten'); };
+document.getElementById('theme').onclick = () => { const h = document.documentElement; h.dataset.theme = h.dataset.theme === 'dark' ? 'light' : 'dark'; };
+
+function render() {
+  renderNav();
+  ({ entries: renderEntries, grants: renderGrants, history: renderHistory, data: renderData, settings: renderSettings, status: renderStatus, help: renderHelp })[section]();
+}
+document.getElementById('sidelogo').innerHTML = logoImg(22);
+render();
+</script>
+</body>
+</html>

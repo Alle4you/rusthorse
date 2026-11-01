@@ -8,6 +8,16 @@ approves, what is stored — gets an [ADR](adr/README.md) and an update to the
 Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 (worth exploring, not designed), **Later** (accepted, not a priority).
 
+## Visual manager
+
+**In progress:** [ADR 0007](adr/0007-visual-manager.md), awaiting independent
+review. M1: metadata browsing/search/groups, agent-approved edits, generated
+values and Show, command snippets, status, locking and verified backup.
+M2: persistent agent configuration, grant revocation, bounded history and
+screen/suspend locking. M3: import UI, safe restoration and exclusive
+KeePassXC handoff. The [reference prototype](design/manager/index.html) uses
+fake data and simulates features not yet implemented.
+
 ## Credential broker: secrets that never enter the client
 
 **Status: Planned.** The most important direction after the first release.
@@ -132,9 +142,9 @@ approved command.
 | **Lock on screen lock and suspend** | Planned | Listen to logind and the screensaver over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables. |
-| **Small GTK interface for browsing and editing entries** | Idea | KeePassXC already covers this well; only if it adds something Rusthorse-specific. |
+| **Visual manager** | In progress | ADR 0007 and milestones above; manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
-| **Clipboard copy with a timeout** | Later | Deliberately left out on X11, where any program can read the clipboard. |
+| **Clipboard copy with a timeout** | Later | Secret Copy remains excluded from manager M1: a timer cannot recall clipboard history. Command-snippet copying contains no values (ADR 0007). |
 
 ## Hardening
 
