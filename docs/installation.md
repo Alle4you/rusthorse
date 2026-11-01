@@ -36,6 +36,16 @@ cargo install --locked --git https://github.com/Alle4you/rusthorse
 Both put the binary at `~/.cargo/bin/rusthorse`. Check it with
 `rusthorse --version`.
 
+AI agents usually run commands in non-interactive shells, which on many
+distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds
+`~/.cargo/bin` to `PATH`. If `command -v rusthorse` finds nothing in the AI's
+own shell (ask it to run that), link the binary into a directory on the
+default `PATH`:
+
+```sh
+ln -s ~/.cargo/bin/rusthorse ~/.local/bin/rusthorse
+```
+
 To build without the Secret Service importer (and its D-Bus dependencies):
 
 ```sh
