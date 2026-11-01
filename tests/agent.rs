@@ -1032,6 +1032,162 @@ fn a_closed_stdout_stops_the_command_like_sigpipe() {
     }
 }
 
+fn raw_run(h: &Harness, argv: &[&str], forward_stdin: bool) -> std::os::unix::net::UnixStream {
+    use rusthorse::protocol::{Binding, Request, RunRequest, send_frame};
+    let stream = std::os::unix::net::UnixStream::connect(&h.socket).expect("connect");
+    let request = Request::Run(RunRequest {
+        bindings: vec![Binding {
+            var: "T".into(),
+            entry: "T".into(),
+        }],
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        cwd: h.dir.path().to_str().expect("utf8").into(),
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        redact: true,
+        forward_stdin,
+    });
+    send_frame(&stream, &request, &[]).expect("send");
+    stream
+}
+
+fn wait_until_dead(pid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_protocol_violation_cancels_even_a_blocked_run() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("flood.pid");
+    let script = format!("echo $$ > {}; exec yes", pidfile.display());
+    // Never read: the agent's sends fill the socket and block.
+    let stream = raw_run(&h, &["sh", "-c", &script], false);
+    let pid = wait_for_pid(&pidfile);
+    std::thread::sleep(Duration::from_millis(500));
+    rusthorse::protocol::send_data(&stream, 7, b"what is this").expect("send garbage");
+    wait_until_dead(pid, "the command survived a protocol violation");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.audit_text().contains("\"outcome\":\"exited\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the request stayed blocked after cancelling"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stream);
+}
+
+#[test]
+fn a_half_closed_connection_cancels_even_with_input_pending() {
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("idle.pid");
+    let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+    let stream = raw_run(&h, &["sh", "-c", &script], true);
+    let pid = wait_for_pid(&pidfile);
+    // More input than the command's stdin pipe holds; it never reads it.
+    let chunk = vec![b'x'; rusthorse::protocol::MAX_DATA_LEN];
+    for _ in 0..3 {
+        rusthorse::protocol::send_data(&stream, rusthorse::protocol::STDIN, &chunk).expect("send");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    wait_until_dead(pid, "a half-closed connection was not noticed");
+    drop(stream);
+}
+
+#[test]
+fn stderr_keeps_flowing_while_stdout_is_stuck() {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (_out_reader, out_writer) = std::io::pipe().expect("pipe");
+    nix::fcntl::fcntl(&out_writer, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).expect("pipe size");
+    let (mut err_reader, err_writer) = std::io::pipe().expect("pipe");
+    let mut client = h
+        .cmd(&[
+            "run",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            "head -c 12000 /dev/zero; echo READY >&2; sleep 5",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(out_writer)))
+        .stderr(Stdio::from(OwnedFd::from(err_writer)))
+        .spawn()
+        .expect("spawn");
+    let seen = within(Duration::from_secs(10), move || {
+        let mut text = Vec::new();
+        let mut byte = [0u8; 1];
+        while !String::from_utf8_lossy(&text).contains("READY") {
+            if err_reader.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            text.push(byte[0]);
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    });
+    assert!(seen.contains("READY"), "stderr was held back: {seen:?}");
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+#[test]
+fn the_library_input_reader_stops_when_the_run_returns() {
+    use rusthorse::client::{Client, RunIo};
+    use rusthorse::protocol::{Binding, RunRequest};
+    use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+    let input = OwnedFd::from(reader.try_clone().expect("dup"));
+    let client = Client::new(h.socket.clone());
+    let request = RunRequest {
+        bindings: vec![Binding {
+            var: "T".into(),
+            entry: "T".into(),
+        }],
+        argv: vec!["true".into()],
+        cwd: h.dir.path().to_str().expect("utf8").into(),
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        redact: true,
+        forward_stdin: true,
+    };
+    let response = client
+        .run_with(
+            request,
+            RunIo {
+                input: Some(input),
+                stdout: Box::new(std::io::sink()),
+                stderr: Box::new(std::io::sink()),
+            },
+        )
+        .expect("run");
+    assert!(matches!(
+        response,
+        rusthorse::protocol::Response::Exited { code: Some(0), .. }
+    ));
+    std::thread::sleep(Duration::from_millis(300));
+    writer.write_all(b"LATER\n").expect("write");
+    drop(writer);
+    let mut left = String::new();
+    reader.read_to_string(&mut left).expect("read");
+    assert_eq!(left, "LATER\n", "input written after the run was consumed");
+}
+
 #[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();

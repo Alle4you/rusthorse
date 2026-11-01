@@ -42,6 +42,18 @@ pub const STDOUT: u8 = 1;
 /// Data channel: the command's standard error (agent → client).
 pub const STDERR: u8 = 2;
 
+/// Flow-control channel (client → agent): the payload is a big-endian `u32`
+/// number of bytes of [`STDOUT`] data the client has written out and is ready
+/// to receive again.
+pub const CREDIT_STDOUT: u8 = 0x81;
+/// Flow-control channel (client → agent) for [`STDERR`]; see [`CREDIT_STDOUT`].
+pub const CREDIT_STDERR: u8 = 0x82;
+
+/// How much data the agent may send on each output channel before the client
+/// grants more credit. Each channel has its own window, so a client whose
+/// stdout is stuck still receives stderr.
+pub const INITIAL_CREDIT: usize = 1024 * 1024;
+
 /// A string holding secret material; its heap buffer is wiped on drop.
 pub type SecretString = Zeroizing<String>;
 
@@ -511,6 +523,22 @@ pub fn send_data(stream: &UnixStream, channel: u8, data: &[u8]) -> io::Result<()
     frame.extend_from_slice(data);
     let mut writer = stream;
     writer.write_all(&frame)
+}
+
+/// Grant `amount` more bytes of credit for an output channel ([`STDOUT`] or
+/// [`STDERR`]).
+pub fn send_credit(stream: &UnixStream, channel: u8, amount: u32) -> io::Result<()> {
+    let credit_channel = match channel {
+        STDOUT => CREDIT_STDOUT,
+        STDERR => CREDIT_STDERR,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credit is only granted for stdout and stderr",
+            ));
+        }
+    };
+    send_data(stream, credit_channel, &amount.to_be_bytes())
 }
 
 /// A frame of either kind.

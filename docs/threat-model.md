@@ -290,17 +290,23 @@ Output is delivered like in a pipeline: while the requester stays connected,
 the agent waits for it to read, however long that takes, and keeps the copy
 of the secret values that the redactor needs. Meanwhile the command may
 itself be blocked writing its output, exactly as it would be in a pipeline
-whose reader stopped. The request ends as soon as the requester reads its
-output or disconnects (a write to a socket whose peer is gone fails at once);
-a requester that does neither ties up one of the agent's 64 connections.
+whose reader stopped. Stdout and stderr have separate 1 MiB flow-control
+windows, so one stuck channel does not stop the other. The request ends as
+soon as the requester reads its output, or closes, half-closes or breaks the
+connection (each of which cancels it: the agent shuts the socket down, which
+fails a pending send at once). A requester that does neither ties up one of
+the agent's 64 connections.
 
 ### L18 — Forwarded input races the end of the command
 
 With `run --stdin`, the `rusthorse run` process reads its own stdin and sends
 it to the agent while the command runs. Input typed in the instant the command
 finishes may be read by `rusthorse run` — which exits right after — and lost
-instead of reaching the next program that reads the terminal. Without
-`--stdin` (the default), the requester's input is never read.
+instead of reaching the next program that reads the terminal. Programs using
+the library API (`Client::run_with`) get the same behaviour: the input reader
+reads only after `poll` reports data and stops within about 100 ms after the
+call returns. Without `--stdin` (the default), the requester's input is never
+read.
 
 ## 8. Running AI agents in isolation
 
@@ -355,6 +361,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Second review of the code and of the fixes (AI-assisted, Codex). | See the second table. |
 | 2026-10-31 | Third review: verification of the second round (AI-assisted, Codex). | See the third table. |
 | 2026-10-31 | Fourth review: verification of the third round (AI-assisted, Codex). | See the fourth table. |
+| 2026-10-31 | Fifth review: verification of the new I/O design (AI-assisted, Codex). | See the fifth table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -423,3 +430,13 @@ While implementing this round, a test caught that `nix`'s `PollFd::revents()`
 returns nothing at all when the kernel reports a bit `nix` does not name
 (`POLLRDHUP`), which made disconnects invisible; the agent relies on
 `POLLHUP` instead.
+
+Findings of the fifth review (verification of the new I/O design; N8, N15 and
+N16 were confirmed fixed):
+
+| Finding | Disposition |
+|---|---|
+| N17 — cancelling (on a protocol violation or a half-close) killed the command but left the socket open, so a blocked send kept the request stuck; a half-close went unnoticed while input was pending | **Fixed:** one cancellation path shuts the socket down (failing any pending send without taking the send lock) and terminates the group; the watcher polls with `POLLRDHUP` through raw `poll(2)`, so a half-close is seen even with input pending; half-close and any protocol violation are defined as cancellation. |
+| N18 — the CLI relayed stdout and stderr in order, so a stuck stdout held stderr back | **Fixed:** per-channel writer threads and per-channel credit windows (1 MiB). |
+| N19 — the library's `Client::run` left a stdin reader running after it returned | **Fixed:** `Client::run_with` takes the input and outputs explicitly; its reader reads only after `poll` and stops within ~100 ms of the return. |
+| Docs: "one response frame", "the client only receives the exit status", cancellation states | **Fixed** (protocol, ADR 0002, architecture, L18, L19). |

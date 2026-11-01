@@ -97,4 +97,13 @@ From the fourth review:
 - A process whose main thread exited while other threads run is terminated
   with its group.
 
+From the fifth review:
+
+- Per-channel flow control (credit frames, 1 MiB windows) and per-channel
+  writer threads in the client: a stuck stdout no longer holds up stderr.
+- Cancellation (close, half-close, protocol violation) shuts the socket down
+  and terminates the command; half-closes are detected with `POLLRDHUP`.
+- `Client::run_with` with explicit I/O for library users; its input reader
+  stops when the call returns.
+
 [Unreleased]: https://github.com/Alle4you/rusthorse/commits/main

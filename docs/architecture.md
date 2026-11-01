@@ -120,11 +120,14 @@ sends the redacted output over the connection as data frames, and the
 `rusthorse run` process writes them to its stdout and stderr (and, with
 `--stdin`, reads its own stdin and sends it on). Output is delivered like in a
 pipeline: while the caller stays connected, the agent waits for it to read,
-however slowly. The only thing the agent writes is its own socket, so when
-the caller goes away a pending write fails at once and every worker stops. If
-the caller's stdout is closed (`| head`), `rusthorse run` closes the
-connection — which stops the command — and exits with status 141, like a
-process killed by `SIGPIPE`.
+however slowly. `rusthorse run` writes each channel on its own thread and
+grants the agent credit per channel as it writes, so a stuck stdout does not
+hold up stderr (each channel has a 1 MiB window). The only thing the agent
+writes is its own socket. A full close, a half-close or a protocol violation
+by the caller cancels the request: the agent shuts the socket down — which
+fails any send in progress at once — and terminates the command. If the
+caller's stdout is closed (`| head`), `rusthorse run` closes the connection
+and exits with status 141, like a process killed by `SIGPIPE`.
 
 ## Policy
 

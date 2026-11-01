@@ -14,7 +14,9 @@ Protocol version: **1** (`PROTOCOL_VERSION` in
 - The agent reads the peer's credentials with `SO_PEERCRED` and silently
   closes connections from other users.
 - **One request per connection.** The client connects, sends one request
-  frame, reads one response frame and closes the connection.
+  message and reads one response message, then closes the connection. During
+  a `run` with redaction, data frames flow in both directions before the
+  response (see [Framing](#framing)).
 
 ## Framing
 
@@ -29,10 +31,22 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
 - A **message** body is a UTF-8 JSON object, at most 4 MiB. Requests and
   responses are messages.
 - A **data** frame carries part of a running command's input or output, at
-  most 64 KiB of data. Channel `0` is the command's stdin (client → agent;
-  an empty data frame means end of input), `1` its stdout and `2` its stderr
-  (agent → client). Data frames are only valid during a `run` with
-  redaction, and never carry file descriptors.
+  most 64 KiB of data, on one channel:
+
+  | Channel | Direction | Meaning |
+  |---|---|---|
+  | `0` | client → agent | The command's stdin; an empty frame means end of input. Only allowed when the request set `forward_stdin`. |
+  | `1` | agent → client | The command's (redacted) stdout. |
+  | `2` | agent → client | The command's (redacted) stderr. |
+  | `0x81` | client → agent | Credit for channel 1: a big-endian `u32` number of bytes the client has written out. |
+  | `0x82` | client → agent | Credit for channel 2. |
+
+  Data frames are only valid during a `run` with redaction, and never carry
+  file descriptors.
+- **Flow control.** The agent sends at most 1 MiB on each output channel
+  beyond what the client has acknowledged with credit frames. The client
+  grants credit as it writes data out. Each channel has its own window, so a
+  client whose stdout is stuck still receives stderr.
 - A `run` request **without redaction** carries exactly three file
   descriptors — the client's stdin, stdout and stderr, in that order — as
   `SCM_RIGHTS` ancillary data on the **first byte** of the frame (send the
@@ -47,11 +61,16 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   8 are already waiting for the human.
 - While a `run` request is in progress, the client must keep the connection
   open. With redaction the agent sends the command's output as data frames
-  (channels 1 and 2) and finally the `exited` (or `error`) message; the
-  client writes the data to its own stdout and stderr. If `forward_stdin` is
-  set, the client sends its input as channel-0 data frames, then an empty one
-  at end of input; otherwise it sends nothing. Closing the connection makes
-  the agent terminate the command.
+  (channels 1 and 2) and finally the `exited` (or `error`) message, which
+  always comes after the last data frame; the client writes the data to its
+  own stdout and stderr and grants credit. If `forward_stdin` is set, the
+  client sends its input as channel-0 data frames, then an empty one at end
+  of input.
+- **Cancellation.** Closing the connection, half-closing it
+  (`shutdown(SHUT_WR)`), or sending anything not listed above (a message, an
+  unknown channel, unrequested input, an oversized or truncated frame)
+  cancels the request: the agent shuts the socket down and terminates the
+  command's process group.
 
 ## Requests
 

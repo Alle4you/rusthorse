@@ -43,8 +43,9 @@ The agent executes approved commands itself:
 - After the human answers, the agent checks that the vault generation, the
   entries (by UUID) and the program's and directory's inodes are unchanged
   before reading any value.
-- The client only receives the exit status. If it disconnects, the agent
-  terminates the command.
+- The client receives the command's redacted output (with redaction) and
+  its exit status. If it disconnects, half-closes the connection or breaks
+  the protocol, the agent terminates the command.
 
 ## Alternatives considered
 
