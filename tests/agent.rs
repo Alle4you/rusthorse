@@ -1182,6 +1182,8 @@ fn the_library_input_reader_stops_when_the_run_returns() {
     ));
     std::thread::sleep(Duration::from_millis(300));
     writer.write_all(b"LATER\n").expect("write");
+    // Give a reader that is (wrongly) still running ample time to take it.
+    std::thread::sleep(Duration::from_millis(500));
     drop(writer);
     let mut left = String::new();
     reader.read_to_string(&mut left).expect("read");
