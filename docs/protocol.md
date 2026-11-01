@@ -4,14 +4,15 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **3** (`PROTOCOL_VERSION` in
+Protocol version: **4** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
 |---|---|
 | 1 | First design: descriptors passed for every `run`. Never released. |
 | 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
-| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`, `reveal.purpose`. |
+| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`. |
+| 4 | `reveal.purpose` (`show`, `copy`): what the client says it will do with a revealed value, named in the approval dialog and the audit log. Unreleased builds that reported protocol 3 had this field with another meaning for `copy` (one paste, then cleared); clients of protocol 4 refuse those agents. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -148,9 +149,7 @@ master password in its own dialogs.
 client's own statement: the agent cannot enforce it, the dialog labels it
 "Stated purpose (unverified)", and its warnings hold whatever the client
 does. An approval for one purpose is never remembered and never reused for
-another. The field was added within protocol 3: clients leave it out when
-they have no purpose to state, and an agent that predates it ignores it and
-shows the wording for printing.
+another. Clients leave the field out when they have no purpose to state.
 
 ### NewEntry
 
@@ -230,7 +229,7 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 3,
+  "protocol_version": 4,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,

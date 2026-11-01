@@ -145,7 +145,7 @@ approved command.
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables. |
 | **Visual manager** | M1 implemented, awaiting review | ADR 0007 and milestones above; manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
-| **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard, and in a clipboard history, until something else is copied. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
+| **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |
 | **Auto-type into the focused window** | Idea | KeePassXC's approach; X11 only, and it can type into the wrong window. |
 

@@ -403,7 +403,7 @@ CLI: it never opens the vault and never receives the master password. Its
 forms carry metadata only; every change is a request the agent approves in
 its own dialog.
 
-- **Requests.** It uses the protocol-3 requests and targets entries by UUID.
+- **Requests.** It uses the protocol-4 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
   started by the human runs at a time, on a worker thread, with bounded
   waits; closing the window shuts the connection down. A lost answer to a

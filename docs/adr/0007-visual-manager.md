@@ -48,7 +48,7 @@ client workers. Closing a window or losing a reply does not prove a pending
 change was cancelled: report unknown outcomes, never automatically retry.
 Status polling is read-only and does not extend the agent's idle timeout.
 Metadata and shown secrets are cleared on observed lock/disconnection; there
-is no synchronous push notification of external locks in protocol 3.
+is no synchronous push notification of external locks in the protocol.
 
 ### 2. Show, Copy and memory
 
@@ -69,9 +69,10 @@ requester receives the value and can do anything with it — so the dialog
 labels it **"Stated purpose (unverified)"** and its explanation says so. The
 purpose changes the dialog's title, question and warning, and is written in
 the audit record (`value, to copy to the clipboard`), so the log tells a
-copy from a display. Without the field (the CLI), nothing changes. Within
-protocol 3 this is an optional field: an agent that predates it ignores it
-and shows the CLI's wording, which is stricter, not weaker.
+copy from a display. Without the field (the CLI), nothing changes. The field
+came with protocol 4: its meaning for `copy` changed before any release
+(from "one paste, then cleared" to a plain copy), so the version was bumped
+and a client of protocol 4 refuses an agent that could show the old wording.
 
 #### Show
 
@@ -99,7 +100,8 @@ authorizes this extra exposure, as it does with the CLI.
 
 Copy sends a `reveal` with purpose `copy`; the agent's dialog asks "Copy the
 value of an entry to the clipboard?" and warns that the value stays on the
-clipboard, and in a clipboard history, until something else is copied, that
+clipboard until something else is copied and that a clipboard history may
+keep it even after that, that
 other programs of the session can read it, and that it must never be pasted
 into a chat with an AI. After approval, the manager puts the value on the
 clipboard **as plain text, like any copy**: it can be pasted any number of
@@ -119,7 +121,8 @@ cleared it after 20 seconds, on lock and at exit, and announced
 tightened it. Then the maintainer's first try on Cinnamon (Muffin 6.6)
 showed what the desktop does with any copy:
 
-- Muffin, like Mutter in GNOME, keeps its own copy of the clipboard: it
+- Muffin keeps its own copy of the clipboard (Mutter, which it derives from,
+  is understood to do the same in GNOME; not verified): it
   fetches the text **the instant** an application copies — before any paste
   — and ignores `x-kde-passwordManagerHint` (it does not even ask for it).
   The single delivery went to the desktop, and the human's paste came back
@@ -130,8 +133,9 @@ showed what the desktop does with any copy:
 - On X11, GTK 4 cannot deliver `x-kde-passwordManagerHint` at all (it serves
   only formats whose name contains a slash).
 
-So a stricter Copy cannot be made to work with the desktops Rusthorse
-targets, and the maintainer judged that it would not be worth it anyway: a
+So that single-paste design cannot work on Cinnamon. Other protections may
+be possible (clearing on a timer, as KeePassXC does), but the maintainer
+judged that more would not be worth it: a
 user who cannot copy a value will photograph or screenshot it, which is
 worse. The protection that matters is that nothing gets a value without the
 human's approval in the agent's dialog, and that the human is told where a
@@ -217,9 +221,9 @@ launch of the live vault. The manager never writes a KDBX itself.
 
 ### 7. Protocol, packaging and tests
 
-M1 adds one optional field to protocol 3, `reveal.purpose` (section 2); no
-other request or response changes, and the field is omitted when absent, so
-the CLI's requests are unchanged. Future requests in M2/M3 need documented
+M1 adds one optional field, `reveal.purpose` (section 2), with protocol 4;
+no other request or response changes, and the field is omitted when absent,
+so the CLI's requests are unchanged. Future requests in M2/M3 need documented
 capabilities or a version bump before a new client uses them. Changes to meaning, framing or error guarantees always
 bump `PROTOCOL_VERSION`; new fields are optional and omitted when absent.
 All clients preserve definite versus uncertain outcomes, even for unknown

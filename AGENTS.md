@@ -113,7 +113,7 @@ Breaking one of these is a security bug, whatever the tests say.
    writes nothing to standard output but its one answer. With zenity: only
    options that zenity 3 and 4 both have (no `--icon-name`), no colours or
    icons of our own. Verified on zenity 3.44 and GTK 4.14, dark and light.
-7. **Error contract** (protocol 3): every error other than `outcome_unknown`
+7. **Error contract** (since protocol 3): every error other than `outcome_unknown`
    means the vault file was not changed and no command was started. Clients
    treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
    outcome unknown (any request with effects); `125` `run` did not start

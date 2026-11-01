@@ -296,9 +296,10 @@ visual manager uses both:
 - **Copy** puts the value on the clipboard as plain text, like any copy. It
   stays there until something else is copied; other programs of the session
   can read it (on X11 any of them; on Wayland those using a data-control
-  protocol); the desktop keeps its own copy — Cinnamon (verified) and GNOME
-  fetch it the moment it is copied and restore it when the copying program
-  exits — and a clipboard history may keep it for ever; and the program it
+  protocol); the desktop keeps its own copy — Cinnamon fetches it the moment it is
+  copied and restores it when the copying program exits (verified with
+  Muffin 6.6.3; GNOME's Mutter is understood to do the same, not verified)
+  — and a clipboard history may keep it for ever; and the program it
   is pasted into receives it, so a value pasted into the wrong window (a
   chat with an AI) is gone. Rusthorse cannot take a copied value back. What
   it does: Copy needs its own approval, whose dialog says all this; the
@@ -802,4 +803,17 @@ shown value is decided on the value itself, not on its escaped form (a test
 caught an escape being cut into groups). L14, ADR 0007, the guide and the
 agent's dialog texts say where a copied value goes.
 
-**Awaiting:** review of the redesign (Codex).
+Review of the redesign (Codex, AI-assisted, 2026-11-01; verdict: not ready),
+and what was done:
+
+| Finding | Disposition |
+|---|---|
+| The meaning of `reveal.purpose` changed under the same protocol version: the new manager, talking to an agent built before the change, got an approval whose dialog promised "one paste, then clear it" and copied plainly; and copied from Show though that dialog did not say it could | **Fixed:** protocol 4. Clients refuse an agent of another version, so a manager never relies on a dialog of another meaning. The manager's test of an older agent now uses the version before the current one. |
+| Copying a value with a NUL character crashed the manager (GTK text cannot hold a NUL) | **Fixed:** the value is not copied, in part or whole, and the manager says why without showing it; tested from the entry and from the Show window. |
+| "Stays on the clipboard, and in a clipboard history, until something else is copied" suggested that copying something else also clears a history | **Fixed:** the dialogs, the window and the docs now say that it stays on the clipboard until something else is copied, and that a clipboard history may keep it even after that. The end-to-end test checks the agent's wording. |
+| `RevealPurpose::Copy`'s documentation still promised a single paste; GNOME's behaviour was stated as fact though only Cinnamon was tested; the ADR said no stricter Copy could work at all; a comment said the shutdown cleanup runs "however it quits" | **Fixed:** documentation corrected; GNOME marked as not verified; the ADR says the single-paste design cannot work on Cinnamon and that the maintainer chose not to add other protections; the comment says a signal skips it. |
+
+Each fix was reverted in a copy of the tree to see a test fail (3 of 3;
+the documentation fixes have no test).
+
+**Awaiting:** verification of these fixes (Codex).

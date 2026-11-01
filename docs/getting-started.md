@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 3)
+  ok    rusthorse 0.1.0 (protocol 4)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/home/me/.cargo/bin/rusthorse)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
@@ -125,6 +125,6 @@ Then tell your AI agent how to use them — paste the snippet from
 The optional [manager](manager.md) shows the same vault in a window
 (`cargo run --locked -p rusthorse-manager` from the source tree). Try it with
 a fake entry first: create it, edit it, copy its `rusthorse run` command, and
-try **Show** and **Copy**. A copied value stays on the clipboard, and in a
-clipboard history, until you copy something else. Both are for you at the
+try **Show** and **Copy**. A copied value stays on the clipboard until you
+copy something else, and a clipboard history may keep it even after that. Both are for you at the
 desktop and ask for your approval; an AI agent uses `rusthorse run`.

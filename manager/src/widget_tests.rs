@@ -511,6 +511,27 @@ fn desktop_flow() {
     button(&escaped, "Copy").emit_clicked();
     assert_eq!(paste().as_deref(), Some("price-\u{20ac}-1"));
     button(&escaped, "Hide now").emit_clicked();
+    // A value with a NUL is never copied, in part or whole, and nothing
+    // crashes: neither from the entry nor from the Show window.
+    s.window.clipboard().set_text("before the copy");
+    s.put_on_clipboard(
+        "Fake NUL",
+        &SecretString::new("FAKE-before\0FAKE-after".to_string()),
+    );
+    assert!(s.message.text().contains("NUL"), "{}", s.message.text());
+    assert!(!s.message.text().contains("FAKE-before"));
+    assert_eq!(paste().as_deref(), Some("before the copy"));
+    s.show_secret_for(
+        "Fake NUL shown",
+        false,
+        "FAKE-before\0FAKE-after".to_string().into(),
+        Duration::from_secs(30),
+    );
+    let nul = s.revealed.borrow().as_ref().unwrap().clone();
+    assert_eq!(shown_text(&nul), "FAKE-before\\u{0}FAKE-after");
+    button(&nul, "Copy").emit_clicked();
+    assert_eq!(paste().as_deref(), Some("before the copy"));
+    button(&nul, "Hide now").emit_clicked();
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
 
     // A lock made elsewhere while a request waits for the human is seen.

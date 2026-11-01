@@ -148,10 +148,10 @@ program's password prompt, use **Copy value…** in the Secret rows (or
    paste it where it belongs, as many times as you need.
 
 > **Note: a copied value stays on the clipboard until you copy something
-> else, and your desktop may keep it in a clipboard history.** Cinnamon and
-> GNOME keep their own copy of whatever is on the clipboard — they take it
-> the moment you copy and put it back if the program that copied it closes
-> — and clipboard managers (CopyQ, Klipper, GPaste, …) may keep a list of
+> else, and a clipboard history may keep it even after that.** Cinnamon
+> keeps its own copy of whatever is on the clipboard — it takes it the
+> moment you copy and puts it back if the program that copied it closes
+> (GNOME probably does the same; not verified) — and clipboard managers (CopyQ, Klipper, GPaste, …) may keep a list of
 > past copies. Rusthorse cannot take a copied value back. When you are done,
 > copy something harmless to replace it, and delete it from your clipboard
 > history if you use one.

@@ -379,7 +379,7 @@ impl Manager {
             ),
             (
                 "Show and Copy",
-                "Show asks the agent, then displays the value in a window that hides after 30 seconds or when it loses focus; you can copy it from there. Copy asks the agent, then puts the value on the clipboard like any copied text: it stays there — and in your clipboard history, if your desktop keeps one — until you copy something else. Other programs of your desktop session can read the clipboard. Paste it only where it belongs, never into a chat with an AI.",
+                "Show asks the agent, then displays the value in a window that hides after 30 seconds or when it loses focus; you can copy it from there. Copy asks the agent, then puts the value on the clipboard like any copied text: it stays there until you copy something else, and a clipboard history may keep it even after that. Other programs of your desktop session can read the clipboard. Paste it only where it belongs, never into a chat with an AI.",
             ),
             (
                 "Use it from a command",
@@ -1122,7 +1122,7 @@ impl Manager {
         let secret = group(
             "Secret",
             Some(
-                "Show and Copy ask for your approval in the agent's dialog. A shown value hides after 30 seconds. A copied value stays on the clipboard — and in your clipboard history, if your desktop keeps one — until you copy something else.",
+                "Show and Copy ask for your approval in the agent's dialog. A shown value hides after 30 seconds. A copied value stays on the clipboard until you copy something else, and a clipboard history may keep it even after that.",
             ),
         );
         for (title, notes, present) in [
@@ -1254,10 +1254,21 @@ impl Manager {
     /// Put a value on the clipboard as plain text, like any copy. GTK and
     /// the desktop keep their own copies; nothing here can take them back.
     fn put_on_clipboard(&self, title: &str, value: &SecretString) {
+        // GTK's text is NUL-terminated: a value with a NUL would be cut (or
+        // make the conversion fail). Copy nothing rather than part of it.
+        if value.contains('\0') {
+            self.feedback(
+                &format!(
+                    "{title} contains a NUL character, which the clipboard cannot carry: nothing was copied."
+                ),
+                true,
+            );
+            return;
+        }
         self.window.clipboard().set_text(value.as_str());
         self.feedback(
             &format!(
-                "{title} was copied. It stays on the clipboard — and in your clipboard history, if your desktop keeps one — until you copy something else."
+                "{title} was copied. It stays on the clipboard until you copy something else, and a clipboard history may keep it even after that."
             ),
             false,
         );
@@ -1304,7 +1315,7 @@ impl Manager {
         let buttons = row_box(8);
         let copy = button("Copy", Some("edit-copy-symbolic"));
         copy.set_tooltip_text(Some(
-            "Copies what is shown, without asking again. It stays on the clipboard until you copy something else.",
+            "Copies what is shown, without asking again. It stays on the clipboard until you copy something else; a clipboard history may keep it longer.",
         ));
         buttons.append(&copy);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);

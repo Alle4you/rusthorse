@@ -54,7 +54,8 @@ fn load_style() {
 }
 
 /// Hide a shown value and drop what the window holds when the application
-/// shuts down, however it quits.
+/// shuts down normally. (A signal that ends the process skips this; the
+/// window and its memory go with the process.)
 pub(crate) fn wipe_at_shutdown(
     app: &adw::Application,
     state: &Rc<RefCell<Option<Rc<window::Manager>>>>,

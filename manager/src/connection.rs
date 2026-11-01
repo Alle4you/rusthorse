@@ -228,7 +228,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     fn status() -> Response {
-        serde_json::from_value(serde_json::json!({"type":"status","protocol_version":3,"agent_version":"test","vault":"/fake","vault_exists":true,"locked":false,"idle_timeout_secs":0,"remembered_approvals":0})).expect("status")
+        serde_json::from_value(serde_json::json!({"type":"status","protocol_version":protocol::PROTOCOL_VERSION,"agent_version":"test","vault":"/fake","vault_exists":true,"locked":false,"idle_timeout_secs":0,"remembered_approvals":0})).expect("status")
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
                     let Response::Status(mut info) = status() else {
                         unreachable!()
                     };
-                    info.protocol_version = 2;
+                    info.protocol_version = protocol::PROTOCOL_VERSION - 1;
                     protocol::send_frame(&s, &Response::Status(info), &[]).expect("answer");
                     listener.set_nonblocking(true).expect("nonblocking");
                     thread::sleep(Duration::from_millis(100));

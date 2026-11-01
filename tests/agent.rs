@@ -2008,6 +2008,10 @@ fn a_stated_reveal_purpose_is_shown_and_audited() {
         k == "Stated purpose (unverified)" && v == "put the value on the clipboard"
     }));
     assert!(request.warnings[0].contains("never into a chat with an AI"));
+    // Copying something else replaces the clipboard, not a history's copy.
+    assert!(request.warnings[0].contains(
+        "until something else is copied, and a clipboard history may keep it even after that"
+    ));
     assert!(!request.can_remember);
 
     // Allowed: the value, and an audit record that names the purpose.

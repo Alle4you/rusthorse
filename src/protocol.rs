@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 /// was not changed and no command was started), which clients rely on;
 /// `status.agent_executable`, `status.agent_executable_id`,
 /// `status.agent_executable_replaced`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed;
 // agents of version 2 and earlier do not guarantee it, so the version must
@@ -160,9 +160,11 @@ pub enum Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevealPurpose {
-    /// Display it in the client's own window for a short time.
+    /// Display it in the client's own window for a short time, from where
+    /// the human may copy it.
     Show,
-    /// Put it on the clipboard for a single paste, then clear it.
+    /// Put it on the clipboard, where it stays until something else is
+    /// copied (and where clipboard histories may keep it).
     Copy,
 }
 

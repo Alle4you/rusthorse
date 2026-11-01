@@ -16,8 +16,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   agent, to browse, search and filter entries by group; create, edit, rename
   and delete them; generate values; **Show** a value in a window that hides
   after 30 seconds or on focus loss; **Copy** a value to the clipboard (it
-  stays there, and in a clipboard history, until something else is copied —
-  the window says so); copy the `rusthorse run`
+  stays there until something else is copied, and a clipboard history may
+  keep it even after that — the window says so); copy the `rusthorse run`
   command for an entry; lock and unlock; back up; change the master password.
   Every change and every value still goes through the agent's approval.
   Awaiting independent review.
@@ -64,6 +64,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   125 for "did not run".
 
 ### Changed
+
+- **Protocol 4.** `reveal` takes an optional `purpose`; see Added. Upgrade the
+  agent together with its clients and restart it: clients refuse an agent of
+  another protocol version.
 
 - Protocol version 3 (data frames and credits, new requests, definite
   errors); clients refuse an agent that speaks another version.
