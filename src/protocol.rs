@@ -139,6 +139,11 @@ pub enum Request {
         /// Return the notes instead of the password.
         #[serde(default)]
         notes: bool,
+        /// What the client says it will do with the value, so that the
+        /// approval dialog and the audit log can say it. The agent cannot
+        /// enforce it. Absent: the client prints it (`rusthorse reveal`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<RevealPurpose>,
     },
     /// Copy the (encrypted) vault file to `path` and check that the copy
     /// opens with the current master password.
@@ -148,6 +153,17 @@ pub enum Request {
     },
     /// Run a command with secrets in its environment (requires approval).
     Run(RunRequest),
+}
+
+/// What a client says it will do with a revealed value
+/// ([`Request::Reveal`]). Stated by the client, not verified by the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevealPurpose {
+    /// Display it in the client's own window for a short time.
+    Show,
+    /// Put it on the clipboard for a single paste, then clear it.
+    Copy,
 }
 
 impl Request {
@@ -1009,12 +1025,27 @@ mod tests {
         let json = serde_json::to_value(Request::Reveal {
             name: "x".into(),
             notes: false,
+            purpose: None,
         })
         .expect("json");
         assert_eq!(
             json,
             serde_json::json!({"type": "reveal", "name": "x", "notes": false})
         );
+        let json = serde_json::to_value(Request::Reveal {
+            name: "x".into(),
+            notes: false,
+            purpose: Some(RevealPurpose::Copy),
+        })
+        .expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "reveal", "name": "x", "notes": false, "purpose": "copy"})
+        );
+        let old: Request =
+            serde_json::from_value(serde_json::json!({"type": "reveal", "name": "x"}))
+                .expect("a request without purpose");
+        assert!(matches!(old, Request::Reveal { purpose: None, .. }));
         let resp = serde_json::to_value(Response::Error {
             code: ErrorCode::Denied,
             message: "no".into(),

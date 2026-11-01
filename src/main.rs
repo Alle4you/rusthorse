@@ -850,7 +850,12 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
 }
 
 fn reveal(client: &Client, name: String, notes: bool) -> anyhow::Result<u8> {
-    let Response::Secret { value } = check(client.call(&Request::Reveal { name, notes })?)? else {
+    let Response::Secret { value } = check(client.call(&Request::Reveal {
+        name,
+        notes,
+        purpose: None,
+    })?)?
+    else {
         bail!("unexpected response");
     };
     println!("{}", value.as_str());

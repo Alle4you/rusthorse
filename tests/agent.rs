@@ -1983,6 +1983,67 @@ fn notes_can_be_revealed_with_approval() {
 }
 
 #[test]
+fn a_stated_reveal_purpose_is_shown_and_audited() {
+    use rusthorse::protocol::{ErrorCode, Request, Response, RevealPurpose};
+    let h = Harness::new();
+    h.add_secret("API", "copy-me-once", &[]);
+    let reveal = |purpose| Request::Reveal {
+        name: "API".into(),
+        notes: false,
+        purpose: Some(purpose),
+    };
+
+    // Denied: no value, and the dialog said what the value was wanted for.
+    h.decide(&[Decision::Deny]);
+    match h.call(&reveal(RevealPurpose::Copy)) {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+        _ => panic!("a denied reveal must be an error"),
+    }
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert_eq!(
+        request.summary,
+        "Copy the value of an entry to the clipboard?"
+    );
+    assert!(request.details.iter().any(|(k, v)| {
+        k == "Stated purpose (unverified)"
+            && v == "put the value on the clipboard for one paste, then clear it"
+    }));
+    assert!(request.warnings[0].contains("never into a chat with an AI"));
+    assert!(!request.can_remember);
+
+    // Allowed: the value, and an audit record that names the purpose.
+    h.decide(&[Decision::AllowOnce]);
+    match h.call(&reveal(RevealPurpose::Copy)) {
+        Response::Secret { value } => assert_eq!(value.as_str(), "copy-me-once"),
+        _ => panic!("an approved reveal must return the value"),
+    }
+    h.decide(&[Decision::AllowOnce]);
+    assert!(matches!(
+        h.call(&reveal(RevealPurpose::Show)),
+        Response::Secret { .. }
+    ));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert_eq!(request.summary, "Show the value of an entry on screen?");
+    let audit = h.audit_text();
+    assert!(audit.contains("value, to copy to the clipboard"));
+    assert!(audit.contains("value, to show"));
+    assert!(!audit.contains("copy-me-once"));
+
+    // Without a purpose (the CLI), the dialog is unchanged.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["reveal", "API"]);
+    assert_eq!(text(&out.stdout).trim(), "copy-me-once");
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert_eq!(request.summary, "Reveal the value of an entry?");
+    assert!(
+        !request
+            .details
+            .iter()
+            .any(|(k, _)| k == "Stated purpose (unverified)")
+    );
+}
+
+#[test]
 fn backups_are_written_and_verified() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);

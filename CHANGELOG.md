@@ -14,6 +14,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- `reveal` takes an optional `purpose` (`show` or `copy`): the approval
+  dialog asks the matching question, labels it as stated by the requester,
+  warns accordingly, and the audit record names it. Requests without it — the
+  CLI's — are unchanged.
+
 - `rusthorse-dialog`, Rusthorse's own dialog program (GTK 4 and libadwaita,
   [ADR 0006](docs/adr/0006-own-dialog-program.md)): approvals with the command
   in its own card and the details in two columns, content that scrolls while

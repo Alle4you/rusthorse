@@ -45,8 +45,8 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::exec;
 use crate::peer::Peer;
 use crate::protocol::{
-    self, EntryChanges, ErrorCode, ImportedEntry, NewEntry, Request, Response, RunRequest,
-    SecretString, StatusInfo, ValueChange,
+    self, EntryChanges, ErrorCode, ImportedEntry, NewEntry, Request, Response, RevealPurpose,
+    RunRequest, SecretString, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
@@ -403,7 +403,11 @@ impl Agent {
             Request::Import { entries, replace } => self.import(peer, entries, replace),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
-            Request::Reveal { name, notes } => self.reveal(peer, &name, notes),
+            Request::Reveal {
+                name,
+                notes,
+                purpose,
+            } => self.reveal(peer, &name, notes, purpose),
             Request::Backup { path } => self.backup(peer, &path),
             Request::Run(_) => Err(Failure::invalid("run requests carry file descriptors")),
         }
@@ -1150,7 +1154,13 @@ impl Agent {
         }))
     }
 
-    fn reveal(&self, peer: &Peer, name: &str, notes: bool) -> Result<Response, Failure> {
+    fn reveal(
+        &self,
+        peer: &Peer,
+        name: &str,
+        notes: bool,
+        purpose: Option<RevealPurpose>,
+    ) -> Result<Response, Failure> {
         let what = if notes { "notes" } else { "value" };
         let read = |v: &Vault, id| if notes { v.notes(id) } else { v.secret(id) };
         let generation = self.generation(peer)?;
@@ -1164,28 +1174,70 @@ impl Agent {
             }
             Ok(v.info(id))
         })?;
+        // The purpose is the requester's own statement: the dialog says so,
+        // and the warnings hold whatever the requester really does.
+        let (title, summary, stated, warning, audited) = match purpose {
+            None => (
+                "Rusthorse — reveal a secret",
+                format!("Reveal the {what} of an entry?"),
+                None,
+                format!(
+                    "The {what} will be printed by the requesting process. If an AI agent asked, it will see it and it may end up in its logs."
+                ),
+                what.to_string(),
+            ),
+            Some(RevealPurpose::Show) => (
+                "Rusthorse — show a secret",
+                format!("Show the {what} of an entry on screen?"),
+                Some(format!(
+                    "show the {what} in its own window for a short time"
+                )),
+                format!(
+                    "Anyone who can see your screen, and other programs of your desktop session, can see the {what} while it is shown."
+                ),
+                format!("{what}, to show"),
+            ),
+            Some(RevealPurpose::Copy) => (
+                "Rusthorse — copy a secret",
+                format!("Copy the {what} of an entry to the clipboard?"),
+                Some(format!(
+                    "put the {what} on the clipboard for one paste, then clear it"
+                )),
+                format!(
+                    "While the {what} is on the clipboard, other programs of your desktop session can read it, and a clipboard history may keep it. Paste it only where it belongs — never into a chat with an AI."
+                ),
+                format!("{what}, to copy to the clipboard"),
+            ),
+        };
+        let mut details = vec![
+            ("Entry".into(), info.identity()),
+            ("Reveals".into(), what.into()),
+        ];
+        if let Some(stated) = &stated {
+            details.push(("Stated purpose (unverified)".into(), stated.clone()));
+        }
+        details.push(("Requested by (unverified)".into(), peer.describe()));
         let request = ApprovalRequest {
-            title: "Rusthorse — reveal a secret".into(),
-            summary: format!("Reveal the {what} of an entry?"),
+            title: title.into(),
+            summary,
             explanation: format!(
                 "The program that asked receives the {what} in clear text and can do anything \
-                 with it."
+                 with it{}.",
+                if purpose.is_some() {
+                    ", whatever it says it will do"
+                } else {
+                    ""
+                }
             ),
             command: None,
-            details: vec![
-                ("Entry".into(), info.identity()),
-                ("Reveals".into(), what.into()),
-                ("Requested by (unverified)".into(), peer.describe()),
-            ],
+            details,
             facts: Vec::new(),
-            warnings: vec![format!(
-                "The {what} will be printed by the requesting process. If an AI agent asked, it will see it and it may end up in its logs."
-            )],
+            warnings: vec![warning],
             can_remember: false,
         };
         let event = AuditEvent::new("reveal", peer)
             .entries(vec![info.identity()])
-            .detail(what);
+            .detail(audited);
         self.approve(request, None, event)?;
         self.with_vault_at(generation, |v| {
             let id = v.find(&info.id)?;

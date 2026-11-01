@@ -11,7 +11,7 @@ Protocol version: **3** (`PROTOCOL_VERSION` in
 |---|---|
 | 1 | First design: descriptors passed for every `run`. Never released. |
 | 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
-| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. |
+| 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`, `reveal.purpose`. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -105,7 +105,7 @@ Every request is an object with a `type` field.
 | `import` | `entries` (array of `{entry, value}`), `replace` (bool) | `ok` |
 | `edit` | `name`, `changes` ([EntryChanges](#entrychanges)) | `ok` |
 | `remove` | `name` | `ok` |
-| `reveal` | `name`, `notes` (bool, optional) | `secret` |
+| `reveal` | `name`, `notes` (bool, optional), `purpose` (optional, see [Reveal](#reveal)) | `secret` |
 | `change_password` | — | `ok` |
 | `backup` | `path` (absolute, must not exist) | `ok` |
 | `run` | see [Run](#run) | `exited` |
@@ -129,6 +129,28 @@ carry `"generate": {"length": 32, "alphabet": "alnum"}` (alphabets `alnum`,
 `symbols`, `hex`; length 8–1024): the agent generates the value after
 approval. `change_password` makes the agent ask for the current and the new
 master password in its own dialogs.
+
+### Reveal
+
+```json
+{"type": "reveal", "name": "8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f", "notes": false, "purpose": "copy"}
+```
+
+`purpose` says what the client will do with the value:
+
+| `purpose` | Meaning | Dialog asks | Audit `detail` |
+|---|---|---|---|
+| absent | The client prints it (`rusthorse reveal`). | "Reveal the value of an entry?" | `value` |
+| `"show"` | It shows the value in its own window for a short time. | "Show the value of an entry on screen?" | `value, to show` |
+| `"copy"` | It puts the value on the clipboard for one paste, then clears it. | "Copy the value of an entry to the clipboard?" | `value, to copy to the clipboard` |
+
+(`notes` instead of `value` with `"notes": true`.) The purpose is the
+client's own statement: the agent cannot enforce it, the dialog labels it
+"Stated purpose (unverified)", and its warnings hold whatever the client
+does. An approval for one purpose is never remembered and never reused for
+another. The field was added within protocol 3: clients leave it out when
+they have no purpose to state, and an agent that predates it ignores it and
+shows the wording for printing.
 
 ### NewEntry
 
