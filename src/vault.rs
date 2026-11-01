@@ -178,6 +178,10 @@ pub struct Vault {
     /// old one (simulates another program saving at that moment).
     #[cfg(test)]
     before_rename: Option<SaveHook>,
+    /// Test hook: runs on a backup copy before it is verified (simulates
+    /// corruption on the way to the disk).
+    #[cfg(test)]
+    before_verify: Option<SaveHook>,
 }
 
 impl std::fmt::Debug for Vault {
@@ -211,6 +215,8 @@ impl Vault {
             discard_backup: false,
             #[cfg(test)]
             before_rename: None,
+            #[cfg(test)]
+            before_verify: None,
         };
         vault.write_file(false)?;
         Ok(vault)
@@ -248,6 +254,8 @@ impl Vault {
             discard_backup: false,
             #[cfg(test)]
             before_rename: None,
+            #[cfg(test)]
+            before_verify: None,
         })
     }
 
@@ -538,7 +546,7 @@ impl Vault {
     /// Copy the vault file, as it is on disk (encrypted), to `dest`, which
     /// must not exist; then decrypt the copy with the current master password
     /// to prove it is a usable backup. Returns the number of entries in it.
-    pub fn backup_to(&self, dest: &Path) -> Result<usize, VaultError> {
+    pub fn backup_to(&mut self, dest: &Path) -> Result<usize, VaultError> {
         let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
         if current != self.fingerprint {
             return Err(VaultError::ChangedOnDisk);
@@ -561,7 +569,16 @@ impl Vault {
             let _ = fs::remove_file(dest);
             return Err(e);
         }
-        let copy = Vault::open(dest, self.password.clone())?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_verify.take() {
+            hook(dest);
+        }
+        let copy = Vault::open(dest, self.password.clone()).map_err(|e| {
+            VaultError::Invalid(format!(
+                "the backup at {} was written but does not open ({e}); do not rely on it",
+                dest.display()
+            ))
+        })?;
         Ok(copy.entries().len())
     }
 
@@ -1023,6 +1040,25 @@ mod tests {
         ));
         let reopened = Vault::open(&path, secret("new passphrase here")).expect("open");
         assert!(reopened.find("x").is_ok());
+    }
+
+    #[test]
+    fn a_backup_that_does_not_open_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault.add(&entry("x"), &secret("abcd"), false).expect("add");
+        vault.save().expect("save");
+        let dest = dir.path().join("copy.kdbx");
+        vault.before_verify = Some(Box::new(|path: &Path| {
+            let mut bytes = fs::read(path).expect("read");
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xff;
+            fs::write(path, bytes).expect("corrupt");
+        }));
+        assert!(matches!(
+            vault.backup_to(&dest),
+            Err(VaultError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -479,3 +479,5 @@ gaps it listed:
 | Search, `open`, generated values, `doctor`, completions, protocol-version check | **Done.** |
 | Clipboard, lock on screen lock or suspend, man page, packages | **Later** (clipboard deliberately omitted on X11; see the roadmap). |
 | CI never ran; no rehearsal on the real desktop | **Open:** runs once the repository is published; the desktop rehearsal is the owner's first test. |
+| MSRV | The declared minimum Rust version (1.89) was checked with that toolchain. |
+| Coverage | A mutation run reverted each of 41 fixes in turn: 39 make the suite fail (one only after a test that corrupts a backup before it is verified was added); the two not caught are the ones described in the sixth table. |
