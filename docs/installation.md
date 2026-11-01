@@ -10,12 +10,13 @@ uninstalling.
 |---|---|
 | Linux with systemd user services | Tested on Linux Mint 22.3 (Ubuntu 24.04 base). |
 | A graphical session (X11 or Wayland) | The agent shows its dialogs on your desktop. |
-| `zenity` | Tested with 3.44. Install with `sudo apt install zenity`. |
-| Rust 1.89 or newer | Only to build. Install with [rustup](https://rustup.rs). |
+| GTK 4.12 and libadwaita 1.4 or newer (recommended) | For `rusthorse-dialog`, Rusthorse's own dialogs: Ubuntu 24.04, Linux Mint 22, Fedora 39, Debian 13 and later. |
+| `zenity` | The fallback when `rusthorse-dialog` is not installed. Tested with 3.44. Install with `sudo apt install zenity`. |
+| Rust 1.89 or newer (1.92 for `rusthorse-dialog`) | Only to build. Install with [rustup](https://rustup.rs). |
 | A Secret Service provider (optional) | Only for `rusthorse import secret-service` (GNOME Keyring, KWallet). |
 
-Rusthorse does not need root, does not use Flatpak or Snap, and installs a
-single binary.
+Rusthorse does not need root, does not use Flatpak or Snap, and installs two
+binaries: `rusthorse` and, if your system has GTK 4, `rusthorse-dialog`.
 
 ## 1. Build and install
 
@@ -30,11 +31,27 @@ cargo install --locked --path .
 Or directly:
 
 ```sh
-cargo install --locked --git https://github.com/Alle4you/rusthorse
+cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse
 ```
 
 Both put the binary at `~/.cargo/bin/rusthorse`. Check it with
 `rusthorse --version`.
+
+Then install `rusthorse-dialog`, the program that shows the agent's dialogs
+([ADR 0006](adr/0006-own-dialog-program.md)). It needs the GTK 4 and
+libadwaita development packages to build:
+
+```sh
+sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config     # Debian, Ubuntu, Mint
+sudo dnf install gtk4-devel libadwaita-devel pkgconf-pkg-config  # Fedora
+
+cargo install --locked --path dialog      # from the clone
+# or: cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-dialog
+```
+
+It must sit next to `rusthorse` (both in `~/.cargo/bin`): the agent looks for
+it there and nowhere else. Without it, the agent shows its dialogs with
+zenity. `rusthorse doctor` says which one the agent uses.
 
 AI agents usually run commands in non-interactive shells, which on many
 distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds

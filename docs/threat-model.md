@@ -109,7 +109,7 @@ The boundary that matters is between **requesters** and the **agent**.
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
 | P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). | A1 |
 | P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). The one exception is `rusthorse init`, which reads the password of a *new* vault in the CLI (terminal or dialog) before any agent is involved. | A1, A2 (not on X11, L2) |
-| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field), or be too tall to read at once (estimated for an 11-point font), are refused, never truncated; only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
+| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. | A1, A2 |
@@ -233,8 +233,10 @@ make part of itself bold or tiny, and only ordinary characters (ASCII, Latin
 letters, a little punctuation) are drawn as themselves: everything else —
 line separators, invisible and combining characters, other scripts such as
 the Cyrillic `а` that looks like a Latin `a`, emoji — appears as a `\u{…}`
-escape. Requests whose dialog would be too tall to read at once are refused,
-by an estimate made for an 11-point font; larger fonts or a smaller screen
+escape. `rusthorse-dialog` scrolls a long request and keeps Allow disabled
+until its end has been in view — which does not prove it was read; with
+zenity, requests whose dialog would be too tall to read at once are refused,
+by an estimate made for an 11-point font, and larger fonts or a smaller screen
 can still make a dialog taller than the screen. ASCII itself has characters
 some fonts draw alike (`l`, `I`, `1`). The requester chain is made of process
 names any program can choose — the dialog labels it "unverified".
@@ -378,11 +380,8 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - **One cgroup per approved command** (L17), with resource limits.
 - **Bounded KDF parameters** before unlocking (L12).
 - **Per-entry policies**: restrict an entry to listed programs or hosts.
-- **Rusthorse's own dialog program** instead of zenity
-  ([ADR 0006](adr/0006-own-dialog-program.md), accepted): a separate GTK 4
-  process started like zenity, plain text only, scrolling content with fixed
-  buttons, and approval disabled until the whole request has been shown;
-  later, a grants panel to inspect and revoke remembered approvals.
+- **A grants panel** in `rusthorse-dialog`, to inspect and revoke remembered
+  approvals (and, later, broker tokens).
 - **A "waiting for your answer" hint** in the terminal while a dialog is
   open, driven by an explicit event from the agent.
 - Signed release artifacts.

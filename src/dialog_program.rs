@@ -532,7 +532,25 @@ mod tests {
         program
     }
 
+    /// Run a fake program just written. Running a file right after writing
+    /// it fails with "Text file busy" while a process forked by another test
+    /// still holds the writing descriptor (until its exec); only tests run
+    /// programs they have just written, so only they retry.
     fn run(program: &Path, id: &str, deadline: Duration) -> anyhow::Result<Reply> {
+        let busy = |e: &anyhow::Error| {
+            e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error)
+                    == Some(nix::libc::ETXTBSY)
+            })
+        };
+        for _ in 0..50 {
+            match exchange(program, &[], &request(id), Instant::now() + deadline) {
+                Err(e) if busy(&e) => std::thread::sleep(Duration::from_millis(20)),
+                other => return other,
+            }
+        }
         exchange(program, &[], &request(id), Instant::now() + deadline)
     }
 

@@ -25,7 +25,7 @@ flowchart LR
 
     CLI -- "Unix socket: JSON messages<br/>+ data frames (input, output)" --> H
     H --> P
-    P -- "zenity dialogs" --> U
+    P -- "dialogs (rusthorse-dialog,<br/>or zenity)" --> U
     P --> V
     V <-- "decrypt / encrypt" --> F
     P -- "spawn" --> C
@@ -34,7 +34,7 @@ flowchart LR
     P --> L
 ```
 
-There are two programs in one binary:
+There are two programs in one binary, and a third, optional one:
 
 - **The agent** (`rusthorse agent`) runs for the whole desktop session. It is
   the only component that decrypts the vault, sees secret values, shows
@@ -43,13 +43,15 @@ There are two programs in one binary:
   arguments into one request, sends it over the socket, prints the response
   and exits. It never handles the master password, and for `run` it never
   handles secret values.
+- **`rusthorse-dialog`** (GTK 4 and libadwaita, built separately) shows one
+  dialog for the agent and exits. Without it, the agent uses zenity.
 
 ## Process model
 
 ```mermaid
 flowchart TB
     systemd["systemd --user"] --> agent["rusthorse agent<br/>(non-dumpable)"]
-    agent --> zenity["zenity (dialogs)"]
+    agent --> dialog["rusthorse-dialog, or zenity<br/>(one process per dialog)"]
     agent --> cmd["approved command<br/>(own process group)"]
     terminal["terminal / AI agent"] --> shell["shell"] --> cli["rusthorse run …"]
     cli -. "socket + fds" .-> agent
@@ -63,8 +65,9 @@ flowchart TB
   other process of the same user and disables core dumps.
 - Approved commands are children of the agent, in their own process group.
   The caller's shell cannot attach to them with a debugger either.
-- Dialogs are separate `zenity` processes started by the agent. The caller
-  cannot answer them through its terminal.
+- Dialogs are separate processes started by the agent — `rusthorse-dialog`,
+  or zenity when it is not installed. The caller cannot answer them through
+  its terminal.
 
 ## Lifecycle of a `run` request
 
@@ -73,7 +76,7 @@ sequenceDiagram
     autonumber
     participant C as rusthorse run (caller)
     participant A as agent
-    participant Z as zenity
+    participant Z as dialog
     participant X as approved command
 
     C->>A: connect; Run{bindings, argv, cwd, env, redact} (fds 0,1,2 only with --no-redact)
@@ -258,21 +261,18 @@ background thread checks the idle timeout every second.
 
 ### Dialogs
 
-zenity is run from `/usr/bin` (or `/usr/local/bin`), never through `PATH`,
-with `/` as its working directory and only the display, locale and D-Bus
-variables in its environment. Its answer is read from a socket pair rather
-than a pipe, because other processes of the same user can open a pipe through
-`/proc/<pid>/fd` but not a socket. Text for the entry dialog has backslashes
-and underscores escaped. The question dialog is laid out with Pango markup —
-a headline, an explanation, one block per detail, the facts in one quieter
-line, the warnings in bold. It uses no colour or icon of its own, only
-options zenity 3 and 4 share, so it follows the desktop's theme. The password
-and value prompts stay plain entry dialogs, where Enter submits. Only an exit
-status of 0 with no output (Allow once), or 1 with the exact label of the
-extra button (Allow for N), counts as approval.
+The agent shows its dialogs with `rusthorse-dialog`, Rusthorse's own GTK 4
+program ([ADR 0006](adr/0006-own-dialog-program.md)), and with zenity only
+when that program is not installed. Both are separate processes started from
+an absolute path, with `/` as working directory and a minimal environment,
+and both answer through a socket pair rather than a pipe, because other
+processes of the same user can open a pipe through `/proc/<pid>/fd` but not
+a socket. Default **Deny**, a timeout that denies, and only exact, expected
+answers approve, in both.
 
-Dialogs draw only characters whose glyphs are predictable: printable ASCII,
-the letters of Latin-1 and Latin Extended-A (accented letters of European
+Every string a dialog shows goes through `ui::dialog_text` first. Dialogs
+draw only characters whose glyphs are predictable: printable ASCII, the
+letters of Latin-1 and Latin Extended-A (accented letters of European
 languages) except look-alikes of ASCII (`×`, `÷`, `ı`, `Ĳ`, `ĳ`, `ĸ`, `ŉ`,
 `ſ`), and the punctuation of Rusthorse's own texts. Every other character —
 controls, line and paragraph separators, invisible and combining characters,
@@ -280,26 +280,63 @@ other scripts, emoji — is shown as a `\u{…}` escape, so nothing a requester
 sends can hide, reorder or overlap other text, letters of other scripts cannot
 pass for Latin ones, and what is drawn has a known width. (Text that literally
 contains `\u{…}` looks the same as an escape; the reader must assume the
-character it names.) Then `&`, `<`, `>`, quotes and the backslash become character
-references (the backslash as `&#92;`, which reads the same whether or not
-zenity processes escape sequences), so a value can neither add a tag nor be
-changed. Tests check both.
+character it names.)
 
-A request whose dialog text would exceed 4000 characters — counting the room
-reserved for the "Allow for" note — or whose dialog would be too tall to read
-at once is refused rather than shown truncated. The height is estimated in
-pixels for an 11-point interface font at 96 DPI: details are monospaced (every
-character the same width; one outside ASCII counted twice), warnings, which
-may quote the requester, are measured as if every character were a bold "W",
-and lines are wrapped word by word as Pango does, so text built from words
-just over half a line long is counted as the line per word it really takes.
-The content may take at most 880 pixels, leaving 200 for the title bar,
-buttons and a desktop panel on a 1080-pixel screen. In the dialogs measured
-with the real renderer (Sans 11, nearly two thousand built to be as tall as
-possible), the real height stayed below the estimate, by 1 to 60 per cent.
-Larger fonts, a higher scale or a smaller screen make dialogs taller than
-estimated. `import`
-splits large imports into batches whose names take at most 24 lines.
+**`rusthorse-dialog`.** The agent looks for it in the directory of its own
+executable only, and uses it if — after resolving links — it is a regular,
+executable file owned by the user or root that nobody else can modify. If
+the agent's own executable was replaced since it started, it shows no dialog
+until restarted. The program gets one end of a socket pair as standard input
+and output: the agent sends one length-framed JSON request (at most 64 KiB:
+version, a random identifier, the dialog's texts) and closes its sending
+side; the program answers with one frame (at most 8 KiB) carrying the same
+version and identifier, and exits. An approval needs that one well-formed
+answer, end of stream and a clean exit, all within one deadline (the dialog
+timeout plus 5 seconds); after it the agent kills the program and counts the
+dialog as unanswered. Anything else — a crash, a partial, oversized or
+contradictory answer, a failure after answering — is an error, never an
+approval. Its environment holds only the session's display, D-Bus and locale
+variables (and the X authority file, resolved before `HOME` changes), with
+`HOME` and the XDG directories pointing to a new `0700` directory removed
+after the dialog, and in-memory GSettings: no per-user GTK configuration,
+style sheet or setting can restyle the dialog or enable the GTK Inspector.
+The program refuses a request of another version, or with text that is not
+drawable as it is, before showing anything. It shows every string as plain
+text — no markup — in a window whose content scrolls while the buttons stay
+in view; when the content does not fit, **Allow** stays disabled until its end
+has been in view once (an obligation to reach the end, not proof of reading).
+Selectable text takes the keyboard focus, so the end can be reached without a
+mouse.
+
+**zenity.** zenity is run from `/usr/bin` (or `/usr/local/bin`), never
+through `PATH`. Text for the entry dialog has backslashes and underscores
+escaped. The question dialog is laid out with Pango markup — a headline, an
+explanation, one block per detail, the facts in one quieter line, the
+warnings in bold — after `&`, `<`, `>`, quotes and the backslash become
+character references (the backslash as `&#92;`, which reads the same whether
+or not zenity processes escape sequences), so a value can neither add a tag
+nor be changed. It uses no colour or icon of its own, only options zenity 3
+and 4 share. Only an exit status of 0 with no output (Allow once), or 1 with
+the exact label of the extra button (Allow for N), counts as approval.
+
+zenity's dialogs cannot scroll, and their buttons sit below the content, so
+with zenity a request whose dialog would be too tall to read at once is
+refused rather than shown truncated. The height is estimated in pixels for an
+11-point interface font at 96 DPI: details are monospaced (every character
+the same width; one outside ASCII counted twice), warnings, which may quote
+the requester, are measured as if every character were a bold "W", and lines
+are wrapped word by word as Pango does, so text built from words just over
+half a line long is counted as the line per word it really takes. The content
+may take at most 880 pixels, leaving 200 for the title bar, buttons and a
+desktop panel on a 1080-pixel screen. In the dialogs measured with the real
+renderer (Sans 11, nearly two thousand built to be as tall as possible), the
+real height stayed below the estimate, by 1 to 60 per cent. Larger fonts, a
+higher scale or a smaller screen make dialogs taller than estimated.
+
+With either program, a request whose dialog text would exceed 4000
+characters (counting the room reserved for the "Allow for" note) is refused,
+and `import` splits large imports into batches whose names take at most 24
+lines.
 
 ## Audit log
 
@@ -319,7 +356,10 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/vault.rs`](../src/vault.rs) | KDBX4 access, field mapping, atomic saves. |
 | [`src/protocol.rs`](../src/protocol.rs) | Request and response types, framing, fd passing. |
 | [`src/client.rs`](../src/client.rs) | Client side of the protocol; relays a `run`'s input and output. |
-| [`src/ui.rs`](../src/ui.rs) | The `Ui` trait and the zenity implementation. |
+| [`src/ui.rs`](../src/ui.rs) | The `Ui` trait, `dialog_text`, and the zenity implementation. |
+| [`src/dialog_program.rs`](../src/dialog_program.rs) | Finding, starting and supervising `rusthorse-dialog`; falling back to zenity. |
+| [`src/dialog_protocol.rs`](../src/dialog_protocol.rs) | The protocol between the agent and `rusthorse-dialog`. |
+| [`dialog/`](../dialog) | `rusthorse-dialog`, the GTK 4 dialog program, and its tests on a virtual display. |
 | [`src/exec.rs`](../src/exec.rs) | Program resolution and environment cleaning for `run`. |
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |
 | [`src/peer.rs`](../src/peer.rs) | Peer credentials and the requester process chain. |

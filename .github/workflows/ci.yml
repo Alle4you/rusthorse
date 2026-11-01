@@ -35,6 +35,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  dialog:
+    name: rusthorse-dialog (GTK 4)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: GTK 4, libadwaita and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config xvfb xdotool
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p rusthorse-dialog --all-targets
+      - name: Tests (widgets on Xvfb)
+        run: cargo test -p rusthorse-dialog
+
   msrv:
     name: minimum supported Rust version
     runs-on: ubuntu-24.04

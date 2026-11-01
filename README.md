@@ -93,13 +93,17 @@ and keeps the value out of the agent's reach in the common case.
 
 ## Quick start
 
-Requirements: Linux with a graphical session (X11 or Wayland), `zenity`,
-systemd user services, and Rust 1.89 or newer. Full instructions, including
+Requirements: Linux with a graphical session (X11 or Wayland), systemd user
+services, GTK 4 and libadwaita for Rusthorse's own dialogs (or `zenity`), and
+Rust 1.92 or newer (1.89 without the dialogs). Full instructions, including
 uninstalling, are in [docs/installation.md](docs/installation.md).
 
 ```sh
-# 1. Build and install the binary into ~/.cargo/bin
-cargo install --locked --git https://github.com/Alle4you/rusthorse
+# 1. Build and install the binaries into ~/.cargo/bin
+cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse
+#    and Rusthorse's own dialogs (without them, the agent uses zenity)
+sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
+cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-dialog
 
 # 2. Start the agent as a systemd user service
 curl -fsSLo ~/.config/systemd/user/rusthorse-agent.service --create-dirs \
@@ -197,9 +201,8 @@ The main direction is a **credential broker**: instead of the secret, an
 approved command receives a short-lived token that only works through
 Rusthorse, and the agent uses the real credential on its behalf — an HTTP
 proxy for APIs, an `ssh-agent` for SSH keys, then database connectors. The
-key never enters the client process at all. Also planned: an in-process
-interface instead of zenity, locking on screen lock and suspend, packaged
-releases. Details, status and reasons are in [docs/roadmap.md](docs/roadmap.md).
+key never enters the client process at all. Also planned: locking on screen
+lock and suspend, packaged releases. Details, status and reasons are in [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
 

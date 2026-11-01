@@ -11,6 +11,12 @@ keywords = ["secrets", "password-manager", "keepass", "ai-agents", "cli"]
 categories = ["command-line-utilities", "authentication"]
 exclude = ["/.github"]
 
+[workspace]
+# `rusthorse-dialog` (dialog/) needs GTK 4 and libadwaita to build; plain
+# `cargo build` and `cargo test` here build `rusthorse` only.
+members = [".", "dialog"]
+default-members = ["."]
+
 [features]
 default = ["secret-service"]
 # `rusthorse import secret-service`: read items from GNOME Keyring / KWallet

@@ -219,7 +219,8 @@ All fields are optional; omitted fields are left unchanged.
   "remembered_approvals": 1,
   "agent_executable": "/home/me/.cargo/bin/rusthorse",
   "agent_executable_id": [66306, 1835012],
-  "agent_executable_replaced": false
+  "agent_executable_replaced": false,
+  "dialogs": "/home/me/.cargo/bin/rusthorse-dialog"
 }
 ```
 
@@ -235,6 +236,9 @@ identity, not by the ` (deleted)` the kernel appends to the name, which a
 real file name could also end with; it is left out when the agent cannot tell
 (for example, without permission to examine the path), as is
 `agent_executable_id` when the agent cannot read its own identity.
+`dialogs` names what shows the agent's dialogs: the path of
+`rusthorse-dialog`, `zenity` when that program is not installed, or `none: `
+followed by why neither can be used; agents that predate it leave it out.
 Clients should check `protocol_version` and refuse to continue on a mismatch.
 
 ### EntryInfo

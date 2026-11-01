@@ -56,7 +56,15 @@ cargo test --all-features
 cargo test --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo +1.89 check --all-targets    # MSRV; CI runs the same
+
+# rusthorse-dialog (dialog/): needs libgtk-4-dev and libadwaita-1-dev; its
+# widget tests run on a virtual display (xvfb, xdotool), never on yours.
+cargo clippy -p rusthorse-dialog --all-targets -- -D warnings
+cargo test -p rusthorse-dialog
 ```
+
+The workspace's default member is `rusthorse`, so plain `cargo` commands do
+not build the dialog program; `cargo fmt --all` formats both.
 
 The MSRV is **1.89**: do not use newer standard-library APIs, and avoid APIs
 deprecated in newer releases whose replacements 1.89 lacks (for example
@@ -87,11 +95,13 @@ Breaking one of these is a security bug, whatever the tests say.
    `\u{…}`. Never truncate what the human approves: refuse a request whose
    dialog is too long or too tall (`MAX_DIALOG_CHARS`, `MAX_DETAIL_CHARS`,
    `ui::metrics::MAX_HEIGHT`).
-6. **Dialogs stay portable**: pass only zenity options that zenity 3 and 4
-   both have (no `--icon-name`), and use no colours or icons of our own, so
-   they follow the desktop's theme. Verified on zenity 3.44, dark and light.
-   The planned dialog program ([ADR 0006](docs/adr/0006-own-dialog-program.md))
-   uses libadwaita's styles and only the theme's standard icons.
+6. **Dialogs stay portable and plain.** `rusthorse-dialog`
+   ([ADR 0006](docs/adr/0006-own-dialog-program.md)) shows plain text only
+   (no markup), uses libadwaita's styles and only the theme's standard icons,
+   keeps Allow disabled until the end of the content has been reached, and
+   writes nothing to standard output but its one answer. With zenity: only
+   options that zenity 3 and 4 both have (no `--icon-name`), no colours or
+   icons of our own. Verified on zenity 3.44 and GTK 4.14, dark and light.
 7. **Error contract** (protocol 3): every error other than `outcome_unknown`
    means the vault file was not changed and no command was started. Clients
    treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
@@ -174,7 +184,9 @@ present and capture only its window, in a dark and a light theme
 | Path | What |
 |---|---|
 | `src/agent.rs` | The agent: policy, approvals, dialogs, `run` |
-| `src/ui.rs` | Dialogs, `dialog_text`, markup, height estimate |
+| `src/ui.rs` | The `Ui` trait, `dialog_text`, zenity dialogs and their height estimate |
+| `src/dialog_program.rs`, `src/dialog_protocol.rs` | Driving `rusthorse-dialog`; the protocol between them |
+| `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |

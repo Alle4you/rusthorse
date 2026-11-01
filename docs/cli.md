@@ -89,8 +89,10 @@ rusthorse status [--json]
 ```
 
 Shows the agent version, the vault path, whether it is locked, when it will
-lock itself, how many approvals are remembered and the program file the agent
-runs (with a note if it was replaced since the agent started).
+lock itself, how many approvals are remembered, which program shows its
+dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why) and
+the program file the agent runs (with a note if it was replaced since the
+agent started).
 
 ## `rusthorse unlock` / `rusthorse lock`
 
@@ -366,11 +368,15 @@ speaks the same protocol version and runs the same program file as this
 own `/proc/self/exe`, not by name, so this says "same file", not "same source
 code" (an agent still running a file that was since replaced or removed is an
 error: restart it; a different file, or one that cannot be compared, is a
-warning) —
-the systemd service is enabled, zenity
-is installed, the session type (X11 is reported as a warning — see the threat
-model), Yama `ptrace_scope`, the vault's format and permissions, and the
-socket directory's permissions. Exits with status 1 if anything failed.
+warning) — which program shows the agent's dialogs (`rusthorse-dialog` next
+to the agent's executable, checked as the agent checks it and by running
+`rusthorse-dialog --check`, which opens no window and reports its version and
+protocol; missing is a warning, since zenity then shows the dialogs; unusable
+or incompatible is an error), the systemd service is enabled, zenity is
+installed (only a warning when `rusthorse-dialog` is), the session type (X11
+is reported as a warning — see the threat model), Yama `ptrace_scope`, the
+vault's format and permissions, and the socket directory's permissions. Exits
+with status 1 if anything failed.
 
 ## `rusthorse completions`
 

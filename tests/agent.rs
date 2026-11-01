@@ -2593,8 +2593,11 @@ fn descriptors_on_other_requests_are_rejected() {
 fn read_only_requests_do_not_keep_the_vault_unlocked() {
     let h = Harness::with_idle_timeout(Duration::from_secs(2));
     h.add_secret("T", "abcdefgh", &[]);
+    // Polls until the vault locks: 2 seconds of idle time plus the agent's
+    // one-second check, with room for a slow, busy machine. If `list` kept
+    // the vault unlocked, it would never lock.
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(4) {
+    while started.elapsed() < Duration::from_secs(15) {
         let _ = h.run(&["list"]);
         std::thread::sleep(Duration::from_millis(300));
         let status = h.run(&["status", "--json"]);

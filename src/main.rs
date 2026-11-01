@@ -1352,6 +1352,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
     let mut vault = paths::vault();
     let mut audit = paths::audit_log();
     let mut where_from = "the default location (the agent is not reachable)";
+    let mut dialog_program = false;
     match client.call(&Request::Status) {
         Ok(Response::Status(info)) => {
             vault = PathBuf::from(&info.vault);
@@ -1377,7 +1378,9 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                 info.agent_executable_replaced,
                 info.agent_executable_id,
             ));
-            checks.push(dialog_check(&info.agent_executable));
+            let dialogs = dialog_check(&info.agent_executable);
+            dialog_program = matches!(dialogs, Check::Ok(_));
+            checks.push(dialogs);
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
                     "no vault at {} — run `rusthorse init`",
@@ -1415,13 +1418,19 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
         .any(|p| std::path::Path::new(p).is_file())
     {
         checks.push(Check::Ok("zenity is installed".into()));
+    } else if dialog_program {
+        checks.push(Check::Warn(
+            "zenity, the fallback when rusthorse-dialog is missing, is not installed".into(),
+        ));
     } else {
         checks.push(Check::Fail(
             "zenity is not installed — `sudo apt install zenity`".into(),
         ));
     }
     match std::env::var("XDG_SESSION_TYPE").as_deref() {
-        Ok("wayland") => checks.push(Check::Ok("Wayland session: other programs cannot click dialogs".into())),
+        Ok("wayland") => checks.push(Check::Ok(
+            "Wayland session: other programs cannot synthesize input into dialogs (accessibility tools still can: threat model L2)".into(),
+        )),
         Ok("x11") => checks.push(Check::Warn(
             "X11 session: any program of your user can click \"Allow\" or read keystrokes (threat model L2)".into(),
         )),

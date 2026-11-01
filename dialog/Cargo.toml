@@ -1,0 +1,29 @@
+[package]
+name = "rusthorse-dialog"
+version = "0.1.0"
+edition = "2024"
+# The GTK bindings need a newer Rust than `rusthorse` itself (1.89).
+rust-version = "1.92"
+description = "The dialogs of the Rusthorse agent: approvals and password prompts (GTK 4 + libadwaita)."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Alle4you/rusthorse"
+readme = "../README.md"
+publish = false
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_4"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+rusthorse = { path = "..", default-features = false }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+serde = "1.0.229"
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+unwrap_used = "warn"
