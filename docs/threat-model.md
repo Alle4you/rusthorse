@@ -282,6 +282,15 @@ A descendant that started a new session or group (`setsid`, `setpgid`)
 escapes this and keeps the secret in its environment; stopping the agent's
 systemd service kills all of them (cgroup). *Planned:* one cgroup per command.
 
+### L19 — A connected client that does not read holds the request open
+
+Output is delivered like in a pipeline: while the requester stays connected,
+the agent waits for it to read, however long that takes, and keeps the copy
+of the secret values that the redactor needs. The command itself has already
+been terminated (L17). The request ends as soon as the requester reads its
+output or disconnects; a requester that does neither only ties up one of the
+agent's 64 connections.
+
 ### L18 — Forwarded input races the end of the command
 
 With `run --stdin`, the agent forwards the requester's input while the command
@@ -340,6 +349,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Initial threat model, written with the first implementation. | — |
 | 2026-10-31 | Adversarial design and code review (AI-assisted, Codex). | See below. |
 | 2026-10-31 | Second review of the code and of the fixes (AI-assisted, Codex). | See the second table. |
+| 2026-10-31 | Third review: verification of the second round (AI-assisted, Codex). | See the third table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -374,9 +384,21 @@ Findings of the second review (of the code after the fixes above):
 | N4 — a protected `Title` was disclosed | **Fixed:** shown as `[protected title]`, matched only by UUID (P1). |
 | N5 — two entries with the same title in different groups looked identical in dialogs | **Fixed:** entries are shown as `Group/Title (uuid)` in dialogs and the audit log (P7). |
 | N6 — descriptors still leaked when the open-file limit truncated a message | **Fixed:** the control buffer is parsed directly and every installed descriptor is owned and closed. |
-| N7 — stdin forwarding consumed input after the command ended and could block | **Fixed:** stdin is `/dev/null` unless `--stdin`; forwarding stops before reading and never blocks; residual race documented (L18). |
+| N7 — stdin forwarding consumed input after the command ended and could block | **Fixed:** stdin is `/dev/null` unless `--stdin`; forwarding stops before reading; residual race documented (L18). (The claim that forwarding "never blocks" made here was wrong; see N12 in the third review.) |
 | N8 — descendants in the same process group survived | **Fixed:** the group is terminated when the command ends or the client disconnects; `setsid` escapes documented (L17). |
 | N9 — an unwritable audit log failed the unlock but left the vault open | **Fixed:** recorded before publishing (P12). |
 | N10 — per-field limits did not bound the whole dialog | **Fixed:** whole-dialog limit (P7). |
 | N11 — the request timeout was per read, so a slow drip could exceed it | **Fixed:** a deadline for the whole request (P13). |
 | Tests did not fail when several fixes were reverted | **Fixed:** new tests for each fix. A mutation run then reverted each of the 15 fixes in turn; the test suite failed every time (tests now have deadlines, so a regression that hangs fails instead of blocking). |
+
+Findings of the third review (verification of the second round; N1–N6, N9 and
+N11 were confirmed fixed):
+
+| Finding | Disposition |
+|---|---|
+| N7 (partial) — the input worker could stay blocked in `read` if another process drained the requester's input | **Mitigated:** it holds no secrets and is no longer waited for indefinitely. |
+| N8 (partial) / N13 — a process whose name is not UTF-8 made `/proc` parsing fail, and the group was then treated as dead and not signalled | **Fixed:** `/proc` is parsed as bytes; anything that cannot be inspected counts as alive. |
+| N10 (partial) — the "Allow for" note was added after the length check; the unlock prompt was not checked | **Fixed:** room is reserved for the note; the unlock prompt is checked. |
+| N12 — writing to a client descriptor that was not being read blocked the request even after the client left | **Fixed:** writes never block indefinitely (sockets with `MSG_DONTWAIT`, other descriptors in `PIPE_BUF` chunks after `poll`), and a disconnect aborts them at once. A connected client that does not read still holds the request (L19). |
+| N14 — the `SCM_RIGHTS` control buffer was a byte vector, not aligned for `cmsghdr` (undefined behaviour with an unusual allocator) | **Fixed:** u64-backed buffers on receive *and* send. The test written for this showed that `nix`'s own `sendmsg` has the same latent problem, so Rusthorse no longer uses it. |
+| Coverage — reverting only the `_` variable in the approval key passed all tests | **Fixed:** dedicated test; a mutation run reverting each of 21 fixes in turn is described in the commit history. |

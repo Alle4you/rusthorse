@@ -109,7 +109,14 @@ sequenceDiagram
 
 When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
-left of the command's process group and `SIGKILL` three seconds later. The
+left of the command's process group and `SIGKILL` three seconds later.
+
+Output is forwarded like in a pipeline: the agent waits for the caller to
+read, however slowly. Writes to the caller's descriptors never block
+indefinitely — the agent cannot set `O_NONBLOCK` on them, because that flag
+is shared with the caller, so it writes sockets with `MSG_DONTWAIT` and
+anything else in chunks of at most `PIPE_BUF` (4096) bytes after `poll`
+reports them writable — which lets a disconnect stop every worker at once. The
 leader is reaped only afterwards, so its process group id cannot be reused by
 an unrelated process while it is being signalled.
 
@@ -240,7 +247,8 @@ than a pipe, because other processes of the same user can open a pipe through
 and underscores escaped; the question dialog uses `--no-markup`. Only an exit
 status of 0 with no output (Allow once), or 1 with the exact label of the
 extra button (Allow for N), counts as approval. A request whose dialog text
-would exceed 4000 characters is refused rather than shown truncated.
+would exceed 4000 characters — counting the room reserved for the "Allow
+for" note — is refused rather than shown truncated.
 
 ## Audit log
 

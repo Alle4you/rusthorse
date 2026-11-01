@@ -76,4 +76,14 @@ From the second review (of the code after those fixes):
   when it exits.
 - Whole-dialog length limit; a real deadline for receiving requests.
 
+From the third review:
+
+- Writes to the requester's output never block indefinitely and stop at once
+  when it disconnects; slow readers still get all output.
+- `/proc` is parsed as bytes: processes with non-UTF-8 names are terminated
+  with their group.
+- `SCM_RIGHTS` control buffers are aligned for `cmsghdr` on receive and
+  send; `nix::sys::socket::sendmsg` is no longer used.
+- The dialog limit counts the "Allow for" note; the unlock prompt is checked.
+
 [Unreleased]: https://github.com/Alle4you/rusthorse/commits/main
