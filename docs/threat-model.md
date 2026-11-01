@@ -107,7 +107,7 @@ The boundary that matters is between **requesters** and the **agent**.
 | P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap in the instant between that check and the start of the program, and changes to file *contents*, are not prevented (L4). | A1, A2 |
 | P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. Reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
-| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent and filtered before being written to the requester's descriptors; its stdin is `/dev/null`, or an agent-owned pipe with `run --stdin`. The requester's own descriptors never reach the command, so a writable "stdin" cannot be used as a way back. Exact-match only (L5). | A1 |
+| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). | A1 |
 | P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). The one exception is `rusthorse init`, which reads the password of a *new* vault in the CLI (terminal or dialog) before any agent is involved. | A1, A2 (not on X11, L2) |
 | P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal; zenity runs from an absolute path with a minimal environment and `/` as working directory; requester-controlled text is escaped (control, bidirectional and zero-width characters; backslashes and underscores for zenity's entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field) are refused, never truncated; default button **Deny**; unanswered dialogs are denied; only exact, expected zenity results count as approval. | A1, A2 (not on X11, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
@@ -278,6 +278,8 @@ that command your full access. The dialog states this.
 When the command exits — or the requester disconnects first — every remaining
 process in its process group is terminated (SIGTERM, then SIGKILL after 3
 seconds), so background jobs started by the command do not keep the secret.
+A process counts as alive while any of its threads is (its main thread may
+already have exited).
 A descendant that started a new session or group (`setsid`, `setpgid`)
 escapes this and keeps the secret in its environment; stopping the agent's
 systemd service kills all of them (cgroup). *Planned:* one cgroup per command.
@@ -286,15 +288,17 @@ systemd service kills all of them (cgroup). *Planned:* one cgroup per command.
 
 Output is delivered like in a pipeline: while the requester stays connected,
 the agent waits for it to read, however long that takes, and keeps the copy
-of the secret values that the redactor needs. The command itself has already
-been terminated (L17). The request ends as soon as the requester reads its
-output or disconnects; a requester that does neither only ties up one of the
-agent's 64 connections.
+of the secret values that the redactor needs. Meanwhile the command may
+itself be blocked writing its output, exactly as it would be in a pipeline
+whose reader stopped. The request ends as soon as the requester reads its
+output or disconnects (a write to a socket whose peer is gone fails at once);
+a requester that does neither ties up one of the agent's 64 connections.
 
 ### L18 — Forwarded input races the end of the command
 
-With `run --stdin`, the agent forwards the requester's input while the command
-runs. Input typed in the instant the command finishes may be read and lost
+With `run --stdin`, the `rusthorse run` process reads its own stdin and sends
+it to the agent while the command runs. Input typed in the instant the command
+finishes may be read by `rusthorse run` — which exits right after — and lost
 instead of reaching the next program that reads the terminal. Without
 `--stdin` (the default), the requester's input is never read.
 
@@ -350,6 +354,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-10-31 | Adversarial design and code review (AI-assisted, Codex). | See below. |
 | 2026-10-31 | Second review of the code and of the fixes (AI-assisted, Codex). | See the second table. |
 | 2026-10-31 | Third review: verification of the second round (AI-assisted, Codex). | See the third table. |
+| 2026-10-31 | Fourth review: verification of the third round (AI-assisted, Codex). | See the fourth table. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -402,3 +407,18 @@ N11 were confirmed fixed):
 | N12 — writing to a client descriptor that was not being read blocked the request even after the client left | **Fixed:** writes never block indefinitely (sockets with `MSG_DONTWAIT`, other descriptors in `PIPE_BUF` chunks after `poll`), and a disconnect aborts them at once. A connected client that does not read still holds the request (L19). |
 | N14 — the `SCM_RIGHTS` control buffer was a byte vector, not aligned for `cmsghdr` (undefined behaviour with an unusual allocator) | **Fixed:** u64-backed buffers on receive *and* send. The test written for this showed that `nix`'s own `sendmsg` has the same latent problem, so Rusthorse no longer uses it. |
 | Coverage — reverting only the `_` variable in the approval key passed all tests | **Fixed:** dedicated test; a mutation run reverting each of 21 fixes in turn is described in the commit history. |
+
+Findings of the fourth review (verification of the third round; N10, N13 and
+N14 were confirmed fixed):
+
+| Finding | Disposition |
+|---|---|
+| N15 — a concurrent writer could fill the requester's pipe between `poll` and `write`, so a write the agent made could still block after a disconnect; the same applied to the input worker's reads | **Fixed by design:** with redaction the agent no longer reads or writes the requester's descriptors at all. Output and input travel as data frames over the agent's own socket, whose writes fail at once when the peer goes away; `rusthorse run` relays them to its own stdio. |
+| N7 / N12 (partial) — a detached input worker could consume input after the result | **Fixed:** there is no input worker in the agent any more; `rusthorse run` reads its own stdin only with `--stdin` and exits right after the result (L18). |
+| N16 — a process whose main thread called `pthread_exit()` shows as a zombie while other threads run, so it was not signalled | **Fixed:** a process counts as alive while any thread in `/proc/<pid>/task` is (L17). |
+| Docs overclaimed that writes never block and that the command is always already terminated in L19 | **Fixed** (architecture, L19). |
+
+While implementing this round, a test caught that `nix`'s `PollFd::revents()`
+returns nothing at all when the kernel reports a bit `nix` does not name
+(`POLLRDHUP`), which made disconnects invisible; the agent relies on
+`POLLHUP` instead.

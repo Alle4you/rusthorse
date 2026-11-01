@@ -18,25 +18,40 @@ Protocol version: **1** (`PROTOCOL_VERSION` in
 
 ## Framing
 
+There are two kinds of frame, told apart by the top bit of the length word:
+
 ```
-+----------------------+---------------------------+
-| length: u32, big end | body: `length` bytes JSON |
-+----------------------+---------------------------+
+message frame:  | 0 | length: 31 bits | body: `length` bytes of JSON         |
+data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
+                  └── length word: u32, big-endian
 ```
 
-- The body is a UTF-8 JSON object, at most 4 MiB.
-- A `run` request carries exactly three file descriptors — the client's
-  stdin, stdout and stderr, in that order — as `SCM_RIGHTS` ancillary data on
-  the **first byte** of the frame (send the whole frame with one `sendmsg`
-  call; if it is short, write the rest normally). Any other request that
-  carries descriptors is rejected with `invalid_request`.
+- A **message** body is a UTF-8 JSON object, at most 4 MiB. Requests and
+  responses are messages.
+- A **data** frame carries part of a running command's input or output, at
+  most 64 KiB of data. Channel `0` is the command's stdin (client → agent;
+  an empty data frame means end of input), `1` its stdout and `2` its stderr
+  (agent → client). Data frames are only valid during a `run` with
+  redaction, and never carry file descriptors.
+- A `run` request **without redaction** carries exactly three file
+  descriptors — the client's stdin, stdout and stderr, in that order — as
+  `SCM_RIGHTS` ancillary data on the **first byte** of the frame (send the
+  whole frame with one `sendmsg` call; if it is short, write the rest
+  normally). A `run` with redaction carries none: its input and output travel
+  as data frames, so the agent never touches the client's own descriptors.
+  Any request with the wrong number of descriptors is rejected with
+  `invalid_request`.
 - The whole request must arrive within 10 seconds of connecting (a deadline,
   not a per-read timeout). The agent handles
   at most 64 connections at a time and refuses (with `denied`) requests when
   8 are already waiting for the human.
 - While a `run` request is in progress, the client must keep the connection
-  open and must not send anything. Closing it makes the agent terminate the
-  command.
+  open. With redaction the agent sends the command's output as data frames
+  (channels 1 and 2) and finally the `exited` (or `error`) message; the
+  client writes the data to its own stdout and stderr. If `forward_stdin` is
+  set, the client sends its input as channel-0 data frames, then an empty one
+  at end of input; otherwise it sends nothing. Closing the connection makes
+  the agent terminate the command.
 
 ## Requests
 
@@ -129,9 +144,9 @@ All fields are optional; omitted fields are left unchanged.
   the resolved program path and `cwd` must each fit in 1000 characters.
 - With `redact: true`, the command's stdin is `/dev/null` unless
   `forward_stdin` is `true` (optional, default `false`), in which case the
-  agent reads the client's stdin descriptor and forwards it. The agent only
-  writes to the stdout and stderr descriptors. With `redact: false`, the three
-  descriptors are given to the command as they are.
+  agent feeds it from the client's channel-0 data frames. With
+  `redact: false`, the three descriptors sent with the request are given to
+  the command as they are.
 
 ## Responses
 

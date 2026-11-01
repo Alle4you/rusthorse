@@ -38,7 +38,6 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, killpg};
-use nix::sys::socket::MsgFlags;
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::{Pid, getuid};
 
@@ -919,9 +918,24 @@ impl Agent {
         run: RunRequest,
         fds: Vec<OwnedFd>,
     ) -> Result<Response, Failure> {
-        let [stdin, stdout, stderr]: [OwnedFd; 3] = fds.try_into().map_err(|_| {
-            Failure::invalid("run needs exactly three file descriptors (stdin, stdout, stderr)")
-        })?;
+        // With redaction the agent never touches the client's own descriptors:
+        // output and input travel over this connection as data frames, and the
+        // client writes its stdout and reads its stdin itself. Without
+        // redaction, the client hands its three descriptors to the command.
+        let client_fds: Option<[OwnedFd; 3]> = if run.redact {
+            if !fds.is_empty() {
+                return Err(Failure::invalid(
+                    "with redaction, run requests carry no file descriptors",
+                ));
+            }
+            None
+        } else {
+            Some(fds.try_into().map_err(|_| {
+                Failure::invalid(
+                    "run without redaction needs exactly three file descriptors (stdin, stdout, stderr)",
+                )
+            })?)
+        };
         if run.argv.is_empty() {
             return Err(Failure::invalid("empty command"));
         }
@@ -1133,27 +1147,25 @@ impl Agent {
         for (var, _, value) in &secrets {
             command.env(var, value.as_str());
         }
-        // With redaction, the command gets only descriptors owned by the
-        // agent: a descriptor passed as "stdin" may be writable (a socket or a
-        // terminal), which would be an unfiltered way back to the client. Its
-        // input is /dev/null unless forwarding was requested.
-        let mut client_stdin = None;
-        let mut destinations = None;
-        if run.redact {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            if run.forward_stdin {
-                command.stdin(Stdio::piped());
-                client_stdin = Some(stdin);
-            } else {
-                command.stdin(Stdio::null());
-                drop(stdin);
+        // With redaction the command gets only pipes owned by the agent (and
+        // /dev/null as input unless forwarding was requested).
+        match client_fds {
+            Some([stdin, stdout, stderr]) => {
+                command
+                    .stdin(Stdio::from(stdin))
+                    .stdout(Stdio::from(stdout))
+                    .stderr(Stdio::from(stderr));
             }
-            destinations = Some((stdout, stderr));
-        } else {
-            command
-                .stdin(Stdio::from(stdin))
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
+            None => {
+                command
+                    .stdin(if run.forward_stdin {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            }
         }
         let mut child = command.spawn().map_err(|e| {
             Failure::new(
@@ -1174,38 +1186,42 @@ impl Agent {
         let finished = Arc::new(AtomicBool::new(false));
 
         let mut pumps = Vec::new();
-        if let Some((out_dest, err_dest)) = destinations {
+        if run.redact {
+            // Output frames from both workers go through one lock, so frames
+            // never interleave.
+            let writer = Arc::new(Mutex::new(
+                stream
+                    .try_clone()
+                    .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?,
+            ));
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
                 .map(|(_, entry, value)| (entry.clone(), value.as_bytes().to_vec()))
                 .collect();
             let make = || Redactor::new(labels.iter().map(|(l, s)| (l.as_str(), s.as_slice())));
-            for (from, to) in [
-                (child.stdout.take().map(OwnedFd::from), out_dest),
-                (child.stderr.take().map(OwnedFd::from), err_dest),
+            for (channel, from) in [
+                (protocol::STDOUT, child.stdout.take().map(OwnedFd::from)),
+                (protocol::STDERR, child.stderr.take().map(OwnedFd::from)),
             ] {
                 if let Some(from) = from {
                     let redactor = make();
+                    let writer = Arc::clone(&writer);
                     let (done, abort) = (Arc::clone(&leader_done), Arc::clone(&abort));
-                    pumps.push(thread::spawn(move || pump(from, to, redactor, done, abort)));
+                    pumps.push(thread::spawn(move || {
+                        pump(from, channel, writer, redactor, done, abort)
+                    }));
                 }
             }
             for (_, mut bytes) in labels {
                 zeroize::Zeroize::zeroize(&mut bytes);
             }
         }
-        let input_worker = match (client_stdin, child.stdin.take()) {
-            (Some(from), Some(to)) => {
-                let (done, abort) = (Arc::clone(&leader_done), Arc::clone(&abort));
-                Some(thread::spawn(move || pump_stdin(from, to, done, abort)))
-            }
-            _ => None,
-        };
+        let child_stdin = child.stdin.take();
         drop(secrets);
 
         let watcher = stream.try_clone().ok().map(|s| {
             let (abort, finished) = (Arc::clone(&abort), Arc::clone(&finished));
-            thread::spawn(move || watch_client(s, pid, abort, finished))
+            thread::spawn(move || watch_client(s, pid, child_stdin, abort, finished))
         });
 
         // Wait for the leader to exit without reaping it.
@@ -1220,17 +1236,12 @@ impl Agent {
         terminate_group(pid);
         leader_done.store(true, Ordering::SeqCst);
         // Output workers hold the secrets (in their redactors). They finish
-        // when the remaining output is delivered, or at once if the client
-        // disconnects; a client that stays connected without reading keeps
+        // when the remaining output has been sent, or at once if the client
+        // disconnects (a write to a socket whose peer has gone fails
+        // immediately); a client that stays connected without reading keeps
         // them waiting, exactly as a pipeline would (threat model L19).
         for pump in pumps {
             let _ = pump.join();
-        }
-        // The input worker holds no secrets. It normally ends within 100 ms;
-        // if another reader drained the client's input between `poll` and
-        // `read`, it stays blocked in `read` and is left to end on its own.
-        if let Some(worker) = input_worker {
-            join_within(worker, Duration::from_secs(1));
         }
         finished.store(true, Ordering::SeqCst);
         if let Some(watcher) = watcher {
@@ -1286,15 +1297,35 @@ fn group_alive(pgid: Pid) -> bool {
             Err(_) => return true,
         };
         match parse_stat_group(&stat) {
-            Some((state, pgrp)) => {
-                if pgrp == pgid.as_raw() && state != b'Z' && state != b'X' {
+            Some((state, pgrp)) if pgrp == pgid.as_raw() => {
+                if state != b'Z' && state != b'X' {
+                    return true;
+                }
+                // A thread-group leader that called pthread_exit() shows as a
+                // zombie while its other threads keep running.
+                if has_live_threads(&entry.path()) {
                     return true;
                 }
             }
+            Some(_) => {}
             None => return true,
         }
     }
     false
+}
+
+/// Whether any thread of the process at `/proc/<pid>` is not a zombie.
+/// Uninspectable threads count as live.
+fn has_live_threads(proc_dir: &Path) -> bool {
+    let Ok(tasks) = std::fs::read_dir(proc_dir.join("task")) else {
+        return false;
+    };
+    tasks
+        .flatten()
+        .any(|task| match std::fs::read(task.path().join("stat")) {
+            Ok(stat) => !matches!(parse_stat_group(&stat), Some((b'Z' | b'X', _))),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        })
 }
 
 /// The state letter and process group from a `/proc/<pid>/stat` line:
@@ -1326,146 +1357,6 @@ fn terminate_group(pgid: Pid) {
         thread::sleep(Duration::from_millis(50));
     }
     let _ = killpg(pgid, Signal::SIGKILL);
-}
-
-/// Wait up to `limit` for a thread; after that, leave it running detached.
-fn join_within(handle: thread::JoinHandle<()>, limit: Duration) {
-    let deadline = Instant::now() + limit;
-    while !handle.is_finished() {
-        if Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    let _ = handle.join();
-}
-
-/// Largest write that `poll` guarantees not to block on a pipe.
-const PIPE_BUF: usize = 4096;
-
-/// A descriptor received from the client, written in a way that never blocks
-/// indefinitely and can be abandoned when the client goes away. Its file
-/// status flags are shared with the client, so `O_NONBLOCK` is never set on
-/// it; instead sockets are written with `MSG_DONTWAIT`, and anything else in
-/// chunks of at most `PIPE_BUF` bytes once `poll` reports it writable (which
-/// cannot block on a pipe).
-struct ClientOutput {
-    file: File,
-    socket: bool,
-}
-
-impl ClientOutput {
-    fn new(fd: OwnedFd) -> Self {
-        use nix::sys::stat::{SFlag, fstat};
-        let socket = fstat(&fd)
-            .map(|st| SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFSOCK)
-            .unwrap_or(false);
-        Self {
-            file: File::from(fd),
-            socket,
-        }
-    }
-
-    fn write_all(&mut self, mut data: &[u8], abort: &AtomicBool) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        while !data.is_empty() {
-            if abort.load(Ordering::SeqCst) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            let mut fds = [PollFd::new(self.file.as_fd(), PollFlags::POLLOUT)];
-            match poll(&mut fds, PollTimeout::from(100u16)) {
-                Ok(0) | Err(Errno::EINTR) => continue,
-                Ok(_) => {}
-                Err(e) => return Err(e.into()),
-            }
-            let chunk = &data[..data.len().min(PIPE_BUF)];
-            let written = if self.socket {
-                match nix::sys::socket::send(
-                    self.file.as_raw_fd(),
-                    chunk,
-                    MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-                ) {
-                    Ok(n) => n,
-                    Err(Errno::EAGAIN | Errno::EINTR) => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            } else {
-                match self.file.write(chunk) {
-                    Ok(n) => n,
-                    Err(e)
-                        if e.kind() == io::ErrorKind::WouldBlock
-                            || e.kind() == io::ErrorKind::Interrupted =>
-                    {
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
-            if written == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            data = &data[written..];
-        }
-        Ok(())
-    }
-}
-
-/// Forward the client's input to the command's stdin pipe until either side
-/// ends, the command has finished or the client went away. Our end of the
-/// pipe is non-blocking (it is not shared with anyone).
-fn pump_stdin(
-    from: OwnedFd,
-    to: std::process::ChildStdin,
-    leader_done: Arc<AtomicBool>,
-    abort: Arc<AtomicBool>,
-) {
-    let stopped = || leader_done.load(Ordering::SeqCst) || abort.load(Ordering::SeqCst);
-    let mut from = File::from(from);
-    let mut to = File::from(OwnedFd::from(to));
-    if fcntl(&to, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err() {
-        return;
-    }
-    let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
-    while !stopped() {
-        let mut fds = [PollFd::new(from.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut fds, PollTimeout::from(100u16)) {
-            Ok(0) | Err(Errno::EINTR) => continue,
-            Ok(_) => {}
-            Err(_) => return,
-        }
-        // Checked again right before reading, so that input typed after the
-        // command finished is left for whoever reads the terminal next.
-        if stopped() {
-            return;
-        }
-        let n = match from.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(e)
-                if e.kind() == io::ErrorKind::Interrupted
-                    || e.kind() == io::ErrorKind::WouldBlock =>
-            {
-                continue;
-            }
-            Err(_) => return,
-        };
-        let mut data = &buf[..n];
-        while !data.is_empty() {
-            if stopped() {
-                return;
-            }
-            match to.write(data) {
-                Ok(0) => return,
-                Ok(written) => data = &data[written..],
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let mut fds = [PollFd::new(to.as_fd(), PollFlags::POLLOUT)];
-                    let _ = poll(&mut fds, PollTimeout::from(100u16));
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return,
-            }
-        }
-    }
 }
 
 fn ok(message: impl Into<String>) -> Response {
@@ -1565,19 +1456,26 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
     out
 }
 
-/// Copy a command's output to the client's descriptor, redacting secrets.
+/// Send a command's output to the client as data frames, redacting secrets.
 /// Ends at end-of-file; once the command is done, also when the pipe stays
 /// quiet for 500 ms (only a descendant that escaped the process group can
 /// still hold it open); and at once when the client disconnects.
 fn pump(
     from: OwnedFd,
-    to: OwnedFd,
+    channel: u8,
+    writer: Arc<Mutex<UnixStream>>,
     mut redactor: Redactor,
     leader_done: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
 ) {
+    let send = |data: &[u8]| -> io::Result<()> {
+        let stream = writer.lock().unwrap_or_else(|p| p.into_inner());
+        for chunk in data.chunks(protocol::MAX_DATA_LEN) {
+            protocol::send_data(&stream, channel, chunk)?;
+        }
+        Ok(())
+    };
     let mut from = File::from(from);
-    let mut to = ClientOutput::new(to);
     let mut buf = zeroize::Zeroizing::new(vec![0u8; 16 * 1024]);
     let mut quiet_since: Option<Instant> = None;
     loop {
@@ -1603,9 +1501,10 @@ fn pump(
             Ok(0) => break,
             Ok(n) => {
                 let out = redactor.push(&buf[..n]);
-                if to.write_all(&out, &abort).is_err() {
-                    // The reader went away. Dropping `from` gives the command
+                if !out.is_empty() && send(&out).is_err() {
+                    // The client went away. Dropping `from` gives the command
                     // SIGPIPE on its next write, as with a normal pipe.
+                    abort.store(true, Ordering::SeqCst);
                     return;
                 }
             }
@@ -1613,26 +1512,105 @@ fn pump(
             Err(_) => break,
         }
     }
-    let _ = to.write_all(&redactor.finish(), &abort);
+    let rest = redactor.finish();
+    if !rest.is_empty() {
+        let _ = send(&rest);
+    }
 }
 
-/// Terminate the command's process group and stop all workers if the client
-/// disconnects before the request has finished.
-fn watch_client(stream: UnixStream, pgid: Pid, abort: Arc<AtomicBool>, finished: Arc<AtomicBool>) {
-    let mut buf = [0u8; 64];
+/// Watch the connection while the command runs: forward input frames to the
+/// command's stdin (when forwarding was requested), and terminate the
+/// command's process group and stop all workers if the client disconnects.
+/// The command's stdin pipe belongs to the agent, so it is made non-blocking:
+/// a command that stops reading cannot block this thread.
+fn watch_client(
+    stream: UnixStream,
+    pgid: Pid,
+    child_stdin: Option<std::process::ChildStdin>,
+    abort: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+) {
+    let mut stdin = child_stdin.map(|s| File::from(OwnedFd::from(s)));
+    if let Some(file) = &stdin
+        && fcntl(file, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err()
+    {
+        stdin = None;
+    }
+    let mut pending = zeroize::Zeroizing::new(Vec::new());
+    let disconnected = |abort: &AtomicBool| {
+        abort.store(true, Ordering::SeqCst);
+        terminate_group(pgid);
+    };
     while !finished.load(Ordering::SeqCst) {
-        let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut fds, PollTimeout::from(200u16)) {
-            Ok(0) | Err(Errno::EINTR) => continue,
-            Ok(_) => match (&stream).read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    abort.store(true, Ordering::SeqCst);
-                    terminate_group(pgid);
+        // Read the next frame only once the previous input was delivered.
+        // A disconnect is still reported meanwhile: when the peer of a Unix
+        // stream socket closes, poll() sets POLLHUP whatever was requested.
+        // (Not POLLRDHUP: nix's `revents()` returns None for bits it does not
+        // know, which would hide every event.)
+        let socket_events = if pending.is_empty() {
+            PollFlags::POLLIN
+        } else {
+            PollFlags::empty()
+        };
+        let wants_write = !pending.is_empty() && stdin.is_some();
+        let (socket_ready, stdin_ready) = {
+            let mut fds = vec![PollFd::new(stream.as_fd(), socket_events)];
+            if let (true, Some(file)) = (wants_write, &stdin) {
+                fds.push(PollFd::new(file.as_fd(), PollFlags::POLLOUT));
+            }
+            match poll(&mut fds, PollTimeout::from(200u16)) {
+                Ok(0) | Err(Errno::EINTR) => continue,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            (
+                fds[0].revents().unwrap_or(PollFlags::empty()),
+                fds.get(1)
+                    .and_then(|f| f.revents())
+                    .unwrap_or(PollFlags::empty()),
+            )
+        };
+        if socket_ready.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+            disconnected(&abort);
+            return;
+        }
+        if socket_ready.contains(PollFlags::POLLIN) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            match protocol::recv_any_before(&stream, Some(deadline)) {
+                Ok(protocol::Frame::Data(protocol::STDIN, data)) => {
+                    if data.is_empty() {
+                        stdin = None; // end of input: the command sees EOF
+                    } else if stdin.is_some() {
+                        pending = data;
+                    }
+                }
+                // Anything else from the client is ignored.
+                Ok(_) => {}
+                Err(_) => {
+                    disconnected(&abort);
                     return;
                 }
-                Ok(_) => {}
-            },
-            Err(_) => return,
+            }
+        }
+        if stdin_ready.contains(PollFlags::POLLOUT)
+            && let Some(file) = &mut stdin
+        {
+            match file.write(&pending) {
+                Ok(n) => {
+                    pending.drain(..n);
+                }
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    // The command closed its input.
+                    stdin = None;
+                    pending.clear();
+                }
+            }
+        } else if stdin_ready.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+            stdin = None;
+            pending.clear();
         }
     }
 }

@@ -27,7 +27,7 @@ terminal.
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
-| other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`). |
+| other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141 when the output of `rusthorse run` itself was closed). |
 
 Messages go to standard error; data (listings, JSON, revealed values) goes to
 standard output.
@@ -198,10 +198,15 @@ command itself, in the requested directory, with your environment minus
 `LD_*` variables plus the secrets. Unless `--no-redact` is given, the command's
 standard output and error are pipes owned by the agent, and every occurrence
 of a secret value (4 characters or longer) in them is replaced with
-`[REDACTED:<entry>]`; its standard input is `/dev/null`, unless `--stdin`
-asks the agent to forward yours. Programs therefore see pipes rather than a
-terminal. With `--no-redact`, the command gets the caller's descriptors
-directly (including stdin).
+`[REDACTED:<entry>]` before the agent sends the output back to
+`rusthorse run`, which prints it. The command's standard input is
+`/dev/null`, unless `--stdin` makes `rusthorse run` forward yours. Programs
+therefore see pipes rather than a terminal. With `--no-redact`, the command
+gets the caller's descriptors directly (including stdin).
+
+If the output of `rusthorse run` is closed early (for example
+`rusthorse run … | head`), it stops the command and exits with status 141,
+like a program killed by `SIGPIPE`.
 
 When the command exits, anything it left running in its process group (for
 example `sleep 30 &`) is terminated; if `rusthorse run` is interrupted before

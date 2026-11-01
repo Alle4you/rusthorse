@@ -86,4 +86,15 @@ From the third review:
   send; `nix::sys::socket::sendmsg` is no longer used.
 - The dialog limit counts the "Allow for" note; the unlock prompt is checked.
 
+From the fourth review:
+
+- With redaction, the agent no longer touches the requester's descriptors:
+  output and input travel as data frames over the socket and `rusthorse run`
+  relays them to its own stdio (protocol: data frames; descriptors only for
+  `--no-redact`).
+- `rusthorse run` exits with 141 and stops the command when its own output is
+  closed.
+- A process whose main thread exited while other threads run is terminated
+  with its group.
+
 [Unreleased]: https://github.com/Alle4you/rusthorse/commits/main

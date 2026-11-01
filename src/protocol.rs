@@ -28,6 +28,20 @@ pub const MAX_FDS: usize = 3;
 /// The kernel's limit on descriptors per `SCM_RIGHTS` message.
 const SCM_MAX_FD: usize = 253;
 
+/// Set in a frame's length word to mark a *data* frame (see [`send_data`]).
+pub const DATA_FLAG: u32 = 0x8000_0000;
+
+/// Largest payload of one data frame, in bytes.
+pub const MAX_DATA_LEN: usize = 64 * 1024;
+
+/// Data channel: the command's standard input (client → agent). An empty
+/// data frame on this channel means end of input.
+pub const STDIN: u8 = 0;
+/// Data channel: the command's standard output (agent → client).
+pub const STDOUT: u8 = 1;
+/// Data channel: the command's standard error (agent → client).
+pub const STDERR: u8 = 2;
+
 /// A string holding secret material; its heap buffer is wiped on drop.
 pub type SecretString = Zeroizing<String>;
 
@@ -479,18 +493,58 @@ fn send_raw(stream: &UnixStream, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
     writer.flush()
 }
 
-/// Read one frame. Returns its body and any file descriptors attached to it.
+/// Send one data frame: a length word with [`DATA_FLAG`] set, one channel
+/// byte, then `data`. Used for the input and output of `run` with redaction,
+/// so that the agent never writes to (or reads from) the client's own
+/// descriptors. The frame is written with a single `write_all`; callers that
+/// share a socket between threads must serialize their calls.
+pub fn send_data(stream: &UnixStream, channel: u8, data: &[u8]) -> io::Result<()> {
+    if data.len() > MAX_DATA_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data frame too large",
+        ));
+    }
+    let mut frame = Vec::with_capacity(5 + data.len());
+    frame.extend_from_slice(&(DATA_FLAG | (1 + data.len() as u32)).to_be_bytes());
+    frame.push(channel);
+    frame.extend_from_slice(data);
+    let mut writer = stream;
+    writer.write_all(&frame)
+}
+
+/// A frame of either kind.
+pub enum Frame {
+    /// A JSON message, with any file descriptors attached to it.
+    Message(Zeroizing<Vec<u8>>, Vec<OwnedFd>),
+    /// A data frame: channel and payload.
+    Data(u8, Zeroizing<Vec<u8>>),
+}
+
+/// Read one message frame. Returns its body and any file descriptors
+/// attached to it. A data frame here is a protocol error.
 pub fn recv_frame(stream: &UnixStream) -> io::Result<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)> {
     recv_frame_before(stream, None)
 }
 
-/// Read one frame, failing with [`io::ErrorKind::TimedOut`] if the whole
-/// frame has not arrived by `deadline`. (A per-read timeout would let a client
-/// that sends one byte at a time hold the connection indefinitely.)
+/// Read one message frame, failing with [`io::ErrorKind::TimedOut`] if the
+/// whole frame has not arrived by `deadline`. (A per-read timeout would let a
+/// client that sends one byte at a time hold the connection indefinitely.)
 pub fn recv_frame_before(
     stream: &UnixStream,
     deadline: Option<Instant>,
 ) -> io::Result<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)> {
+    match recv_any_before(stream, deadline)? {
+        Frame::Message(body, fds) => Ok((body, fds)),
+        Frame::Data(..) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected data frame",
+        )),
+    }
+}
+
+/// Read one frame of either kind, by `deadline` if one is given.
+pub fn recv_any_before(stream: &UnixStream, deadline: Option<Instant>) -> io::Result<Frame> {
     let arm = || -> io::Result<()> {
         if let Some(deadline) = deadline {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -515,11 +569,24 @@ pub fn recv_frame_before(
         arm()?;
         got += read_some(&mut reader, &mut header[got..])?;
     }
-    let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_FRAME_LEN {
+    let word = u32::from_be_bytes(header);
+    let is_data = word & DATA_FLAG != 0;
+    let len = (word & !DATA_FLAG) as usize;
+    let limit = if is_data {
+        MAX_DATA_LEN + 1
+    } else {
+        MAX_FRAME_LEN
+    };
+    if len > limit || (is_data && len == 0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame of {len} bytes exceeds the {MAX_FRAME_LEN}-byte limit"),
+            format!("frame of {len} bytes is invalid (limit {limit})"),
+        ));
+    }
+    if is_data && !fds.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file descriptors attached to a data frame",
         ));
     }
     let mut body = Zeroizing::new(vec![0u8; len]);
@@ -531,7 +598,13 @@ pub fn recv_frame_before(
     if deadline.is_some() {
         stream.set_read_timeout(None)?;
     }
-    Ok((body, fds))
+    if is_data {
+        let channel = body[0];
+        let data = Zeroizing::new(body[1..].to_vec());
+        Ok(Frame::Data(channel, data))
+    } else {
+        Ok(Frame::Message(body, fds))
+    }
 }
 
 /// One `read`, treating end-of-file as an error and retrying on `EINTR`.
@@ -742,6 +815,39 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         drop(b);
         let _ = writer.join();
+    }
+
+    #[test]
+    fn data_frames_round_trip_and_are_told_apart_from_messages() {
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        send_data(&a, STDOUT, b"hello").expect("send");
+        send_data(&a, STDIN, b"").expect("send eof");
+        send_frame(
+            &a,
+            &Response::Ok {
+                message: "done".into(),
+            },
+            &[],
+        )
+        .expect("send");
+        match recv_any_before(&b, None).expect("recv") {
+            Frame::Data(STDOUT, data) => assert_eq!(data.as_slice(), b"hello"),
+            _ => panic!("expected stdout data"),
+        }
+        match recv_any_before(&b, None).expect("recv") {
+            Frame::Data(STDIN, data) => assert!(data.is_empty()),
+            _ => panic!("expected end of input"),
+        }
+        assert!(matches!(
+            recv_any_before(&b, None).expect("recv"),
+            Frame::Message(..)
+        ));
+        // A data frame where a request is expected is an error.
+        send_data(&a, STDOUT, b"x").expect("send");
+        assert_eq!(
+            recv_frame(&b).err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
     }
 
     #[test]

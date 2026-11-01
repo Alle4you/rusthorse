@@ -23,14 +23,14 @@ flowchart LR
     U(("you"))
     F[("vault.kdbx")]
 
-    CLI -- "Unix socket: JSON frame<br/>+ stdin/stdout/stderr (SCM_RIGHTS)" --> H
+    CLI -- "Unix socket: JSON messages<br/>+ data frames (input, output)" --> H
     H --> P
     P -- "zenity dialogs" --> U
     P --> V
     V <-- "decrypt / encrypt" --> F
     P -- "spawn" --> C
     C -- "stdout / stderr pipes" --> R
-    R -- "redacted output, written to the caller's fds" --> CLI
+    R -- "redacted output as data frames;<br/>the CLI writes its own stdout" --> CLI
     P --> L
 ```
 
@@ -53,7 +53,7 @@ flowchart TB
     agent --> cmd["approved command<br/>(own process group)"]
     terminal["terminal / AI agent"] --> shell["shell"] --> cli["rusthorse run …"]
     cli -. "socket + fds" .-> agent
-    cmd -. "inherits the caller's<br/>stdin, stdout, stderr" .-> cli
+    cmd -. "pipes owned by the agent<br/>(the caller's own fds only with --no-redact)" .-> cli
 ```
 
 - The agent is started by systemd, so it is **not** a descendant of the
@@ -76,7 +76,7 @@ sequenceDiagram
     participant Z as zenity
     participant X as approved command
 
-    C->>A: connect; Run{bindings, argv, cwd, env, redact} + fds 0,1,2
+    C->>A: connect; Run{bindings, argv, cwd, env, redact} (fds 0,1,2 only with --no-redact)
     A->>A: SO_PEERCRED: same uid? read process chain
     alt vault locked
         A->>Z: master password dialog
@@ -95,10 +95,10 @@ sequenceDiagram
     A->>X: spawn with env + secrets; stdout, stderr = agent-owned pipes;<br/>stdin = /dev/null (or a pipe with --stdin)
     loop while running
         opt run --stdin
-            C-->>A: caller's input (fd 0), forwarded to the command's stdin pipe
+            C-->>A: the CLI reads its own stdin and sends it as data frames
         end
         X-->>A: output
-        A-->>C: redacted output, written to the caller's fds 1 and 2
+        A-->>C: redacted output as data frames; the CLI writes it to its stdout/stderr
     end
     X-->>A: exit (not yet reaped)
     A->>A: terminate what is left of its process group, join all workers, reap
@@ -111,14 +111,20 @@ When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
 left of the command's process group and `SIGKILL` three seconds later.
 
-Output is forwarded like in a pipeline: the agent waits for the caller to
-read, however slowly. Writes to the caller's descriptors never block
-indefinitely — the agent cannot set `O_NONBLOCK` on them, because that flag
-is shared with the caller, so it writes sockets with `MSG_DONTWAIT` and
-anything else in chunks of at most `PIPE_BUF` (4096) bytes after `poll`
-reports them writable — which lets a disconnect stop every worker at once. The
-leader is reaped only afterwards, so its process group id cannot be reused by
-an unrelated process while it is being signalled.
+The leader is reaped only afterwards, so its process group id cannot be
+reused by an unrelated process while it is being signalled. A process whose
+main thread has exited while other threads still run counts as alive.
+
+With redaction, the agent never touches the caller's own descriptors. It
+sends the redacted output over the connection as data frames, and the
+`rusthorse run` process writes them to its stdout and stderr (and, with
+`--stdin`, reads its own stdin and sends it on). Output is delivered like in a
+pipeline: while the caller stays connected, the agent waits for it to read,
+however slowly. The only thing the agent writes is its own socket, so when
+the caller goes away a pending write fails at once and every worker stops. If
+the caller's stdout is closed (`| head`), `rusthorse run` closes the
+connection — which stops the command — and exits with status 141, like a
+process killed by `SIGPIPE`.
 
 ## Policy
 
@@ -265,7 +271,7 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/agent.rs`](../src/agent.rs) | The agent: socket server, policy, unlock, approvals, `run`. |
 | [`src/vault.rs`](../src/vault.rs) | KDBX4 access, field mapping, atomic saves. |
 | [`src/protocol.rs`](../src/protocol.rs) | Request and response types, framing, fd passing. |
-| [`src/client.rs`](../src/client.rs) | Client side of the protocol. |
+| [`src/client.rs`](../src/client.rs) | Client side of the protocol; relays a `run`'s input and output. |
 | [`src/ui.rs`](../src/ui.rs) | The `Ui` trait and the zenity implementation. |
 | [`src/exec.rs`](../src/exec.rs) | Program resolution and environment cleaning for `run`. |
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |

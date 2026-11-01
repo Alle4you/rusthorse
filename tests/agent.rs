@@ -511,7 +511,10 @@ fn client_disconnect_kills_the_command() {
     let _ = client.wait();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Path::new(&format!("/proc/{pid}")).exists() {
-        assert!(Instant::now() < deadline, "the command outlived its client");
+        if Instant::now() >= deadline {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            panic!("the command outlived its client: {stat}");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -921,6 +924,115 @@ fn the_dialog_limit_counts_the_remember_note() {
 }
 
 #[test]
+fn a_process_whose_main_thread_exited_is_still_terminated() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: python3 not available");
+        return;
+    }
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("mt.pid");
+    // The main thread exits with pthread_exit(); another thread keeps the
+    // process alive, so /proc shows the leader as a zombie.
+    let program = format!(
+        "import ctypes, os, threading, time\n\
+         open({:?}, 'w').write(str(os.getpid()))\n\
+         threading.Thread(target=time.sleep, args=(30,)).start()\n\
+         ctypes.CDLL(None).pthread_exit(None)\n",
+        pidfile.display().to_string()
+    );
+    let mut client = h
+        .cmd(&["run", "T", "--", "python3", "-c", &program])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = wait_for_pid(&pidfile);
+    std::thread::sleep(Duration::from_millis(300));
+    client.kill().expect("kill client");
+    let _ = client.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{pid}/task")).exists() && threads_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "a thread of the command outlived its client"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn descriptors_go_with_unredacted_runs_only() {
+    use rusthorse::protocol::{
+        Binding, ErrorCode, Request, Response, RunRequest, read_message, send_frame,
+    };
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    let request = |redact: bool| {
+        Request::Run(RunRequest {
+            bindings: vec![Binding {
+                var: "T".into(),
+                entry: "T".into(),
+            }],
+            argv: vec!["true".into()],
+            cwd: "/".into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            redact,
+            forward_stdin: false,
+        })
+    };
+    let devnull = std::fs::File::open("/dev/null").expect("devnull");
+    let fd = devnull.as_fd();
+    for (redact, fds) in [(true, vec![fd, fd, fd]), (false, vec![])] {
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        send_frame(&stream, &request(redact), &fds).expect("send");
+        let response: Response = read_message(&stream).expect("read");
+        assert!(
+            matches!(
+                response,
+                Response::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                }
+            ),
+            "redact={redact}: {response:?}"
+        );
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_closed_stdout_stops_the_command_like_sigpipe() {
+    use std::io::Read;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let pidfile = h.dir.path().join("yes.pid");
+    let script = format!("echo $$ > {}; exec yes", pidfile.display());
+    let mut client = h
+        .cmd(&["run", "T", "--", "sh", "-c", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let mut out = client.stdout.take().expect("stdout");
+    let mut first = [0u8; 4];
+    out.read_exact(&mut first).expect("some output");
+    drop(out); // like `| head -c 4`
+    let status = within(TEST_LIMIT, move || client.wait().expect("wait"));
+    assert_eq!(status.code(), Some(141));
+    let pid = wait_for_pid(&pidfile);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(Instant::now() < deadline, "the command kept running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
@@ -1028,6 +1140,19 @@ fn alive(pid: u32) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Whether any thread of the process is not a zombie.
+fn threads_alive(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read(task.path().join("stat")).is_ok_and(|stat| {
+            let close = stat.iter().rposition(|&b| b == b')').unwrap_or(0);
+            !matches!(stat.get(close + 2), Some(b'Z' | b'X'))
+        })
+    })
 }
 
 fn wait_for_pid(path: &Path) -> u32 {

@@ -23,17 +23,23 @@ and the CLI `exec`s the command — has two flaws:
 
 The agent executes approved commands itself:
 
-- The client sends `argv`, `cwd`, its environment and its stdin, stdout and
-  stderr as file descriptors (`SCM_RIGHTS`).
+- The client sends `argv`, `cwd` and its environment. Without redaction it
+  also sends its stdin, stdout and stderr as file descriptors (`SCM_RIGHTS`)
+  for the command to use directly.
 - The agent resolves `argv[0]` to a canonical absolute path, removes `LD_*`
   variables, flags variables that can inject code, shows all of it in the
   approval dialog, and only then reads the secret values.
 - The agent spawns the command as its own child, in a new process group.
   With redaction (the default) the command's stdout and stderr are pipes
-  owned by the agent, which filters them for secret values before writing to
-  the client's descriptors; its stdin is `/dev/null`, or an agent-owned pipe
-  fed from the client's input with `run --stdin`. The client's descriptors themselves never reach the command,
-  since a descriptor passed as "stdin" may be writable.
+  owned by the agent, which filters them for secret values and sends the
+  result back over the connection as data frames; the client writes them to
+  its own stdout and stderr. The command's stdin is `/dev/null`, or an
+  agent-owned pipe fed from data frames the client sends with `run --stdin`.
+  In this mode the client's descriptors never reach the command or the agent.
+  (A first version handed them to the agent, which wrote to them directly;
+  the reviews of 2026-10-31 showed that a descriptor passed as "stdin" may be
+  writable, and that writes to descriptors shared with other processes cannot
+  be made reliably cancellable.)
 - After the human answers, the agent checks that the vault generation, the
   entries (by UUID) and the program's and directory's inodes are unchanged
   before reading any value.
