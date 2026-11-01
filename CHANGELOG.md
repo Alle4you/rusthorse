@@ -15,7 +15,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   [ADR 0006](docs/adr/0006-own-dialog-program.md)): approvals with the command
   in its own card and the details in two columns, content that scrolls while
   the buttons stay in view, **Allow** disabled until the end of a long request
-  has been reached, and a password dialog with a labelled field. The agent
+  has been reached (with a hint saying so), and a password dialog with a
+  labelled field. The agent
   uses it when it is installed next to `rusthorse`, zenity otherwise; it
   talks to it over one socket with a framed, versioned protocol under a
   deadline, and starts it with no per-user GTK configuration. `status` and

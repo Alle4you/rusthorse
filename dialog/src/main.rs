@@ -361,7 +361,19 @@ fn approval_window(
     let deny = gtk::Button::with_label("Deny");
     let once = gtk::Button::with_label("Allow once");
     let for_n = remember.as_ref().map(|r| gtk::Button::with_label(&r.label));
-    let mut buttons: Vec<gtk::Widget> = vec![deny.clone().upcast(), spacer()];
+    // Says why Allow is disabled while the end of the content has not been
+    // reached; overlay scrollbars only show when the pointer is over them.
+    let hint = label(
+        "Scroll to the end to allow",
+        &["dim-label", "caption"],
+        1.0,
+        false,
+    );
+    hint.set_valign(gtk::Align::Center);
+    hint.set_wrap(false);
+    hint.set_visible(false);
+    let mut buttons: Vec<gtk::Widget> =
+        vec![deny.clone().upcast(), spacer(), hint.clone().upcast()];
     if let Some(button) = &for_n {
         buttons.push(button.clone().upcast());
     }
@@ -377,19 +389,21 @@ fn approval_window(
     }
     let adjustment = scroller.vadjustment();
     let update = {
-        let (reached, allow) = (Rc::clone(&reached), allow.clone());
+        let (reached, allow, hint) = (Rc::clone(&reached), allow.clone(), hint.clone());
         move |adjustment: &gtk::Adjustment| {
-            if end_in_view(
+            let in_view = end_in_view(
                 adjustment.value(),
                 adjustment.page_size(),
                 adjustment.upper(),
-            ) == Some(true)
-            {
+            );
+            if in_view == Some(true) {
                 reached.set(true);
             }
             for button in &allow {
                 button.set_sensitive(reached.get());
             }
+            // Only once laid out, so that it does not flash on dialogs that fit.
+            hint.set_visible(in_view.is_some() && !reached.get());
         }
     };
     adjustment.connect_changed(update.clone());

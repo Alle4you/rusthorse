@@ -311,7 +311,8 @@ The program refuses a request of another version, or with text that is not
 drawable as it is, before showing anything. It shows every string as plain
 text — no markup — in a window whose content scrolls while the buttons stay
 in view; when the content does not fit, **Allow** stays disabled until its end
-has been in view once (an obligation to reach the end, not proof of reading).
+has been in view once (an obligation to reach the end, not proof of reading),
+and a line next to it says "Scroll to the end to allow".
 Selectable text takes the keyboard focus, so the end can be reached without a
 mouse.
 
