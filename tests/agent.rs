@@ -1936,11 +1936,18 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
         },
         value: SecretString::new(value.into()),
     };
+    // Would be approved: the refusal must come from the duplicate check,
+    // before any dialog.
+    h.decide(&[Decision::AllowOnce]);
     let response = h.call(&Request::Import {
         entries: vec![item("aaaa1"), item("bbbb2")],
         replace: true,
     });
-    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    match response {
+        Response::Error { message, .. } => assert!(message.contains("more than once"), "{message}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
 }
 
 #[test]
