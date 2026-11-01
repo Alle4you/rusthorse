@@ -379,7 +379,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - **Bounded KDF parameters** before unlocking (L12).
 - **Per-entry policies**: restrict an entry to listed programs or hosts.
 - **Rusthorse's own dialog program** instead of zenity
-  ([ADR 0006](adr/0006-own-dialog-program.md), proposed): a separate GTK 4
+  ([ADR 0006](adr/0006-own-dialog-program.md), accepted): a separate GTK 4
   process started like zenity, plain text only, scrolling content with fixed
   buttons, and approval disabled until the whole request has been shown;
   later, a grants panel to inspect and revoke remembered approvals.
@@ -666,3 +666,18 @@ tests):
 |---|---|
 | AGENTS.md still said dialogs never come from the client (`init` without a terminal asks for the master password itself) and gave exit status 4 for denials without excepting `run` (125); CONTRIBUTING.md kept the old rules without the exceptions | **Fixed:** both files state the same exceptions and statuses. |
 | The roadmap said peer credentials make a copied token useless elsewhere; a process can hand a connected socket to another, and loopback TCP has no peer credentials | **Fixed (design):** the claim is limited to new Unix connections, and both gaps are listed as questions for the ADR. |
+
+Findings of the twenty-second and twenty-third reviews, of the design of
+[ADR 0006](adr/0006-own-dialog-program.md) before any code (verdicts:
+implement after changes; then change first; accepted after the changes
+below):
+
+| Finding | Disposition |
+|---|---|
+| The request was to go to the dialog program on standard input, which as a pipe another process could read or rewrite through `/proc`: the dialog could show one request while the agent ran another | **Fixed (design):** one socket pair for both directions, length-framed JSON with size limits, a request identifier echoed in the answer, a private protocol version checked before anything is shown. |
+| The agent would have relied on the program to time out and to answer sensibly | **Fixed (design):** one external deadline covers the whole exchange, after which the agent kills and reaps the program; a partial, oversized or contradictory answer, or a failure after a valid answer, is a denial. |
+| "Nobody approves what they could not see" overclaimed | **Fixed (design):** an obligation to reach the end of the content, checked after layout and on every resize, for every way to approve; one scroll, no truncation. |
+| Environment, per-user GTK configuration (a `gtk.css` could hide text), the Inspector and the accessibility API were not settled | **Fixed (design):** an enumerated environment, a fresh private configuration directory per dialog, in-memory settings; the accessibility path documented in L2, as it already applies to zenity. |
+| No compatibility contract between an agent and a program installed later | **Fixed (design):** protocol version, `--check`, `status` and `doctor` report the program. |
+| Replacing `HOME` would have hidden `~/.Xauthority` from X11 sessions that do not export `XAUTHORITY`, making every dialog fail | **Fixed (design):** the authority file is resolved before `HOME` is replaced and passed explicitly; tested with and without `XAUTHORITY`. |
+| Lesser points: the `init` exception, theme wording, icons, when zenity is the fallback, the private directory's lifetime, the light/dark preference depending on the portal | **Fixed (design).** |

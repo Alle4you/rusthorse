@@ -1,6 +1,6 @@
 # 0006. Rusthorse's own dialog program replaces zenity
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-01
 
 ## Context
@@ -95,20 +95,31 @@ case. The same supervision applies to zenity.
 
 The program receives only these variables, taken from the agent's own
 environment (the desktop session's, through systemd), never from a request:
-`DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`,
-`DBUS_SESSION_BUS_ADDRESS`, `LANG`, `LC_*` and `LANGUAGE`. The agent adds:
+`DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` (the real one:
+Wayland and the session's services live there), `DBUS_SESSION_BUS_ADDRESS`,
+`LANG`, `LC_*` and `LANGUAGE`. The agent adds:
 
+- `XAUTHORITY`, when it is not set and `DISPLAY` is: the X authority file is
+  resolved **before** `HOME` is replaced (`$HOME/.Xauthority` of the real
+  home), so an X11 session that keeps it in the default place still reaches
+  the display;
 - `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` pointing to
-  an empty private directory, and `XDG_DATA_DIRS=/usr/local/share:/usr/share`,
-  so the program reads no per-user GTK configuration, style sheet, theme or
-  icon: a file such as `~/.config/gtk-4.0/gtk.css`, which any program of the
-  user can write, could otherwise hide or restyle text in the dialog;
+  a private directory, and `XDG_DATA_DIRS=/usr/local/share:/usr/share`, so the
+  program reads no per-user GTK configuration, style sheet, theme or icon: a
+  file such as `~/.config/gtk-4.0/gtk.css`, which any program of the user can
+  write, could otherwise hide or restyle text in the dialog. The agent
+  creates a new, empty directory for every dialog (mode `0700`, writable by
+  the program, for GTK's caches) and removes it once the program has been
+  reaped, also after errors, so nothing one dialog writes reaches the next.
+  This keeps the user's files out of the dialog; it is not isolation from
+  malware running as the same user;
 - `GSETTINGS_BACKEND=memory`, so per-user settings — including the one that
   enables the GTK Inspector's keyboard shortcut — keep their defaults.
 
 Nothing that loads code into GTK is passed (`GTK_MODULES`,
 `GIO_EXTRA_MODULES`, `GTK_IM_MODULE`, `GTK_DEBUG`, `GDK_*`, `LD_*`). The light
-or dark preference still arrives through the desktop portal on D-Bus.
+or dark preference still arrives through the desktop portal on D-Bus when the
+desktop provides one; otherwise libadwaita's default applies.
 Accessibility stays enabled, so screen readers work; its consequence is
 below.
 
@@ -202,8 +213,9 @@ which the threat model already treats as out of scope.
 
 - **Readability**: real columns, scrolling with fixed buttons, a distinct
   password dialog — shown to the owner as a prototype, light and dark. The
-  look is libadwaita's: it follows the desktop's light or dark preference,
-  not every GTK theme, and uses only the theme's standard icons.
+  look is libadwaita's: it follows the desktop's light or dark preference
+  when the desktop portal provides it (libadwaita's default otherwise), not
+  every GTK theme, and uses only the theme's standard icons.
 - **Security, kept**: the process model of ADR 0003 (separate process,
   absolute path, minimal environment, default Deny, exact answers), now with
   a socket in both directions, a request identifier, a size-limited framed
@@ -224,7 +236,9 @@ which the threat model already treats as out of scope.
   libadwaita development packages; `rusthorse` still builds without them.
 - **Testing**: the agent's side is tested with fake dialog programs that
   hang, answer partially or too much, answer with another version or
-  identifier, or answer and then fail. The program's request parsing and
+  identifier, or answer and then fail; the environment it builds is tested
+  with and without `XAUTHORITY`, and the private directory's removal after
+  every outcome. The program's request parsing and
   decision logic are tested without a display; its widgets — focus, the
   approval gate, resizing, scaling, long strings, accessibility — are tested
   on an isolated virtual display, never on the maintainer's screen. The look

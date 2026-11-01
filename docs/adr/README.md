@@ -12,7 +12,7 @@ supersedes the old one, which is marked as such.
 | [0003](0003-agent-side-dialogs.md) | Approvals are dialogs shown by the agent | Accepted |
 | [0004](0004-native-distribution.md) | Native binary and systemd user service, no Flatpak | Accepted |
 | [0005](0005-remembered-approvals-opt-in.md) | Remembered approvals are opt-in and bound to the vault generation | Accepted |
-| [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Proposed |
+| [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Accepted |
 
 ## Writing a new ADR
 
