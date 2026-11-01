@@ -417,6 +417,7 @@ N14 were confirmed fixed):
 | N7 / N12 (partial) — a detached input worker could consume input after the result | **Fixed:** there is no input worker in the agent any more; `rusthorse run` reads its own stdin only with `--stdin` and exits right after the result (L18). |
 | N16 — a process whose main thread called `pthread_exit()` shows as a zombie while other threads run, so it was not signalled | **Fixed:** a process counts as alive while any thread in `/proc/<pid>/task` is (L17). |
 | Docs overclaimed that writes never block and that the command is always already terminated in L19 | **Fixed** (architecture, L19). |
+| Coverage | A mutation run after this round reverted each of 23 fixes from all four rounds in turn; the test suite failed for every one. |
 
 While implementing this round, a test caught that `nix`'s `PollFd::revents()`
 returns nothing at all when the kernel reports a bit `nix` does not name
