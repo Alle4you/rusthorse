@@ -375,7 +375,7 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/dialog_program.rs`](../src/dialog_program.rs) | Finding, starting and supervising `rusthorse-dialog`; falling back to zenity. |
 | [`src/dialog_protocol.rs`](../src/dialog_protocol.rs) | The protocol between the agent and `rusthorse-dialog`. |
 | [`dialog/`](../dialog) | `rusthorse-dialog`, the GTK 4 dialog program, and its tests on a virtual display. |
-| [`manager/`](../manager) | `rusthorse-manager`, the GTK 4 window to manage entries: agent requests on a worker, the single-paste clipboard content, tests on a virtual display. |
+| [`manager/`](../manager) | `rusthorse-manager`, the GTK 4 window to manage entries: agent requests on a worker, the window, tests on a virtual display. |
 | [`src/exec.rs`](../src/exec.rs) | Program resolution and environment cleaning for `run`. |
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |
 | [`src/peer.rs`](../src/peer.rs) | Peer credentials and the requester process chain. |
@@ -411,22 +411,21 @@ its own dialog.
 - **Status.** A background `status` every five seconds, also while a
   request waits for the human; it never blocks the controls and does not
   postpone the idle lock. A result that predates a request of the human's is
-  ignored. A lock it observes clears the entries, a shown value and a copied
-  value; answers the waiting request returns afterwards that describe the
+  ignored. A lock it observes clears the entries and a shown value, and
+  answers the waiting request returns afterwards that describe the
   vault as open — a value, a list, an "unlocked" status read before the
   lock — are dropped, and the manager asks for the status again. An unlock
   done elsewhere (the CLI) loads the list, which asks nothing because the
   vault is open.
 - **Show.** `reveal` with purpose `show`: the value appears in a window of its
-  own, not selectable, grouped by four characters when that cannot mislead,
-  for at most 30 seconds or until the window loses focus.
-- **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard
-  through a content provider that delivers it **once** — every later request
-  fails — and wipes it after 20 seconds, on lock, on close and at shutdown
-  (signals included). Wiping empties the provider and never claims the
-  clipboard again, which could destroy what another program has just
-  copied. See [ADR 0007, section 2](adr/0007-visual-manager.md#2-show-copy-and-memory)
-  and [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client).
+  own, not selectable, grouped by four characters when the value is plain
+  ASCII without spaces, for at most 30 seconds or until the window loses
+  focus. Its Copy button copies the shown value without a new approval.
+- **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard as
+  plain text and stays until something else is copied; the desktop and
+  clipboard histories may keep it. See
+  [ADR 0007, section 2](adr/0007-visual-manager.md#copy) and
+  [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client).
 - **Memory.** Values live in zeroizing buffers in Rust; GTK's own copies
-  (labels, clipboard transfers) are emptied when no longer needed but cannot
-  be wiped reliably. The process is non-dumpable.
+  are emptied when no longer needed but cannot be wiped reliably, and a
+  copied value is out of reach. The process is non-dumpable.

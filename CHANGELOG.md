@@ -15,8 +15,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   [guide](docs/manager.md)): a GTK 4 and libadwaita window, client of the
   agent, to browse, search and filter entries by group; create, edit, rename
   and delete them; generate values; **Show** a value in a window that hides
-  after 30 seconds or on focus loss; **Copy** a value for a single paste,
-  cleared after 20 seconds, on lock and on close; copy the `rusthorse run`
+  after 30 seconds or on focus loss; **Copy** a value to the clipboard (it
+  stays there, and in a clipboard history, until something else is copied —
+  the window says so); copy the `rusthorse run`
   command for an entry; lock and unlock; back up; change the master password.
   Every change and every value still goes through the agent's approval.
   Awaiting independent review.

@@ -19,7 +19,7 @@ awaiting an independent review: try it with fake entries first.
 | Browse, search and filter entries by group | Moving an entry to another group; editing notes |
 | Create, edit, rename and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
-| Copy a value for a single paste, after approval | A history view of the audit log (M2) |
+| Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
 | The command that gives a value to a program (`rusthorse run`) | Import from `.env` or GNOME Keyring, restore a backup, a safe hand-off to KeePassXC (M3) |
 | Verified backup of the vault; change of the master password | |
 
@@ -73,8 +73,9 @@ the manager does **not** lock the vault.
 If the vault is locked by something else — the agent's idle timer,
 `rusthorse lock` — the manager notices at its next check (every five
 seconds, also while one of the agent's dialogs waits for you) and clears
-what it shows and what it copied; a value that arrives after such a lock is
-neither shown nor copied. If you unlock with the CLI, the list appears by
+what it shows; a value that arrives after such a lock is neither shown nor
+copied. (A value you already copied stays on the clipboard: see
+[Copy a value](#copy-a-value).) If you unlock with the CLI, the list appears by
 itself.
 
 ### Create an entry
@@ -128,63 +129,44 @@ appears in a small window:
 - for 30 seconds at most, and it closes as soon as the window loses focus,
   when you click **Hide now**, or when the vault is locked.
 
+Its **Copy** button copies the value you are looking at — exactly, even
+where the window shows an escape — without asking again; the agent's dialog
+for Show told you that you could. What happens to a copied value is
+explained in the next section.
+
 Anyone who can see your screen, and other programs of your desktop session,
 can see a shown value. Never ask an AI agent to use Show.
 
-### Copy a value — for one paste
+### Copy a value
 
-For a long key you need to paste into a web console, a sign-in form or a
-program's password prompt, use **Copy value…** (in the Secret rows, or in the
-Show window).
+For a key you need to paste into a web console, a sign-in form or a
+program's password prompt, use **Copy value…** in the Secret rows (or
+**Copy** in the Show window).
 
-1. The agent asks "**Copy the value of an entry to the clipboard?**" — a
-   separate approval, even if you just approved Show.
-2. A banner at the top says what is on the clipboard and counts down:
-   *"… is on the clipboard for one paste · cleared in 20 s"*, with
-   **Clear now**.
-3. **Paste it once**, right away. The first program that asks for the
-   clipboard gets the value — normally your paste — and nothing after it:
-   the manager says *"The value was pasted once and is no longer on the
-   clipboard"*. A second paste, from any program, gets nothing. (A program
-   that asks twice for a single paste gets nothing the second time: copy
-   again.)
-4. Without a paste, the value is wiped after **20 seconds**. It is also
-   wiped when you lock, when the vault is locked elsewhere, when the agent
-   becomes unreachable, and when you close the manager or it is stopped
-   (Ctrl+C, a logout). If you copy something else meanwhile, the manager
-   does not touch it.
+1. The agent asks "**Copy the value of an entry to the clipboard?**".
+2. After you allow it, the value is on the clipboard like any text you copy:
+   paste it where it belongs, as many times as you need.
 
-**Why one paste and not a timer.** The clipboard is where values leak: on
-X11 every program of your session can read it, a clipboard history can keep
-it for ever, a phone link (GSConnect, KDE Connect) can send it to your phone,
-and a value pasted into the wrong window is gone — a chat with an AI sends it
-to the AI's provider. These copies happen in the first second; a timer that
-clears the clipboard later cannot undo them. Rusthorse therefore delivers
-the value **once**: whatever reads it first uses it up. If a program got
-there before you, your own paste usually comes back empty, and you notice
-instead of the value leaking silently. Not always: a program that took the
-value could put it back on the clipboard as its own (some clipboard tools
-do), and then your paste works; Rusthorse cannot see that.
+> **Note: a copied value stays on the clipboard until you copy something
+> else, and your desktop may keep it in a clipboard history.** Cinnamon and
+> GNOME keep their own copy of whatever is on the clipboard — they take it
+> the moment you copy and put it back if the program that copied it closes
+> — and clipboard managers (CopyQ, Klipper, GPaste, …) may keep a list of
+> past copies. Rusthorse cannot take a copied value back. When you are done,
+> copy something harmless to replace it, and delete it from your clipboard
+> history if you use one.
 
-**If your paste comes back empty**, one of these happened:
+Other programs of your desktop session can read the clipboard, and a value
+pasted into the wrong window is gone — a chat with an AI sends it to the
+AI's provider. Paste only where the value belongs. If a value may have gone
+somewhere it should not, rotate it (**New random value**, then update it at
+the provider).
 
-- the value had already been wiped — 20 seconds passed, the vault was
-  locked, or you clicked **Clear now**; the bottom line says which;
-- the program you paste into asked twice for one paste and got nothing the
-  second time — copy again;
-- another program read the clipboard before you. If the manager said
-  *"Another program took the value as soon as it was copied — probably a
-  clipboard history"*, that is the likely case.
-
-When another program may have read it, assume a clipboard history keeps the
-value: open it and delete the item, or turn its history off, and consider
-rotating the secret (**New random value**, then update the provider). The manager marks the value with `x-kde-passwordManagerHint:
-secret`, which Klipper, KDE Connect and some other histories honour, but on
-X11 GTK 4 cannot deliver that mark, so on X11 no history is told.
-
-What Copy does **not** protect against: a program of your session that reads
-the clipboard during those seconds; the program you paste into. Paste only
-where the value belongs.
+Why no stricter Copy: a first version gave the value to a single paste and
+cleared it after 20 seconds, but Cinnamon takes every copy at once (so the
+single paste was always the desktop's) and restores it later anyway; and a
+user who cannot copy a long key will photograph it, which is worse. See
+[ADR 0007](adr/0007-visual-manager.md#copy).
 
 ### Back up the vault
 
@@ -213,15 +195,14 @@ the new password in its own dialogs. The manager never receives them.
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |
 | "Incompatible agent protocol" | The agent and the manager come from different versions. Upgrade both and restart the agent yourself. |
 | "Restart needed" on the Status page | The agent's program file was replaced after it started (an upgrade). Restart the service before using dialogs. |
-| Your paste comes back empty | See [Copy a value](#copy-a-value--for-one-paste) for the possible causes. |
 | "The vault was locked while the agent was asking you, so the value was neither shown nor copied" | The manager saw the vault locked while a Show or Copy was waiting — for example, the vault locked itself just before you clicked and the agent asked for the master password first. For safety, a value that arrives after a lock is dropped. Your approval was used up; click Show or Copy again. |
 
 ## Security notes
 
 - The manager is non-dumpable and keeps values in buffers that are wiped;
-  GTK's own copies (labels, clipboard transfers) are emptied when no longer
-  needed but cannot be wiped reliably, and on X11 other programs of your
-  session can capture windows.
+  GTK's own copies (labels) are emptied when no longer needed but cannot be
+  wiped reliably, and on X11 other programs of your session can capture
+  windows. A copied value is out of Rusthorse's hands (see the note above).
 - Show and Copy are for you at the desktop. An AI agent uses
   `rusthorse run`, which keeps the value inside the approved command.
 - The full analysis is in [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client)

@@ -1190,21 +1190,19 @@ impl Agent {
                 "Rusthorse — show a secret",
                 format!("Show the {what} of an entry on screen?"),
                 Some(format!(
-                    "show the {what} in its own window for a short time"
+                    "show the {what} in its own window for a short time; you can copy it from there"
                 )),
                 format!(
-                    "Anyone who can see your screen, and other programs of your desktop session, can see the {what} while it is shown."
+                    "Anyone who can see your screen, and other programs of your desktop session, can see the {what} while it is shown. If you copy it, it stays on the clipboard, and in a clipboard history, until something else is copied."
                 ),
                 format!("{what}, to show"),
             ),
             Some(RevealPurpose::Copy) => (
                 "Rusthorse — copy a secret",
                 format!("Copy the {what} of an entry to the clipboard?"),
-                Some(format!(
-                    "put the {what} on the clipboard for one paste, then clear it"
-                )),
+                Some(format!("put the {what} on the clipboard")),
                 format!(
-                    "While the {what} is on the clipboard, other programs of your desktop session can read it, and a clipboard history may keep it. Paste it only where it belongs — never into a chat with an AI."
+                    "The {what} stays on the clipboard, and in a clipboard history if you use one, until something else is copied; other programs of your desktop session can read it. Paste it only where it belongs — never into a chat with an AI."
                 ),
                 format!("{what}, to copy to the clipboard"),
             ),

@@ -128,8 +128,8 @@ rusthorse run GH_TOKEN=GITHUB_TOKEN -- gh pr create --fill
 `rusthorse-manager` is a window to see and organise your entries: search,
 groups, create, edit, delete, generate values, back up. When you approve it
 in the agent's dialog, it shows a value for 30 seconds or copies it to the
-clipboard for **a single paste**. Like the CLI, it never opens the vault and
-never sees the master password.
+clipboard. Like the CLI, it never opens the vault and never sees the master
+password.
 
 ```sh
 cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4+
@@ -137,8 +137,7 @@ cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4
 
 This first milestone ([ADR 0007](docs/adr/0007-visual-manager.md)) awaits
 independent review. The [manager guide](docs/manager.md) explains every
-action, what Show and Copy protect and what they do not, and what comes
-later.
+action, where a shown or copied value can end up, and what comes later.
 
 ## Using it with AI agents
 

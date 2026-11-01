@@ -10,8 +10,14 @@ use std::sync::{
 };
 
 /// Decisions: `allow`; `hold`, which keeps the "human" looking at the
-/// dialog until it is cleared; and `asking`, set while held.
-struct Scripted(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
+/// dialog until it is cleared; `asking`, set while held; and a count of the
+/// approval dialogs shown.
+struct Scripted(
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 impl Ui for Scripted {
     fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
         Ok(Typed::Value("fake master password".to_string().into()))
@@ -20,6 +26,7 @@ impl Ui for Scripted {
         Ok(Typed::Value("FAKE-desktop-value".to_string().into()))
     }
     fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+        self.3.fetch_add(1, Ordering::SeqCst);
         let until = Instant::now() + Duration::from_secs(30);
         while self.1.load(Ordering::SeqCst) && Instant::now() < until {
             self.2.store(true, Ordering::SeqCst);
@@ -170,7 +177,7 @@ fn focus(name: &str) {
 }
 
 /// What another program gets when it pastes; `None` when it gets nothing
-/// (an error, or empty content from a wiped value).
+/// (an error, or empty content).
 fn paste() -> Option<String> {
     let (ok, text) = x11(&["/usr/bin/xclip", "-o", "-selection", "clipboard"]);
     (ok && !text.is_empty()).then_some(text)
@@ -277,6 +284,7 @@ fn desktop_flow() {
     let allowed = Arc::new(AtomicBool::new(true));
     let hold = Arc::new(AtomicBool::new(false));
     let asking = Arc::new(AtomicBool::new(false));
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let agent = Agent::new(
         AgentConfig {
             vault,
@@ -290,6 +298,7 @@ fn desktop_flow() {
             Arc::clone(&allowed),
             Arc::clone(&hold),
             Arc::clone(&asking),
+            Arc::clone(&approvals),
         )),
     );
     let listener = Agent::bind(&socket).unwrap();
@@ -453,136 +462,58 @@ fn desktop_flow() {
     focus("^Rusthorse$");
     spin_until(|| !focused.is_visible());
 
-    // Copy: one paste gets the value, the next gets nothing, and clipboard
-    // histories are told it is a password. Read by another X11 client.
+    // Copy: denied, the clipboard keeps what it had; allowed, the value is
+    // on it like any copied text — every paste gets it. Read by another X11
+    // client.
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    s.window.clipboard().set_text("before the copy");
     allowed.store(false, Ordering::SeqCst);
     button(&s.detail, "Copy value…").emit_clicked();
     settle(&s);
-    assert!(s.copied.borrow().is_none());
-    assert!(!s.banner.is_revealed());
+    assert_eq!(paste().as_deref(), Some("before the copy"));
     allowed.store(true, Ordering::SeqCst);
     button(&s.detail, "Copy value…").emit_clicked();
     settle(&s);
-    assert!(s.banner.is_revealed());
-    assert!(s.banner.title().contains("for one paste"));
-    // GTK 4 on X11 serves only formats whose name has a slash, so the
-    // password hint is offered but cannot be read here (docs/manager.md).
-    let (ok, hint) = x11(&[
-        "/usr/bin/xclip",
-        "-o",
-        "-selection",
-        "clipboard",
-        "-t",
-        crate::clipboard::HINT,
-    ]);
-    assert!(!ok && hint.is_empty());
-    let wait = Instant::now() + Duration::from_millis(600);
-    spin_until(|| Instant::now() >= wait);
     assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
-    // A second reader, right away, gets nothing.
-    assert_eq!(paste(), None);
-    spin_until(|| s.copied.borrow().is_none());
-    assert!(!s.banner.is_revealed());
-    assert!(
-        s.message.text().contains("pasted once"),
-        "{}",
-        s.message.text()
-    );
-    assert_eq!(paste(), None);
-
-    // Taken right after the copy (as a clipboard history does): say so.
-    s.put_on_clipboard_for(
-        "Fake grabbed copy",
-        "FAKE-copy-grabbed".to_string().into(),
-        Duration::from_secs(20),
-    );
-    assert_eq!(paste().as_deref(), Some("FAKE-copy-grabbed"));
-    spin_until(|| s.copied.borrow().is_none());
+    assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
     assert!(
         s.message.text().contains("clipboard history"),
         "{}",
         s.message.text()
     );
 
-    // Not pasted in time: cleared.
-    s.put_on_clipboard_for(
-        "Fake expiring copy",
-        "FAKE-copy-expiring".to_string().into(),
-        Duration::from_millis(200),
+    // The Show window copies what it shows, exactly, without asking again.
+    s.window.clipboard().set_text("before the copy");
+    let before = approvals.load(Ordering::SeqCst);
+    button(&s.detail, "Show value…").emit_clicked();
+    settle(&s);
+    assert_eq!(approvals.load(Ordering::SeqCst), before + 1);
+    let reveal = s.revealed.borrow().as_ref().unwrap().clone();
+    button(&reveal, "Copy").emit_clicked();
+    assert_eq!(approvals.load(Ordering::SeqCst), before + 1, "asked again");
+    assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
+    button(&reveal, "Hide now").emit_clicked();
+    // What is shown escaped is copied as it is.
+    s.show_secret_for(
+        "Fake escaped",
+        false,
+        "price-\u{20ac}-1".to_string().into(),
+        Duration::from_secs(30),
     );
-    spin_until(|| s.copied.borrow().is_none());
-    assert!(s.message.text().contains("Not pasted in time"));
-    assert_eq!(paste(), None);
-
-    // Something copied afterwards is left alone.
-    s.put_on_clipboard_for(
-        "Fake replaced copy",
-        "FAKE-copy-replaced".to_string().into(),
-        Duration::from_secs(20),
-    );
-    s.window.clipboard().set_text("not a secret");
-    spin_until(|| s.copied.borrow().is_none());
-    assert_eq!(paste().as_deref(), Some("not a secret"));
-
-    // Another program that takes the clipboard before GTK has noticed keeps
-    // it: clearing wipes our value and never claims the clipboard back.
-    s.put_on_clipboard_for(
-        "Fake raced copy",
-        "FAKE-copy-raced".to_string().into(),
-        Duration::from_secs(20),
-    );
-    let mut owner = std::process::Command::new("/usr/bin/xclip")
-        .args(["-selection", "clipboard", "-i", "-quiet"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    {
-        use std::io::Write;
-        let mut input = owner.stdin.take().unwrap();
-        input.write_all(b"copied by another program").unwrap();
-    }
-    // Without running the main loop, GTK cannot see that it lost the
-    // clipboard: it still believes it owns it.
-    std::thread::sleep(Duration::from_millis(500));
+    let escaped = s.revealed.borrow().as_ref().unwrap().clone();
+    // Shown escaped and not grouped (grouping could cut the escape).
+    assert_eq!(shown_text(&escaped), "price-\\u{20ac}-1");
     assert!(
-        s.copied
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .content
-            .is_on(&s.window.clipboard())
+        !descendants(&escaped)
+            .iter()
+            .any(|w| w.clone().downcast::<gtk::FlowBox>().is_ok())
     );
-    s.clear_clipboard("cleared during a race");
-    let settle_frame = Instant::now() + Duration::from_millis(300);
-    spin_until(|| Instant::now() >= settle_frame);
-    assert_eq!(paste().as_deref(), Some("copied by another program"));
-    let _ = owner.kill();
-    let _ = owner.wait();
-
-    // Locking clears a copied value at once.
-    s.put_on_clipboard_for(
-        "Fake locked copy",
-        "FAKE-copy-locked".to_string().into(),
-        Duration::from_secs(20),
-    );
-    button(&s.window, "Lock now").emit_clicked();
-    assert!(s.copied.borrow().is_none());
-    assert_eq!(paste(), None);
-    settle(&s);
-    assert_eq!(s.pill.text(), "Locked");
-    button(&s.window, "Unlock").emit_clicked();
-    settle(&s);
-    spin_until(|| s.job.borrow().is_none() && !s.entries.borrow().is_empty());
+    button(&escaped, "Copy").emit_clicked();
+    assert_eq!(paste().as_deref(), Some("price-\u{20ac}-1"));
+    button(&escaped, "Hide now").emit_clicked();
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
 
-    // A lock made elsewhere while a request waits for the human is seen,
-    // and the copied value goes at once.
-    button(&s.detail, "Copy value…").emit_clicked();
-    settle(&s);
-    assert!(s.copied.borrow().is_some());
+    // A lock made elsewhere while a request waits for the human is seen.
     hold.store(true, Ordering::SeqCst);
     button(&s.detail, "New random value…").emit_clicked();
     assert!(s.job.borrow().is_some());
@@ -595,14 +526,10 @@ fn desktop_flow() {
         Response::Ok { .. }
     ));
     let seen = Instant::now() + Duration::from_secs(9);
-    spin_until(|| s.copied.borrow().is_none() || Instant::now() >= seen);
-    assert!(
-        s.copied.borrow().is_none(),
-        "lock not seen during the request"
-    );
+    spin_until(|| s.pill.text() == "Locked" || Instant::now() >= seen);
+    assert_eq!(s.pill.text(), "Locked", "lock not seen during the request");
+    assert!(s.entries.borrow().is_empty());
     assert!(s.job.borrow().is_some(), "the request is still waiting");
-    assert_eq!(s.pill.text(), "Locked");
-    assert_eq!(paste(), None);
     hold.store(false, Ordering::SeqCst);
     settle(&s);
     button(&s.window, "Unlock").emit_clicked();
@@ -611,20 +538,20 @@ fn desktop_flow() {
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
 
     // A value that arrives after such a lock was seen is not used.
+    s.window.clipboard().set_text("before the copy");
     hold.store(true, Ordering::SeqCst);
     button(&s.detail, "Copy value…").emit_clicked();
     spin_until(|| asking.load(Ordering::SeqCst));
     s.lock_seen.set(true);
     hold.store(false, Ordering::SeqCst);
     settle(&s);
-    assert!(s.copied.borrow().is_none());
     assert!(s.revealed.borrow().is_none());
     assert!(
         s.message.text().contains("neither shown nor copied"),
         "{}",
         s.message.text()
     );
-    assert_eq!(paste(), None);
+    assert_eq!(paste().as_deref(), Some("before the copy"));
 
     // Answers already on their way when a lock is seen do not undo it: a
     // refresh whose "unlocked" status is queued, then a lock elsewhere seen
@@ -736,25 +663,23 @@ fn desktop_flow() {
         .call(&Request::Status)
         .unwrap();
     assert!(matches!(status, Response::Status(i) if i.locked));
-    // Closing wipes a value still on the clipboard.
-    s.put_on_clipboard_for(
-        "Fake copy at exit",
-        "FAKE-copy-at-exit".to_string().into(),
-        Duration::from_secs(20),
+    // Closing, and the application's shutdown, hide a shown value.
+    s.show_secret_for(
+        "Fake shown at exit",
+        false,
+        "FAKE-shown-at-exit".to_string().into(),
+        Duration::from_secs(30),
     );
     s.window.close();
     assert!(s.closed.get());
     assert!(s.job.borrow().is_none());
-    assert!(s.copied.borrow().is_none());
-    assert_eq!(paste(), None);
-    // So does the application's shutdown, which a termination signal
-    // triggers (tests/signals.rs checks that a signal quits normally).
-    s.put_on_clipboard_for(
-        "Fake copy at shutdown",
-        "FAKE-copy-at-shutdown".to_string().into(),
-        Duration::from_secs(20),
+    assert!(s.revealed.borrow().is_none());
+    s.show_secret_for(
+        "Fake shown at shutdown",
+        false,
+        "FAKE-shown-at-shutdown".to_string().into(),
+        Duration::from_secs(30),
     );
     app.emit_by_name::<()>("shutdown", &[]);
-    assert!(s.copied.borrow().is_none());
-    assert_eq!(paste(), None);
+    assert!(s.revealed.borrow().is_none());
 }

@@ -2,8 +2,10 @@
 
 - Status: Proposed
 - Date: 2026-11-01
-- Amended: 2026-11-01 — Copy of a value for a single paste (section 2), at
-  the maintainer's request: without it, long random keys had to be retyped.
+- Amended: 2026-11-01 — Copy of a value (section 2), at the maintainer's
+  request: without it, long random keys had to be retyped. A first design
+  served the value to a single paste; trying it on Cinnamon showed that the
+  desktop itself defeats that, and the maintainer chose a plain copy.
 
 ## Context
 
@@ -27,7 +29,7 @@ protocol compatibility before operations. No service is started or restarted.
 
 M1 implements status, explicit unlock/lock, metadata list/search/group
 filter, details, create (including group), edit/rename/delete, generated
-values, approved Show and single-paste Copy of password/notes, a safely
+values, approved Show and Copy of password/notes, a safely
 quoted UUID-based command snippet, password change and verified backup
 through existing requests.
 Existing groups cannot be changed by `edit`; M1 says so instead of emulating
@@ -84,7 +86,8 @@ approval that is never remembered. The value appears in a window of its own:
   agent's dialogs;
 - hidden after 30 seconds, when the window loses focus, on close, on a lock
   the manager observes, and before any other request; its labels are emptied
-  when it closes.
+  when it closes;
+- with a Copy button that copies the value shown (see Copy below).
 
 It is not cached in entry models. Rust-owned value buffers are zeroizing;
 GTK, accessibility, display and allocator copies cannot be reliably wiped.
@@ -92,59 +95,47 @@ Disable core dumps and mark the manager non-dumpable before GTK starts; this
 does not protect its screen from X11 or its accessibility tree. A reveal
 authorizes this extra exposure, as it does with the CLI.
 
-#### Copy, for a single paste
+#### Copy
 
-The clipboard is the riskiest place a value can go: on X11 every program of
-the session can read it, on any desktop a clipboard history can keep it for
-ever, a phone link (GSConnect, KDE Connect) can send it to another device,
-and a value pasted into the wrong window — a chat with an AI, say — is sent
-away. A timer that clears the clipboard after a while (the common design)
-addresses none of these: the copies are made in the first second. Copy is
-therefore built around **one paste**, not around a timer:
+Copy sends a `reveal` with purpose `copy`; the agent's dialog asks "Copy the
+value of an entry to the clipboard?" and warns that the value stays on the
+clipboard, and in a clipboard history, until something else is copied, that
+other programs of the session can read it, and that it must never be pasted
+into a chat with an AI. After approval, the manager puts the value on the
+clipboard **as plain text, like any copy**: it can be pasted any number of
+times and stays until something else is copied. The manager says so after
+each copy, and so do the Secret rows and the Help page.
 
-1. **Its own approval.** Copy sends a `reveal` with purpose `copy`; the
-   dialog asks "Copy the value of an entry to the clipboard?" and warns that
-   other programs can read the clipboard and that it must never be pasted
-   into a chat with an AI. Copying from the Show window asks again: that
-   approval said "show".
-2. **One delivery.** The value is not handed to GTK as a string. A
-   `GdkContentProvider` of the manager's own answers each request: the first
-   request for text gets the value, and every later request — from any
-   program, however soon — fails. A program that asks twice for one paste
-   gets nothing the second time. (A first version allowed a one-second
-   grace for such programs; the review showed that two different programs
-   could then both get the value, so it was dropped.)
-3. **Wiped anyway** after 20 seconds without a paste, on Lock now, on a
-   lock it observes, when the agent becomes unreachable, when the window
-   closes and when the application shuts down (signals included). Wiping
-   empties the provider; the manager never claims the clipboard again to
-   clear it, because another program may own it already without GTK knowing
-   yet, and a new claim would destroy what that program copied. Pastes after
-   the wipe get empty content.
-4. **Not left for a clipboard manager.** The provider declares no storable
-   format, but GTK 4.14 on X11 may still offer the clipboard to a clipboard
-   manager (`SAVE_TARGETS`) at exit; what keeps the value from being stored
-   then is that it was wiped before the application shut down.
-5. **Marked as a password** with `x-kde-passwordManagerHint: secret`, which
-   Klipper, KDE Connect and some other histories honour. *On X11, GTK 4
-   serves only formats whose name contains a slash (verified with GTK 4.14),
-   so this hint is announced but cannot be read there.* It may help on
-   Wayland; that is not verified.
-6. **Visible.** A banner shows what is on the clipboard and the seconds
-   left, with "Clear now". When the value is taken within half a second of
-   the copy — faster than a human pastes — the manager says that another
-   program, probably a clipboard history, took it and may keep it.
+The Show window has a **Copy** button that copies the value it shows,
+exactly (escapes undone), without asking again: the `show` dialog says "you
+can copy it from there" and warns of the clipboard history. Copying from the
+Show window is therefore not a separate entry in the audit log; Copy from
+the entry is (`value, to copy to the clipboard`).
 
-What this does **not** protect against: a program of the session that reads
-the clipboard while the value is there; a history that ignores the hint (on
-X11, all of them) — although such a history uses up the single delivery, so
-the human's own paste usually comes back empty and the banner may say what
-happened, unless the history puts the value back on the clipboard as its own,
-which Rusthorse cannot see; the program the value is pasted into. The
-guarantee is one delivery by Rusthorse's own provider, not the detection of
-every copy. On Wayland, other programs cannot read the
-clipboard without focus unless the compositor offers a data-control protocol
-(wlroots, KDE do), which clipboard managers use.
+**Why not more.** A first version served the value to a **single paste**: a
+content provider of its own delivered the text to the first request only,
+cleared it after 20 seconds, on lock and at exit, and announced
+`x-kde-passwordManagerHint: secret` for clipboard histories. Two reviews
+tightened it. Then the maintainer's first try on Cinnamon (Muffin 6.6)
+showed what the desktop does with any copy:
+
+- Muffin, like Mutter in GNOME, keeps its own copy of the clipboard: it
+  fetches the text **the instant** an application copies — before any paste
+  — and ignores `x-kde-passwordManagerHint` (it does not even ask for it).
+  The single delivery went to the desktop, and the human's paste came back
+  empty, every time.
+- When the application that owns the clipboard exits, the desktop puts its
+  copy back on the clipboard. Wiping the value inside the manager does not
+  reach that copy; only a new owner with no text makes the desktop forget it.
+- On X11, GTK 4 cannot deliver `x-kde-passwordManagerHint` at all (it serves
+  only formats whose name contains a slash).
+
+So a stricter Copy cannot be made to work with the desktops Rusthorse
+targets, and the maintainer judged that it would not be worth it anyway: a
+user who cannot copy a value will photograph or screenshot it, which is
+worse. The protection that matters is that nothing gets a value without the
+human's approval in the agent's dialog, and that the human is told where a
+copied value goes.
 
 Not chosen, for now: **drag and drop** of the value onto a field (only the
 drop target receives it, no clipboard involved — an idea for a later
@@ -255,20 +246,27 @@ require allowed and denied end-to-end tests in `tests/agent.rs` as well.
 - Implement all prototype pages immediately: would hide new policy and
   persistence mechanisms inside a GUI change. Milestones keep them reviewable.
 - No Copy at all (the first version of this ADR): long random keys had to be
-  retyped, or revealed in a terminal, whose scrollback keeps them.
-- Copy with only a timer that clears the clipboard: histories and other
-  programs copy the value long before the timer fires, and any number of
-  pastes work meanwhile; see section 2.
-- Copy without a new approval after Show: the approval said "show", and the
-  audit log would not record the copy.
+  retyped, or revealed in a terminal, whose scrollback keeps them, or
+  photographed.
+- Copy for a single paste, cleared after 20 seconds (built and reviewed,
+  then dropped): the desktop's own clipboard manager takes the single paste
+  and keeps a copy that it restores at exit; see section 2.
+- Copy with a timer that clears the clipboard (KeePassXC's way): it would
+  make the desktop forget the value after a while, but histories and other
+  programs copy it in the first second, and a cleared clipboard surprises a
+  user who copied something else meanwhile; the maintainer preferred a
+  predictable plain copy and an honest note.
+- A new approval for Copy in the Show window: the user had just approved
+  seeing the value, and asking twice looked like a loop. The `show` dialog
+  says instead that the value can be copied from there.
 
 ## Consequences
 
 The first milestone is useful but does not reproduce every prototype control.
 No persistent settings, grants/history viewer, import UI, restoration,
 automatic screen/suspend lock or exclusive KeePassXC handoff is claimed yet.
-Copy puts a value where other programs can read it, for a short time and a
-single paste; the threat model (L14) records what it does not protect.
+Copy puts a value where other programs and clipboard histories can keep it;
+the threat model (L14) records it.
 Before real credentials, the maintainer must review the reveal exposure,
 the Copy design, milestones and manual-lock limitations. ADR and M1 remain
 **awaiting independent review**, not Accepted by their implementer.

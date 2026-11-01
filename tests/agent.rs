@@ -2005,8 +2005,7 @@ fn a_stated_reveal_purpose_is_shown_and_audited() {
         "Copy the value of an entry to the clipboard?"
     );
     assert!(request.details.iter().any(|(k, v)| {
-        k == "Stated purpose (unverified)"
-            && v == "put the value on the clipboard for one paste, then clear it"
+        k == "Stated purpose (unverified)" && v == "put the value on the clipboard"
     }));
     assert!(request.warnings[0].contains("never into a chat with an AI"));
     assert!(!request.can_remember);
@@ -2024,6 +2023,12 @@ fn a_stated_reveal_purpose_is_shown_and_audited() {
     ));
     let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
     assert_eq!(request.summary, "Show the value of an entry on screen?");
+    // The manager's Show window can copy what it shows without asking again:
+    // this approval must say so.
+    assert!(request.details.iter().any(|(k, v)| {
+        k == "Stated purpose (unverified)" && v.contains("you can copy it from there")
+    }));
+    assert!(request.warnings[0].contains("clipboard history"));
     let audit = h.audit_text();
     assert!(audit.contains("value, to copy to the clipboard"));
     assert!(audit.contains("value, to show"));

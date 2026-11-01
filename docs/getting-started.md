@@ -125,6 +125,6 @@ Then tell your AI agent how to use them — paste the snippet from
 The optional [manager](manager.md) shows the same vault in a window
 (`cargo run --locked -p rusthorse-manager` from the source tree). Try it with
 a fake entry first: create it, edit it, copy its `rusthorse run` command, and
-try **Show** and **Copy** — Copy puts the value on the clipboard for a single
-paste. Both are for you at the desktop and ask for your approval; an AI agent
-uses `rusthorse run`.
+try **Show** and **Copy**. A copied value stays on the clipboard, and in a
+clipboard history, until you copy something else. Both are for you at the
+desktop and ask for your approval; an AI agent uses `rusthorse run`.

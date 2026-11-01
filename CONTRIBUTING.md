@@ -74,7 +74,7 @@ And check the following by hand:
 - Never log, include in error messages or put in the audit log a secret
   value, a master password or notes. A value leaves a client only where the
   human asked for it: printed by `reveal`, shown in the manager's Show
-  window, or put on the clipboard by its Copy for a single paste.
+  window, or put on the clipboard by its Copy.
 - Keep secret material in `Zeroizing` types where practical, and do not
   `Debug`-print structures that contain it.
 - Anything a requester controls that appears in a dialog must go through

@@ -91,9 +91,8 @@ Breaking one of these is a security bug, whatever the tests say.
 2. **Never** log, audit or put in an error message a secret value, the master
    password or notes. A value leaves a client only where the human asked for
    it: printed by `reveal`, shown in the manager's Show window, or put on the
-   clipboard by its Copy for a single paste
-   ([ADR 0007](docs/adr/0007-visual-manager.md)). Keep secrets in `Zeroizing`
-   types; never `Debug` a structure that contains one.
+   clipboard by its Copy ([ADR 0007](docs/adr/0007-visual-manager.md)). Keep
+   secrets in `Zeroizing` types; never `Debug` a structure that contains one.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
 4. **Approval and secret-entry dialogs are shown by the agent**, never by

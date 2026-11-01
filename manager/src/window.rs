@@ -15,7 +15,6 @@ use rusthorse::protocol::{
     ValueChange,
 };
 
-use crate::clipboard::{CLIPBOARD_SECONDS, SecretContent};
 use crate::connection::{Failure, Job};
 use crate::model::{self, Form, ValueMode};
 
@@ -31,17 +30,6 @@ enum Pending {
     Reveal { title: String, notes: bool },
     Copy { title: String },
 }
-
-/// A value on the clipboard, waiting for its one paste.
-struct Copied {
-    content: SecretContent,
-    title: String,
-    at: Instant,
-    until: Instant,
-}
-
-/// A paste this soon after the copy was not made by a human.
-const TAKEN_AT_ONCE: Duration = Duration::from_millis(500);
 
 pub(crate) struct Manager {
     pub window: adw::ApplicationWindow,
@@ -79,11 +67,9 @@ pub(crate) struct Manager {
     lock_hint: gtk::Label,
     message: gtk::Label,
     waiting: gtk::Box,
-    banner: adw::Banner,
     actions: RefCell<Vec<gtk::Button>>,
     revealed: RefCell<Option<adw::Window>>,
     editor: RefCell<Option<adw::Window>>,
-    copied: RefCell<Option<Copied>>,
 }
 
 /// Plain text: never markup, and drawn through the same character filter
@@ -180,13 +166,17 @@ fn button(text: &str, icon: Option<&str>) -> gtk::Button {
     b
 }
 
-/// The value in groups of four characters, which are easier to read and
-/// compare. Only for values made of printable ASCII without spaces; anything
-/// else is shown as it is, so that the grouping can never be mistaken for
-/// part of the value.
-fn value_view(value: &str) -> gtk::Widget {
-    let groupable = value.len() > 8 && value.bytes().all(|b| b.is_ascii_graphic());
-    if !groupable {
+/// Whether a value is shown in groups of four characters, which are easier
+/// to read and compare: only values made of printable ASCII without spaces,
+/// judged on the value itself (its escaped form is always ASCII), so that the
+/// grouping can never cut an escape or be mistaken for part of the value.
+fn groupable(value: &str) -> bool {
+    value.len() > 8 && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The value as drawn (escaped), grouped by four if `grouped`.
+fn value_view(value: &str, grouped: bool) -> gtk::Widget {
+    if !grouped {
         let shown = label(value);
         shown.set_selectable(false);
         shown.add_css_class("monospace");
@@ -389,7 +379,7 @@ impl Manager {
             ),
             (
                 "Show and Copy",
-                "Show asks the agent, then displays the value in a window that hides after 30 seconds or when it loses focus. Copy asks the agent, then puts the value on the clipboard for one paste: after that paste, or after 20 seconds, it is cleared. Other programs of your desktop session can read the clipboard while the value is there, so paste right away, and never into a chat with an AI.",
+                "Show asks the agent, then displays the value in a window that hides after 30 seconds or when it loses focus; you can copy it from there. Copy asks the agent, then puts the value on the clipboard like any copied text: it stays there — and in your clipboard history, if your desktop keeps one — until you copy something else. Other programs of your desktop session can read the clipboard. Paste it only where it belongs, never into a chat with an AI.",
             ),
             (
                 "Use it from a command",
@@ -436,7 +426,7 @@ impl Manager {
             }
         });
 
-        // Content column: header bar, clipboard banner, pages, status bar.
+        // Content column: header bar, pages, status bar.
         let content = column(0);
         let header = adw::HeaderBar::builder()
             .show_start_title_buttons(false)
@@ -449,9 +439,6 @@ impl Manager {
         add.add_css_class("suggested-action");
         header.pack_end(&add);
         content.append(&header);
-        let banner = adw::Banner::new("");
-        banner.set_button_label(Some("Clear now"));
-        content.append(&banner);
         content.append(&stack);
         let bar = row_box(10);
         margins(&bar, 8, 16);
@@ -522,11 +509,9 @@ impl Manager {
             lock_hint,
             message,
             waiting,
-            banner,
             actions: RefCell::new(vec![]),
             revealed: RefCell::new(None),
             editor: RefCell::new(None),
-            copied: RefCell::new(None),
         });
         manager.actions.replace(vec![
             refresh.clone(),
@@ -543,12 +528,6 @@ impl Manager {
             s.submit(Request::ChangePassword, Pending::Change)
         });
         manager.connect_button(&backup, |s| s.backup());
-        let weak = Rc::downgrade(&manager);
-        manager.banner.connect_button_clicked(move |_| {
-            if let Some(s) = weak.upgrade() {
-                s.clear_clipboard("The clipboard was cleared.");
-            }
-        });
         let weak = Rc::downgrade(&manager);
         manager.rows.set_header_func(move |row, before| {
             let Some(s) = weak.upgrade() else { return };
@@ -606,7 +585,6 @@ impl Manager {
                 return glib::ControlFlow::Break;
             };
             s.receive();
-            s.tick_clipboard();
             glib::ControlFlow::Continue
         });
         let weak = Rc::downgrade(&manager);
@@ -620,16 +598,13 @@ impl Manager {
         manager
     }
 
-    /// Forget everything secret and stop talking to the agent. Called when
-    /// the window closes and when the application shuts down (including on
-    /// SIGINT, SIGTERM and SIGHUP), before GTK can offer the clipboard to a
-    /// clipboard manager.
+    /// Forget what is shown and stop talking to the agent. Called when the
+    /// window closes and when the application shuts down.
     pub fn shutdown(&self) {
         self.closed.set(true);
         self.job.borrow_mut().take();
         self.poll.borrow_mut().take();
         self.hide_revealed();
-        self.clear_clipboard("");
         if let Some(editor) = self.editor.borrow_mut().take() {
             editor.close();
         }
@@ -697,7 +672,6 @@ impl Manager {
             self.submit(Request::Unlock, Pending::Change);
         } else {
             self.hide_revealed();
-            self.clear_clipboard("The clipboard was cleared because the vault was locked.");
             self.clear_entries();
             self.submit(Request::Lock, Pending::Change);
         }
@@ -773,7 +747,7 @@ impl Manager {
                 _ if !fresh => {}
                 Ok(Response::Status(info)) if info.locked => {
                     // Locked elsewhere, maybe while a dialog is open: forget
-                    // what is shown and copied now, and any value to come.
+                    // what is shown now, and any value to come.
                     self.lock_seen.set(pending);
                     self.apply_status(info, false);
                 }
@@ -849,7 +823,7 @@ impl Manager {
             }
             Ok(Response::Secret { value }) => match purpose {
                 Pending::Reveal { title, notes } => self.show_secret(&title, notes, value),
-                Pending::Copy { title } => self.put_on_clipboard(&title, value),
+                Pending::Copy { title } => self.put_on_clipboard(&title, &value),
                 _ => self.feedback("Unexpected answer. Refresh and look before retrying.", true),
             },
             Ok(_) => self.feedback("Unexpected answer. Refresh and look before retrying.", true),
@@ -864,7 +838,6 @@ impl Manager {
         self.lock.set_label("Unlock");
         self.lock_hint.set_text("");
         self.hide_revealed();
-        self.clear_clipboard("");
         self.clear_entries();
         clear(&self.status_page);
         let g = group("Agent", None);
@@ -893,7 +866,6 @@ impl Manager {
         *self.status.borrow_mut() = Some(info);
         if locked {
             self.hide_revealed();
-            self.clear_clipboard("The clipboard was cleared because the vault was locked.");
             self.clear_entries();
         } else if list || was_locked {
             // Unlocked here or elsewhere (the CLI): listing asks nothing.
@@ -1150,7 +1122,7 @@ impl Manager {
         let secret = group(
             "Secret",
             Some(
-                "Show and Copy ask for your approval in the agent's dialog. A shown value hides after 30 seconds; a copied one can be pasted once and is cleared after 20 seconds.",
+                "Show and Copy ask for your approval in the agent's dialog. A shown value hides after 30 seconds. A copied value stays on the clipboard — and in your clipboard history, if your desktop keeps one — until you copy something else.",
             ),
         );
         for (title, notes, present) in [
@@ -1279,67 +1251,16 @@ impl Manager {
         );
     }
 
-    fn put_on_clipboard(&self, title: &str, value: SecretString) {
-        self.put_on_clipboard_for(title, value, Duration::from_secs(CLIPBOARD_SECONDS));
-    }
-
-    fn put_on_clipboard_for(&self, title: &str, value: SecretString, lifetime: Duration) {
-        self.clear_clipboard("");
-        let content = SecretContent::new(value);
-        self.window.clipboard().set_content(Some(&content)).ok();
-        *self.copied.borrow_mut() = Some(Copied {
-            content,
-            title: title.to_string(),
-            at: Instant::now(),
-            until: Instant::now() + lifetime,
-        });
-        self.tick_clipboard();
-        self.banner.set_revealed(true);
-    }
-
-    /// Keep the banner's countdown current, and clear the value after its
-    /// paste or its deadline.
-    fn tick_clipboard(&self) {
-        let outcome = {
-            let copied = self.copied.borrow();
-            let Some(c) = copied.as_ref() else { return };
-            if let Some(t) = c.content.served_at() {
-                Some(if t.saturating_duration_since(c.at) < TAKEN_AT_ONCE {
-                    "Another program took the value as soon as it was copied — probably a clipboard history, which may keep it. Your own paste will come back empty. The value is no longer on the clipboard."
-                } else {
-                    "The value was pasted once and is no longer on the clipboard. If your own paste came back empty, another program took it first."
-                })
-            } else if !c.content.is_on(&self.window.clipboard()) {
-                Some("Something else was copied; the value is no longer on the clipboard.")
-            } else if Instant::now() >= c.until {
-                Some("Not pasted in time. The value is no longer on the clipboard.")
-            } else {
-                let left = c.until.saturating_duration_since(Instant::now()).as_secs() + 1;
-                self.banner.set_title(&rusthorse::ui::dialog_text(&format!(
-                    "{} is on the clipboard for one paste · cleared in {left} s",
-                    c.title
-                )));
-                None
-            }
-        };
-        if let Some(reason) = outcome {
-            self.clear_clipboard(reason);
-        }
-    }
-
-    /// Wipe the copied value, so that no later request gets it. The
-    /// clipboard itself is not claimed again to empty it: another program
-    /// may own it by now without GTK knowing yet, and claiming it would
-    /// destroy what that program copied.
-    fn clear_clipboard(&self, reason: &str) {
-        let Some(c) = self.copied.borrow_mut().take() else {
-            return;
-        };
-        c.content.wipe();
-        self.banner.set_revealed(false);
-        if !reason.is_empty() {
-            self.feedback(reason, false);
-        }
+    /// Put a value on the clipboard as plain text, like any copy. GTK and
+    /// the desktop keep their own copies; nothing here can take them back.
+    fn put_on_clipboard(&self, title: &str, value: &SecretString) {
+        self.window.clipboard().set_text(value.as_str());
+        self.feedback(
+            &format!(
+                "{title} was copied. It stays on the clipboard — and in your clipboard history, if your desktop keeps one — until you copy something else."
+            ),
+            false,
+        );
     }
 
     fn hide_revealed(&self) {
@@ -1371,23 +1292,20 @@ impl Manager {
         let body = column(14);
         margins(&body, 18, 24);
         body.append(&styled(title, &["title-4"]));
-        // Neither selection nor a copy action: no accidental PRIMARY export.
+        // Not selectable: no accidental export to the PRIMARY selection. The
+        // Copy button below copies the value exactly, escapes undone.
         let display = SecretString::new(rusthorse::ui::dialog_text(&value));
-        let shown = value_view(display.as_str());
+        let shown = value_view(display.as_str(), groupable(&value));
         drop(display);
-        drop(value);
+        let kept = Rc::new(RefCell::new(Some(value)));
         body.append(&shown);
         let countdown = styled("", &["caption", "dim-label"]);
         body.append(&countdown);
         let buttons = row_box(8);
-        let copy = button(
-            if notes {
-                "Copy notes…"
-            } else {
-                "Copy value…"
-            },
-            Some("edit-copy-symbolic"),
-        );
+        let copy = button("Copy", Some("edit-copy-symbolic"));
+        copy.set_tooltip_text(Some(
+            "Copies what is shown, without asking again. It stays on the clipboard until you copy something else.",
+        ));
         buttons.append(&copy);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -1407,20 +1325,21 @@ impl Manager {
                 w.close();
             }
         });
-        // Copy from here asks the agent again: the approval said "show".
+        // The approval said the value could be copied from here (see the
+        // agent's wording for `show`), so this asks nothing.
         let manager = Rc::downgrade(self);
-        let entry = self.current();
-        copy.set_sensitive(entry.is_some());
+        let copied = format!("The {} of {title}", if notes { "notes" } else { "value" });
+        let value = Rc::clone(&kept);
         copy.connect_clicked(move |_| {
             if let Some(s) = manager.upgrade()
-                && let Some(e) = &entry
-                && s.job.borrow().is_none()
+                && let Some(v) = value.borrow().as_ref()
             {
-                s.copy(e, notes);
+                s.put_on_clipboard(&copied, v);
             }
         });
         let shown_ref = shown.clone();
         window.connect_close_request(move |w| {
+            kept.borrow_mut().take();
             wipe_labels(&shown_ref);
             w.set_content(None::<&gtk::Widget>);
             glib::Propagation::Proceed

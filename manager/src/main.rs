@@ -1,13 +1,11 @@
 //! The visual Rusthorse client. It never opens a vault or starts the agent.
 
-mod clipboard;
 mod connection;
 mod model;
 mod window;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio};
@@ -55,33 +53,8 @@ fn load_style() {
     styles.connect_dark_notify(apply);
 }
 
-/// Set when SIGINT, SIGTERM or SIGHUP arrives; the main loop then quits the
-/// application the normal way, which wipes shown and copied values.
-static QUIT: AtomicBool = AtomicBool::new(false);
-
-/// Block the termination signals in every thread (call before any thread
-/// starts) and wait for them on a thread of their own.
-fn watch_signals() -> Result<(), String> {
-    use nix::sys::signal::{SigSet, Signal};
-    let mut set = SigSet::empty();
-    for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
-        set.add(signal);
-    }
-    set.thread_block().map_err(|e| e.to_string())?;
-    std::thread::Builder::new()
-        .name("signals".into())
-        .spawn(move || {
-            if set.wait().is_ok() {
-                QUIT.store(true, Ordering::SeqCst);
-            }
-        })
-        .map(drop)
-        .map_err(|e| e.to_string())
-}
-
-/// Wipe a shown or copied value when the application shuts down — when its
-/// window closes, when it quits, and when a termination signal makes it quit
-/// — before GTK can offer the clipboard to a clipboard manager.
+/// Hide a shown value and drop what the window holds when the application
+/// shuts down, however it quits.
 pub(crate) fn wipe_at_shutdown(
     app: &adw::Application,
     state: &Rc<RefCell<Option<Rc<window::Manager>>>>,
@@ -100,10 +73,6 @@ fn main() -> std::process::ExitCode {
         eprintln!("rusthorse-manager: cannot protect process memory: {e}");
         return std::process::ExitCode::FAILURE;
     }
-    if let Err(e) = watch_signals() {
-        eprintln!("rusthorse-manager: cannot handle termination signals: {e}");
-        return std::process::ExitCode::FAILURE;
-    }
     let app = adw::Application::builder()
         .application_id("io.github.alle4you.Rusthorse")
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -111,16 +80,6 @@ fn main() -> std::process::ExitCode {
     app.connect_startup(|_| load_style());
     let state = Rc::new(RefCell::new(None::<Rc<window::Manager>>));
     wipe_at_shutdown(&app, &state);
-    let quitting = app.downgrade();
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        if !QUIT.load(Ordering::SeqCst) {
-            return gtk::glib::ControlFlow::Continue;
-        }
-        if let Some(app) = quitting.upgrade() {
-            app.quit();
-        }
-        gtk::glib::ControlFlow::Break
-    });
     let keep = Rc::clone(&state);
     app.connect_activate(move |app| {
         if let Some(manager) = keep.borrow().as_ref() {

@@ -12,7 +12,7 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 
 **M1 implemented, awaiting review** ([ADR 0007](adr/0007-visual-manager.md),
 [guide](manager.md)). M1: metadata browsing, search and groups, agent-approved
-edits, generated values, Show and single-paste Copy, command snippets,
+edits, generated values, Show and Copy, command snippets,
 status, locking and verified backup.
 M2: persistent agent configuration, grant revocation, bounded history and
 screen/suspend locking. M3: import UI, safe restoration and exclusive
@@ -145,7 +145,7 @@ approved command.
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables. |
 | **Visual manager** | M1 implemented, awaiting review | ADR 0007 and milestones above; manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
-| **Copy a value for a single paste** | Done (manager M1) | After its own approval; served to one paste, cleared after 20 s, on lock and on close ([ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory)). |
+| **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard, and in a clipboard history, until something else is copied. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |
 | **Auto-type into the focused window** | Idea | KeePassXC's approach; X11 only, and it can type into the wrong window. |
 

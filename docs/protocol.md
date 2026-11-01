@@ -141,8 +141,8 @@ master password in its own dialogs.
 | `purpose` | Meaning | Dialog asks | Audit `detail` |
 |---|---|---|---|
 | absent | The client prints it (`rusthorse reveal`). | "Reveal the value of an entry?" | `value` |
-| `"show"` | It shows the value in its own window for a short time. | "Show the value of an entry on screen?" | `value, to show` |
-| `"copy"` | It puts the value on the clipboard for one paste, then clears it. | "Copy the value of an entry to the clipboard?" | `value, to copy to the clipboard` |
+| `"show"` | It shows the value in its own window for a short time, from where the human may copy it. | "Show the value of an entry on screen?" | `value, to show` |
+| `"copy"` | It puts the value on the clipboard. | "Copy the value of an entry to the clipboard?" | `value, to copy to the clipboard` |
 
 (`notes` instead of `value` with `"notes": true`.) The purpose is the
 client's own statement: the agent cannot enforce it, the dialog labels it

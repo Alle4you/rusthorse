@@ -14,9 +14,7 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 rusthorse = { path = "..", default-features = false }
 serde_json = "1.0.154"
 serde = { version = "1.0.229", features = ["derive"] }
-nix = { version = "0.31.3", features = ["socket", "fs", "signal"] }
-# Wipes the copies of a value handed to the clipboard.
-zeroize = "1.9.1"
+nix = { version = "0.31.3", features = ["socket", "fs"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"

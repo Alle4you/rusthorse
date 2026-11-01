@@ -291,23 +291,20 @@ visual manager uses both:
   non-dumpable, keeps the value in zeroizing buffers, and hides it after 30
   seconds, on focus loss, on close and on an observed lock, emptying the
   labels.
-- **Copy** puts the value on the clipboard for **one paste**, for at most 20
-  seconds. Meanwhile, other programs of the session can read it (on X11 any
-  of them; on Wayland those using a data-control protocol, as clipboard
-  managers do), a clipboard history may keep it — on X11, GTK 4 cannot
-  deliver the `x-kde-passwordManagerHint` that tells histories to skip it —
-  and the program it is pasted into receives it, so a value pasted into the
-  wrong window (a chat with an AI) is gone. Mitigations: a separate approval
-  whose dialog warns of exactly this; the value is delivered to the first
-  request only, so a history that reads it uses it up and the human's own
-  paste usually comes back empty (not if that program puts the value back
-  on the clipboard as its own, which Rusthorse cannot see); it is wiped after that delivery, after 20 seconds,
-  on lock (including one observed while a dialog waits), on close and at
-  shutdown, signals included — before GTK could offer the clipboard to a
-  clipboard manager, which declaring nothing storable does not prevent;
-  wiping never claims the clipboard back, so what another program copied
-  meanwhile survives; and the manager warns when the value was taken faster
-  than a human pastes. See [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
+- **Show** also offers Copy (below) of what it shows, without a new
+  approval; the `show` dialog says so.
+- **Copy** puts the value on the clipboard as plain text, like any copy. It
+  stays there until something else is copied; other programs of the session
+  can read it (on X11 any of them; on Wayland those using a data-control
+  protocol); the desktop keeps its own copy — Cinnamon (verified) and GNOME
+  fetch it the moment it is copied and restore it when the copying program
+  exits — and a clipboard history may keep it for ever; and the program it
+  is pasted into receives it, so a value pasted into the wrong window (a
+  chat with an AI) is gone. Rusthorse cannot take a copied value back. What
+  it does: Copy needs its own approval, whose dialog says all this; the
+  audit log records it (`value, to copy to the clipboard`); and the manager
+  repeats the note after every copy. A stricter single-paste design was
+  built and dropped: the desktop's own copy defeats it ([ADR 0007](adr/0007-visual-manager.md#copy)).
 
 Status polling is not an immediate signal of a lock made elsewhere: the
 manager checks every five seconds, also while a request waits for the
@@ -787,3 +784,22 @@ approved unlock during a check that saw the lock, and repeated refreshes
 behave. One conservative effect, by design and now in the guide: when a Show
 or Copy has to unlock the vault first, a check during the password dialog
 sees the vault locked and the approved value is dropped; asking again works.
+
+**Copy redesigned after the maintainer's first try (2026-11-01).** On
+Cinnamon, every Copy came back empty when pasted. The logs showed every
+`reveal` approved; a probe on the maintainer's display showed why: Cinnamon's
+window manager (Muffin 6.6.3) fetches the clipboard text the instant an
+application copies — ignoring `x-kde-passwordManagerHint` — so it always took
+the single paste; and it puts its copy back on the clipboard when the copying
+program exits, which wiping inside the manager cannot reach. The maintainer
+chose a plain copy with an honest note over a stricter design that cannot
+work on the target desktops and would push users to photograph values. The
+single-paste provider, the clipboard banner, the termination-signal handling
+that existed for it and their tests were removed; Copy is now plain text
+after its own approval, Copy in the Show window copies what is shown
+without a new approval (the `show` dialog says so), and the grouping of a
+shown value is decided on the value itself, not on its escaped form (a test
+caught an escape being cut into groups). L14, ADR 0007, the guide and the
+agent's dialog texts say where a copied value goes.
+
+**Awaiting:** review of the redesign (Codex).
