@@ -1848,7 +1848,13 @@ fn notes_can_be_revealed_with_approval() {
     let out = h.run(&["reveal", "router", "--notes"]);
     assert_eq!(text(&out.stdout).trim(), "console on J3");
     let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
-    assert!(request.summary.contains("REVEAL the notes"));
+    assert_eq!(request.summary, "Reveal the notes of an entry?");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "Reveals" && v == "notes")
+    );
 }
 
 #[test]

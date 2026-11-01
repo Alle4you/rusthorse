@@ -221,6 +221,9 @@ for commands whose inputs you control. See [ADR 0005](adr/0005-remembered-approv
 Process names in the requester chain are chosen by the processes themselves,
 pids can be reused, and a socket can be handed to another process, so the
 chain is informative only. A flood of requests can cause approval fatigue.
+Text the requester controls is shown literally: dialogs use formatting, but
+every value is escaped before it is placed in it, so a command line cannot
+make part of itself bold, tiny or invisible.
 *Mitigation:* treat unexpected dialogs as a warning sign; deny when in doubt.
 
 ### L10 — The vault can be attacked offline

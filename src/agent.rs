@@ -538,7 +538,7 @@ impl Agent {
             state.generation
         };
         let base = format!(
-            "Type the master password to unlock the Rusthorse vault\n{}\n\nRequested by: {}",
+            "Type the master password to unlock the Rusthorse vault.\n\nVault: {}\nRequested by: {}",
             self.config.vault.display(),
             peer.describe()
         );
@@ -765,16 +765,17 @@ impl Agent {
             (None, Some(spec)) => {
                 let request = ApprovalRequest {
                     title: "Rusthorse — generate a secret".into(),
-                    summary: format!(
-                        "{verb} the entry \"{}\" with a newly generated value?",
-                        entry.name
-                    ),
+                    summary: format!("{verb} an entry with a generated value?"),
+                    explanation: "Rusthorse creates a random value and stores it. Nobody sees it, \
+                                  not even the program that asked."
+                        .into(),
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
                         ("Value".into(), describe_spec(spec)),
                         ("Requested by".into(), peer.describe()),
                     ],
+                    facts: Vec::new(),
                     warnings: if exists {
                         vec!["The current value will be overwritten.".into()]
                     } else {
@@ -787,10 +788,10 @@ impl Agent {
             }
             (None, None) => {
                 let message = format!(
-                    "{verb} the entry \"{}\"{}\n{}\nType the secret value, or Cancel.\n\nRequested by: {}",
+                    "Type the secret value for the entry \"{}\"{}.\n\nFields: {}\nRequested by: {}",
                     util::visible(&entry.name),
                     if exists {
-                        " (the current value will be overwritten)"
+                        " (it replaces the current value)"
                     } else {
                         ""
                     },
@@ -807,15 +808,16 @@ impl Agent {
             (Some(value), _) => {
                 let request = ApprovalRequest {
                     title: "Rusthorse — store a secret".into(),
-                    summary: format!(
-                        "{verb} the entry \"{}\" with a value supplied by the requesting process?",
-                        entry.name
-                    ),
+                    summary: format!("{verb} an entry with a value from a program?"),
+                    explanation: "The program that asked supplied the value, so it already knows \
+                                  it. Rusthorse stores it as it is."
+                        .into(),
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
                         ("Fields".into(), describe_fields(&entry)),
                         ("Requested by".into(), peer.describe()),
                     ],
+                    facts: Vec::new(),
                     warnings: if exists {
                         vec!["The current value will be overwritten.".into()]
                     } else {
@@ -887,11 +889,12 @@ impl Agent {
         details.push(("Requested by".into(), peer.describe()));
         let request = ApprovalRequest {
             title: "Rusthorse — import secrets".into(),
-            summary: format!(
-                "Import {} secrets supplied by the requesting process?",
-                entries.len()
-            ),
+            summary: format!("Import {} secrets?", entries.len()),
+            explanation: "The program that asked supplied these names and values. Check the \
+                          names before you allow it."
+                .into(),
             details,
+            facts: Vec::new(),
             warnings: Vec::new(),
             can_remember: false,
         };
@@ -942,8 +945,10 @@ impl Agent {
             details.push(("Requested by".into(), peer.describe()));
             let request = ApprovalRequest {
                 title: "Rusthorse — change an entry".into(),
-                summary: format!("Change the entry \"{}\"?", current.identity()),
+                summary: "Change an entry?".into(),
+                explanation: "The previous version is kept in the entry's history.".into(),
                 details,
+                facts: Vec::new(),
                 warnings: Vec::new(),
                 can_remember: false,
             };
@@ -958,7 +963,7 @@ impl Agent {
                 let prompt = Prompt {
                     title: "Rusthorse — new value".into(),
                     message: format!(
-                        "New value for \"{}\"\nType the secret value, or Cancel.\n\nRequested by: {}",
+                        "Type the new secret value for the entry \"{}\".\n\nRequested by: {}",
                         util::visible(&current.identity()),
                         peer.describe()
                     ),
@@ -983,12 +988,14 @@ impl Agent {
         let info = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
         let request = ApprovalRequest {
             title: "Rusthorse — delete an entry".into(),
-            summary: format!("Permanently delete the entry \"{}\"?", info.identity()),
+            summary: "Delete an entry?".into(),
+            explanation: "The entry and its history are removed from the vault.".into(),
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Group".into(), info.group.clone().unwrap_or_else(|| "(root)".into())),
                 ("Requested by".into(), peer.describe()),
             ],
+            facts: Vec::new(),
             warnings: vec!["This cannot be undone (the previous file is kept as vault.kdbx.bak until the next save).".into()],
             can_remember: false,
         };
@@ -1089,15 +1096,17 @@ impl Agent {
         })?;
         let request = ApprovalRequest {
             title: "Rusthorse — reveal a secret".into(),
-            summary: format!(
-                "REVEAL the {what} of \"{}\" to the requesting process?",
-                info.identity()
+            summary: format!("Reveal the {what} of an entry?"),
+            explanation: format!(
+                "The program that asked receives the {what} in clear text and can do anything \
+                 with it."
             ),
             details: vec![
                 ("Entry".into(), info.identity()),
                 ("Reveals".into(), what.into()),
                 ("Requested by".into(), peer.describe()),
             ],
+            facts: Vec::new(),
             warnings: vec![format!(
                 "The {what} will be printed by the requesting process. If an AI agent asked, it will see it and it may end up in its logs."
             )],
@@ -1279,11 +1288,12 @@ impl Agent {
         };
         let request = ApprovalRequest {
             title: "Rusthorse — use a secret".into(),
-            summary: "Run this command with the secrets below in its environment?".into(),
+            summary: "Run a command with your secrets?".into(),
+            explanation: "Read the command before you allow it. The secrets go only to this \
+                          command, in its environment."
+                .into(),
             details: vec![
                 ("Command".into(), command_line),
-                ("Program".into(), program_text),
-                ("Directory".into(), run.cwd.clone()),
                 (
                     "Secrets".into(),
                     run.bindings
@@ -1293,6 +1303,11 @@ impl Agent {
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
+                ("Program".into(), program_text),
+                ("Directory".into(), run.cwd.clone()),
+                ("Requested by".into(), peer.describe()),
+            ],
+            facts: vec![
                 ("Input".into(), input.into()),
                 (
                     "Output".into(),
@@ -1306,7 +1321,6 @@ impl Agent {
                     "Runs".into(),
                     "as you, outside any sandbox the requester may be in".into(),
                 ),
-                ("Requested by".into(), peer.describe()),
             ],
             warnings,
             can_remember: true,

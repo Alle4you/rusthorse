@@ -62,6 +62,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   cancelled or unanswered `passwd` dialog is now audited.
 - `backup` to a file that exists says so and asks for a new name, instead of
   "File exists (os error 17)".
+- Approval dialogs are easier to read: a short headline and an explanation,
+  one block per detail with the values in a monospaced font, context in one
+  quieter line and warnings in bold. They follow the desktop's light or dark
+  theme (no colours or icons of their own) and use only options that zenity 3
+  and 4 share. Values are escaped before formatting, so they are shown
+  literally. The password prompts are worded more clearly.
 
 ### Security
 

@@ -2,7 +2,9 @@
 //!
 //! Dialogs are shown **by the agent**, never by the client, so a client cannot
 //! answer them by writing to a terminal. The production implementation uses
-//! `zenity` (tested with 3.44). Tests use their own [`Ui`] implementation.
+//! `zenity` (tested with 3.44), using only options that zenity 4 also has,
+//! and no colours or icons of its own, so the dialogs follow the desktop's
+//! theme. Tests use their own [`Ui`] implementation.
 
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -34,10 +36,17 @@ pub struct Prompt {
 pub struct ApprovalRequest {
     /// Window title.
     pub title: String,
-    /// One-sentence summary of what is being asked.
+    /// The question, as a short headline.
     pub summary: String,
-    /// Label/value pairs with the details (command, program, secrets, ...).
+    /// One or two sentences under the headline: what approving means. May
+    /// be empty.
+    pub explanation: String,
+    /// What to read before deciding (command, program, secrets, ...), as
+    /// label/value pairs; each is shown as its own block.
     pub details: Vec<(String, String)>,
+    /// Context shown in one quieter line under the details (input, output
+    /// handling, ...), as label/value pairs.
+    pub facts: Vec<(String, String)>,
     /// Warnings shown below the details.
     pub warnings: Vec<String>,
     /// Whether "allow for a while" may be offered.
@@ -231,14 +240,12 @@ impl Ui for ZenityUi {
         let remember_label = format!("Allow for {}", format_duration(self.remember_for));
         let offer_remember = request.can_remember && !self.remember_for.is_zero();
 
-        let mut text = approval_text(request);
-        if offer_remember {
-            text.push_str(&remember_note(&remember_label, self.remember_for));
-        }
+        let note = offer_remember.then(|| remember_note(&remember_label, self.remember_for));
+        let text = approval_markup(request, note.as_deref());
         let mut cmd = self.command(&request.title)?;
         cmd.arg("--question")
-            // Literal text: no Pango markup and no escape-sequence processing.
-            .arg("--no-markup")
+            // Pango markup built by `approval_markup`: every value in it went
+            // through `markup_text`.
             .arg("--default-cancel")
             .arg(format!("--text={text}"))
             .arg("--ok-label=Allow once")
@@ -252,18 +259,101 @@ impl Ui for ZenityUi {
     }
 }
 
-/// The text of an approval dialog. Every value goes through [`visible`] so a
-/// requester cannot inject line breaks or bidirectional overrides.
+/// The text of an approval dialog, without formatting: what the dialog says,
+/// used to measure it. Every value goes through [`visible`] so a requester
+/// cannot inject line breaks or bidirectional overrides.
 pub fn approval_text(request: &ApprovalRequest) -> String {
     let mut text = visible(&request.summary);
+    if !request.explanation.is_empty() {
+        text.push('\n');
+        text.push_str(&visible(&request.explanation));
+    }
     text.push_str("\n\n");
-    for (label, value) in &request.details {
+    for (label, value) in request.details.iter().chain(&request.facts) {
         text.push_str(&format!("{label}: {}\n", visible(value)));
     }
     for warning in &request.warnings {
         text.push_str(&format!("\n⚠ {}", visible(warning)));
     }
     text
+}
+
+/// A small vertical gap between blocks.
+const GAP: &str = "<span size=\"5000\"> </span>\n";
+
+/// The approval dialog as Pango markup: the headline, the explanation, one
+/// block per detail (a small label over a monospaced value), the facts in one
+/// quieter line, the warnings in bold and the "Allow for" note, if any.
+/// Secondary text is dimmed with `alpha`, a transparency of the theme's own
+/// text colour, so it reads on light and dark themes alike. Every string goes
+/// through [`markup_text`], so nothing a requester controls can add a tag.
+pub fn approval_markup(request: &ApprovalRequest, note: Option<&str>) -> String {
+    let mut out = format!(
+        "<span size=\"x-large\" weight=\"bold\">{}</span>\n",
+        markup_text(&request.summary)
+    );
+    if !request.explanation.is_empty() {
+        out.push_str(&format!(
+            "<span alpha=\"70%\">{}</span>\n",
+            markup_text(&request.explanation)
+        ));
+    }
+    for (label, value) in &request.details {
+        out.push_str(GAP);
+        out.push_str(&format!(
+            "<span size=\"small\" alpha=\"70%\" weight=\"bold\">{}</span>\n<tt>{}</tt>\n",
+            markup_text(&label.to_uppercase()),
+            markup_text(value)
+        ));
+    }
+    if !request.facts.is_empty() {
+        let facts: Vec<String> = request
+            .facts
+            .iter()
+            .map(|(label, value)| format!("{}: {}", markup_text(label), markup_text(value)))
+            .collect();
+        out.push_str(GAP);
+        out.push_str(&format!(
+            "<span alpha=\"70%\">{}</span>\n",
+            facts.join(" · ")
+        ));
+    }
+    for warning in &request.warnings {
+        out.push_str(GAP);
+        out.push_str(&format!("<b>⚠  {}</b>\n", markup_text(warning)));
+    }
+    if let Some(note) = note {
+        out.push_str(GAP);
+        out.push_str(&format!(
+            "<span size=\"small\" alpha=\"70%\">{}</span>\n",
+            markup_text(note.trim())
+        ));
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
+/// Text to place in Pango markup: [`visible`] first (control and format
+/// characters become `\u{…}`), then `&`, `<`, `>`, quotes and backslashes
+/// become character references, so the text can neither open a tag nor end
+/// one. A backslash is written `&#92;` rather than doubled: zenity 3 passes
+/// markup through `g_strcompress` (which turns `\n` into a line break) before
+/// parsing it, and other versions may not; a reference reads the same either
+/// way, so the dialog shows exactly the value.
+pub fn markup_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in visible(text).chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '\\' => out.push_str("&#92;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The environment for dialogs: the [`DIALOG_ENV`] variables of the agent,
@@ -389,12 +479,137 @@ mod tests {
         let request = ApprovalRequest {
             title: "t".into(),
             summary: "Run a command".into(),
+            explanation: String::new(),
             details: vec![("Command".into(), "echo ok\nSecrets: none".into())],
+            facts: Vec::new(),
             warnings: vec!["careful".into()],
             can_remember: true,
         };
         let text = approval_text(&request);
         assert!(text.contains("Command: echo ok\\u{a}Secrets: none\n"));
         assert!(text.ends_with("⚠ careful"));
+    }
+
+    /// The tags `approval_markup` writes itself.
+    const OUR_TAGS: [&str; 9] = [
+        "<span size=\"x-large\" weight=\"bold\">",
+        "<span alpha=\"70%\">",
+        "<span size=\"small\" alpha=\"70%\" weight=\"bold\">",
+        "<span size=\"small\" alpha=\"70%\">",
+        "<span size=\"5000\">",
+        "</span>",
+        "<tt>",
+        "</tt>",
+        "<b>",
+    ];
+
+    /// Remove our tags and decode character references: what the dialog
+    /// shows. Panics on any other tag or reference.
+    fn shown(markup: &str) -> String {
+        let mut rest = markup;
+        let mut out = String::new();
+        while let Some(c) = rest.chars().next() {
+            if c == '<' {
+                let tag = OUR_TAGS
+                    .iter()
+                    .chain(&["</b>"])
+                    .find(|t| rest.starts_with(**t))
+                    .unwrap_or_else(|| panic!("unexpected tag at {rest:?}"));
+                rest = &rest[tag.len()..];
+            } else if c == '&' {
+                let end = rest.find(';').expect("reference end");
+                out.push(match &rest[..=end] {
+                    "&amp;" => '&',
+                    "&lt;" => '<',
+                    "&gt;" => '>',
+                    "&quot;" => '"',
+                    "&#39;" => '\'',
+                    "&#92;" => '\\',
+                    other => panic!("unexpected reference {other}"),
+                });
+                rest = &rest[end + 1..];
+            } else {
+                assert!(c != '>' && c != '\\', "raw {c:?} in {markup}");
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nothing_a_requester_sends_can_add_markup() {
+        let hostile = [
+            "</tt><span size=\"1\">hidden</span><tt>",
+            "a & b; c &amp; d &#60;",
+            r"printf 'a\nb' \\ end",
+            "quote \" and ' and > and <b>bold</b>",
+            "line\nbreak \u{202E}reversed",
+        ];
+        for value in hostile {
+            let request = ApprovalRequest {
+                title: "t".into(),
+                summary: format!("Headline {value}"),
+                explanation: format!("Explained {value}"),
+                details: vec![
+                    ("Command".into(), value.into()),
+                    (format!("Label {value}"), value.into()),
+                ],
+                facts: vec![("Input".into(), value.into())],
+                warnings: vec![value.into()],
+                can_remember: true,
+            };
+            let markup = approval_markup(&request, Some(value));
+            let text = shown(&markup);
+            let seen = visible(value);
+            // Every value is shown exactly, as text, everywhere it appears.
+            assert_eq!(text.matches(&seen).count(), 7, "{markup}");
+            assert!(text.contains(&format!("Headline {seen}")));
+            assert!(text.contains(&format!("⚠  {seen}")));
+        }
+    }
+
+    #[test]
+    fn a_backslash_reads_the_same_with_or_without_escape_processing() {
+        let markup = markup_text(r"a\nb \\ c");
+        assert_eq!(markup, "a&#92;nb &#92;&#92; c");
+        assert!(!markup.contains('\\'));
+    }
+
+    #[test]
+    fn the_approval_markup_has_a_block_per_detail_and_one_line_of_facts() {
+        let request = ApprovalRequest {
+            title: "t".into(),
+            summary: "Run a command with your secrets?".into(),
+            explanation: "Read it.".into(),
+            details: vec![
+                ("Command".into(), "true".into()),
+                ("Requested by".into(), "bash[1]".into()),
+            ],
+            facts: vec![
+                ("Input".into(), "none".into()),
+                ("Output".into(), "redacted".into()),
+            ],
+            warnings: vec!["careful".into()],
+            can_remember: false,
+        };
+        let markup = approval_markup(&request, None);
+        assert!(markup.starts_with(
+            "<span size=\"x-large\" weight=\"bold\">Run a command with your secrets?</span>\n"
+        ));
+        assert!(markup.contains(">COMMAND</span>\n<tt>true</tt>"));
+        assert!(markup.contains(">REQUESTED BY</span>\n<tt>bash[1]</tt>"));
+        assert!(markup.contains("<span alpha=\"70%\">Input: none · Output: redacted</span>"));
+        assert!(markup.ends_with("<b>⚠  careful</b>"));
+        assert_eq!(
+            shown(&markup),
+            "Run a command with your secrets?\nRead it.\n \nCOMMAND\ntrue\n \nREQUESTED BY\nbash[1]\n \nInput: none · Output: redacted\n \n⚠  careful"
+        );
+        // The text that is measured against the dialog limit has it all.
+        assert_eq!(
+            approval_text(&request),
+            "Run a command with your secrets?\nRead it.\n\nCommand: true\nRequested by: bash[1]\n\
+             Input: none\nOutput: redacted\n\n⚠ careful"
+        );
     }
 }

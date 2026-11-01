@@ -263,7 +263,15 @@ with `/` as its working directory and only the display, locale and D-Bus
 variables in its environment. Its answer is read from a socket pair rather
 than a pipe, because other processes of the same user can open a pipe through
 `/proc/<pid>/fd` but not a socket. Text for the entry dialog has backslashes
-and underscores escaped; the question dialog uses `--no-markup`. Only an exit
+and underscores escaped. The question dialog is laid out with Pango markup —
+a headline, an explanation, one block per detail, the facts in one quieter
+line, the warnings in bold — and every string in it is first made visible
+(control and bidirectional characters shown as `\u{…}`) and then escaped, a
+backslash included, as a character reference, so a value can neither add a
+tag nor be changed by zenity's escape processing; tests check both. It uses
+no colour or icon of its own, only options zenity 3 and 4 share, so it follows
+the desktop's theme. The password and value prompts stay plain entry dialogs,
+where Enter submits. Only an exit
 status of 0 with no output (Allow once), or 1 with the exact label of the
 extra button (Allow for N), counts as approval. A request whose dialog text
 would exceed 4000 characters — counting the room reserved for the "Allow
