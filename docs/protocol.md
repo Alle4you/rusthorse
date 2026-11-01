@@ -232,8 +232,9 @@ different mount namespaces). `agent_executable_replaced` says whether that
 name no longer leads to the running file — it was replaced or removed after
 the agent started, as an upgrade without a restart does — judged by file
 identity, not by the ` (deleted)` the kernel appends to the name, which a
-real file name could also end with; it is `null` when the agent cannot tell
-(for example, no permission to examine the path).
+real file name could also end with; it is left out when the agent cannot tell
+(for example, without permission to examine the path), as is
+`agent_executable_id` when the agent cannot read its own identity.
 Clients should check `protocol_version` and refuse to continue on a mismatch.
 
 ### EntryInfo

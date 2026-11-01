@@ -464,9 +464,10 @@ pub struct StatusInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_executable_id: Option<(u64, u64)>,
     /// Whether the agent's program file was replaced or removed after it
-    /// started, judged by file identity, not by name; `None` when the agent
-    /// cannot tell (for example, no permission to examine the path).
-    #[serde(default)]
+    /// started, judged by file identity, not by name; `None` (the field is
+    /// left out) when the agent cannot tell, for example without permission
+    /// to examine the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_executable_replaced: Option<bool>,
 }
 
@@ -819,6 +820,29 @@ fn recv_with_fds(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn unknown_status_fields_are_left_out_not_null() {
+        // Clients that know the field as a plain boolean must still read it.
+        let status = StatusInfo {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: "x".into(),
+            vault: "/v".into(),
+            vault_exists: true,
+            audit_log: String::new(),
+            locked: true,
+            idle_timeout_secs: 0,
+            locks_in_secs: None,
+            remembered_approvals: 0,
+            agent_executable: "/bin/x".into(),
+            agent_executable_id: None,
+            agent_executable_replaced: None,
+        };
+        let json = serde_json::to_value(&status).expect("json");
+        assert!(json.get("agent_executable_replaced").is_none(), "{json}");
+        assert!(json.get("agent_executable_id").is_none(), "{json}");
+        assert!(!json.to_string().contains("null"), "{json}");
+    }
 
     #[test]
     fn frames_round_trip_with_fds() {
