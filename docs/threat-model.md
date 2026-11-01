@@ -363,6 +363,8 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - **Per-entry policies**: restrict an entry to listed programs or hosts.
 - **An in-process GUI** (instead of zenity) with scrollable details and a
   grants panel to inspect and revoke remembered approvals.
+- **A "waiting for your answer" hint** in the terminal while a dialog is
+  open, driven by an explicit event from the agent.
 - Signed release artifacts.
 
 ## 11. Review history
@@ -562,3 +564,43 @@ first real test):
 | A path the agent could not examine (no permission, an I/O error) was reported as replaced | **Fixed:** only a missing path or a different identity counts as replaced; otherwise the answer is "cannot tell" (the field is left out), never a failure. A first version sent `null`, which a client that knows the field as a plain boolean cannot read (fourteenth review); unknown values are now left out. |
 | `doctor` looked up the agent's path in its own mount namespace, where the same name can lead to another file, and could report "the same program file" for different files | **Fixed:** the agent reports the device and inode of the file it runs, read through its own `/proc/self/exe`, and `doctor` compares that with its own. |
 | Coverage | Reverting each fix of this round makes the suite fail (the permission case is skipped when the tests run as root, which ignores directory modes). |
+
+The fourteenth review found the `null` field above; the fifteenth confirmed
+it fixed and found nothing new (verdict: ready for the first real test).
+
+Findings of the first real test, on the owner's desktop with a vault of fake
+entries, Claude Code and Codex acting as the AI agents. Using a secret
+through `run` worked as designed from both agents — the command received the
+value, the agents saw `[REDACTED:…]` — and denial, the audit log's requester
+chain (`… ← codex ← claude ← …`), `backup` and an `import secret-service
+--dry-run` of 34 items behaved as documented. What it found:
+
+| Finding | Disposition |
+|---|---|
+| R1 — an approval's audit record carried the time the request arrived, 23 seconds before the owner answered | **Fixed:** records are dated when they are written, after the decision. |
+| R2 — the AI's non-interactive shell did not have `~/.cargo/bin` on its `PATH`, so it could not find `rusthorse` | **Fixed (documentation):** [installation.md](installation.md#1-build-and-install) explains the check and the fix; the last setup step in [ai-agents.md](ai-agents.md#setting-up-an-agent) is `rusthorse doctor` from the AI's own shell. |
+| R3 — the owner took the master-password dialog for an approval and clicked Unlock three times with the field empty, which was recorded and reported as three wrong passwords | **Fixed:** the dialog starts with "Type the master password"; an empty field asks again without counting as wrong, and an unlock where nothing was typed is cancelled. [getting-started.md](getting-started.md) tells the two kinds of dialog apart. |
+| R4 — a dialog nobody answered was reported as a denial or a cancellation by the human | **Fixed:** it is `timed_out` in the audit log and "nobody answered … in time" in the message, so "nobody looked" is not mistaken for "the human said no". Exit statuses are unchanged. |
+| R5 — a backup to an existing file failed with "File exists (os error 17)" | **Fixed:** the message says a backup never replaces a file and asks for a new name. |
+| Not covered by this test | "Allow for …" (off by default) and opening a backup copy in KeePassXC; both are left to the owner. |
+
+Findings of the sixteenth review (R1–R5 confirmed fixed; no finding of medium
+or higher severity; verdict: ready to continue the real tests):
+
+| Finding | Disposition |
+|---|---|
+| A regression test ("a batch never sent is not imported") failed about once in thirty full-suite runs: its fake agent closed its listener after answering, but the next connection could still be queued — by the listener, or by the copy a child forked by another test holds until its exec — and was reset after its request was sent | **Fixed:** the fake removes the socket file before its last answer, so later connections fail at once (0 failures in 80 full-suite runs, 40 of them under CPU load). |
+| The documentation said audit times keep the file in order and equal the moment of the answer | **Fixed:** they come from the system clock, after the decision, and can go backwards if the clock is set back. |
+| The `PATH` advice assumed `~/.local/bin` exists and is on the AI's `PATH` | **Fixed:** check first, create the directory, fall back to the absolute path. |
+| Idea: test that each `passwd` dialog, cancelled or unanswered, is recorded once and changes nothing | **Done.** |
+| Idea: a "waiting for you to answer a dialog" hint in the terminal; the reviewer recommends an explicit event from the agent rather than a client-side timer, synchronised with the start of a command's output | **Later.** |
+| Coverage | Reverting each code fix of R1, R3, R4 and R5 makes the suite fail; reverting the test fix brings the intermittent failure back (5 failures in 800 runs of that test under load). |
+
+Findings of the seventeenth review (all of the above confirmed fixed; no new
+finding of medium or higher severity; verdict: ready to continue the real
+tests):
+
+| Finding | Disposition |
+|---|---|
+| An audit time can trail the answer while other records are being written | **Fixed (documentation).** |
+| Ideas: check the in-memory password after a cancelled `passwd`; back up to symbolic links and to a directory without write permission | **Done:** a change applied only in memory, or a followed link, makes the suite fail. |
