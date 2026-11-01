@@ -372,8 +372,11 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - **One cgroup per approved command** (L17), with resource limits.
 - **Bounded KDF parameters** before unlocking (L12).
 - **Per-entry policies**: restrict an entry to listed programs or hosts.
-- **An in-process GUI** (instead of zenity) with scrollable details and a
-  grants panel to inspect and revoke remembered approvals.
+- **Rusthorse's own dialog program** instead of zenity
+  ([ADR 0006](adr/0006-own-dialog-program.md), proposed): a separate GTK 4
+  process started like zenity, plain text only, scrolling content with fixed
+  buttons, and approval disabled until the whole request has been shown;
+  later, a grants panel to inspect and revoke remembered approvals.
 - **A "waiting for your answer" hint** in the terminal while a dialog is
   open, driven by an explicit event from the agent.
 - Signed release artifacts.

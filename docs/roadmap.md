@@ -5,8 +5,8 @@ changes the security model — what a client can obtain, what the human
 approves, what is stored — gets an [ADR](adr/README.md) and an update to the
 [threat model](threat-model.md) before it is built.
 
-Status: **Planned** (agreed direction), **Idea** (worth exploring, not
-designed), **Later** (accepted, not a priority).
+Status: **In progress**, **Planned** (agreed direction), **Idea** (worth
+exploring, not designed), **Later** (accepted, not a priority).
 
 ## Credential broker: secrets that never enter the client
 
@@ -128,7 +128,7 @@ approved command.
 
 | Item | Status | Notes |
 |---|---|---|
-| **In-process interface instead of zenity** (GTK 4) | Planned | Scrollable details with the buttons always visible — which also replaces today's dialog height estimate — and a grants panel to inspect and revoke remembered approvals and broker tokens. |
+| **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | In progress — [ADR 0006](adr/0006-own-dialog-program.md) | A separate process, started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until everything has been shown (which replaces the height estimate), a distinct password dialog; prototype approved by the owner. Later, a grants panel to inspect and revoke remembered approvals and broker tokens. |
 | **Lock on screen lock and suspend** | Planned | Listen to logind and the screensaver over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables. |
