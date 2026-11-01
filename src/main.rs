@@ -23,9 +23,10 @@ use rusthorse::{audit, import, paths};
 /// Exit status for `run` when Rusthorse refused or failed and the command
 /// did not run (as `env` and `docker run` do).
 const EXIT_RUN_FAILURE: u8 = 125;
-/// Exit status for `run` when the connection to the agent was lost after the
-/// request was sent: the command may or may not have run.
-const EXIT_RUN_UNKNOWN: u8 = 124;
+/// Exit status when the outcome is unknown: the request was sent but no answer
+/// came back, or the agent could not confirm it took effect (a command may or
+/// may not have run; a change may or may not have been saved).
+const EXIT_UNKNOWN: u8 = 124;
 /// Exit status when the human denied or cancelled the request.
 const EXIT_DENIED: u8 = 4;
 
@@ -375,8 +376,15 @@ fn main() -> ExitCode {
             if let Some(Exit(code)) = e.downcast_ref::<Exit>() {
                 return ExitCode::from(*code);
             }
-            eprintln!("rusthorse: {e:#}");
-            ExitCode::FAILURE
+            if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                .is_some()
+            {
+                eprintln!("rusthorse: {e:#}; it may or may not have taken effect");
+                ExitCode::from(EXIT_UNKNOWN)
+            } else {
+                eprintln!("rusthorse: {e:#}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -456,6 +464,7 @@ fn check(response: Response) -> anyhow::Result<Response> {
             eprintln!("rusthorse: {message}");
             let status = match code {
                 ErrorCode::Denied | ErrorCode::Cancelled => EXIT_DENIED,
+                ErrorCode::OutcomeUnknown => EXIT_UNKNOWN,
                 _ => 1,
             };
             Err(Exit(status).into())
@@ -872,24 +881,27 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 message,
             } => {
                 eprintln!("rusthorse: {message}");
-                Ok(EXIT_RUN_UNKNOWN)
+                Ok(EXIT_UNKNOWN)
             }
             Response::Error { message, .. } => {
                 eprintln!("rusthorse: {message}");
                 Ok(EXIT_RUN_FAILURE)
             }
-            other => bail!("unexpected {} response from the agent", other.kind()),
+            other => Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
+                format!("unexpected {} response", other.kind()),
+            ))),
         }
     })();
     match outcome {
         Ok(code) => Ok(code),
         Err(e) => {
-            eprintln!("rusthorse: {e:#}");
             if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
                 .is_some()
             {
-                Ok(EXIT_RUN_UNKNOWN)
+                eprintln!("rusthorse: {e:#}; the command may or may not have run");
+                Ok(EXIT_UNKNOWN)
             } else {
+                eprintln!("rusthorse: {e:#}");
                 Ok(EXIT_RUN_FAILURE)
             }
         }
@@ -1000,13 +1012,10 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         if total > 1 {
             eprintln!("batch {} of {total} ({} entries):", i + 1, batch.len());
         }
-        let result = simple(
-            client,
-            &Request::Import {
-                entries: batch,
-                replace,
-            },
-        );
+        let answer = client.call(&Request::Import {
+            entries: batch,
+            replace,
+        });
         let done = if i == 0 {
             "no earlier batch was imported".to_string()
         } else {
@@ -1018,33 +1027,59 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         } else {
             "running the same import again skips the names already imported"
         };
-        match &result {
-            Ok(0) => {}
-            // The agent answered: this batch was refused or failed.
-            Err(e) if e.downcast_ref::<Exit>().is_some() => {
-                if total > 1 {
-                    eprintln!(
-                        "rusthorse: stopped at batch {} of {total}: {done}; batch {} and later \
-                         were not imported — {rerun}",
-                        i + 1,
-                        i + 1
-                    );
-                }
-            }
-            // No answer: the batch may or may not have been imported.
-            Err(_) | Ok(_) => {
+        let not_imported = |status: u8| -> anyhow::Result<u8> {
+            if total > 1 {
                 eprintln!(
-                    "rusthorse: lost the connection during batch {} of {total}: {done}; batch {} \
-                     may or may not have been imported, later ones were not — check with \
-                     `rusthorse list` before {rerun}",
+                    "rusthorse: stopped at batch {} of {total}: {done}; batch {} and later were \
+                     not imported — {rerun}",
                     i + 1,
                     i + 1
                 );
             }
-        }
-        match result {
-            Ok(0) => {}
-            other => return other,
+            Err(Exit(status).into())
+        };
+        let unsure = |what: &str| -> anyhow::Result<u8> {
+            eprintln!(
+                "rusthorse: {what} batch {} of {total}: {done}; batch {} may or may not have been \
+                 imported, later ones were not — check with `rusthorse list` before {rerun}",
+                i + 1,
+                i + 1
+            );
+            Err(Exit(EXIT_UNKNOWN).into())
+        };
+        match answer {
+            Ok(Response::Ok { message }) => eprintln!("{message}"),
+            // Every error except `outcome_unknown` means nothing was saved
+            // (docs/protocol.md, "Errors").
+            Ok(Response::Error { code, message }) if code != ErrorCode::OutcomeUnknown => {
+                eprintln!("rusthorse: {message}");
+                let denied = matches!(code, ErrorCode::Denied | ErrorCode::Cancelled);
+                return not_imported(if denied { EXIT_DENIED } else { 1 });
+            }
+            Ok(Response::Error { message, .. }) => {
+                eprintln!("rusthorse: {message}");
+                return unsure("could not confirm");
+            }
+            Ok(other) => {
+                eprintln!(
+                    "rusthorse: unexpected {} response from the agent",
+                    other.kind()
+                );
+                return unsure("could not confirm");
+            }
+            // The request was sent but no answer came back.
+            Err(e)
+                if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                    .is_some() =>
+            {
+                eprintln!("rusthorse: {e:#}");
+                return unsure("lost the connection during");
+            }
+            // The request was never sent (the agent stopped, say).
+            Err(e) => {
+                eprintln!("rusthorse: {e:#}");
+                return not_imported(1);
+            }
         }
     }
     Ok(0)

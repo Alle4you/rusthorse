@@ -88,6 +88,14 @@ pub enum VaultError {
     /// The database could not be serialized.
     #[error("cannot save the vault: {0}")]
     Save(#[source] DatabaseSaveError),
+    /// The new file replaced the vault, but its directory could not be
+    /// synced: the change is visible, but may not survive a crash or a power
+    /// loss. The save is neither confirmed nor undone.
+    #[error(
+        "the vault file was replaced, but syncing its directory failed ({0}); the change is in \
+         place but may not survive a crash or power loss"
+    )]
+    NotDurable(#[source] std::io::Error),
     /// File system error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -187,6 +195,9 @@ pub struct Vault {
     /// Test hook: make deleting the old-password backup fail.
     #[cfg(test)]
     fail_cleanup: bool,
+    /// Test hook: make syncing the directory fail after the rename.
+    #[cfg(test)]
+    fail_dir_sync: bool,
 }
 
 impl std::fmt::Debug for Vault {
@@ -225,6 +236,8 @@ impl Vault {
             before_verify: None,
             #[cfg(test)]
             fail_cleanup: false,
+            #[cfg(test)]
+            fail_dir_sync: false,
         };
         vault.write_file(false)?;
         Ok(vault)
@@ -267,6 +280,8 @@ impl Vault {
             before_verify: None,
             #[cfg(test)]
             fail_cleanup: false,
+            #[cfg(test)]
+            fail_dir_sync: false,
         })
     }
 
@@ -290,6 +305,13 @@ impl Vault {
     /// if it did. The password change itself is saved either way.
     pub fn take_cleanup_error(&mut self) -> Option<String> {
         self.cleanup_error.take()
+    }
+
+    /// Test hook: make the next saves fail after replacing the file, at the
+    /// directory sync (see [`VaultError::NotDurable`]).
+    #[cfg(test)]
+    pub(crate) fn fail_directory_sync(&mut self) {
+        self.fail_dir_sync = true;
     }
 
     /// Use `new` as the master password from the next save on. That save
@@ -380,10 +402,23 @@ impl Vault {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
-        File::open(&dir)?.sync_all()?;
-        // The renamed file is the one we wrote (same inode), whatever the path
-        // points to by now.
+        // From here on the new file is in place: a failure no longer means
+        // "not saved". The renamed file is the one we wrote (same inode),
+        // whatever the path points to by now.
         self.fingerprint = Some(written);
+        #[cfg(test)]
+        let synced = if self.fail_dir_sync {
+            Err(std::io::Error::other("injected directory sync failure"))
+        } else {
+            File::open(&dir).and_then(|d| d.sync_all())
+        };
+        #[cfg(not(test))]
+        let synced = File::open(&dir).and_then(|d| d.sync_all());
+        if let Err(e) = synced {
+            // Deleting an old-password `.bak` waits for a save that is
+            // confirmed: after a crash, that file may be the only copy.
+            return Err(VaultError::NotDurable(e));
+        }
         if self.discard_backup {
             let backup = dir.join(format!("{name}.bak"));
             #[cfg(test)]
@@ -1108,6 +1143,36 @@ mod tests {
         let problem = vault.take_cleanup_error().expect("the failure is reported");
         assert!(problem.contains("vault.kdbx.bak"), "{problem}");
         assert!(Vault::open(&path, secret("another passphrase")).is_ok());
+    }
+
+    #[test]
+    fn a_failed_directory_sync_is_not_reported_as_unsaved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        vault
+            .add(&entry("old"), &secret("abcd"), false)
+            .expect("add");
+        vault.save().expect("save");
+        vault.change_password(secret("another passphrase"));
+        vault
+            .add(&entry("new"), &secret("efgh"), false)
+            .expect("add");
+        vault.fail_dir_sync = true;
+        assert!(matches!(vault.save(), Err(VaultError::NotDurable(_))));
+        // The change is on disk, and the vault knows it is: no false
+        // "changed by another program" on the next save.
+        let reopened = Vault::open(&path, secret("another passphrase")).expect("new file");
+        assert!(reopened.find("new").is_ok());
+        // The old-password copy is kept until a save is confirmed.
+        let backup = path.with_file_name("vault.kdbx.bak");
+        assert!(Vault::open(&backup, secret("correct horse")).is_ok());
+        vault.fail_dir_sync = false;
+        vault.save().expect("the next save works");
+        assert!(vault.take_cleanup_error().is_none());
+        assert!(
+            !backup.exists(),
+            "the old-password copy is deleted once confirmed"
+        );
     }
 
     #[test]

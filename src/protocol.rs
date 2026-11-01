@@ -140,6 +140,29 @@ pub enum Request {
     Run(RunRequest),
 }
 
+impl Request {
+    /// Whether the request can have an effect that outlasts it — a change to
+    /// the vault, a backup file, a command. When such a request gets no
+    /// answer, the client cannot tell whether it took effect.
+    pub fn has_effects(&self) -> bool {
+        match self {
+            Request::Status
+            | Request::Unlock
+            | Request::Lock
+            | Request::List
+            | Request::Show { .. }
+            | Request::Reveal { .. } => false,
+            Request::Add { .. }
+            | Request::Import { .. }
+            | Request::Edit { .. }
+            | Request::Remove { .. }
+            | Request::ChangePassword
+            | Request::Backup { .. }
+            | Request::Run(_) => true,
+        }
+    }
+}
+
 /// Entry metadata that clients may read without approval.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryFields {

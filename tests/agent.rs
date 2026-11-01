@@ -1950,17 +1950,19 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn a_batch_whose_answer_is_lost_is_reported_as_unknown() {
+/// A fake agent that answers `status`, then answers each `import` with the
+/// next raw JSON reply (`None`: the answer is lost), then stops listening.
+fn fake_import_agent(
+    socket: &Path,
+    replies: Vec<Option<&'static str>>,
+) -> std::thread::JoinHandle<()> {
     use rusthorse::protocol::{
         PROTOCOL_VERSION, Request, Response, StatusInfo, recv_frame, send_frame,
     };
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket = dir.path().join("fake.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-    let fake = std::thread::spawn(move || {
-        let mut imports = 0;
-        for _ in 0..3 {
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+    std::thread::spawn(move || {
+        let mut replies = replies.into_iter();
+        loop {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
@@ -1981,34 +1983,178 @@ fn a_batch_whose_answer_is_lost_is_reported_as_unknown() {
                     send_frame(&stream, &status, &[]).expect("status");
                 }
                 Request::Import { .. } => {
-                    imports += 1;
-                    if imports == 1 {
-                        let ok = Response::Ok {
-                            message: "imported".into(),
-                        };
-                        send_frame(&stream, &ok, &[]).expect("ok");
-                    } // the second batch's answer is lost
+                    let Some(reply) = replies.next() else {
+                        panic!("more batches than expected");
+                    };
+                    if let Some(reply) = reply {
+                        let mut frame = (reply.len() as u32).to_be_bytes().to_vec();
+                        frame.extend_from_slice(reply.as_bytes());
+                        use std::io::Write;
+                        (&stream).write_all(&frame).expect("reply");
+                    }
+                    if replies.len() == 0 {
+                        return; // stop listening: later connections fail
+                    }
                 }
-                _ => {}
+                other => panic!("unexpected request {other:?}"),
             }
         }
-    });
-    let env_file = dir.path().join("many.env");
+    })
+}
+
+/// Import 60 names (two batches) through the fake agent on `socket`.
+fn import_two_batches(dir: &Path, socket: &Path) -> std::process::Output {
+    let env_file = dir.join("many.env");
     let lines: String = (0..60).map(|i| format!("NAME_{i:03}=value{i}\n")).collect();
     std::fs::write(&env_file, lines).expect("write");
-    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+    Command::new(env!("CARGO_BIN_EXE_rusthorse"))
         .args(["import", "dotenv", env_file.to_str().expect("utf8")])
-        .env("RUSTHORSE_SOCKET", &socket)
+        .env("RUSTHORSE_SOCKET", socket)
         .stdin(Stdio::null())
-        .finish();
+        .finish()
+}
+
+const IMPORTED: Option<&str> = Some(r#"{"type":"ok","message":"imported 50"}"#);
+
+#[test]
+fn a_batch_whose_answer_is_lost_is_reported_as_unknown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_import_agent(&socket, vec![IMPORTED, None]);
+    let out = import_two_batches(dir.path(), &socket);
     fake.join().expect("fake");
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("lost the connection during batch 2 of 2"),
+        "{stderr}"
+    );
     assert!(stderr.contains("batches 1 to 1 were imported"), "{stderr}");
     assert!(
         stderr.contains("batch 2 may or may not have been imported"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_batch_the_agent_cannot_confirm_is_reported_as_unknown() {
+    // For example, the vault file was replaced but its directory not synced.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_import_agent(
+        &socket,
+        vec![
+            IMPORTED,
+            Some(r#"{"type":"error","code":"outcome_unknown","message":"not durable"}"#),
+        ],
+    );
+    let out = import_two_batches(dir.path(), &socket);
+    fake.join().expect("fake");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("could not confirm batch 2 of 2"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("batch 2 may or may not have been imported"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("were not imported —"), "{stderr}");
+}
+
+#[test]
+fn a_batch_the_agent_refuses_or_never_receives_is_reported_as_not_imported() {
+    for second in [
+        // Refused: any error other than outcome_unknown means nothing changed.
+        Some(r#"{"type":"error","code":"internal","message":"disk full"}"#),
+        // Never sent: the agent stopped after the first batch.
+        IMPORTED,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("fake.sock");
+        let replies = if second == IMPORTED {
+            vec![IMPORTED]
+        } else {
+            vec![IMPORTED, second]
+        };
+        let fake = fake_import_agent(&socket, replies);
+        let out = import_two_batches(dir.path(), &socket);
+        fake.join().expect("fake");
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("stopped at batch 2 of 2: batches 1 to 1 were imported; batch 2 and later were not imported"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("may or may not"), "{stderr}");
+    }
+}
+
+#[test]
+fn a_lost_answer_is_an_unknown_outcome_only_for_requests_with_effects() {
+    for (args, expected) in [
+        (&["remove", "X"][..], 124),
+        (&["edit", "X", "--host", "h"][..], 124),
+        (&["list"][..], 1),
+        (&["show", "X"][..], 1),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("fake.sock");
+        let fake = fake_agent(&socket, rusthorse::protocol::PROTOCOL_VERSION, None, 2);
+        let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args(args)
+            .env("RUSTHORSE_SOCKET", &socket)
+            .stdin(Stdio::null())
+            .finish();
+        fake.join().expect("fake");
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(expected), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.contains("may or may not have taken effect"),
+            expected == 124,
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_outcome_reported_for_a_change_exits_124() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_agent(
+        &socket,
+        rusthorse::protocol::PROTOCOL_VERSION,
+        Some(r#"{"type":"error","code":"outcome_unknown","message":"not durable"}"#),
+        2,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["remove", "X"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+}
+
+#[test]
+fn an_unexpected_answer_to_run_is_an_unknown_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_agent(
+        &socket,
+        rusthorse::protocol::PROTOCOL_VERSION,
+        Some(r#"{"type":"ok","message":"?"}"#),
+        2,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("may or may not have run"));
 }
 
 #[test]

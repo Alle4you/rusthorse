@@ -33,8 +33,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   how to restart it after an upgrade.
 - `backup DEST` (verified copy), `reveal --notes`, `import --dry-run` and
   automatic import batches.
-- `run` exits with 124 when the connection is lost after the request was
-  sent (outcome unknown), keeping 125 for "did not run".
+- Exit status 124 (outcome unknown) when a request with effects was sent but
+  no usable answer came back, or the agent could not confirm it; `run` keeps
+  125 for "did not run".
 
 ### Changed
 
@@ -46,7 +47,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   that a batch's outcome is unknown when its answer is lost — and imports
   with duplicate names are refused.
 - New error code `outcome_unknown` (exit 124) when the agent cannot determine
-  the result of a command it started.
+  the result of a command it started, or a change was written but could not
+  be synced to disk. Every other error means nothing was changed.
 
 ### Security
 

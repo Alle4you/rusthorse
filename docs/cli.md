@@ -26,7 +26,7 @@ terminal.
 | `1` | Error (agent not running, entry not found, invalid input, …). |
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
-| `124` | `run` only: the outcome is unknown — the connection to the agent was lost after the request was sent, or the agent could not determine the result of a command it had started. The command may or may not have run. |
+| `124` | The outcome is unknown: the request was sent but no usable answer came back, or the agent could not confirm that it took effect (it could not determine the result of a command it had started, or could not sync a change to disk). For `run`, the command may or may not have run; for a change (`add`, `edit`, `remove`, `import`, `passwd`, `backup`), check with `rusthorse list` or `show` before repeating it. Read-only commands exit with 1 instead. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141 when the output of `rusthorse run` itself was closed). |
 
@@ -241,7 +241,7 @@ rusthorse run PGPASSWORD=prod-db -- psql -h db.lan -U app app
 rusthorse run TOKEN=cloudflare -- sh -c 'curl -sH "Authorization: Bearer $TOKEN" https://api.cloudflare.com/client/v4/user/tokens/verify'
 ```
 
-Exit status: the command's, or `125` if it did not run.
+Exit status: the command's, `125` if it did not run, or `124` if Rusthorse cannot tell.
 
 ## `rusthorse reveal`
 
@@ -309,7 +309,11 @@ rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry
 Imports `NAME=value` lines (optional `export`, `#` comments, quoted values).
 `--prefix` is upper-cased and prepended to each name. Existing entries are
 skipped unless `--replace` is given. Entries are sent in batches of at most 50
-(fewer if the names are long), one approval each. `--dry-run` lists the names
+(fewer if the names are long), one approval each; a name that appears twice
+stops the import before anything is sent. If a batch fails, the summary says
+which batches were imported and whether the failed one was not imported (exit
+1, or 4 if denied) or may or may not have been (exit 124: check with
+`rusthorse list` before running the import again). `--dry-run` lists the names
 and whether each is new, exists or is not allowed, and imports nothing.
 
 ## `rusthorse import secret-service`

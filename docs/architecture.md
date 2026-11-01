@@ -234,7 +234,12 @@ atomic compare-and-swap, so only one program should write the vault at a time
 (threat model L15). Every change is a transaction on an in-memory copy: if any
 part of it fails (one invalid entry in an import, say), all of it is rolled
 back. If the save itself fails, the agent locks the vault so that memory never
-holds changes that are not on disk.
+holds changes that are not on disk. A failure after step 3's rename — syncing
+the directory — is different: the new file is already in place, so the agent
+answers `outcome_unknown` (the change may not survive a crash) rather than
+"not saved", and locks the vault so that the next unlock reads whatever the
+file then holds. After a password change, the old-password `vault.kdbx.bak`
+is deleted only once a save has completed.
 
 Deleted entries are recorded in the KDBX `DeletedObjects` list, so that
 merging with an older copy does not bring them back. Vault files larger than

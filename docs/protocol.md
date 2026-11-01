@@ -260,13 +260,21 @@ are not disclosed.
 | `already_exists` | An entry with that name exists (use `replace`). |
 | `ambiguous` | Several entries match; use a `Group/Name` path. |
 | `invalid_request` | Malformed or disallowed request (bad name, missing fds, details too long, program replaced after approval, …). |
-| `outcome_unknown` | `run` only: the command started but its result could not be determined. It may have had effects. |
-| `internal` | Anything else, including an unwritable audit log or a failed save (after which the vault is locked). |
+| `outcome_unknown` | The request may have taken effect, but the agent cannot confirm it: a `run` command started but its result could not be determined, or a change was written to the vault file but the file's directory could not be synced, so it may not survive a crash (the vault is then locked; unlocking reads what the file holds). Do not simply retry. |
+| `internal` | Anything else, including an unwritable audit log or a save that failed before the file was replaced (after which the vault is locked). |
+
+**Every error other than `outcome_unknown` means that the vault file was not
+changed and no command was started.** (The audit log may record the attempt,
+the vault may have been locked, and a `backup` whose copy does not verify
+leaves that copy, which the message names.) A client that sends a request
+with effects — `add`, `import`, `edit`, `remove`, `change_password`,
+`backup`, `run` — and gets no answer, or one it cannot parse, must likewise
+treat the outcome as unknown.
 
 ## Compatibility
 
 - Within a protocol version, new optional request fields, new response
   fields and new error codes may be added. Clients must ignore unknown
-  response fields and treat unknown error codes like `internal`.
+  response fields and treat an unknown error code like `outcome_unknown`.
 - Removing or changing the meaning of a field, or changing framing, bumps
   `PROTOCOL_VERSION`.

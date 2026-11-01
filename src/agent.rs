@@ -128,6 +128,7 @@ impl From<VaultError> for Failure {
             VaultError::ChangedOnDisk => ErrorCode::VaultChanged,
             VaultError::Missing(_) => ErrorCode::VaultMissing,
             VaultError::Invalid(_) => ErrorCode::InvalidRequest,
+            VaultError::NotDurable(_) => ErrorCode::OutcomeUnknown,
             VaultError::Exists(_)
             | VaultError::Open(_)
             | VaultError::Save(_)
@@ -465,7 +466,10 @@ impl Agent {
     /// Apply an approved change and save it, but only if nothing happened to
     /// the vault since `generation`. The change is a transaction: if `f`
     /// fails, everything it did is rolled back. If saving fails, the vault is
-    /// locked so that memory never holds changes that are not on disk.
+    /// locked so that memory never holds changes that are not on disk — and
+    /// if it failed after the file was replaced, the answer is
+    /// [`ErrorCode::OutcomeUnknown`]: the change is on disk, but may not
+    /// survive a crash.
     fn commit<R>(
         &self,
         generation: u64,
@@ -491,10 +495,13 @@ impl Agent {
         let result = vault.transaction(f)?;
         if let Err(e) = vault.save() {
             state.lock();
+            let replaced = matches!(e, VaultError::NotDurable(_));
             let mut failure = Failure::from(e);
-            failure
-                .message
-                .push_str(" (the vault was locked to discard the unsaved change)");
+            failure.message.push_str(if replaced {
+                " (the vault was locked; unlock it to see what the file now holds)"
+            } else {
+                " (the vault was locked to discard the unsaved change)"
+            });
             return Err(failure);
         }
         let cleanup = vault.take_cleanup_error();
@@ -2040,6 +2047,68 @@ pub fn parent_process_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::NewEntry;
+    use crate::vault::KdfParams;
+
+    struct NoDialogs;
+
+    impl Ui for NoDialogs {
+        fn master_password(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+            unreachable!("no dialog expected")
+        }
+        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Option<SecretString>> {
+            unreachable!("no dialog expected")
+        }
+        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+            unreachable!("no dialog expected")
+        }
+    }
+
+    #[test]
+    fn a_save_that_fails_after_replacing_the_file_is_an_unknown_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        let password = || SecretString::new("correct horse".into());
+        let mut vault =
+            Vault::create(&path, password(), KdfParams::INSECURE_FOR_TESTS).expect("create");
+        vault.fail_directory_sync();
+        let agent = Agent::new(
+            AgentConfig {
+                vault: path.clone(),
+                socket: dir.path().join("agent.sock"),
+                audit_log: dir.path().join("audit.jsonl"),
+                idle_timeout: Duration::ZERO,
+                request_timeout: Duration::from_secs(10),
+                send_buffer: None,
+            },
+            Box::new(NoDialogs),
+        );
+        let generation = {
+            let mut state = agent.state();
+            state.vault = Some(vault);
+            state.generation
+        };
+        let entry = NewEntry {
+            name: "X".into(),
+            ..NewEntry::default()
+        };
+        let failure = agent
+            .commit(generation, |v| {
+                v.add(&entry, &SecretString::new("abcd".into()), false)?;
+                Ok(())
+            })
+            .expect_err("the save did not complete");
+        assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+        assert!(
+            failure.message.contains("may not survive"),
+            "{}",
+            failure.message
+        );
+        assert!(!failure.message.contains("discard"), "{}", failure.message);
+        assert!(agent.state().vault.is_none(), "locked, to reload from disk");
+        let on_disk = Vault::open(&path, password()).expect("reopen");
+        assert!(on_disk.find("X").is_ok(), "the change is in the file");
+    }
 
     #[test]
     fn stat_lines_with_odd_process_names_parse() {

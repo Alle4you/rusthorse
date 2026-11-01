@@ -50,8 +50,9 @@ from the vault straight into the approved program.
      failed before the command started — including when the agent is not
      running or is out of date — so the command did not run; if it was
      denied, stop and ask the human instead of retrying a variation. Exit status 124 means the
-     connection was lost after the request was sent: the command may or may
-     not have run, so check before repeating anything that is not idempotent.
+     outcome is unknown (the connection was lost after the request was sent,
+     or the agent could not confirm the result): the command may or may not
+     have run, so check before repeating anything that is not idempotent.
      (A command can also exit with 124 or 125 itself; the `rusthorse:` message
      tells them apart.)
    - To store a new secret, run `rusthorse add NAME [--url …] [--username …]`;

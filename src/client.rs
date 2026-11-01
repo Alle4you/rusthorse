@@ -17,9 +17,11 @@ use zeroize::Zeroizing;
 
 use crate::protocol::{self, Frame, Request, Response, RunRequest};
 
-/// The request reached the agent but the connection failed before its result
-/// arrived: the command may or may not have run. Callers should not simply
-/// retry an operation that is not idempotent.
+/// The request was sent, but no usable answer came back (the connection was
+/// lost, or the answer could not be understood): the request may or may not
+/// have taken effect — a command may or may not have run, a change may or may
+/// not have been saved. Callers should not simply retry an operation that is
+/// not idempotent.
 #[derive(Debug)]
 pub struct OutcomeUnknown(pub String);
 
@@ -27,8 +29,7 @@ impl std::fmt::Display for OutcomeUnknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lost the connection to the agent after the request was sent ({}); \
-             the command may or may not have run",
+            "no usable answer from the agent after the request was sent ({})",
             self.0
         )
     }
@@ -151,11 +152,19 @@ impl Client {
         Ok(())
     }
 
-    /// Send one request and wait for the response.
+    /// Send one request and wait for the response. Once a request that
+    /// [has effects](Request::has_effects) is sent, a missing or unreadable
+    /// answer is an [`OutcomeUnknown`] error.
     pub fn call(&self, request: &Request) -> anyhow::Result<Response> {
         let stream = self.connect()?;
         protocol::send_frame(&stream, request, &[]).context("cannot send the request")?;
-        protocol::read_message(&stream).context("the agent closed the connection")
+        protocol::read_message(&stream).map_err(|e| {
+            if request.has_effects() {
+                anyhow::Error::new(OutcomeUnknown(e.to_string()))
+            } else {
+                anyhow::anyhow!("no usable answer from the agent ({e})")
+            }
+        })
     }
 
     /// Ask the agent to run a command using this process's standard input,
@@ -223,44 +232,68 @@ impl Client {
         // Used only to shut the connection down, so that cancelling never
         // waits for the send lock.
         let canceller = Arc::new(stream.try_clone().context("cannot clone the connection")?);
-        protocol::send_frame(&stream, &Request::Run(request), &[])
-            .context("cannot send the request")?;
         let broken = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let input_credit = Arc::new(InputCredit::new());
 
+        // The relay threads too: the output writers only wait for data, and
+        // the input forwarder reads nothing before the agent grants credit.
+        let nothing_to_forward = forward && io.input.is_none();
         let mut writers = Vec::new();
         let mut queues = Vec::new();
-        for (channel, dest) in [(protocol::STDOUT, io.stdout), (protocol::STDERR, io.stderr)] {
-            let (tx, rx) = mpsc::channel::<Zeroizing<Vec<u8>>>();
-            let (sender, canceller, broken) = (
-                Arc::clone(&sender),
-                Arc::clone(&canceller),
-                Arc::clone(&broken),
-            );
-            writers.push(thread::spawn(move || {
-                write_output(rx, dest, channel, sender, canceller, broken)
-            }));
-            queues.push(tx);
-        }
-        let input_worker = match (forward, io.input) {
-            (true, Some(input)) => {
+        let mut input_worker = None;
+        let prepared = (|| -> anyhow::Result<()> {
+            for (channel, dest) in [(protocol::STDOUT, io.stdout), (protocol::STDERR, io.stderr)] {
+                let (tx, rx) = mpsc::channel::<Zeroizing<Vec<u8>>>();
+                let (sender, canceller, broken) = (
+                    Arc::clone(&sender),
+                    Arc::clone(&canceller),
+                    Arc::clone(&broken),
+                );
+                writers.push(
+                    thread::Builder::new()
+                        .name("rusthorse-output".into())
+                        .spawn(move || write_output(rx, dest, channel, sender, canceller, broken))
+                        .context("cannot start an output thread")?,
+                );
+                queues.push(tx);
+            }
+            if let (true, Some(input)) = (forward, io.input) {
                 let (sender, done, credit) = (
                     Arc::clone(&sender),
                     Arc::clone(&done),
                     Arc::clone(&input_credit),
                 );
-                Some(thread::spawn(move || {
-                    forward_input(input, sender, credit, done)
-                }))
+                input_worker = Some(
+                    thread::Builder::new()
+                        .name("rusthorse-input".into())
+                        .spawn(move || forward_input(input, sender, credit, done))
+                        .context("cannot start the input thread")?,
+                );
             }
-            (true, None) => {
-                // Forwarding was requested but there is nothing to read.
-                let _ = protocol::send_data(&stream, protocol::STDIN, &[]);
-                None
+            Ok(())
+        })();
+        let sent = prepared.and_then(|()| {
+            protocol::send_frame(&stream, &Request::Run(request), &[])
+                .context("cannot send the request")
+        });
+        if let Err(e) = sent {
+            // Nothing reached the agent: stop the threads and report it.
+            drop(queues);
+            done.store(true, Ordering::SeqCst);
+            input_credit.wake();
+            for writer in writers {
+                let _ = writer.join();
             }
-            (false, _) => None,
-        };
+            if let Some(worker) = input_worker {
+                let _ = worker.join();
+            }
+            return Err(e);
+        }
+        if nothing_to_forward {
+            // Forwarding was requested but there is nothing to read.
+            let _ = protocol::send_data(&stream, protocol::STDIN, &[]);
+        }
 
         // The output queues are bounded by the credit window the agent
         // respects, so pushing into them never blocks this loop.
