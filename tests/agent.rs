@@ -94,6 +94,14 @@ impl Harness {
     }
 
     fn with_timeouts(idle_timeout: Duration, request_timeout: Duration) -> Harness {
+        Harness::with_config(idle_timeout, request_timeout, None)
+    }
+
+    fn with_config(
+        idle_timeout: Duration,
+        request_timeout: Duration,
+        send_buffer: Option<usize>,
+    ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
         Vault::create(
@@ -111,6 +119,7 @@ impl Harness {
             audit_log: audit.clone(),
             idle_timeout,
             request_timeout,
+            send_buffer,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -1843,19 +1852,30 @@ fn a_missing_or_old_agent_means_did_not_run() {
 
 #[test]
 fn unread_acknowledgements_do_not_pin_a_finished_command() {
-    let h = Harness::new();
+    // A tiny send buffer on the agent side: a handful of unread
+    // acknowledgements is enough to block the agent's acknowledgement writer.
+    let h = Harness::with_config(Duration::ZERO, Duration::from_secs(10), Some(4096));
     h.add_secret("T", "abcdefgh", &[]);
     h.decide(&[Decision::AllowOnce]);
-    let stream = raw_run(&h, &["head", "-c", "1000"], true);
+    const FRAMES: usize = 2_000;
+    // No output: the output workers finish as soon as the command exits, so
+    // only the acknowledgement writer is left blocked.
+    let script = format!("head -c {FRAMES} >/dev/null");
+    let stream = raw_run(&h, &["sh", "-c", &script], true);
     let sender = stream.try_clone().expect("clone");
-    within(Duration::from_secs(20), move || {
-        for _ in 0..1000 {
+    within(Duration::from_secs(30), move || {
+        for i in 0..FRAMES {
             rusthorse::protocol::send_data(&sender, rusthorse::protocol::STDIN, b"x")
                 .expect("the agent stopped reading the connection");
+            if i % 50 == 0 {
+                // Let the agent acknowledge in many small steps.
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     });
-    // The command has read its 1000 bytes and exited; acknowledgements were
-    // never read. A half-close must still end the request.
+    // The command has read everything and exited; its acknowledgements were
+    // never read. A half-close must still end the request, releasing the
+    // blocked writer.
     std::thread::sleep(Duration::from_millis(500));
     stream
         .shutdown(std::net::Shutdown::Write)

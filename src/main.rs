@@ -544,6 +544,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         audit_log: args.audit_log.unwrap_or_else(paths::audit_log),
         idle_timeout: args.idle_timeout,
         request_timeout: Duration::from_secs(10),
+        send_buffer: None,
     };
     let ui = ZenityUi {
         remember_for: args.remember,

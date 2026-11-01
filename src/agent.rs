@@ -90,6 +90,10 @@ pub struct AgentConfig {
     pub idle_timeout: Duration,
     /// How long a client has to send its whole request (10 s in production).
     pub request_timeout: Duration,
+    /// Size of each connection's send buffer (`SO_SNDBUF`); `None` keeps the
+    /// system default. Only tests set it, to make back-pressure happen after a
+    /// few frames instead of after hundreds of kilobytes.
+    pub send_buffer: Option<usize>,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -337,6 +341,9 @@ impl Agent {
         if peer.uid != getuid().as_raw() {
             // Another user (only possible if the socket directory was opened up).
             return Ok(());
+        }
+        if let Some(size) = self.config.send_buffer {
+            nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::SndBuf, &size)?;
         }
         let deadline = Instant::now() + self.config.request_timeout;
         let (body, fds) = protocol::recv_frame_before(stream, Some(deadline))?;
