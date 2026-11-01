@@ -273,12 +273,14 @@ extra button (Allow for N), counts as approval.
 
 Dialogs draw only characters whose glyphs are predictable: printable ASCII,
 the letters of Latin-1 and Latin Extended-A (accented letters of European
-languages) except look-alikes of ASCII (`×`, `÷`, `ı`, `ĸ`, `ſ`), and the
-punctuation of Rusthorse's own texts. Every other character — controls, line
-and paragraph separators, invisible and combining characters, other scripts,
-emoji — is shown as a `\u{…}` escape, so nothing a requester sends can hide,
-reorder, overlap or impersonate other text, and what is drawn has a known
-width. Then `&`, `<`, `>`, quotes and the backslash become character
+languages) except look-alikes of ASCII (`×`, `÷`, `ı`, `Ĳ`, `ĳ`, `ĸ`, `ŉ`,
+`ſ`), and the punctuation of Rusthorse's own texts. Every other character —
+controls, line and paragraph separators, invisible and combining characters,
+other scripts, emoji — is shown as a `\u{…}` escape, so nothing a requester
+sends can hide, reorder or overlap other text, letters of other scripts cannot
+pass for Latin ones, and what is drawn has a known width. (Text that literally
+contains `\u{…}` looks the same as an escape; the reader must assume the
+character it names.) Then `&`, `<`, `>`, quotes and the backslash become character
 references (the backslash as `&#92;`, which reads the same whether or not
 zenity processes escape sequences), so a value can neither add a tag nor be
 changed. Tests check both.
@@ -291,11 +293,12 @@ character the same width; one outside ASCII counted twice), warnings, which
 may quote the requester, are measured as if every character were a bold "W",
 and lines are wrapped word by word as Pango does, so text built from words
 just over half a line long is counted as the line per word it really takes.
-The content may take at most 880 pixels: the dialog, its title bar and
-buttons then fit on a 1080-pixel screen under a desktop panel even when the
-estimate is exact, as it nearly is for text built to be wide; for ordinary
-dialogs the estimate is 1.4 to 1.6 times the real height. Larger fonts, a
-higher scale or a smaller screen make dialogs taller than estimated. `import`
+The content may take at most 880 pixels, leaving 200 for the title bar,
+buttons and a desktop panel on a 1080-pixel screen. In the dialogs measured
+with the real renderer (Sans 11, nearly two thousand built to be as tall as
+possible), the real height stayed below the estimate, by 1 to 60 per cent.
+Larger fonts, a higher scale or a smaller screen make dialogs taller than
+estimated. `import`
 splits large imports into batches whose names take at most 24 lines.
 
 ## Audit log

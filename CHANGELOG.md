@@ -71,7 +71,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   chain is labelled "unverified".
 - Dialogs draw only ordinary characters as themselves (ASCII, Latin letters,
   a little punctuation) and every other one as a `\u{…}` escape, so a value
-  cannot hide, reorder, overlap or impersonate text; requests whose dialog
+  cannot hide, reorder or overlap text, nor pass letters of other scripts for
+  Latin ones; requests whose dialog
   would be too tall to read at once are refused (an estimate in pixels for an
   11-point font), so a long or crafted value cannot push the rest of a dialog
   out of sight. `import` batches are sized to fit (24 lines of names).

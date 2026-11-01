@@ -287,11 +287,12 @@ const GAP: &str = "<span size=\"5000\"> </span>\n";
 /// Whether a character is shown as itself in a dialog. Only characters whose
 /// glyphs have an ordinary width and stay on their own line are: printable
 /// ASCII, the letters of Latin-1 and Latin Extended-A (the accented letters of
-/// European languages) except those that pass for ASCII (`×`, `÷`, `ı`, `ĸ`,
-/// `ſ`), and the punctuation of Rusthorse's own texts.
+/// European languages) except those that pass for ASCII (`×`, `÷`, `ı`, `Ĳ`,
+/// `ĳ`, `ĸ`, `ŉ`, `ſ`), and the punctuation of Rusthorse's own texts.
 fn shown_as_is(c: char) -> bool {
     match c {
-        '\u{D7}' | '\u{F7}' | '\u{131}' | '\u{138}' | '\u{17F}' => false,
+        '\u{D7}' | '\u{F7}' | '\u{131}' | '\u{132}' | '\u{133}' | '\u{138}' | '\u{149}'
+        | '\u{17F}' => false,
         ' '..='~' | '\u{C0}'..='\u{17F}' => true,
         '\u{B7}' | '\u{2013}' | '\u{2014}' | '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}'
         | '\u{2026}' | '\u{2190}' | '\u{2192}' => true,
@@ -304,8 +305,9 @@ fn shown_as_is(c: char) -> bool {
 /// look-alikes of ASCII, and a little punctuation) — controls, separators,
 /// invisible and combining characters, other scripts, emoji — becomes a
 /// `\u{…}` escape. What is drawn
-/// is then predictable in width and height: it cannot hide, reorder or
-/// overlap anything, nor pass for other characters.
+/// is then predictable in width and height and cannot hide, reorder or
+/// overlap anything. Text that literally contains `\u{…}` looks the same as
+/// an escape, so a reader must take any `\u{…}` for the character it names.
 pub fn dialog_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -352,10 +354,10 @@ pub mod metrics {
     /// Height of the gap between blocks.
     pub const GAP: usize = 9;
     /// The most an approval dialog's content may take: with an 11-point font,
-    /// the dialog with its title bar and buttons then fits on a screen 1080
-    /// pixels high under a desktop panel, even when the estimate is exact (as
-    /// it nearly is for text built to be wide); for ordinary dialogs it is 1.4
-    /// to 1.6 times the real height.
+    /// 200 pixels remain for the title bar, buttons and a desktop panel on a
+    /// screen 1080 pixels high, even when the estimate is nearly exact (text
+    /// built to be wide). In the dialogs measured, the estimate exceeded the
+    /// real height by 1 to 60 per cent.
     pub const MAX_HEIGHT: usize = 880;
 }
 
@@ -829,17 +831,18 @@ mod tests {
         );
         assert_eq!(dialog_text("A ← B → C — “D” …"), "A ← B → C — “D” …");
         for (raw, shown) in [
-            ("\u{2028}", "\\u{2028}"),                           // line separator
-            ("\u{8F0}", "\\u{8f0}"),                             // combining mark of any block
-            ("e\u{301}", "e\\u{301}"),                           // even a single one
-            ("\u{2800}", "\\u{2800}"),                           // blank Braille pattern
-            ("\u{6F22}", "\\u{6f22}"),                           // CJK, drawn double width
-            ("\u{FF37}", "\\u{ff37}"),                           // fullwidth W
-            ("\u{1F600}", "\\u{1f600}"),                         // emoji
-            ("p\u{430}ypal", "p\\u{430}ypal"),                   // Cyrillic a, a look-alike
-            ("\u{D7}\u{131}\u{17F}", "\\u{d7}\\u{131}\\u{17f}"), // ×, ı, ſ
-            ("\u{A0}\u{AD}", "\\u{a0}\\u{ad}"),                  // no-break space, soft hyphen
-            ("\u{7F}\u{85}", "\\u{7f}\\u{85}"),                  // controls
+            ("\u{2028}", "\\u{2028}"),                             // line separator
+            ("\u{8F0}", "\\u{8f0}"),                               // combining mark of any block
+            ("e\u{301}", "e\\u{301}"),                             // even a single one
+            ("\u{2800}", "\\u{2800}"),                             // blank Braille pattern
+            ("\u{6F22}", "\\u{6f22}"),                             // CJK, drawn double width
+            ("\u{FF37}", "\\u{ff37}"),                             // fullwidth W
+            ("\u{1F600}", "\\u{1f600}"),                           // emoji
+            ("p\u{430}ypal", "p\\u{430}ypal"),                     // Cyrillic a, a look-alike
+            ("\u{D7}\u{131}\u{17F}", "\\u{d7}\\u{131}\\u{17f}"),   // ×, ı, ſ
+            ("\u{132}\u{133}\u{149}", "\\u{132}\\u{133}\\u{149}"), // Ĳ, ĳ, ŉ
+            ("\u{A0}\u{AD}", "\\u{a0}\\u{ad}"),                    // no-break space, soft hyphen
+            ("\u{7F}\u{85}", "\\u{7f}\\u{85}"),                    // controls
         ] {
             assert_eq!(dialog_text(raw), shown, "{raw:?}");
         }
