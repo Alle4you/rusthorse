@@ -3,7 +3,8 @@
 Thank you for helping. Rusthorse handles secrets, so the bar for changes is
 higher than usual: every change must keep the security properties described
 in the [threat model](docs/threat-model.md) and must keep the documentation
-true.
+true. AI coding agents: read [AGENTS.md](AGENTS.md), which states the same
+rules in short form.
 
 ## Reporting bugs and proposing features
 
