@@ -415,6 +415,7 @@ impl Agent {
         state.remembered.retain(|r| r.until > now);
         let locked = state.vault.is_none();
         let idle = self.config.idle_timeout;
+        let executable = std::fs::read_link("/proc/self/exe").ok();
         StatusInfo {
             protocol_version: protocol::PROTOCOL_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -426,9 +427,15 @@ impl Agent {
             locks_in_secs: (!locked && !idle.is_zero())
                 .then(|| idle.saturating_sub(state.last_used.elapsed()).as_secs()),
             remembered_approvals: state.remembered.len(),
-            agent_executable: std::fs::read_link("/proc/self/exe")
+            agent_executable: executable
+                .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            // `/proc/self/exe` itself always leads to the running file, even
+            // once its name points elsewhere or nowhere.
+            agent_executable_replaced: executable.as_deref().is_some_and(|path| {
+                util::replaced(path, util::file_identity(Path::new("/proc/self/exe")).ok())
+            }),
         }
     }
 

@@ -610,7 +610,15 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     }
     println!("remembered: {} approval(s)", info.remembered_approvals);
     if !info.agent_executable.is_empty() {
-        println!("program:    {}", info.agent_executable);
+        println!(
+            "program:    {}{}",
+            info.agent_executable,
+            if info.agent_executable_replaced {
+                " (replaced since the agent started — restart it)"
+            } else {
+                ""
+            }
+        );
     }
     Ok(0)
 }
@@ -1200,26 +1208,38 @@ enum Check {
     Fail(String),
 }
 
-/// Whether the agent runs the program file this `rusthorse` was started from.
-fn agent_executable_check(agent: &str) -> Check {
+/// Whether the agent still runs the program file it was started from, and
+/// whether that is the same file (by device and inode, not by name) as this
+/// `rusthorse`. Same file is not proof of the same build if a file is
+/// rewritten in place, which installers do not do.
+fn agent_executable_check(agent: &str, replaced: bool) -> Check {
+    use rusthorse::util::file_identity;
     const RESTART: &str = "run `systemctl --user restart rusthorse-agent`";
     if agent.is_empty() {
         return Check::Warn("the agent did not say which program file it runs".into());
     }
-    if agent.ends_with(" (deleted)") {
+    if replaced {
         return Check::Fail(format!(
-            "the agent runs an old build: its program file was replaced or removed after it \
-             started ({agent}) — {RESTART}"
+            "the agent runs an old build: its program file ({agent}) was replaced or removed \
+             after it started — {RESTART}"
         ));
     }
-    let ours = std::fs::read_link("/proc/self/exe").map(|p| p.display().to_string());
-    match ours {
-        Ok(ours) if ours == agent => Check::Ok(format!("the agent runs this build ({agent})")),
-        Ok(ours) => Check::Warn(format!(
-            "the agent runs {agent}, but this is {ours}; if both should be the same build, \
-             {RESTART}"
+    let ours = std::path::Path::new("/proc/self/exe");
+    match (
+        file_identity(std::path::Path::new(agent)),
+        file_identity(ours),
+    ) {
+        (Ok(theirs), Ok(mine)) if theirs == mine => Check::Ok(format!(
+            "the agent runs the same program file as this rusthorse ({agent})"
         )),
-        Err(_) => Check::Ok(format!("the agent runs {agent}")),
+        (Ok(_), Ok(_)) => Check::Warn(format!(
+            "the agent runs {agent}, a different program file from this rusthorse ({}); if \
+             both should be the same build, {RESTART}",
+            std::fs::read_link(ours).map_or_else(|_| "?".into(), |p| p.display().to_string())
+        )),
+        _ => Check::Warn(format!(
+            "cannot compare the agent's program file ({agent}) with this rusthorse's"
+        )),
     }
 }
 
@@ -1259,7 +1279,10 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                     rusthorse::protocol::PROTOCOL_VERSION
                 )));
             }
-            checks.push(agent_executable_check(&info.agent_executable));
+            checks.push(agent_executable_check(
+                &info.agent_executable,
+                info.agent_executable_replaced,
+            ));
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
                     "no vault at {} — run `rusthorse init`",
@@ -1411,18 +1434,26 @@ mod tests {
     #[test]
     fn doctor_notices_an_agent_running_a_replaced_binary() {
         assert!(matches!(
-            agent_executable_check("/home/me/.cargo/bin/rusthorse (deleted)"),
+            agent_executable_check("/home/me/.cargo/bin/rusthorse (deleted)", true),
             Check::Fail(m) if m.contains("restart")
         ));
         let ours = std::fs::read_link("/proc/self/exe").expect("exe");
         assert!(matches!(
-            agent_executable_check(&ours.display().to_string()),
+            agent_executable_check(&ours.display().to_string(), false),
             Check::Ok(_)
         ));
+        // Another file, even under a name ending like the kernel's marker.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let other = dir.path().join("rusthorse (deleted)");
+        std::fs::write(&other, b"x").expect("write");
         assert!(matches!(
-            agent_executable_check("/somewhere/else/rusthorse"),
-            Check::Warn(_)
+            agent_executable_check(&other.display().to_string(), false),
+            Check::Warn(m) if m.contains("different program file")
         ));
-        assert!(matches!(agent_executable_check(""), Check::Warn(_)));
+        assert!(matches!(
+            agent_executable_check("/nonexistent/rusthorse", false),
+            Check::Warn(m) if m.contains("cannot compare")
+        ));
+        assert!(matches!(agent_executable_check("", false), Check::Warn(_)));
     }
 }

@@ -33,6 +33,19 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Device and inode of the file at `path` (symlinks followed), which identify
+/// a file independently of its name.
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let meta = std::fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Whether `path` no longer names the file whose identity is `running`: it was
+/// replaced or removed. An unknown identity (`None`) is never "replaced".
+pub fn replaced(path: &Path, running: Option<(u64, u64)>) -> bool {
+    running.is_some_and(|running| file_identity(path).map_or(true, |now| now != running))
+}
+
 /// Whether `name` is a portable environment variable name (`[A-Za-z_][A-Za-z0-9_]*`).
 pub fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -134,6 +147,26 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replaced_files_are_told_apart_by_identity_not_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A name that happens to end like the kernel's marker is not a sign.
+        let path = dir.path().join("agent (deleted)");
+        std::fs::write(&path, b"one").expect("write");
+        let running = file_identity(&path).ok();
+        assert!(!replaced(&path, running));
+        // Replaced by another file under the same name.
+        let new = dir.path().join("new");
+        std::fs::write(&new, b"two").expect("write");
+        std::fs::rename(&new, &path).expect("rename");
+        assert!(replaced(&path, running));
+        // Removed.
+        std::fs::remove_file(&path).expect("remove");
+        assert!(replaced(&path, running));
+        // Unknown identity: no claim.
+        assert!(!replaced(&path, None));
+    }
 
     #[test]
     fn env_names() {
