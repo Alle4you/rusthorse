@@ -42,8 +42,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   an agent that speaks another version.
 - `passwd` reports when the old-password backup could not be deleted.
 - `doctor` checks the files the agent actually uses.
-- Imports report which batches were imported when a later one fails, and
-  the dry run flags duplicate names.
+- Imports report which batches were imported when a later one fails — or
+  that a batch's outcome is unknown when its answer is lost — and imports
+  with duplicate names are refused.
+- New error code `outcome_unknown` (exit 124) when the agent cannot determine
+  the result of a command it started.
 
 ### Security
 

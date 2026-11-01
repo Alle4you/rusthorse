@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 1)
+  ok    rusthorse 0.1.0 (protocol 2)
   ok    agent 0.1.0 is running (locked)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
   ok    the systemd user service is enabled

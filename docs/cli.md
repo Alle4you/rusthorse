@@ -26,7 +26,7 @@ terminal.
 | `1` | Error (agent not running, entry not found, invalid input, …). |
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
-| `124` | `run` only: the connection to the agent was lost after the request was sent; the command may or may not have run. |
+| `124` | `run` only: the outcome is unknown — the connection to the agent was lost after the request was sent, or the agent could not determine the result of a command it had started. The command may or may not have run. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141 when the output of `rusthorse run` itself was closed). |
 

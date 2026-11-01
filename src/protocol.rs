@@ -446,6 +446,9 @@ pub enum ErrorCode {
     Ambiguous,
     /// The request is malformed or not allowed.
     InvalidRequest,
+    /// `run`: the command started, but its result could not be determined.
+    /// It may have had effects; do not simply retry.
+    OutcomeUnknown,
     /// Anything else (I/O errors, dialog failures, ...).
     Internal,
 }

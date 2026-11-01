@@ -1910,6 +1910,120 @@ fn doctor_checks_the_vault_the_agent_uses() {
 }
 
 #[test]
+fn duplicate_names_are_refused_before_anything_is_imported() {
+    use rusthorse::protocol::{EntryFields, ImportedEntry, NewEntry, Request, Response};
+    let h = Harness::new();
+    assert!(h.run(&["unlock"]).status.success());
+    let env_file = h.dir.path().join("dup.env");
+    std::fs::write(&env_file, "DUP=first\nOTHER=x1234\nDUP=second\n").expect("write");
+    let file = env_file.to_str().expect("utf8");
+    let preview = h.run(&["import", "dotenv", file, "--dry-run"]);
+    assert!(
+        text(&preview.stdout)
+            .contains("dup      DUP  (appears more than once: the import will be refused)")
+    );
+    let out = h.run(&["import", "dotenv", file, "--replace"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("appear more than once"));
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(!text(&h.run(&["list"]).stdout).contains("OTHER"));
+    // The agent refuses such a batch too.
+    let item = |value: &str| ImportedEntry {
+        entry: NewEntry {
+            name: "DUP".into(),
+            fields: EntryFields::default(),
+            ..NewEntry::default()
+        },
+        value: SecretString::new(value.into()),
+    };
+    let response = h.call(&Request::Import {
+        entries: vec![item("aaaa1"), item("bbbb2")],
+        replace: true,
+    });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+}
+
+#[test]
+fn a_batch_whose_answer_is_lost_is_reported_as_unknown() {
+    use rusthorse::protocol::{
+        PROTOCOL_VERSION, Request, Response, StatusInfo, recv_frame, send_frame,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let fake = std::thread::spawn(move || {
+        let mut imports = 0;
+        for _ in 0..3 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let (body, _fds) = recv_frame(&stream).expect("request");
+            match serde_json::from_slice::<Request>(&body).expect("json") {
+                Request::Status => {
+                    let status = Response::Status(StatusInfo {
+                        protocol_version: PROTOCOL_VERSION,
+                        agent_version: "fake".into(),
+                        vault: "/nonexistent".into(),
+                        vault_exists: true,
+                        audit_log: String::new(),
+                        locked: false,
+                        idle_timeout_secs: 0,
+                        locks_in_secs: None,
+                        remembered_approvals: 0,
+                    });
+                    send_frame(&stream, &status, &[]).expect("status");
+                }
+                Request::Import { .. } => {
+                    imports += 1;
+                    if imports == 1 {
+                        let ok = Response::Ok {
+                            message: "imported".into(),
+                        };
+                        send_frame(&stream, &ok, &[]).expect("ok");
+                    } // the second batch's answer is lost
+                }
+                _ => {}
+            }
+        }
+    });
+    let env_file = dir.path().join("many.env");
+    let lines: String = (0..60).map(|i| format!("NAME_{i:03}=value{i}\n")).collect();
+    std::fs::write(&env_file, lines).expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["import", "dotenv", env_file.to_str().expect("utf8")])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake");
+    assert!(!out.status.success());
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("batches 1 to 1 were imported"), "{stderr}");
+    assert!(
+        stderr.contains("batch 2 may or may not have been imported"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_unknown_outcome_from_the_agent_exits_124() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let fake = fake_agent(
+        &socket,
+        rusthorse::protocol::PROTOCOL_VERSION,
+        Some(r#"{"type":"error","code":"outcome_unknown","message":"waiting failed"}"#),
+        2,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    fake.join().expect("fake");
+    assert_eq!(out.status.code(), Some(124), "{}", text(&out.stderr));
+}
+
+#[test]
 fn locking_while_the_dialog_is_open_cancels_the_run() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);

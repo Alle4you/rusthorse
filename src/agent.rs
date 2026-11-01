@@ -471,6 +471,18 @@ impl Agent {
         generation: u64,
         f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
     ) -> Result<R, Failure> {
+        self.commit_reporting(generation, f)
+            .map(|(result, _)| result)
+    }
+
+    /// [`Agent::commit`], also returning — read under the same lock as the
+    /// save, so that nothing (a `lock`, say) can come in between — any problem
+    /// with the cleanup that followed the save.
+    fn commit_reporting<R>(
+        &self,
+        generation: u64,
+        f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
+    ) -> Result<(R, Option<String>), Failure> {
         let mut state = self.state();
         if state.generation != generation {
             return Err(locked_meanwhile());
@@ -485,9 +497,10 @@ impl Agent {
                 .push_str(" (the vault was locked to discard the unsaved change)");
             return Err(failure);
         }
+        let cleanup = vault.take_cleanup_error();
         state.generation += 1;
         state.last_used = Instant::now();
-        Ok(result)
+        Ok((result, cleanup))
     }
 
     fn ensure_unlocked(&self, peer: &Peer) -> Result<(), Failure> {
@@ -773,8 +786,15 @@ impl Agent {
                 entries.len()
             )));
         }
+        let mut names = std::collections::HashSet::new();
         for item in &entries {
             crate::vault::validate_name(&item.entry.name)?;
+            if !names.insert(item.entry.name.as_str()) {
+                return Err(Failure::invalid(format!(
+                    "{} appears more than once in the import; nothing was imported",
+                    item.entry.name
+                )));
+            }
         }
         let generation = self.generation(peer)?;
         let (new, existing): (Vec<&str>, Vec<&str>) = self.with_vault(peer, |v| {
@@ -967,11 +987,10 @@ impl Agent {
             ));
         }
         self.record(event.outcome("changed"))?;
-        self.commit(generation, |v| {
+        let ((), cleanup) = self.commit_reporting(generation, |v| {
             v.change_password(first);
             Ok(())
         })?;
-        let cleanup = self.with_vault(peer, |v| Ok(v.take_cleanup_error()))?;
         Ok(ok(match cleanup {
             None => "master password changed; the previous file (encrypted with the old \
                      password) was deleted"
@@ -1302,6 +1321,12 @@ impl Agent {
                     .stderr(Stdio::piped());
             }
         }
+        // Everything that can fail is prepared before the command starts: once
+        // it has started, the only answer is its exit status (or, if waiting
+        // for it fails, "outcome unknown").
+        let internal = |e: io::Error| Failure::new(ErrorCode::Internal, e.to_string());
+        let writer = Arc::new(Mutex::new(stream.try_clone().map_err(internal)?));
+        let watch_stream = stream.try_clone().map_err(internal)?;
         let mut child = command.spawn().map_err(|e| {
             Failure::new(
                 ErrorCode::InvalidRequest,
@@ -1322,13 +1347,9 @@ impl Agent {
 
         let mut pumps = Vec::new();
         let credits = Arc::new(Credits::new());
-        // Frames to the client from the output workers and the watcher go
-        // through one lock, so they never interleave.
-        let writer = Arc::new(Mutex::new(
-            stream
-                .try_clone()
-                .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?,
-        ));
+        // Frames to the client from the output workers and the
+        // acknowledgement writer go through one lock (`writer`, cloned
+        // above), so they never interleave.
         if run.redact {
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
@@ -1374,7 +1395,7 @@ impl Agent {
             let (acks_done, abort) = (Arc::clone(&acks_done), Arc::clone(&abort));
             thread::spawn(move || acks.run(&writer, &acks_done, &abort))
         });
-        let watcher = stream.try_clone().ok().map(|s| {
+        let watcher = Some(watch_stream).map(|s| {
             let watch = Watch {
                 stream: s,
                 acks: Arc::clone(&acks),
@@ -1420,11 +1441,24 @@ impl Agent {
         if let Some(watcher) = watcher {
             let _ = watcher.join();
         }
-        let status = child.wait();
+        let unknown = |e: &dyn std::fmt::Display| {
+            let _ = self.audit.record(
+                &run_event(peer, &run, &identities)
+                    .outcome("unknown")
+                    .detail(e.to_string()),
+            );
+            Failure::new(
+                ErrorCode::OutcomeUnknown,
+                format!("the command started but its result could not be determined: {e}"),
+            )
+        };
         if let Err(e) = waited {
-            return Err(Failure::new(ErrorCode::Internal, e.to_string()));
+            terminate_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(unknown(&e));
         }
-        let status = status.map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
+        let status = child.wait().map_err(|e| unknown(&e))?;
         let detail = match (status.code(), status.signal()) {
             (Some(code), _) => format!("exit code {code}"),
             (None, Some(sig)) => format!("killed by signal {sig}"),

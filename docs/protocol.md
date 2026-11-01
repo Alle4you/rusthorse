@@ -207,7 +207,7 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -260,6 +260,7 @@ are not disclosed.
 | `already_exists` | An entry with that name exists (use `replace`). |
 | `ambiguous` | Several entries match; use a `Group/Name` path. |
 | `invalid_request` | Malformed or disallowed request (bad name, missing fds, details too long, program replaced after approval, …). |
+| `outcome_unknown` | `run` only: the command started but its result could not be determined. It may have had effects. |
 | `internal` | Anything else, including an unwritable audit log or a failed save (after which the vault is locked). |
 
 ## Compatibility

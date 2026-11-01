@@ -867,6 +867,13 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 signal: Some(sig), ..
             } => Ok((128 + sig).clamp(0, 255) as u8),
             Response::Exited { .. } => Ok(EXIT_RUN_FAILURE),
+            Response::Error {
+                code: ErrorCode::OutcomeUnknown,
+                message,
+            } => {
+                eprintln!("rusthorse: {message}");
+                Ok(EXIT_RUN_UNKNOWN)
+            }
             Response::Error { message, .. } => {
                 eprintln!("rusthorse: {message}");
                 Ok(EXIT_RUN_FAILURE)
@@ -945,6 +952,19 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
     if pairs.is_empty() {
         bail!("nothing found to import");
     }
+    let mut seen = std::collections::HashSet::new();
+    let duplicates: std::collections::BTreeSet<&str> = pairs
+        .iter()
+        .filter(|(name, _)| !seen.insert(name.as_str()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !duplicates.is_empty() {
+        bail!(
+            "these names appear more than once, so nothing was imported: {} \
+             (fix the source, or use --prefix to tell them apart)",
+            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
     let entries: Vec<ImportedEntry> = pairs
         .into_iter()
         .map(|(name, value)| ImportedEntry {
@@ -987,15 +1007,40 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                 replace,
             },
         );
-        let failed = !matches!(result, Ok(0));
-        if failed && i > 0 {
-            eprintln!(
-                "rusthorse: stopped at batch {} of {total}: batches 1 to {i} were imported, \
-                 batch {} and later were not — run the same import again to finish \
-                 (already imported names are skipped)",
-                i + 1,
-                i + 1
-            );
+        let done = if i == 0 {
+            "no earlier batch was imported".to_string()
+        } else {
+            format!("batches 1 to {i} were imported")
+        };
+        let rerun = if replace {
+            "running the same import again re-imports everything (with --replace, \
+             already imported entries are overwritten with the same values)"
+        } else {
+            "running the same import again skips the names already imported"
+        };
+        match &result {
+            Ok(0) => {}
+            // The agent answered: this batch was refused or failed.
+            Err(e) if e.downcast_ref::<Exit>().is_some() => {
+                if total > 1 {
+                    eprintln!(
+                        "rusthorse: stopped at batch {} of {total}: {done}; batch {} and later \
+                         were not imported — {rerun}",
+                        i + 1,
+                        i + 1
+                    );
+                }
+            }
+            // No answer: the batch may or may not have been imported.
+            Err(_) | Ok(_) => {
+                eprintln!(
+                    "rusthorse: lost the connection during batch {} of {total}: {done}; batch {} \
+                     may or may not have been imported, later ones were not — check with \
+                     `rusthorse list` before {rerun}",
+                    i + 1,
+                    i + 1
+                );
+            }
         }
         match result {
             Ok(0) => {}
@@ -1020,7 +1065,7 @@ fn import_preview(client: &Client, names: Vec<String>, replace: bool) -> anyhow:
     for name in &names {
         let first = seen.insert(name.as_str());
         let (mark, note) = if !first {
-            ("dup", "appears more than once; only the first is imported")
+            ("dup", "appears more than once: the import will be refused")
         } else if existing.contains(name.as_str()) {
             (
                 "exists",
