@@ -89,10 +89,11 @@ run …` does. The agent needs no change for it.
 
 The URL is not a secret: it is not redacted, and the approval dialog does not
 list it any more than it lists the rest of the requester's environment.
-`--url` is refused before anything is asked when the entry has no URL (or
+`--url` is refused before the run is approved when the entry has no URL (or
 the file marks it protected), when `VAR` is already the variable of a
 secret, and when `VAR` is one of the variables that change how programs start
-(`LD_*`, the risky list).
+(`LD_*`, the risky list). Reading the URL needs the vault open: if it is
+locked, the master-password dialog comes first.
 
 ### 6. The manager
 

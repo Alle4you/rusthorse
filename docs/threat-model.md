@@ -859,4 +859,25 @@ Writing it made one existing gap visible, now in L4: variables that redirect
 where an approved program sends a key (`OPENAI_BASE_URL`, `HTTPS_PROXY`)
 come from the requester and are not listed in the run dialog. Ten mutations
 of the new behaviour, and one of a fix made before review (a kind hid a row
-whose field the file withholds), each made a test fail. Awaiting review.
+whose field the file withholds), each made a test fail.
+
+Review of the kinds, `run --url` and the layout fixes (Codex, AI-assisted,
+2026-11-01): **ready to keep trying with fake entries.** The three layout
+findings above are confirmed fixed (reverting each fix made its test fail).
+No high or medium finding. Also checked: `--url` replaces an inherited
+variable and refuses collisions and risky names; an identical URL reuses a
+remembered approval and another URL asks again; a denied edit keeps the old
+kind; a foreign `Kind` is listed by name and a protected one withheld; edits
+and `--replace` keep the previous state in the history; a protected URL is
+refused without being printed; the manager refuses a protocol-4 agent; the
+snippet stays literal shell for hostile names and ids.
+
+| Finding | Disposition |
+|---|---|
+| Low — the CLI reference and ADR 0008 said `--url` is refused "before anything is asked", but with the vault locked the master-password dialog comes first (reading the URL needs the vault open) | **Fixed** in both: refused before the run is approved; the unlock may come first. |
+
+Ideas from the same review, not adopted yet: list destination and proxy
+variables in the run dialog (already planned under L4), a kind filter in the
+manager, a "show all fields" switch in the form, and end-to-end tests for a
+changed URL under a remembered approval and for the manager against a
+protocol-4 agent (both checked by hand in this review).

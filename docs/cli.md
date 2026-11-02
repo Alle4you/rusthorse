@@ -224,11 +224,13 @@ endpoint — in variable `VAR`. `rusthorse run` reads the URL from the entry's
 metadata before sending the request, as `rusthorse show` would, and adds it to
 the environment it sends, exactly as if you had written
 `VAR=https://… rusthorse run …`. The URL is not a secret: it is not redacted
-from the output and the dialog does not list it. `--url` is refused, before
-anything is asked, when the entry has no URL (or the file marks it
-protected), when `VAR` is already a secret's variable, and when `VAR` is a
-variable that changes how programs start (`LD_*` and the risky variables
-listed below).
+from the output and the dialog does not list it. Reading the URL needs the
+vault open, like `show`: if it is locked, the agent asks for the master
+password first. `--url` is refused, before any approval is asked for the run,
+when the entry has no URL (or the file marks it protected), when `VAR` is
+already a secret's variable, and when `VAR` is a variable that changes how
+programs start (`LD_*` and the risky variables listed below); the last two
+are refused before anything is asked.
 
 Requires approval; the dialog shows:
 
