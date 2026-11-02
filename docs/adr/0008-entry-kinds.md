@@ -97,8 +97,9 @@ locked, the master-password dialog comes first.
 
 ### 6. The manager
 
-The entry form starts with a Kind row and shows the fields of that kind; the
-details call the URL by its kind's name and show the kind under the entry's
+The entry form starts with a Kind row and shows the fields of that kind (a
+"Show all fields" switch, off when the form opens, shows every field without
+changing the kind); the details call the URL by its kind's name and show the kind under the entry's
 name. For an API key with an endpoint, the command snippet passes the endpoint
 too, in a variable named after the key's (`OPENAI_API_KEY` →
 `OPENAI_BASE_URL`, which the OpenAI and Anthropic libraries read; `NAME_URL`

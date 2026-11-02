@@ -344,11 +344,24 @@ fn desktop_flow() {
         .filter_map(|w| w.downcast::<adw::ComboRow>().ok())
         .find(|c| c.title() == "Kind")
         .expect("kind row");
+    let all = descendants(&editor)
+        .into_iter()
+        .find_map(|w| w.downcast::<adw::SwitchRow>().ok())
+        .expect("show all fields");
     assert_eq!(kind.selected(), 0, "Other");
     assert!(inputs[2..6].iter().all(|r| r.is_visible()));
+    assert!(!all.is_visible(), "Other shows every field already");
     kind.set_selected(1);
     assert_eq!(inputs[3].title(), "Endpoint URL");
     assert!(inputs[2].is_visible() && inputs[3].is_visible());
+    assert!(!inputs[4].is_visible() && !inputs[5].is_visible());
+    // Every field, without changing the kind or what the URL is called.
+    assert!(all.is_visible() && !all.is_active());
+    all.set_active(true);
+    assert!(inputs[2..6].iter().all(|r| r.is_visible()));
+    assert_eq!(inputs[3].title(), "Endpoint URL");
+    assert_eq!(kind.selected(), 1);
+    all.set_active(false);
     assert!(!inputs[4].is_visible() && !inputs[5].is_visible());
     inputs[3].set_text("https://example.invalid");
     kind.set_selected(3);
@@ -363,7 +376,12 @@ fn desktop_flow() {
     assert!(!inputs[5].is_visible());
     // A row the file withholds stays, with its warning, whatever the kind.
     let loose: Vec<adw::EntryRow> = (0..7).map(|_| adw::EntryRow::new()).collect();
-    shape_rows(&loose, Some(EntryKind::ApiKey), [false, true, true, false]);
+    shape_rows(
+        &loose,
+        Some(EntryKind::ApiKey),
+        [false, true, true, false],
+        false,
+    );
     assert!(loose[4].is_visible() && !loose[5].is_visible());
     assert_eq!(loose[3].title(), "Endpoint URL (protected; unchanged)");
     kind.set_selected(1);

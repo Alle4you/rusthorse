@@ -16,8 +16,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   (`--kind other` or `--clear kind` removes it), shown by `show`, filtered by
   `list --kind`, and stored in the KDBX field `Kind`. The kind names the
   fields — the URL of an API key is its endpoint — and decides which ones the
-  manager's form offers, never hiding one that has a value. It grants
-  nothing.
+  manager's form offers, never hiding one that has a value ("Show all
+  fields" shows every one). It grants nothing.
 - `run --url VAR=ENTRY` also gives the command an entry's URL, such as an
   API's endpoint, in variable `VAR`. The URL is not a secret: it is neither
   redacted nor listed in the approval dialog. The manager's command for an

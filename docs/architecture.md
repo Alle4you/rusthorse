@@ -430,7 +430,7 @@ its own dialog.
 - **Kinds.** The entry form starts with a Kind row; the kind decides which
   of Username, URL, Host and Port the form offers and what the URL is called
   ("Endpoint URL" for an API key, "Admin page" for a device). A row with a
-  value is always shown. The command snippet of an API key with an endpoint
+  value is always shown, and a "Show all fields" switch shows every row. The command snippet of an API key with an endpoint
   adds `--url` ([ADR 0008](adr/0008-entry-kinds.md)).
 - **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard as
   plain text and stays until something else is copied; the desktop and

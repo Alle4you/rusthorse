@@ -1502,6 +1502,13 @@ impl Manager {
             );
         }
         fields_group.add(&kind);
+        // Every row without changing the kind (for the odd entry that needs
+        // one more field). Not stored: the form opens with it off.
+        let all = adw::SwitchRow::builder()
+            .title("Show all fields")
+            .subtitle("Every field, whatever the kind")
+            .build();
+        fields_group.add(&all);
         let mut fields = Vec::new();
         for (name, value, protected) in [
             ("Name", &initial.name, "Title"),
@@ -1530,15 +1537,19 @@ impl Manager {
             fields.push(row);
         }
         let hidden_by_file = ["UserName", "URL", "Host", "Port"].map(withheld);
-        shape_rows(&fields, initial.kind, hidden_by_file);
-        let rows = fields.clone();
-        kind.connect_selected_notify(move |row| {
-            shape_rows(
-                &rows,
-                model::KIND_CHOICES[row.selected() as usize],
-                hidden_by_file,
-            );
-        });
+        let reshape = {
+            let (rows, kind, all) = (fields.clone(), kind.clone(), all.clone());
+            move || {
+                let chosen = model::KIND_CHOICES[kind.selected() as usize];
+                // "Other" shows every field already.
+                all.set_visible(chosen.is_some());
+                shape_rows(&rows, chosen, hidden_by_file, all.is_active());
+            }
+        };
+        reshape();
+        let again = reshape.clone();
+        kind.connect_selected_notify(move |_| again());
+        all.connect_active_notify(move |_| reshape());
         body.append(&fields_group);
         let value_group = group(
             "Value",
@@ -1697,15 +1708,22 @@ impl Manager {
 }
 
 /// Fit the entry form to `kind`: of its rows 2–5 (Username, URL, Host,
-/// Port), show those the kind offers and every one with text or withheld by
-/// the file (`withheld`, in the same order); name the URL row for the kind.
-fn shape_rows(rows: &[adw::EntryRow], kind: Option<EntryKind>, withheld: [bool; 4]) {
+/// Port), show those the kind offers — all of them with `all` — and every
+/// one with text or withheld by the file (`withheld`, in the same order);
+/// name the URL row for the kind.
+fn shape_rows(rows: &[adw::EntryRow], kind: Option<EntryKind>, withheld: [bool; 4], all: bool) {
+    let offered = if all { None } else { kind };
     for ((row, field), withheld) in rows[2..6]
         .iter()
         .zip([Field::Username, Field::Url, Field::Host, Field::Port])
         .zip(withheld)
     {
-        row.set_visible(model::shows(kind, field, !row.text().is_empty(), withheld));
+        row.set_visible(model::shows(
+            offered,
+            field,
+            !row.text().is_empty(),
+            withheld,
+        ));
     }
     let url = EntryKind::url_label(kind);
     rows[3].set_title(&if withheld[1] {

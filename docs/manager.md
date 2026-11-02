@@ -103,7 +103,10 @@ that kind uses:
 | Other | all of them | URL |
 
 A field that already has a value stays in the form whatever the kind, so
-changing the kind never hides or removes anything. The kind is stored in the
+changing the kind never hides or removes anything. For an entry that needs
+one more field — an API key reached through a host and port, say — turn on
+**Show all fields**: every field appears and the kind stays as it is. The
+switch is not stored; the form always opens with it off. The kind is stored in the
 vault (the KeePass field `Kind`) and shown under the entry's name; see
 [ADR 0008](adr/0008-entry-kinds.md). Tags stay free, for projects or
 environments (`prod`, `test`) and for search.
