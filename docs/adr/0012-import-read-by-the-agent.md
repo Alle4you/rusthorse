@@ -32,9 +32,8 @@ not be another place that holds secrets.
    absolute path — and the entry name for each; the agent reads the values
    itself, after approval. No client holds the values. The dialog says where
    they come from, because the agent reads them there: for keyring items,
-   one row per entry with the item the agent found at that path (label and
-   attributes, or "no such keyring item", or "locked"); for a file, its
-   path.
+   one row per entry with the item as the approved listing showed it (label
+   and attributes, and "locked" if so); for a file, its path.
 2. **Nothing of the source before the approval.** What the request says by
    itself is checked first (names, a count, an absolute path); everything
    that depends on the source comes after the human allows the import — a
@@ -42,7 +41,9 @@ not be another place that holds secrets.
    request does not tell its sender what the keyring or a file holds.
    Keyring items can be imported only from a listing (`keyring_items`) the
    human allowed the same program to see, within 10 minutes and since the
-   last lock; the dialog shows the items as that listing showed them, so
+   last lock (a lock while the listing is under way keeps nothing of it);
+   other items are refused before any dialog, alike whatever the keyring
+   holds. The dialog shows the items as that listing showed them, so
    that nothing in it — not even its size, which decides whether it can be
    shown at all — is news to the requester. After the approval, an item is
    read only if it is still what the dialog showed (same label and
@@ -51,8 +52,8 @@ not be another place that holds secrets.
 3. **Requests** (protocol 6, not yet released):
    - `keyring_items` → the metadata of the Secret Service's items: object
      path, label, attributes, whether locked. No secret is read.
-   - `dotenv_names` (`path`, `prefix`) → the names in the file. The agent
-     parses it and drops the values at once.
+   - `dotenv_names` (`path`) → the names in the file. The agent parses it
+     and drops the values at once.
    - `import_from` (`source`, `tags`, `replace`) → `ok`. The source is
      `keyring` with a list of `{id, name}`, or `dotenv` with `path`,
      `prefix` and the `names` to import. At most 100 entries, one dialog per
@@ -62,15 +63,19 @@ not be another place that holds secrets.
    answers it), an item whose secret is not UTF-8 text, a `.env` path that
    is not absolute, not a regular file or larger than 1 MiB, a name that is
    not in the source, and the usual: invalid or duplicate names. `.env`
-   files are read as python-dotenv and Node's dotenv read them (quoted
-   values over several lines, a backslash before a quote keeps it open); a
-   file that could hide a value from that reading is refused as a whole,
-   rather than reading the rest of a value as more variables. Clients size
-   their batches with the agent's own dialog builder, for the longest dialog
-   a batch could have. Every call to the Secret Service is bounded (10 seconds), and
-   so is the whole operation, connecting and authenticating included (30
-   seconds): past it, the agent shuts the connection's socket down, which
-   ends it.
+   files are read in the one dialect that python-dotenv and Node's dotenv
+   both read alike — one-line
+   values, quoted without a backslash or their own quote inside, or
+   unquoted with a `#` only after a space — and any other file is refused
+   as a whole, naming the line: the readers disagree on the rest, and
+   reading on could take part of a value for more names. Values over
+   several lines (a PEM key) are added with `rusthorse add` instead. Clients
+   size their batches with the agent's own dialog builder, for the longest
+   dialog a batch could have (every entry existing, the longest requester
+   chain) and at most 100 entries. A request uses the Secret Service once —
+   the listing, or the reading after approval — within 30 seconds, each
+   call within 10; past them the agent shuts the connection's socket down,
+   which ends it, and answers within 5 more seconds.
 5. **The CLI uses the same requests**, so that `rusthorse import` no longer
    holds values either. The `import` request (values from the client) stays
    for other clients; its dialog keeps saying that the requester supplied

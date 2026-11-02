@@ -1318,7 +1318,7 @@ fn large_imports_are_split_into_readable_batches() {
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
     // Real run: the names, then several batches, one approval each,
     // everything imported.
-    h.decide(&[Decision::AllowOnce; 10]);
+    h.decide(&[Decision::AllowOnce; 30]);
     let out = h.run(&["import", "dotenv", env_file.to_str().expect("utf8")]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(h.ui.approvals_asked.load(Ordering::SeqCst) >= 4);
@@ -2795,10 +2795,11 @@ fn import_two_batches(dir: &Path, socket: &Path) -> std::process::Output {
             })
             .collect()
     };
-    let first = rusthorse::import::batch_sizes(&planned(500), Some(&path))[0];
+    // (The fake agent does not say which dialogs it shows: heights count.)
+    let first = rusthorse::import::batch_sizes(&planned(500), Some(&path), true)[0];
     let count = first + 5;
     assert_eq!(
-        rusthorse::import::batch_sizes(&planned(count), Some(&path)),
+        rusthorse::import::batch_sizes(&planned(count), Some(&path), true),
         [first, 5]
     );
     let lines: String = (0..count)
@@ -4453,39 +4454,41 @@ mod import_from {
     fn the_names_of_a_file_never_include_pieces_of_a_value() {
         let h = Harness::new();
         let file = h.dir.path().join("key.env");
-        std::fs::write(
-            &file,
-            "PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\n\
-             FAKE_PRIVATE_KEY_MATERIAL==\n\
-             -----END PRIVATE KEY-----\"\nNORMAL=x\n",
-        )
-        .unwrap();
-        let names = |h: &Harness| {
+        let names = |h: &Harness, text: &str| {
+            std::fs::write(&file, text).unwrap();
             h.decide(&[Decision::AllowOnce]);
             h.call(&Request::DotenvNames {
                 path: file.display().to_string(),
             })
         };
-        let Response::Names { names: found } = names(&h) else {
+        // Files the readers do not all read alike are refused, naming the
+        // line and nothing of it: a value over several lines, Node's
+        // `NAME: value` with `=` in its value, a backslash before a quote.
+        for (text, line) in [
+            (
+                "PRIVATE_KEY=\"-----BEGIN-----\nFAKE_PRIVATE_KEY_MATERIAL==\n-----END-----\"\nNORMAL=x\n",
+                "line 1:",
+            ),
+            (
+                "KEY: \"start=value\nFAKE_PRIVATE_MATERIAL==\nend=tail\"\nNORMAL=x\n",
+                "line 1:",
+            ),
+            ("OK=1\nKEY=\"FAKE\\\\\"\n# note \"\nNORMAL=x\n", "line 2:"),
+        ] {
+            match names(&h, text) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                    assert!(message.contains(line), "{message}");
+                    assert!(!message.contains("FAKE"), "{message}");
+                }
+                other => panic!("{text:?}: unexpected {}", other.kind()),
+            }
+        }
+        // The common dialect.
+        let Response::Names { names: found } = names(&h, "A='x'\nexport B=\"y\" # c\nC=z\n") else {
             panic!("no names");
         };
-        assert_eq!(found, ["PRIVATE_KEY", "NORMAL"]);
-        // A quote never closed: the file is refused, and nothing of it shown.
-        std::fs::write(
-            &file,
-            "OK=1\nKEY=\"FAKE_SECRET_START\nFAKE_LOOKS_LIKE=a name\n",
-        )
-        .unwrap();
-        match names(&h) {
-            Response::Error { message, .. } => {
-                assert!(
-                    message.contains("line 2: a quoted value is not closed"),
-                    "{message}"
-                );
-                assert!(!message.contains("FAKE_"), "{message}");
-            }
-            other => panic!("unexpected {}", other.kind()),
-        }
+        assert_eq!(found, ["A", "B", "C"]);
     }
 
     #[test]
@@ -4761,6 +4764,33 @@ mod import_from {
             assert!(h.run(&["lock"]).status.success());
             refused(&pick(FIRST, "FAKE_A"), "list the keyring first");
             assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn a_lock_while_the_keyring_is_listed_keeps_nothing_of_the_listing() {
+            let mut slow = segredo("FAKE_A", "fake-a-value");
+            slow.delay = Duration::from_millis(400);
+            let Some((bus, _service)) = keyring(vec![slow]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            h.decide(&[Decision::AllowOnce]);
+            let socket = h.socket.clone();
+            let listing = std::thread::spawn(move || {
+                rusthorse::client::Client::new(socket)
+                    .call(&Request::KeyringItems)
+                    .expect("listing")
+            });
+            // While the agent waits for the slow keyring.
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(h.run(&["lock"]).status.success());
+            match listing.join().expect("join") {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::Locked, "{message}");
+                    assert!(!message.contains("FAKE_A"), "{message}");
+                }
+                other => panic!("unexpected {}", other.kind()),
+            }
         }
 
         #[test]

@@ -470,14 +470,15 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
-Imports `NAME=value` lines, read as python-dotenv and Node's dotenv read
-them: an optional `export`, `#` comment lines, values in single, double or
-back quotes that may span lines (a quote with a backslash before it does not
-close), python-dotenv's escapes in quotes (`\n`, `\"`, … in double quotes;
-`\\` and `\'` in single quotes), and an unquoted value that ends at ` #`.
-A file that could hide a value from that reading — a quote never closed,
-text after a closing quote, a quote on a line that is not `NAME=value` — is
-refused, naming the line only.
+Imports `NAME=value` lines in the one `.env` dialect that python-dotenv and
+Node's dotenv both read alike (Docker's `--env-file` keeps quotes in the
+value, and shells take no spaces around `=`): an optional `export`, `#` comment lines, one-line values either
+in single, double or back quotes with neither that quote nor a backslash
+inside (then only spaces or a comment), or unquoted, where a `#` after a
+space starts a comment. Any other file — a value over several lines, a
+backslash in quotes, a `#` without a space before it in an unquoted value,
+a quote on a line that is not `NAME=value` — is refused, naming the line
+only: add such values with `rusthorse add`.
 The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):
 this command never holds a value. It first asks the agent for the names in
 the file — the agent asks you in a dialog before it shows them — then sends

@@ -1414,7 +1414,13 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         #[cfg(feature = "secret-service")]
         ImportFrom::Keyring => None,
     };
-    let sizes = rusthorse::import::batch_sizes(&planned, dotenv);
+    // As tall a dialog as the agent's dialog program shows.
+    let dialogs = match client.call(&Request::Status) {
+        Ok(Response::Status(info)) => info.dialogs,
+        _ => None,
+    };
+    let limit_height = rusthorse::import::dialogs_limit_height(dialogs.as_deref());
+    let sizes = rusthorse::import::batch_sizes(&planned, dotenv, limit_height);
     let mut rest = picks.into_iter();
     let batches: Vec<Vec<Pick>> = sizes
         .into_iter()

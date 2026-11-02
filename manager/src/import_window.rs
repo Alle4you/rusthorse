@@ -437,7 +437,13 @@ impl Manager {
                     }),
                 })
                 .collect();
-            let sizes = rusthorse::import::batch_sizes(&planned, path.as_deref());
+            let limit_height = rusthorse::import::dialogs_limit_height(
+                s.status
+                    .borrow()
+                    .as_ref()
+                    .and_then(|i| i.dialogs.as_deref()),
+            );
+            let sizes = rusthorse::import::batch_sizes(&planned, path.as_deref(), limit_height);
             let mut rest = chosen.into_iter();
             let requests: VecDeque<Request> = sizes
                 .into_iter()

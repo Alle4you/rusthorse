@@ -303,6 +303,8 @@ pub mod fake {
         pub secret: Vec<u8>,
         /// Whether it is locked.
         pub locked: bool,
+        /// Answer its label only after this long (a slow keyring).
+        pub delay: std::time::Duration,
     }
 
     impl Item {
@@ -316,6 +318,7 @@ pub mod fake {
                     .collect(),
                 secret: secret.as_bytes().to_vec(),
                 locked: false,
+                delay: std::time::Duration::ZERO,
             }
         }
     }
@@ -401,6 +404,7 @@ pub mod fake {
 
         #[zbus(property)]
         fn label(&self) -> String {
+            std::thread::sleep(self.0.delay);
             self.0.label.clone()
         }
 

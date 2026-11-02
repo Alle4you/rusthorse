@@ -73,7 +73,7 @@ use crate::ui::MAX_DIALOG_CHARS;
 const MAX_DETAIL_CHARS: usize = 1000;
 
 /// Most entries in one import batch (all of them are listed in the dialog).
-const MAX_IMPORT: usize = 100;
+const MAX_IMPORT: usize = crate::import::MAX_ENTRIES;
 /// The largest `.env` file the agent reads for an import.
 const MAX_DOTENV_BYTES: u64 = 1024 * 1024;
 
@@ -169,6 +169,9 @@ struct State {
     /// The last keyring listing the human allowed, and to whom: keyring
     /// imports may only use items of it (ADR 0012). A lock forgets it.
     keyring_listing: Option<KeyringListing>,
+    /// Incremented on every lock only: a keyring listing under way when the
+    /// vault is locked is not kept.
+    locks: u64,
 }
 
 impl State {
@@ -176,6 +179,7 @@ impl State {
         self.vault = None;
         self.remembered.clear();
         self.keyring_listing = None;
+        self.locks += 1;
         self.generation += 1;
     }
 }
@@ -261,6 +265,7 @@ impl Agent {
                 remembered: Vec::new(),
                 generation: 0,
                 keyring_listing: None,
+                locks: 0,
             }),
             dialog: Mutex::new(()),
             waiting_for_dialog: AtomicUsize::new(0),
@@ -988,10 +993,19 @@ impl Agent {
             can_remember: false,
         };
         self.approve(request, None, AuditEvent::new("keyring_items", peer))?;
+        let locks = self.state().locks;
         let items = crate::keyring::items(&self.config.keyring)
             .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
-        // What this program may now import from, and what its dialogs show.
-        self.state().keyring_listing = Some(KeyringListing {
+        // What this program may now import from, and what its dialogs show —
+        // unless the vault was locked meanwhile, which forgets approvals.
+        let mut state = self.state();
+        if state.locks != locks {
+            return Err(Failure::new(
+                ErrorCode::Locked,
+                "the vault was locked while the keyring was being listed; list it again",
+            ));
+        }
+        state.keyring_listing = Some(KeyringListing {
             requester: (peer.pid, crate::peer::start_time(peer.pid)),
             at: Instant::now(),
             items: items
@@ -999,6 +1013,7 @@ impl Agent {
                 .map(|item| (item.id.clone(), item.clone()))
                 .collect(),
         });
+        drop(state);
         let response = Response::KeyringItems { items };
         let size = serde_json::to_vec(&response).map_or(usize::MAX, |b| b.len());
         if size > protocol::MAX_FRAME_LEN - 1024 {

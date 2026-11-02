@@ -1258,3 +1258,23 @@ Each fix was reverted in a copy of the tree to see a test fail (12 of 13).
 The survivor: comparing `init`'s paths by device and inode instead of by
 resolved path differs only for bind mounts, which the tests cannot create
 without privileges; it is kept for them, checked by review only.
+
+Fifth review (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Confirmed fixed: `init`'s paths (also a bind mount, which the reviewer made
+in an unprivileged namespace; reverting to comparison by path made it fail),
+the dialog rows, the refusal alike without a listing; the normal flow —
+create from the manager, import 34 fake items, reopen the file and compare
+every value — passed. Findings:
+
+| Finding | Disposition |
+|---|---|
+| High — Node's `NAME: value` with an `=` inside the value got past the check for lines that are not `NAME=value`, and `dotenv_names` returned lines of the value | **Fixed** by giving up on following each library: `.env` files are read in the one dialect python-dotenv and Node's dotenv both read alike (one-line values; in quotes without a backslash or their own quote; unquoted with `#` only after a space), and any other line refuses the file, naming the line. Values over several lines are added with `rusthorse add`. Tested with both reproductions. |
+| Medium — two backslashes before a quote: python-dotenv and Node read it differently, so the imported value could differ from the program's | **Fixed** by the same rule: a backslash in a quoted value refuses the file. |
+| Medium — batches could hold more than the 100 entries the agent takes | **Fixed:** `import::MAX_ENTRIES`, shared by the agent and the batch planner. Tested with 250 tiny entries. |
+| Medium — a lock while the keyring was being listed left that listing usable for imports | **Fixed:** a lock counter is taken before listing and checked, under the same lock, before the listing is kept; a lock meanwhile fails the listing with `locked`. Tested with a keyring slowed down during the listing. |
+| Low — the room kept for the requester chain was not the longest possible | **Fixed:** eight 15-byte names of invalid UTF-8 (each byte shown as `\u{fffd}`) and the longest process ids; the height limit is applied only when the agent's dialogs are zenity's (`status.dialogs`). |
+| Low — ADR 0012 named a dialog row for missing items and a `prefix` for `dotenv_names` | **Fixed.** |
+
+Each fix was reverted in a copy of the tree to see a test fail (9 of 9; for
+the requester's room, a test with the longest chain the agent can describe
+was added first).

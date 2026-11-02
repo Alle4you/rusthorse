@@ -179,8 +179,10 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
 - `import_from` imports at most 100 entries, after one approval. Keyring
   items can be imported only from the last `keyring_items` listing that
   the human allowed **this program** (the same process) to see, in the last
-  10 minutes and since the vault was last locked; other items, or no such
-  listing, are refused before any dialog, alike whatever the keyring holds.
+  10 minutes and since the vault was last locked (a lock while the listing
+  is under way makes it fail with `locked` and keeps nothing of it); other
+  items, or no such listing, are refused before any dialog, alike whatever
+  the keyring holds. At most 100 entries per request.
   The dialog shows one row per entry — "Entry 1", "Entry 2", … — with the
   entry's name and the item it comes from as that listing showed it (label
   and attributes, or "locked"), so nothing in it, not even its size, is
@@ -195,11 +197,10 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
   entries are skipped unless `replace`.
 - A `.env` path must be absolute and name a regular file of at most 1 MiB,
   in UTF-8. The agent opens it without waiting (a FIFO is refused, not
-  waited on) and reads it as the user it runs as, as python-dotenv and
-  Node's dotenv read `.env` files (see [cli.md](cli.md#rusthorse-import-dotenv));
-  a file that could hide a value from that reading — a quote never closed,
-  text after a closing quote, a quote on a line that is not `NAME=value` —
-  is refused (`invalid_request`, naming the line only).
+  waited on) and reads it as the user it runs as, in the one dialect
+  python-dotenv and Node's dotenv both read alike (see [cli.md](cli.md#rusthorse-import-dotenv)):
+  any other file — a value over several lines among others — is refused
+  (`invalid_request`, naming the line only).
 - A request uses the Secret Service once — the listing, or the reading
   after the approval — and each call is limited to 10 seconds, the whole
   use, connecting and authenticating included, to 30; past them the agent
