@@ -193,8 +193,10 @@ pub struct Dotenv {
 /// backslash in quotes, a value in back quotes, a `#` without a blank before
 /// it in an unquoted value, a `${…}` in a value (python-dotenv replaces it),
 /// a name set twice, the name `__proto__` (Node's dotenv drops it), and any
-/// line that is not one of the three above — nothing is
-/// skipped without a word, so a file is imported whole or not at all.
+/// line that is not one of the three above. Nothing is skipped without a
+/// word: the whole file is checked before any name is given, so a file with
+/// an error starts no import. (An import then saves batch by batch: batches
+/// allowed before one that is denied or fails stay saved.)
 pub fn parse_dotenv(text: &str) -> Result<Dotenv, String> {
     let mut parsed = Dotenv {
         pairs: Vec::new(),

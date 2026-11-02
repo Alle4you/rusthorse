@@ -1302,7 +1302,7 @@ backup and compare again — passed. Findings, all in `.env` files:
 | Finding | Disposition |
 |---|---|
 | Medium — `KEY=${PART}-suffix` was imported as written, while python-dotenv, by default, replaces `${PART}` (also in single quotes) | **Fixed:** a value holding `${` refuses the file; Rusthorse does not expand variables, from the file or from its own environment. |
-| Medium — names were checked for repetition only among those with a value: with `DUP=` and `DUP=x`, batches were saved before the second one was refused | **Fixed:** a name set twice refuses the file when it is read — before any listing or import — so a file is imported whole or not at all. |
+| Medium — names were checked for repetition only among those with a value: with `DUP=` and `DUP=x`, batches were saved before the second one was refused | **Fixed:** a name set twice refuses the file when it is read — before any listing or import — so such a file starts no import. (An import still saves batch by batch; batches allowed before a denied or failed one stay saved, and the CLI and the manager say which.) |
 | Low — the name `__proto__`, which Node's dotenv drops, was accepted | **Fixed:** refused. |
 | Low — a carriage return at the very end of a file, without a line feed, was taken for a line end | **Fixed:** only a carriage return before a line feed ends a line. |
 
@@ -1313,3 +1313,18 @@ default (replacing `${…}`) and new cases (`${…}`, `$NAME`, `__proto__`,
 with Rusthorse's names and values.
 
 Each fix was reverted in a copy of the tree to see a test fail (4 of 4).
+
+Eighth review (Codex, AI-assisted, 2026-11-02): **ready.** The four
+findings are confirmed fixed; a differential check of 79,434 fake files, of
+which 8,558 accepted, found no difference in names or values between
+Rusthorse, python-dotenv 1.2.2 (interpolating, as by default) and Node's
+dotenv 17.4.2, and no value coming back as a name or in an error. The
+maintainer's flow — create the vault from the manager, import 34 fake items
+of the `segredo` tool's form, compare every value, back up, reopen the
+backup and compare again — passed. One low finding, documentation: "a file
+is imported whole or not at all" suggested that all batches are one
+transaction — **fixed**: the whole file is checked before any name is
+listed, so a file with an error starts no import, and the import saves
+batch by batch. The reviewer's opinion: ready for the planned first real
+use; deleting the originals stays the last step, after each entry is used
+and an independent backup is checked.
