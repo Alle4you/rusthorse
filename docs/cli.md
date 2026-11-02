@@ -259,9 +259,10 @@ which one is meant cannot be told) is refused without an approval dialog.
 The dialog shows the destination as a path from the top, and which group
 that is, since names alone can look alike:
 
-- `/Work/Servers (existing group 8d2f6c1e)` — an existing group, by the
-  start of its UUID;
-- `/Work/Servers (creates Servers in /Work, group 1a2b3c4d)` or
+- `/Work/Servers (existing group 8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)` — an
+  existing group, by its whole UUID (names can look alike, and another
+  program can give two groups UUIDs that start alike);
+- `/Work/Servers (creates Servers in /Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)` or
   `/Work/Servers (creates Work/Servers at the top level)` — what is created,
   and where;
 - `/ (the top level)`.

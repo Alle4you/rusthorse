@@ -15,8 +15,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   (`/` for the top level) and the **Group** field of the manager's **Edit**
   form, which used to be locked. The group is created if needed, and the
   agent's approval dialog shows the destination as a path from the top with
-  the start of the group's UUID, or what it creates (`/Work/Servers
-  (existing group 8d2f6c1e)`, `/ (the top level)`); a path through two
+  the group's UUID, or what it creates (`/Work/Servers (existing group
+  8d2f6c1e-…)`, `/ (the top level)`); a path through two
   groups of the same name is refused. The UUID stays the same, and the entry
   records the group it came from.
 - **Change the value from the manager**: the **Secret** section has a row

@@ -183,11 +183,14 @@ top level**, outside any group. A group's name follows the rules for an
 entry's name (for example at most 128 characters, no control or invisible
 characters): the form says which rule a name breaks before it sends
 anything. Left as it is, the row moves nothing, even for a group named by
-another KeePass client with spaces or a `/` in its name. The agent's
-approval dialog shows the destination as a path from the top and says which
-group it is — `/Work/Servers (existing group 8d2f6c1e)`, by the start of its
-UUID, or what it creates, `/Work/Servers (creates Servers in /Work, group
-1a2b3c4d)` — or `/ (the top level)`. A path through two groups of the same
+another KeePass client with spaces or a `/` in its name. Edited, the row is
+sent and the agent decides whether it is a move by the group itself: a
+group named `Work/Servers` by another client is not the nested `Work` →
+`Servers`, though both read the same, and a path to the group the entry is
+in moves nothing. The agent's approval dialog shows the destination as a
+path from the top and says which group it is — `/Work/Servers (existing
+group 8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)`, by its whole UUID, or what it
+creates, `/Work/Servers (creates Servers in /Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)` — or `/ (the top level)`. A path through two groups of the same
 name side by side is refused, since which one is meant cannot be told. A move keeps the entry's
 UUID, so the command of **Use it from a command**, which names the entry by
 UUID, still works; a command that names it by its old `Group/Name` path no

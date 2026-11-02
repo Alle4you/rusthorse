@@ -299,10 +299,10 @@ checks it before the approval dialog: an invalid path, one that leads into
 the recycle bin (where an entry would be hidden from every listing), or one
 through two groups of the same name side by side is refused with
 `invalid_request` without an approval dialog. The dialog shows the
-destination normalized and from the top, with the start of the UUID of the
-deepest existing group and what would be created (`/Work/Servers (existing
-group 8d2f6c1e)`, `/Work/Servers (creates Servers in /Work, group
-1a2b3c4d)`, `/ (the top level)`). A path that leads to the group the entry
+destination normalized and from the top, with the whole UUID of the deepest
+existing group and what would be created (`/Work/Servers (existing group
+8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)`, `/Work/Servers (creates Servers in
+/Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)`, `/ (the top level)`). A path that leads to the group the entry
 is already in — compared by identity, not by how its path reads — is
 dropped from the request before the dialog; if nothing else changes, the
 request fails with `invalid_request` ("nothing to change"). The audit

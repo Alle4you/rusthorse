@@ -962,24 +962,22 @@ pub struct GroupTarget {
 
 impl GroupTarget {
     /// The destination as a dialog shows it: a path from the top (`/` alone
-    /// for the top level), which group of the vault that is — by the start
-    /// of its UUID, since names alone can look alike — or what is created
-    /// and where.
+    /// for the top level), which group of the vault that is — by its whole
+    /// UUID, since names can look alike and another program can give two
+    /// groups UUIDs that start alike — or what is created and where.
     pub fn describe(&self) -> String {
-        let short = |uuid: &str| uuid.chars().take(8).collect::<String>();
         let path = format!("/{}", self.path);
         match (&self.existing_uuid, self.created.is_empty()) {
             (None, true) => "/ (the top level)".to_string(),
-            (Some(uuid), true) => format!("{path} (existing group {})", short(uuid)),
+            (Some(uuid), true) => format!("{path} (existing group {uuid})"),
             (None, false) => format!(
                 "{path} (creates {} at the top level)",
                 self.created.join("/")
             ),
             (Some(uuid), false) => format!(
-                "{path} (creates {} in /{}, group {})",
+                "{path} (creates {} in /{}, group {uuid})",
                 self.created.join("/"),
                 self.existing_path,
-                short(uuid)
             ),
         }
     }
@@ -1483,16 +1481,11 @@ mod tests {
         add_in(&mut vault, "router", "Work");
         let work = vault.resolve_group("Work").expect("work");
         let uuid = work.existing_uuid.clone().expect("existing");
-        assert_eq!(
-            work.describe(),
-            format!("/Work (existing group {})", &uuid[..8])
-        );
+        assert_eq!(uuid.len(), 36, "{uuid}");
+        assert_eq!(work.describe(), format!("/Work (existing group {uuid})"));
         assert_eq!(
             vault.resolve_group("Work/Servers").expect("new").describe(),
-            format!(
-                "/Work/Servers (creates Servers in /Work, group {})",
-                &uuid[..8]
-            )
+            format!("/Work/Servers (creates Servers in /Work, group {uuid})")
         );
         assert_eq!(
             vault.resolve_group("New/Deeper").expect("new").describe(),

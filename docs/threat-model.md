@@ -281,8 +281,12 @@ until its end has been in view — which does not prove it was read; with
 zenity, requests whose dialog would be too tall to read at once are refused,
 by an estimate made for an 11-point font, and larger fonts or a smaller screen
 can still make a dialog taller than the screen. ASCII itself has characters
-some fonts draw alike (`l`, `I`, `1`). The requester chain is made of process
-names any program can choose — the dialog labels it "unverified".
+some fonts draw alike (`l`, `I`, `1`). A name drawn as an escape and a name
+that holds those characters literally (`東京` and `\u{6771}\u{4eac}`) look
+the same; dialogs add the entry's UUID (its first 8 characters) and a
+destination group's whole UUID, but a file written by another program can
+give two entries UUIDs that start alike. The requester chain is made of
+process names any program can choose — the dialog labels it "unverified".
 *Mitigation:* treat unexpected dialogs as a warning sign; deny when in doubt.
 
 ### L10 — The vault can be attacked offline
@@ -1439,7 +1443,7 @@ group behind, and a moved entry opens in KeePassXC 2.7.6. Findings:
 
 | Finding | Disposition |
 |---|---|
-| Medium — the destination did not identify one group: with two sibling groups named `Shared` (another KeePass client allows them), the dialog showed `/Shared` and the entry went to the first; a group named `東京` and one named literally `\u{6771}\u{4eac}` were two destinations drawn alike | **Fixed:** a path through two groups of the same name side by side is refused, before any dialog (also for `add --group`); the dialog says which group the destination is — the start of the UUID of the deepest existing group — and what is created: `/Work/Servers (existing group 8d2f6c1e)`, `/Work/Servers (creates Servers in /Work, group 1a2b3c4d)`, `/ (the top level)`. Names that look alike stay a limit of every dialog (L9); the UUID tells existing groups apart. The audit record says from where to where. |
+| Medium — the destination did not identify one group: with two sibling groups named `Shared` (another KeePass client allows them), the dialog showed `/Shared` and the entry went to the first; a group named `東京` and one named literally `\u{6771}\u{4eac}` were two destinations drawn alike | **Fixed:** a path through two groups of the same name side by side is refused, before any dialog (also for `add --group`); the dialog says which group the destination is — the UUID of the deepest existing group — and what is created: `/Work/Servers (existing group 8d2f6c1e-…)`, `/Work/Servers (creates Servers in /Work, group 1a2b3c4d-…)`, `/ (the top level)`. Names that look alike stay a limit of every dialog (L9); the UUID tells existing groups apart (the whole UUID since the next review). The audit record says from where to where. |
 | Medium — whether a move was needed was decided by comparing paths as text: an entry in a group named `Work/Servers` (with a `/` in its name) was taken to be in the nested `Work` → `Servers` already, so a move there was dropped and the edit reported done | **Fixed:** the path is resolved to a group and compared with the entry's group by identity, in the agent before the dialog and in the vault when saving. |
 | Low — the manager's form compared normalized paths on both sides, so changing a group named ` Work ` to `Work` (another group) changed nothing | **Fixed:** a row left as it is moves nothing; an edited row is compared, normalized, with the group's exact name. |
 | Low — `docs/architecture.md` and `docs/getting-started.md` still said protocol 6 | **Fixed.** |
@@ -1448,3 +1452,18 @@ Each fix was checked against the mistake it must catch, made in a copy of
 the tree (5 of 5: the first of two same-named groups taken, a move decided
 by the path's text, the destination shown without its group, no audit of
 the move, the manager comparing normalized names).
+
+Second review of the group move (Codex, AI-assisted, 2026-11-02; verdict:
+not ready). Confirmed fixed: same-named siblings, the move decided by
+identity in the agent and the vault, the manager's groups with spaces, the
+protocol version in the docs. An external write during the approval made
+the request fail (exit 1) and left the other program's file whole (L15).
+Findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — the 8-character start of a UUID did not tell groups apart: a file prepared by another program can give two groups UUIDs that start alike (`deadbeef-1111-…`, `deadbeef-2222-…`); with names drawn alike (`東京`, and literally `\u{6771}\u{4eac}`) both destinations read `/\u{6771}\u{4eac} (existing group deadbeef)` | **Fixed:** the dialog and the audit record show the whole UUID. Entries are still identified by the start of theirs in dialogs (`Group/Name (8d2f6c1e)`); two entries with look-alike names and UUIDs that start alike can only come from a file written by another program (the agent chooses the UUIDs of what it creates) — a limit noted under L9. |
+| Medium — the manager still decided by text: with the entry in a group named `Work/Servers`, editing the row to `/Work/Servers` (meaning the nested groups) sent no move | **Fixed:** an edited row is always sent, normalized, and the agent decides by the group itself; an untouched row is not sent. |
+
+Each fix was checked against the mistake it must catch, made in a copy of
+the tree (2 of 2: a short UUID in the dialog, the manager deciding by text).

@@ -794,7 +794,7 @@ fn edit_moves_an_entry_to_another_group_only_when_allowed() {
     assert_eq!(out.status.code(), Some(4));
     assert_eq!(
         approval_detail(&h, "Move to group"),
-        Some(format!("/Work (existing group {})", &uuid[..8]))
+        Some(format!("/Work (existing group {})", uuid))
     );
     h.decide(&[Decision::Deny]);
     let out = h.run(&["edit", "DB_PASSWORD", "--group", "Work/Servers/Db"]);
@@ -807,7 +807,7 @@ fn edit_moves_an_entry_to_another_group_only_when_allowed() {
         approval_detail(&h, "Move to group"),
         Some(format!(
             "/Work/Servers/Db (creates Db in /Work/Servers, group {})",
-            &servers.existing_uuid.expect("existing")[..8]
+            servers.existing_uuid.expect("existing")
         ))
     );
     assert_eq!(listed_group(&h, "DB_PASSWORD"), None);
@@ -887,7 +887,7 @@ fn a_move_goes_to_the_group_the_path_leads_to_and_only_one() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         approval_detail(&h, "Move to group"),
-        Some(format!("/Work/Servers (existing group {})", &uuid[..8]))
+        Some(format!("/Work/Servers (existing group {})", uuid))
     );
     let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
     let id = vault.find("API_KEY").expect("entry");

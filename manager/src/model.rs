@@ -90,12 +90,13 @@ impl Form {
             changes.rename = Some(self.name.clone());
         }
         // Untouched, the row is no move: a group of another client keeps
-        // its exact name (` Work `, or a `/` in it). Edited, the row is read
-        // as the agent reads a path; spaces around a `/` or a doubled `/`
-        // that lead back to the same text are no move. The empty path is the
-        // top level. (The agent decides by the group itself, not its text.)
+        // its exact name (` Work `, or a `/` in it). Edited, the row is sent
+        // as the agent reads a path (the empty path is the top level), and
+        // the agent decides by the group itself whether it is a move: text
+        // alone cannot tell a group named `Work/Servers` from `Work` →
+        // `Servers`.
         let group = group_path(&self.group);
-        if self.group != before.group && group != before.group {
+        if self.group != before.group {
             for component in group.split('/').filter(|c| !c.is_empty()) {
                 rusthorse::vault::validate_name(component).map_err(|e| format!("Group: {e}"))?;
             }
@@ -457,10 +458,12 @@ pub(crate) mod tests {
             changes(&form, &top).expect_err("no move"),
             "Nothing changed."
         );
+        // Edited to ` / `, the row is sent; the agent finds the entry
+        // already at the top level and drops the move.
         form.group = " / ".into();
         assert_eq!(
-            changes(&form, &top).expect_err("no move"),
-            "Nothing changed."
+            changes(&form, &top).expect("sent").group.as_deref(),
+            Some("")
         );
         form.group = "AI".into();
         assert_eq!(
@@ -486,20 +489,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_same_group_written_differently_is_no_move() {
+    fn an_edited_group_row_is_sent_for_the_agent_to_decide() {
+        // The entry is in a group whose path reads `Work/Servers`: it may be
+        // the nested `Work` → `Servers`, or one group of another client
+        // with a `/` in its name. Text alone cannot tell, so an edited row
+        // is sent, normalized, and the agent compares the groups themselves
+        // (and drops a move to the group the entry is in).
         let mut entry = entry();
         entry.group = Some("Work/Servers".into());
         let mut form = Form::from_entry(&entry);
         for typed in [" Work / Servers ", "Work//Servers/", "/Work/Servers"] {
             form.group = typed.into();
-            let error = changes(&form, &entry).expect_err(typed);
-            assert_eq!(error, "Nothing changed.", "{typed:?}");
+            let sent = changes(&form, &entry).expect(typed);
+            assert_eq!(sent.group.as_deref(), Some("Work/Servers"), "{typed:?}");
         }
-        // Another change is sent without a move.
+        // Left as it is, the row is not sent, with or without other changes.
+        let mut form = Form::from_entry(&entry);
+        assert_eq!(
+            changes(&form, &entry).expect_err("untouched"),
+            "Nothing changed."
+        );
         form.port = "22".into();
-        let changes = changes(&form, &entry).expect("edit");
-        assert_eq!(changes.port, Some(22));
-        assert!(changes.group.is_none());
+        let sent = changes(&form, &entry).expect("edit");
+        assert_eq!(sent.port, Some(22));
+        assert!(sent.group.is_none());
     }
 
     #[test]
