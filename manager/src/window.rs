@@ -12,7 +12,7 @@ use adw::prelude::*;
 use gtk::{gio, glib, pango};
 use rusthorse::protocol::{
     EntryChanges, EntryInfo, EntryKind, Field, Request, Response, RevealPurpose, SecretString,
-    StatusInfo, ValueChange,
+    StatusInfo,
 };
 
 use crate::connection::{Failure, Job};
@@ -1364,21 +1364,6 @@ impl Manager {
         let e = entry.clone();
         self.connect_button(&edit, move |s| s.edit(Some(e.clone())));
         toolbar.append(&edit);
-        let generate = button("New random value…", Some("emblem-synchronizing-symbolic"));
-        let id = entry.id.clone();
-        self.connect_button(&generate, move |s| {
-            s.submit(
-                Request::Edit {
-                    name: id.clone(),
-                    changes: EntryChanges {
-                        value: Some(ValueChange::Generate(Default::default())),
-                        ..Default::default()
-                    },
-                },
-                Pending::Change,
-            )
-        });
-        toolbar.append(&generate);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         toolbar.append(&spacer);
@@ -1464,6 +1449,51 @@ impl Manager {
             self.connect_button(&copy, move |s| s.copy(&e, notes));
             line.append(&copy);
             secret.add(&key_row(title, &line));
+        }
+        // Changing the value: each choice in view, each going straight to
+        // the agent. Rows, not more buttons on the Value line, which would
+        // make the window too wide for a 1024-pixel screen.
+        for (name, icon, title, subtitle, change) in [
+            (
+                "change-value",
+                "dialog-password-symbolic",
+                "Change the value…",
+                "Type the new value in the agent's dialog.",
+                ValueMode::Prompt,
+            ),
+            (
+                "random-value",
+                "emblem-synchronizing-symbolic",
+                "Replace with a random value…",
+                "32 letters and digits, made by the agent after you approve. Nobody sees it; change it at the provider too.",
+                ValueMode::Generate,
+            ),
+        ] {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .use_markup(false)
+                .activatable(true)
+                .build();
+            row.set_widget_name(name);
+            row.add_prefix(&gtk::Image::from_icon_name(icon));
+            let id = entry.id.clone();
+            let weak = Rc::downgrade(self);
+            row.connect_activated(move |_| {
+                if let Some(s) = weak.upgrade() {
+                    s.submit(
+                        Request::Edit {
+                            name: id.clone(),
+                            changes: EntryChanges {
+                                value: change.change(),
+                                ..Default::default()
+                            },
+                        },
+                        Pending::Change,
+                    )
+                }
+            });
+            secret.add(&row);
         }
         self.detail.append(&secret);
 
@@ -1832,23 +1862,48 @@ impl Manager {
                 "You never type a value here. The agent asks for it in its own dialog, or generates one.",
             ),
         );
-        let modes: &[&str] = if old.is_some() {
-            &[
-                "Keep the current value",
-                "Type a new one in the agent's dialog",
-                "Generate 32 random letters and digits",
+        // Every choice in view, one row each, the first one chosen.
+        let typed = (
+            ValueMode::Prompt,
+            if old.is_some() {
+                "Type a new value"
+            } else {
+                "Type the value"
+            },
+            "The agent asks for it in its own dialog after you send this.",
+        );
+        let generated = (
+            ValueMode::Generate,
+            "Generate a random value",
+            "32 letters and digits, made by the agent. Nobody sees it.",
+        );
+        let choices = if old.is_some() {
+            vec![
+                (ValueMode::Keep, "Keep the current value", ""),
+                typed,
+                generated,
             ]
         } else {
-            &[
-                "Type it in the agent's dialog",
-                "Generate 32 random letters and digits",
-            ]
+            vec![typed, generated]
         };
-        let mode = adw::ComboRow::builder()
-            .title("New value")
-            .model(&gtk::StringList::new(modes))
-            .build();
-        value_group.add(&mode);
+        let mut checks: Vec<gtk::CheckButton> = Vec::new();
+        for (i, (_, title, subtitle)) in choices.iter().enumerate() {
+            let check = gtk::CheckButton::new();
+            check.set_group(checks.first());
+            check.set_active(i == 0);
+            check.set_valign(gtk::Align::Center);
+            let row = adw::ActionRow::builder()
+                .title(*title)
+                .use_markup(false)
+                .activatable_widget(&check)
+                .build();
+            if !subtitle.is_empty() {
+                row.set_subtitle(subtitle);
+            }
+            row.add_prefix(&check);
+            value_group.add(&row);
+            checks.push(check);
+        }
         body.append(&value_group);
         if old.is_some() {
             body.append(&styled(
@@ -1891,13 +1946,8 @@ impl Manager {
                 port: fields[5].text().into(),
                 tags: fields[6].text().into(),
             };
-            let selected = mode.selected() + if old.is_some() { 0 } else { 1 };
-            let mode = match selected {
-                0 => ValueMode::Keep,
-                1 => ValueMode::Prompt,
-                _ => ValueMode::Generate,
-            };
-            match form.request(old.as_ref(), mode) {
+            let chosen = checks.iter().position(|c| c.is_active()).unwrap_or(0);
+            match form.request(old.as_ref(), choices[chosen].0) {
                 Ok(request) => {
                     if let Some(s) = weak.upgrade()
                         && s.job.borrow().is_none()

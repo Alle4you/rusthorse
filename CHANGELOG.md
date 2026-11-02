@@ -11,6 +11,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **Change the value from the manager**: the **Secret** section has a row
+  **Change the value…**, which opens the agent's dialog for the new value
+  at once, and **Replace with a random value…** (before, **New random
+  value** in the entry's toolbar). Typing a new value used to be hidden in
+  **Edit**, behind a drop-down that kept the current value.
 - **`rusthorse guide ai`** prints a guide for AI agents, built into the
   binary: the rules, how to find entries and use `run`, what each exit
   status means and what to do, and how to store secrets without seeing
@@ -128,6 +133,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- The manager's entry form shows how the value is made as one row per
+  choice (keep it, type a new one, generate one), the first one chosen,
+  instead of a drop-down.
 - A message that cannot be written to standard error (`2>/dev/full`) no
   longer makes the CLI crash with status 101: the message is dropped and
   the exit status keeps its meaning (125: the run did not start).

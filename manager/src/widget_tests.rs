@@ -114,6 +114,31 @@ fn entry_rows(root: &impl IsA<gtk::Widget>) -> Vec<adw::EntryRow> {
 }
 
 /// The text a revealed value shows: one plain label, never split.
+/// The activatable row named `name` under `root`.
+fn named_row(root: &impl IsA<gtk::Widget>, name: &str) -> adw::ActionRow {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+        .find(|r| r.widget_name() == name)
+        .unwrap_or_else(|| panic!("no row {name}"))
+}
+
+/// The value choices of an entry form: each row's title and its check
+/// button.
+fn value_choices(root: &impl IsA<gtk::Widget>) -> Vec<(String, gtk::CheckButton)> {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+        .filter(|r| r.type_() == adw::ActionRow::static_type())
+        .filter_map(|r| {
+            let check = descendants(&r)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::CheckButton>().ok())?;
+            Some((r.title().to_string(), check))
+        })
+        .collect()
+}
+
 fn shown_text(root: &impl IsA<gtk::Widget>) -> String {
     let labels = value_labels(root);
     assert_eq!(labels.len(), 1, "the value is one label");
@@ -375,6 +400,11 @@ fn desktop_flow() {
     let inputs = entry_rows(&editor);
     assert_eq!(inputs.len(), 7);
     assert_eq!(inputs[0].title(), "Name");
+    // How the value is made: every choice in view, typing it chosen.
+    let choices = value_choices(&editor);
+    let titles: Vec<_> = choices.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(titles, ["Type the value", "Generate a random value"]);
+    assert!(choices[0].1.is_active() && !choices[1].1.is_active());
     inputs[0].set_text("FAKE_DESKTOP_KEY");
     inputs[1].set_text("AI");
     // The kind decides which rows are offered and what the URL is called;
@@ -679,7 +709,7 @@ fn desktop_flow() {
 
     // A lock made elsewhere while a request waits for the human is seen.
     hold.store(true, Ordering::SeqCst);
-    button(&s.detail, "New random value…").emit_clicked();
+    ActionRowExt::activate(&named_row(&s.detail, "random-value"));
     assert!(s.job.borrow().is_some());
     // Lock only once the request is at the approval dialog; earlier, the
     // request would find the vault locked and ask for the password again.
@@ -800,12 +830,50 @@ fn desktop_flow() {
     assert_eq!(inputs[0].title(), "Name");
     assert!(!inputs[1].is_sensitive());
     inputs[0].set_text("RENAMED_FAKE");
+    // The value: kept unless another choice is made, one choice at a time.
+    let choices = value_choices(&editor);
+    let titles: Vec<_> = choices.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Keep the current value",
+            "Type a new value",
+            "Generate a random value"
+        ]
+    );
+    assert!(choices[0].1.is_active());
+    choices[1].1.set_active(true);
+    assert!(!choices[0].1.is_active() && !choices[2].1.is_active());
+    choices[2].1.set_active(true);
+    assert!(!choices[1].1.is_active());
+    drop(choices);
     button(&editor, "Send to agent…").emit_clicked();
     settle(&s);
     assert_eq!(s.entries.borrow()[0].id, id);
     assert_eq!(s.entries.borrow()[0].name, "RENAMED_FAKE");
+    // The form's choice was sent: the value is a generated one.
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
-    button(&s.detail, "New random value…").emit_clicked();
+    named(&s.detail, "show-value").emit_clicked();
+    settle(&s);
+    let generated = shown_text(s.revealed.borrow().as_ref().unwrap());
+    assert_eq!(generated.len(), 32, "{generated:?}");
+    assert!(generated.chars().all(|c| c.is_ascii_alphanumeric()));
+    // Change… goes straight to the agent's dialog for the new value: no
+    // form, and no approval before it.
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    let asked = approvals.load(Ordering::SeqCst);
+    ActionRowExt::activate(&named_row(&s.detail, "change-value"));
+    settle(&s);
+    assert_eq!(approvals.load(Ordering::SeqCst), asked);
+    assert!(s.message.text().contains("updated"), "{}", s.message.text());
+    assert!(s.revealed.borrow().as_ref().is_none_or(|w| !w.is_visible()));
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    named(&s.detail, "show-value").emit_clicked();
+    settle(&s);
+    let typed = shown_text(s.revealed.borrow().as_ref().unwrap());
+    assert_eq!(typed, "FAKE-desktop-value");
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    ActionRowExt::activate(&named_row(&s.detail, "random-value"));
     settle(&s);
     assert!(s.revealed.borrow().as_ref().is_none_or(|w| !w.is_visible()));
     s.rows.select_row(s.rows.row_at_index(0).as_ref());

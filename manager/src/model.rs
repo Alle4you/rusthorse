@@ -148,11 +148,7 @@ impl Form {
                 .cloned()
                 .collect();
         }
-        changes.value = match value {
-            ValueMode::Keep => None,
-            ValueMode::Prompt => Some(ValueChange::Prompt),
-            ValueMode::Generate => Some(ValueChange::Generate(Spec::default())),
-        };
+        changes.value = value.change();
         if changes.is_empty() {
             return Err("Nothing changed.".into());
         }
@@ -217,6 +213,17 @@ pub(crate) enum ValueMode {
     Keep,
     Prompt,
     Generate,
+}
+
+impl ValueMode {
+    /// The change of value this choice asks the agent for.
+    pub(crate) fn change(self) -> Option<ValueChange> {
+        match self {
+            ValueMode::Keep => None,
+            ValueMode::Prompt => Some(ValueChange::Prompt),
+            ValueMode::Generate => Some(ValueChange::Generate(Spec::default())),
+        }
+    }
 }
 
 pub(crate) fn matches(entry: &EntryInfo, query: &str, group: Option<&str>) -> bool {
