@@ -265,8 +265,11 @@ Requires approval; the dialog shows:
 The requester sets these variables, and with them it can make an approved,
 well-known program send your secret to a server of its own: check the host
 of every one. They are settings found in the environment, not the
-connections the program will make. Only unambiguous values are shown, each
-item of a list (`,`, `|` or spaces) on its own terms:
+connections the program will make. Only unambiguous values are shown. The
+values of list variables — `GOPROXY` (`,` or `|`), `PIP_EXTRA_INDEX_URL`,
+`UV_EXTRA_INDEX_URL`, `UV_INDEX` (spaces) — are judged item by item; any
+other value is one item, so that a comma inside a URL's path cannot pass
+part of the path off as an item of its own:
 
 - a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
   names, passwords, paths, queries and fragments — where credentials and

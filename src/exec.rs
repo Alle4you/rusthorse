@@ -187,6 +187,16 @@ pub fn destination(name: &str) -> Option<Destination> {
     }
 }
 
+/// Destination variables whose value is a list: `GOPROXY` (items separated by
+/// `,` or `|`), and the extra package indexes of pip and uv (separated by
+/// spaces).
+pub const LIST_VARS: &[&str] = &[
+    "GOPROXY",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_INDEX",
+];
+
 /// Shown instead of a destination value, or a part of one, that is not a
 /// plain URL, host name or path.
 pub const NOT_SHOWN: &str = "(not shown)";
@@ -194,8 +204,10 @@ pub const NOT_SHOWN: &str = "(not shown)";
 /// A destination variable's value as dialogs and the audit log show it, and
 /// whether part of it was [`NOT_SHOWN`].
 ///
-/// Only unambiguous forms are shown, item by item in a list separated by
-/// `,`, `|` or spaces (`GOPROXY`, `PIP_EXTRA_INDEX_URL`): a URL keeps its
+/// Only unambiguous forms are shown — with `list`, item by item, the items
+/// separated by `,`, `|` or spaces ([`LIST_VARS`]); otherwise the value is
+/// one item, so that a comma inside a URL's path cannot make part of the
+/// path look like another item. A URL keeps its
 /// scheme, host and port and loses its user name, password, path, query and
 /// fragment, where credentials and tokens travel (`https://…@proxy:3128/…`;
 /// a webhook URL is a secret); `user:password@host` loses its user part; a
@@ -207,7 +219,7 @@ pub const NOT_SHOWN: &str = "(not shown)";
 /// parser that reads `\` as `/` connects to the host *before* the `@`), so
 /// no host drawn from it can be trusted, and copying it could disclose a
 /// credential.
-pub fn shown_destination(value: &str) -> (String, bool) {
+pub fn shown_destination(value: &str, list: bool) -> (String, bool) {
     if value.chars().any(|c| c == '\\' || c.is_control()) {
         return (NOT_SHOWN.to_string(), true);
     }
@@ -225,7 +237,7 @@ pub fn shown_destination(value: &str) -> (String, bool) {
         item.clear();
     };
     for c in value.chars() {
-        if matches!(c, ',' | '|' | ' ') {
+        if list && matches!(c, ',' | '|' | ' ') {
             flush(&mut item, &mut shown);
             shown.push(c);
         } else {
@@ -395,7 +407,10 @@ pub fn prepare_env(client_env: &[(String, String)], secret_vars: &[&str]) -> Pre
                 {
                     shown_paths(value)
                 } else {
-                    shown_destination(value)
+                    shown_destination(
+                        value,
+                        LIST_VARS.contains(&name.to_ascii_uppercase().as_str()),
+                    )
                 };
                 list.insert(name.clone(), shown);
                 unusual.insert(name.clone(), odd);
@@ -536,7 +551,7 @@ mod tests {
                 ("PGHOST", "db.invalid"),
                 (
                     "HOOK_URL",
-                    "https://hooks.example.invalid/T0/B0/FAKE-secret",
+                    "https://hooks.example.invalid/T0/B0/FAKE-secret,FAKE-2",
                 ),
                 (
                     "DATABASE_URL",
@@ -606,7 +621,7 @@ mod tests {
         // Passed through unchanged: only the dialog's copy is shortened.
         assert!(prepared.vars.contains(&(
             "HOOK_URL".into(),
-            "https://hooks.example.invalid/T0/B0/FAKE-secret".into()
+            "https://hooks.example.invalid/T0/B0/FAKE-secret,FAKE-2".into()
         )));
         for (name, expected) in [
             ("NO_PROXY", None),
@@ -626,35 +641,56 @@ mod tests {
         ] {
             assert_eq!(destination(name), expected, "{name}");
         }
-        for (value, shown) in [
-            ("https://h.invalid", "https://h.invalid"),
-            ("https://h.invalid/", "https://h.invalid/…"),
-            ("https://h.invalid?k=FAKE", "https://h.invalid/…"),
-            ("http://[::1]:8080/x", "http://[::1]:8080/…"),
-            ("db.invalid:5432", "db.invalid:5432"),
-            ("u:FAKE@proxy.invalid:3128", "…@proxy.invalid:3128"),
-            ("/home/me/ca@2.pem", "/home/me/ca@2.pem"),
+        for (value, list, shown) in [
+            ("https://h.invalid", false, "https://h.invalid"),
+            ("https://h.invalid/", false, "https://h.invalid/…"),
+            ("https://h.invalid?k=FAKE", false, "https://h.invalid/…"),
+            ("http://[::1]:8080/x", false, "http://[::1]:8080/…"),
+            ("db.invalid:5432", false, "db.invalid:5432"),
+            ("u:FAKE@proxy.invalid:3128", false, "…@proxy.invalid:3128"),
+            ("/home/me/ca@2.pem", false, "/home/me/ca@2.pem"),
+            ("1", false, "1"),
+            // A list variable: item by item.
             (
                 "https://a.invalid https://b.invalid",
+                true,
                 "https://a.invalid https://b.invalid",
             ),
-            ("https://h.invalid|direct", "https://h.invalid|direct"),
-            ("1", "1"),
+            ("https://h.invalid|direct", true, "https://h.invalid|direct"),
+            (
+                "ok.invalid,https:/x.invalid/FAKE",
+                true,
+                "ok.invalid,(not shown)",
+            ),
+            // Any other variable: one item, so a comma or a space inside a
+            // URL never turns part of its path into an item of its own.
+            (
+                "https://h.invalid/a,FAKE-token",
+                false,
+                "https://h.invalid/…",
+            ),
+            (
+                "https://h.invalid/a|FAKE-token",
+                false,
+                "https://h.invalid/…",
+            ),
+            ("https://a.invalid FAKE.invalid", false, "(not shown)"),
+            ("u:FAKE@a.invalid,https://b.invalid", false, "(not shown)"),
             // Ambiguous: never shown, whole or in part.
-            ("http://a@b@h.invalid:1/x", "(not shown)"),
-            ("http://h.invalid\\@other.invalid", "(not shown)"),
-            ("http://h.inv\talid", "(not shown)"),
-            ("https://h%2einvalid", "(not shown)"),
-            ("https://ex\u{e4}mple.invalid", "(not shown)"),
-            ("https://h.invalid:", "(not shown)"),
-            ("https:h.invalid", "(not shown)"),
-            ("1http://h.invalid", "(not shown)"),
-            ("file:///etc/../tmp", "(not shown)"),
-            ("ok.invalid,https:/x.invalid/FAKE", "ok.invalid,(not shown)"),
+            ("http://a@b@h.invalid:1/x", false, "(not shown)"),
+            ("http://h.invalid\\@other.invalid", false, "(not shown)"),
+            ("http://h.inv\talid", false, "(not shown)"),
+            ("https://h%2einvalid", false, "(not shown)"),
+            ("https://ex\u{e4}mple.invalid", false, "(not shown)"),
+            ("https://h.invalid:", false, "(not shown)"),
+            ("https:h.invalid", false, "(not shown)"),
+            ("1http://h.invalid", false, "(not shown)"),
+            ("file:///etc/../tmp", false, "(not shown)"),
         ] {
-            let (text, unusual) = shown_destination(value);
+            let (text, unusual) = shown_destination(value, list);
             assert_eq!(text, shown, "{value}");
             assert_eq!(unusual, shown.contains(NOT_SHOWN), "{value}");
+            assert!(!text.contains("FAKE"), "{value}");
         }
         assert_eq!(shown_paths("/a b"), ("(not shown)".to_string(), true));
     }
