@@ -252,37 +252,44 @@ rusthorse audit
 
 ## Migrating existing secrets
 
-Migrate in four steps, and keep the originals until the last one is done.
+Migrate in five steps, and keep the originals until the fourth is done. The
+agent reads the values itself, from GNOME Keyring or the `.env` file
+([ADR 0012](adr/0012-import-read-by-the-agent.md)): neither the manager nor
+the `rusthorse` command ever holds them, and the import dialog says where
+the agent read them.
 
 1. **Back up** the new vault (see below), so that you can go back.
-2. **Preview** what would be imported — names only, which ones already exist
-   and which appear twice; nothing is sent to the agent (for Secret Service,
-   no secret is even read; a `.env` file is parsed locally):
+2. **Preview** what would be imported — names only, which ones already
+   exist and which appear twice. In the manager: **Import & backup → From
+   GNOME Keyring…** or **From a .env file…**; the agent asks before it shows
+   the items or names, and the window marks each name new, existing, not
+   allowed, repeated or locked. Or in a terminal:
 
    ```sh
    rusthorse import dotenv ~/project/.env --prefix MYAPP_ --dry-run
    rusthorse import secret-service -a service=myapp --name-from key --dry-run
    ```
 
-   The Secret Service form selects items by attribute. For example, items
-   stored with `secret-tool store --label=... service myapp key token` are
-   matched by `-a service=myapp`, and `--name-from key` names each entry
-   after its `key` attribute. Check that the preview lists only what you
-   mean to move: an attribute that is too broad selects other applications'
-   items too.
+   No secret is read for a preview. Keyring items are chosen by attribute:
+   items stored with `secret-tool store --label=... service myapp key token`
+   are matched by `-a service=myapp` (in the manager: type `myapp` in the
+   filter), and `--name-from key` (**Names from: Attribute key**) names each
+   entry after its `key` attribute. Check that the preview lists only what
+   you mean to move: an attribute that is too broad selects other
+   applications' items too.
 
-   **Start with one item.** Add an attribute that selects only it
-   (`-a service=myapp -a key=token`), go through steps 3 and 4 with it, and
-   import the rest only once it works.
-3. **Import**, tagging the result so it is easy to find:
+   **Start with one item.** Tick only it (or add an attribute that selects
+   only it, `-a service=myapp -a key=token`), go through steps 3 and 4 with
+   it, and import the rest only once it works.
+3. **Import**, tagging the result so it is easy to find (the manager tags
+   with `imported` unless you change it):
 
    ```sh
    rusthorse import secret-service -a service=myapp --name-from key --tag migrated
    ```
 
-   The importer reads the items in the `rusthorse` process and sends them to
-   the agent in batches small enough for one approval dialog each (at most 50
-   names per batch).
+   Names go to the agent in batches small enough for one approval dialog
+   each; a locked keyring item stops the import (unlock the keyring first).
 4. **Verify each entry by using it**, not just by listing it: run a real,
    harmless command with it — an API call that only reads, a login check —
    for example:
@@ -294,9 +301,11 @@ Migrate in four steps, and keep the originals until the last one is done.
 
    (The single quotes make the command's shell, not yours, expand the
    variable.) If you will also use KeePassXC, open a backup copy in it and
-   check that the entries are there. Only when every entry has worked, delete
-   the originals with the tool that created them, and update scripts that
-   used the old tool.
+   check that the entries are there.
+5. **Delete the originals** with the tool that created them, and update the
+   scripts that used it. Until then nothing is protected: while a secret is
+   still in GNOME Keyring or a `.env` file, any program of your session —
+   an AI agent too — can read it there, without asking Rusthorse.
 
 ## Backups and restore
 

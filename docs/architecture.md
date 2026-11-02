@@ -165,7 +165,9 @@ needs no lock) and exits with status 141, like a process killed by
 | `add --stdin` | yes | approval | no |
 | `add --generate` | yes | approval (the agent generates the value) | no |
 | `change_password` | yes | current and new password dialogs | no |
-| `import` | yes | one approval for the batch | no |
+| `import` (values from the client) | yes | one approval for the batch | no |
+| `keyring_items`, `dotenv_names` | no | approval (the requester learns labels, attributes or names) | no |
+| `import_from` (values read by the agent) | yes | one approval for the batch, naming the source | no |
 | `edit` | yes | approval (+ value dialog with `--value`) | no |
 | `remove` | yes | approval | no |
 | `reveal` | yes | approval with a warning; the dialog names the client's stated purpose (print, show, copy) | no |
@@ -402,8 +404,8 @@ higher scale or a smaller screen make dialogs taller than estimated.
 
 With either program, a request whose dialog text would exceed 4000
 characters (counting the room reserved for the "Allow for" note) is refused,
-and `import` splits large imports into batches whose names take at most 24
-lines.
+and imports — the CLI's and the manager's — are split into batches whose
+names take at most 24 lines (`import::batch_sizes`).
 
 ## Audit log
 
@@ -433,7 +435,8 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |
 | [`src/peer.rs`](../src/peer.rs) | Peer credentials and the requester process chain. |
 | [`src/audit.rs`](../src/audit.rs) | The audit log. |
-| [`src/import.rs`](../src/import.rs) | `.env` and Secret Service importers. |
+| [`src/import.rs`](../src/import.rs) | `.env` parsing and import batches. |
+| [`src/keyring.rs`](../src/keyring.rs) | GNOME Keyring (Secret Service) for imports the agent reads; a fake service for tests (`fake-keyring`). |
 | [`src/paths.rs`](../src/paths.rs), [`src/util.rs`](../src/util.rs) | Locations and helpers. |
 | [`tests/agent.rs`](../tests/agent.rs) | End-to-end tests against a real agent. |
 
@@ -456,6 +459,10 @@ CLI: it never opens the vault and never receives the master password. Its
 forms carry metadata only; every change is a request the agent approves in
 its own dialog.
 
+- **Import.** It asks the agent for the keyring's items (`keyring_items`)
+  or a `.env` file's names (`dotenv_names`) — the agent asks the human
+  first — lets the human tick them, and sends `import_from` in batches with
+  names only; the agent reads the values ([ADR 0012](adr/0012-import-read-by-the-agent.md)).
 - **First start.** With no vault, it offers **Create vault…**, which sends
   `create_vault`: the agent asks for the new master password in its own
   dialogs. With nothing listening on the socket, it offers **Start agent**,

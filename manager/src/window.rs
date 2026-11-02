@@ -22,14 +22,37 @@ use crate::model::{self, Form, ValueMode};
 const REVEAL_SECONDS: u64 = 30;
 /// How often the status is polled while nothing else is pending.
 const POLL_SECONDS: u32 = 5;
+/// How long Start agent waits for `systemctl --user start`.
+#[cfg(not(test))]
+const START_AGENT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const START_AGENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Pending {
-    Status { list: bool },
+    Status {
+        list: bool,
+    },
     List,
     Change,
-    Reveal { title: String, notes: bool },
-    Copy { title: String },
+    Reveal {
+        title: String,
+        notes: bool,
+    },
+    Copy {
+        title: String,
+    },
+    /// The keyring's items, to choose what to import.
+    KeyringItems,
+    /// The names in this `.env` file, to choose what to import.
+    DotenvNames {
+        path: String,
+    },
+    /// A batch of an import, and the batches after it.
+    Import(import_window::Batches),
 }
+
+#[path = "import_window.rs"]
+mod import_window;
 
 pub(crate) struct Manager {
     pub window: adw::ApplicationWindow,
@@ -346,10 +369,23 @@ impl Manager {
         backup.set_halign(gtk::Align::Start);
         backup_group.add(&backup);
         data.append(&backup_group);
-        let later = group(
-            "Import and restore",
+        let import_group = group(
+            "Import",
             Some(
-                "Importing from a .env file or GNOME Keyring, and restoring a backup, come in later versions. Today: rusthorse import in a terminal (try --dry-run first), and the restore steps in the installation guide. To look at the vault in KeePassXC, open a backup copy, never the live file.",
+                "Move secrets into Rusthorse from GNOME Keyring (for example those of a tool that keeps API keys there) or from a .env file. The agent reads the values itself; this app sees only names. Start with one, check that it works, then import the rest. The originals stay where they were — and while they are there, any program of your session can still read them: delete them once every entry works.",
+            ),
+        );
+        let import_keyring = button("From GNOME Keyring…", Some("dialog-password-symbolic"));
+        let import_dotenv = button("From a .env file…", Some("document-open-symbolic"));
+        let import_buttons = row_box(12);
+        import_buttons.append(&import_keyring);
+        import_buttons.append(&import_dotenv);
+        import_group.add(&import_buttons);
+        data.append(&import_group);
+        let later = group(
+            "Restore",
+            Some(
+                "Restoring a backup comes in a later version; meanwhile, follow the restore steps in the installation guide. To look at the vault in KeePassXC, open a backup copy, never the live file.",
             ),
         );
         data.append(&later);
@@ -359,7 +395,7 @@ impl Manager {
         let policy = group(
             "Agent policy",
             Some(
-                "Auto-lock and remembered approvals are options of the agent service today (--idle-timeout, --remember). Editing them here, and locking when the screen locks or the computer suspends, come in a later version. Closing this app does not lock the vault.",
+                "Auto-lock and remembered approvals are options of the agent service today (--idle-timeout, --remember); editing them here comes in a later version. The agent also locks the vault when the screen locks or the computer suspends (see Status). Closing this app does not lock the vault.",
             ),
         );
         settings.append(&policy);
@@ -530,7 +566,11 @@ impl Manager {
             manager.lock.clone(),
             backup.clone(),
             passwd.clone(),
+            import_keyring.clone(),
+            import_dotenv.clone(),
         ]);
+        manager.connect_button(&import_keyring, |s| s.import_keyring());
+        manager.connect_button(&import_dotenv, |s| s.import_dotenv());
         manager.show_detail();
         manager.connect_button(&refresh, |s| s.refresh());
         manager.connect_button(&add, |s| s.edit(None));
@@ -738,12 +778,33 @@ impl Manager {
         self.starting.set(true);
         self.set_busy(true);
         self.feedback("Starting the agent…", false);
+        // systemctl normally answers at once; one that hangs is stopped.
+        let late = Rc::new(Cell::new(false));
+        {
+            let (late, process) = (Rc::clone(&late), process.clone());
+            glib::timeout_add_local_once(START_AGENT_TIMEOUT, move || {
+                if process.identifier().is_some() {
+                    late.set(true);
+                    process.force_exit();
+                }
+            });
+        }
         let weak = Rc::downgrade(self);
         let waited = process.clone();
         process.communicate_utf8_async(None, gio::Cancellable::NONE, move |result| {
             let Some(s) = weak.upgrade() else { return };
             s.starting.set(false);
             s.set_busy(false);
+            if late.get() {
+                s.feedback(
+                    &format!(
+                        "systemctl did not finish within {} seconds and was stopped; try again, or start the agent as the installation guide says.",
+                        START_AGENT_TIMEOUT.as_secs()
+                    ),
+                    true,
+                );
+                return;
+            }
             match result {
                 Ok(_) if waited.is_successful() => {
                     s.feedback("The agent was started.", false);
@@ -793,6 +854,10 @@ impl Manager {
         self.lock_seen.set(false);
         if !matches!(request, Request::Status | Request::List) {
             self.hide_revealed();
+            // A new action: the last one's message is stale. A status check
+            // or a list — also the one that follows a change — keeps it, so
+            // that what a change reported stays readable.
+            self.message.set_text("");
         }
         match Job::start(self.socket.clone(), request) {
             Ok(job) => {
@@ -809,9 +874,6 @@ impl Manager {
         }
         self.detail.set_sensitive(!busy);
         self.waiting.set_visible(busy);
-        if busy {
-            self.message.set_text("");
-        }
     }
 
     fn feedback(&self, text: &str, problem: bool) {
@@ -875,6 +937,13 @@ impl Manager {
         };
         self.epoch.set(self.epoch.get() + 1);
         self.set_busy(false);
+        let purpose = match purpose {
+            Pending::Import(batches) => {
+                self.after_batch(answer, batches);
+                return;
+            }
+            other => other,
+        };
         match answer {
             Err(failure) => {
                 self.feedback(&failure.text(), true);
@@ -917,6 +986,11 @@ impl Manager {
                     true,
                 );
             }
+            Ok(Response::KeyringItems { items }) => self.pick_keyring(items),
+            Ok(Response::Names { names }) => match purpose {
+                Pending::DotenvNames { path } => self.pick_dotenv(path, names),
+                _ => self.feedback("Unexpected answer. Refresh and look before retrying.", true),
+            },
             Ok(Response::Secret { value }) => match purpose {
                 Pending::Reveal { title, notes } => self.show_secret(&title, notes, value),
                 Pending::Copy { title } => self.put_on_clipboard(&title, &value),

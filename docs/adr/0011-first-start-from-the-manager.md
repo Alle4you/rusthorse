@@ -4,6 +4,9 @@
 - Date: 2026-11-02
 - Amends: [ADR 0007](0007-visual-manager.md) ("The manager does not
   install, start or restart anything"; the vault must exist).
+- Amended: 2026-11-02, after review — how `init` decides that the agent
+  serves the vault, a vault open in memory whose file is gone, the exit
+  statuses of `init` without an agent, a deadline for Start agent.
 
 ## Context
 
@@ -35,9 +38,18 @@ inspect.
    hard link, which fails if the name exists, instead of a rename, which
    would replace a vault that another `init` or agent created meanwhile.
 3. **`rusthorse init` uses the agent when one serves that vault**, and keeps
-   creating the file itself only when no agent does (or one serves another
-   path). The exception of invariant 4 is narrowed to that case.
-4. **The manager's first start.** When `status` says the vault does not
+   creating the file itself only when no agent runs (nothing listens on its
+   socket) or one serves another path. The paths are compared after making
+   them absolute and resolving the links of their existing directories (the
+   agent reports an absolute path); an agent that cannot be asked stops
+   `init` rather than letting it read the password. The exception of
+   invariant 4 is narrowed to that case. Without an agent, a cancelled or
+   unanswered dialog exits 4 and a file written but not synced exits 124,
+   as for requests to the agent.
+4. **Never beside an open vault.** While a vault is unlocked whose file is
+   gone (moved or deleted), `create_vault` is refused: creating one would
+   leave the old vault open in memory beside an empty new one.
+5. **The manager's first start.** When `status` says the vault does not
    exist, the window shows what Rusthorse will create, and where, with a
    **Create vault…** button (also in the sidebar) that sends `create_vault`.
    When nothing listens on the agent's socket, it says so and offers
@@ -46,7 +58,8 @@ inspect.
    manager's process tree, exactly as at login. The manager never starts
    the agent's program itself, and never restarts it. If `systemctl` fails —
    a source installation without the service file — the window shows its
-   message and points to the installation guide.
+   message and points to the installation guide; one that has not finished
+   after 30 seconds is stopped.
 
 ## Alternatives considered
 

@@ -45,8 +45,8 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::exec;
 use crate::peer::Peer;
 use crate::protocol::{
-    self, EntryChanges, ErrorCode, ImportedEntry, NewEntry, Request, Response, RevealPurpose,
-    RunRequest, SecretString, StatusInfo, ValueChange,
+    self, EntryChanges, EntryFields, ErrorCode, ImportSource, ImportedEntry, NewEntry, Request,
+    Response, RevealPurpose, RunRequest, SecretString, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
 use crate::session_lock;
@@ -77,6 +77,8 @@ const MAX_DETAIL_CHARS: usize = 1000;
 
 /// Most entries in one import batch (all of them are listed in the dialog).
 const MAX_IMPORT: usize = 100;
+/// The largest `.env` file the agent reads for an import.
+const MAX_DOTENV_BYTES: u64 = 1024 * 1024;
 
 /// Agent settings.
 #[derive(Debug, Clone)]
@@ -102,6 +104,8 @@ pub struct AgentConfig {
     /// [`KdfParams::DEFAULT`] in production; tests use weaker ones to run
     /// fast.
     pub new_vault_kdf: KdfParams,
+    /// Where imports from GNOME Keyring find the Secret Service (ADR 0012).
+    pub keyring: crate::keyring::Settings,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -454,6 +458,13 @@ impl Agent {
                 purpose,
             } => self.reveal(peer, &name, notes, purpose),
             Request::Backup { path } => self.backup(peer, &path),
+            Request::KeyringItems => self.keyring_items(peer),
+            Request::DotenvNames { path } => self.dotenv_names(peer, &path),
+            Request::ImportFrom {
+                source,
+                tags,
+                replace,
+            } => self.import_from(peer, source, tags, replace),
             Request::Run(_) => Err(Failure::invalid("run requests carry file descriptors")),
         }
     }
@@ -942,6 +953,145 @@ impl Agent {
         entries: Vec<ImportedEntry>,
         replace: bool,
     ) -> Result<Response, Failure> {
+        self.import_entries(peer, entries, replace, Origin::Requester)
+    }
+
+    /// Show the items of GNOME Keyring to the requester, after approval:
+    /// labels and attributes, no secret (ADR 0012).
+    fn keyring_items(&self, peer: &Peer) -> Result<Response, Failure> {
+        let request = ApprovalRequest {
+            title: "Rusthorse — list GNOME Keyring".into(),
+            summary: "Show the items of GNOME Keyring to the program that asked?".into(),
+            explanation: "It will see each item's label and attributes — not its secret — to \
+                          choose what to import into Rusthorse."
+                .into(),
+            command: None,
+            details: vec![("Requested by (unverified)".into(), peer.describe())],
+            facts: Vec::new(),
+            warnings: Vec::new(),
+            can_remember: false,
+        };
+        self.approve(request, None, AuditEvent::new("keyring_items", peer))?;
+        let items = crate::keyring::items(&self.config.keyring)
+            .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
+        let response = Response::KeyringItems { items };
+        let size = serde_json::to_vec(&response).map_or(usize::MAX, |b| b.len());
+        if size > protocol::MAX_FRAME_LEN - 1024 {
+            return Err(Failure::invalid(
+                "the keyring holds too much to list in one answer",
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Show the names of the variables in a `.env` file to the requester,
+    /// after approval; the values are dropped at once.
+    fn dotenv_names(&self, peer: &Peer, path: &str) -> Result<Response, Failure> {
+        check_dotenv_path(path)?;
+        let request = ApprovalRequest {
+            title: "Rusthorse — read a .env file".into(),
+            summary: "Show the names in a .env file to the program that asked?".into(),
+            explanation: "It will see the names of the variables in the file below — not \
+                          their values — to choose what to import into Rusthorse."
+                .into(),
+            command: None,
+            details: vec![
+                ("File".into(), path.to_string()),
+                ("Requested by (unverified)".into(), peer.describe()),
+            ],
+            facts: Vec::new(),
+            warnings: Vec::new(),
+            can_remember: false,
+        };
+        self.approve(
+            request,
+            None,
+            AuditEvent::new("dotenv_names", peer).detail(path),
+        )?;
+        let names = read_dotenv(path, None)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        Ok(Response::Names { names })
+    }
+
+    /// Import secrets that the agent reads itself (ADR 0012): the requester
+    /// names the items or variables and the entry names, never the values.
+    fn import_from(
+        &self,
+        peer: &Peer,
+        source: ImportSource,
+        tags: Vec<String>,
+        replace: bool,
+    ) -> Result<Response, Failure> {
+        let entry = |name: String| NewEntry {
+            name,
+            fields: EntryFields {
+                tags: tags.clone(),
+                ..EntryFields::default()
+            },
+            ..NewEntry::default()
+        };
+        match source {
+            ImportSource::Keyring { items } => {
+                // Refuse what would be refused anyway before reading a secret.
+                check_import_names(items.iter().map(|p| p.name.as_str()), items.len())?;
+                let ids: Vec<&str> = items.iter().map(|p| p.id.as_str()).collect();
+                let values = crate::keyring::read(&self.config.keyring, &ids)
+                    .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
+                let entries = items
+                    .into_iter()
+                    .zip(values)
+                    .map(|(pick, value)| ImportedEntry {
+                        entry: entry(pick.name),
+                        value,
+                    })
+                    .collect();
+                self.import_entries(peer, entries, replace, Origin::Keyring)
+            }
+            ImportSource::Dotenv {
+                path,
+                prefix,
+                names,
+            } => {
+                check_import_names(names.iter().map(String::as_str), names.len())?;
+                check_dotenv_path(&path)?;
+                let mut found = read_dotenv(&path, prefix.as_deref())?;
+                let mut entries = Vec::with_capacity(names.len());
+                for name in names {
+                    let mut matching = found.iter().filter(|(n, _)| *n == name);
+                    if matching.next().is_none() {
+                        return Err(Failure::invalid(format!(
+                            "{name} is not in {path}; nothing was imported"
+                        )));
+                    }
+                    if matching.next().is_some() {
+                        return Err(Failure::invalid(format!(
+                            "{name} appears more than once in {path}; nothing was imported"
+                        )));
+                    }
+                    let at = found
+                        .iter()
+                        .position(|(n, _)| *n == name)
+                        .unwrap_or_default();
+                    let (_, value) = found.swap_remove(at);
+                    entries.push(ImportedEntry {
+                        entry: entry(name),
+                        value,
+                    });
+                }
+                self.import_entries(peer, entries, replace, Origin::Dotenv(&path))
+            }
+        }
+    }
+
+    fn import_entries(
+        &self,
+        peer: &Peer,
+        entries: Vec<ImportedEntry>,
+        replace: bool,
+        origin: Origin<'_>,
+    ) -> Result<Response, Failure> {
         if entries.is_empty() {
             return Err(Failure::invalid("nothing to import"));
         }
@@ -984,12 +1134,42 @@ impl Agent {
             details.push((label.into(), list_names(&existing)));
         }
         details.push(("Requested by (unverified)".into(), peer.describe()));
+        let n = entries.len();
+        let (summary, explanation, event) = match origin {
+            Origin::Requester => (
+                format!("Import {n} secrets?"),
+                "The program that asked supplied these names and values. Check the names \
+                 before you allow it."
+                    .to_string(),
+                AuditEvent::new("import", peer),
+            ),
+            Origin::Keyring => {
+                details.insert(0, ("Read from".into(), "GNOME Keyring".into()));
+                (
+                    format!("Import {n} secrets from GNOME Keyring?"),
+                    "The agent read the values itself, from GNOME Keyring; the program that \
+                     asked chose the items and their names. Check the names before you allow \
+                     it."
+                    .to_string(),
+                    AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
+                )
+            }
+            Origin::Dotenv(path) => {
+                details.insert(0, ("Read from".into(), path.to_string()));
+                (
+                    format!("Import {n} secrets from a .env file?"),
+                    "The agent read the values itself, from the file below; the program that \
+                     asked chose the variables and their names. Check the names before you \
+                     allow it."
+                        .to_string(),
+                    AuditEvent::new("import_from", peer).detail(path),
+                )
+            }
+        };
         let request = ApprovalRequest {
             title: "Rusthorse — import secrets".into(),
-            summary: format!("Import {} secrets?", entries.len()),
-            explanation: "The program that asked supplied these names and values. Check the \
-                          names before you allow it."
-                .into(),
+            summary,
+            explanation,
             command: None,
             details,
             facts: Vec::new(),
@@ -997,11 +1177,7 @@ impl Agent {
             can_remember: false,
         };
         let names: Vec<String> = entries.iter().map(|e| e.entry.name.clone()).collect();
-        self.approve(
-            request,
-            None,
-            AuditEvent::new("import", peer).entries(names),
-        )?;
+        self.approve(request, None, event.entries(names))?;
         self.commit(generation, |v| {
             let (mut added, mut replaced, mut skipped) = (0, 0, 0);
             for item in &entries {
@@ -1222,7 +1398,19 @@ impl Agent {
         if std::fs::symlink_metadata(&path).is_ok() {
             return Err(exists());
         }
-        let started = self.state().generation;
+        let started = {
+            let state = self.state();
+            // An open vault whose file is gone (moved or deleted): creating
+            // one would leave the old one open beside it.
+            if state.vault.is_some() {
+                return Err(Failure::invalid(format!(
+                    "a vault is unlocked, but its file is no longer at {} (moved or deleted?); \
+                     lock it (`rusthorse lock`) before creating a new one",
+                    path.display()
+                )));
+            }
+            state.generation
+        };
         let event = AuditEvent::new("create_vault", peer);
         let shown = path.display().to_string();
         let prompt = |headline: &str, explanation: &str, field: &str, confirm: &str| Prompt {
@@ -1305,7 +1493,9 @@ impl Agent {
             }
         };
         let mut state = self.state();
-        if state.generation != started || state.vault.is_some() {
+        // No vault can have been opened meanwhile: unlocking waits for the
+        // dialog lock, which this request holds.
+        if state.generation != started {
             // Locked while the password was typed: the vault exists, locked.
             drop(state);
             drop(vault);
@@ -1988,6 +2178,91 @@ fn run_event(peer: &Peer, run: &RunRequest, entries: &[String]) -> AuditEvent {
 
 /// All names, comma-separated. Imports are capped at [`MAX_IMPORT`] entries
 /// so that the dialog can list every one of them.
+/// Where the values of an import come from, for its dialog and record.
+enum Origin<'a> {
+    /// The requester sent them (`import`).
+    Requester,
+    /// The agent read them from GNOME Keyring (`import_from`).
+    Keyring,
+    /// The agent read them from this `.env` file (`import_from`).
+    Dotenv(&'a str),
+}
+
+/// The checks of an import's names that need no source: a count within
+/// [`MAX_IMPORT`], valid names, none twice.
+fn check_import_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    count: usize,
+) -> Result<(), Failure> {
+    if count == 0 {
+        return Err(Failure::invalid("nothing to import"));
+    }
+    if count > MAX_IMPORT {
+        return Err(Failure::invalid(format!(
+            "at most {MAX_IMPORT} entries can be imported at once (got {count}); split the import"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        crate::vault::validate_name(name)?;
+        if !seen.insert(name) {
+            return Err(Failure::invalid(format!(
+                "{name} appears more than once in the import; nothing was imported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_dotenv_path(path: &str) -> Result<(), Failure> {
+    if !Path::new(path).is_absolute() {
+        return Err(Failure::invalid(format!(
+            "{path:?} is not an absolute path"
+        )));
+    }
+    Ok(())
+}
+
+/// The variables of the `.env` file at `path`, with `prefix` (upper-cased)
+/// before each name. Only a regular file of at most [`MAX_DOTENV_BYTES`]
+/// is read: opening does not wait (a FIFO would block), and the type is
+/// checked on the opened file.
+fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<Vec<(String, SecretString)>, Failure> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let cannot = |e: std::io::Error| Failure::invalid(format!("cannot read {path}: {e}"));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+        .map_err(cannot)?;
+    let meta = file.metadata().map_err(cannot)?;
+    if !meta.is_file() {
+        return Err(Failure::invalid(format!("{path} is not a regular file")));
+    }
+    if meta.len() > MAX_DOTENV_BYTES {
+        return Err(Failure::invalid(format!(
+            "{path} is larger than {} KiB; Rusthorse reads .env files up to that size",
+            MAX_DOTENV_BYTES / 1024
+        )));
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    Read::by_ref(&mut file)
+        .take(MAX_DOTENV_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() as u64 > MAX_DOTENV_BYTES {
+        return Err(Failure::invalid(format!("{path} grew while it was read")));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Failure::invalid(format!("{path} is not text (UTF-8)")))?;
+    let prefix = prefix.unwrap_or_default().to_uppercase();
+    Ok(crate::import::parse_dotenv(text)
+        .into_iter()
+        .map(|(name, value)| (format!("{prefix}{name}"), value))
+        .collect())
+}
+
 fn list_names(names: &[&str]) -> String {
     if names.is_empty() {
         return "(none)".into();
@@ -2488,6 +2763,7 @@ mod tests {
                 send_buffer: None,
                 session_lock: Default::default(),
                 new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+                keyring: Default::default(),
             },
             Box::new(NoDialogs),
         );
@@ -2540,6 +2816,7 @@ mod tests {
                 send_buffer: None,
                 session_lock: Default::default(),
                 new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+                keyring: Default::default(),
             },
             Box::new(NoDialogs),
         );

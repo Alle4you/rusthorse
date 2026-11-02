@@ -92,7 +92,8 @@ and keeps the value out of the agent's reach in the common case.
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
   (without values). If the log cannot be written, the vault stays locked and
   approval-gated requests are refused.
-- **Migration.** Import from `.env` files and from GNOME Keyring / KWallet.
+- **Migration.** Import from `.env` files and from GNOME Keyring / KWallet,
+  in the manager or the CLI; the agent reads the values itself.
 
 ## Quick start
 
@@ -186,8 +187,8 @@ what Rusthorse can and cannot protect against when the requester is an AI.
 | `open NAME` | Open the entry's URL (access link) in the browser | — |
 | `passwd` | Change the master password | the dialogs themselves |
 | `generate` | Print a random value (nothing stored) | — |
-| `import dotenv FILE` | Import `NAME=value` pairs | yes (one for the batch) |
-| `import secret-service -a KEY=VALUE` | Import from GNOME Keyring / KWallet | yes (one for the batch) |
+| `import dotenv FILE` | Import `NAME=value` pairs; the agent reads the file | yes (to show the names, then one per batch) |
+| `import secret-service -a KEY=VALUE` | Import from GNOME Keyring / KWallet; the agent reads the items | yes (to list the items, then one per batch) |
 | `audit` | Show recent audit records | — |
 | `doctor` | Check the installation and environment | — |
 | `completions SHELL` | Print a shell completion script | — |

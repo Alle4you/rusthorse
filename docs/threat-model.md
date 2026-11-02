@@ -108,7 +108,7 @@ The boundary that matters is between **requesters** and the **agent**.
 | P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. Reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
 | P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). | A1 |
-| P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
+| P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
 | P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and UUID, so two entries with the same title never look alike; requests whose dialog text would exceed 4000 characters (or 1000 for one field) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. | A1, A2, A6 (window) |
@@ -1167,3 +1167,53 @@ dialog itself would fail instead of reaching the desktop. Each fix was
 reverted in a copy of the tree to see a test fail (13 of 14); the survivor,
 the "vault exists" check before waiting for the dialog lock, is redundant
 by design — the check after the lock decides.
+
+**Import read by the agent (2026-11-02).** At the maintainer's request —
+an Import button in the manager, for the migration from GNOME Keyring:
+[ADR 0012](adr/0012-import-read-by-the-agent.md), `keyring_items`,
+`dotenv_names`, `import_from` (protocol 6). The agent reads GNOME Keyring
+and `.env` files itself; the CLI and the manager send names only, and no
+longer hold imported values (AGENTS.md invariant 1 narrowed). The import
+dialog names the source, which the older `import` request could not: there
+the requester supplies the values. Listing the keyring or a file's names
+asks for approval, so that a requester that reaches only the agent — a
+future isolated AI (§8) — cannot use it to learn what the keyring or a file
+holds. A `.env` path must be absolute and a regular file (opened without
+waiting: a FIFO is refused at once); a locked keyring item is refused rather
+than unlocked, because the keyring's prompt has no time limit; every call to
+the Secret Service is bounded (10 s). Tested end to end with a fake Secret
+Service on a private bus (`fake-keyring` feature, never in a release): the
+CLI's keyring import, metadata only in the listing, a locked item refused
+before any dialog; `.env` imports with a prefix, a dry run, denied
+listings, a FIFO, a relative path, missing and repeated names. On Xvfb: the
+manager's two import windows (names from an attribute, the filter, a locked
+item that cannot be ticked, repeated names that keep Import off, a denied
+batch reported as not imported, the values in the vault file). Building the
+test found that the manager erased what a change reported at the status
+check that follows it (for example a warning of `passwd`); fixed. Each
+check was reverted in a copy of the tree to see a test fail (14 of 14; one
+passed at first because the test looked for "from GNOME Keyring" anywhere in
+the dialog, where the explanation says it too — the test now checks the
+summary).
+
+Second review of the package and the first start (Codex, AI-assisted,
+2026-11-02; verdict: not ready). Confirmed fixed: `prerm` and `DPKG_ROOT`,
+the warnings of removal, `daemon-reload`, the Debian changelog (manual pages
+left open, as decided) and the links of the installed documentation; the
+crates' licenses, but for one point below. New findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — `init` compared its path with the agent's as text: `init --vault vault.kdbx` in the vault's directory showed its own dialog, so the password would have entered the requester's process although the agent served that file | **Fixed:** the agent reports an absolute path, and `init` compares paths after making them absolute and resolving the links of their nearest existing directory; when an agent's socket answers with an error (not "nothing listens"), `init` stops instead of asking itself. Tested: `vault.kdbx` and `./sub/../vault.kdbx` use the agent's dialogs; unit tests for links, `.`, `..`, directories not created yet, and which errors mean that no agent runs. |
+| Medium — `create_vault` with a vault open whose file had been moved away created an empty file and said the vault was "locked meanwhile", while the old one stayed open with its entries | **Fixed:** refused while a vault is unlocked (`invalid_request`, lock first); the "locked meanwhile" answer now depends only on a lock. Tested: refused with the file moved, accepted after `lock`, and the old entries are gone. |
+| Medium — `init` without an agent exited 1 when its dialog was cancelled and when the file was written but not synced, against the documented 4 and 124 | **Fixed:** 4 for a cancelled or unanswered dialog, 124 for `NotDurable`, as for requests to the agent; a unit test checks the mapping (the dialog path itself needs a desktop). |
+| Low — for `blake2b_simd`, which ships no license file, the copyright file made up "Copyright (c) the blake2b_simd authors: Jack O'Connor" instead of the original notice | **Fixed:** no notice is made up any more. The crate's license file from the upstream revision it was published from (`Copyright (c) 2018 Jack O'Connor`) is kept in `packaging/licenses/`; `block-modes` 0.9.1 contains no code (its source is one doc comment); any other crate without a license file stops the build. The list of notices no longer picks up sentences of license texts ("the copyright notice …"). |
+
+Ideas from the same review, adopted: the reproductions are now tests (above),
+with two more — the real `rusthorse agent` started with a relative `--vault`
+reports it absolute, and `init` stops when something listens on the socket
+but does not answer; **Start agent** stops a `systemctl` that has not
+finished after 30 seconds (tested with a stand-in that hangs). Not adopted
+yet: a test of the built package's contents. Each fix was reverted in a copy
+of the tree to see a test fail (8 of 8, two of them only once the two tests
+above were added).

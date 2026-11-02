@@ -123,18 +123,41 @@ impl Harness {
         request_timeout: Duration,
         send_buffer: Option<usize>,
     ) -> Harness {
-        // Never the real buses: tests of locking start private ones.
+        // Never the real buses: tests of locking and of the keyring start
+        // private ones.
         Harness::build(
             idle_timeout,
             request_timeout,
             send_buffer,
             rusthorse::session_lock::Settings::default(),
+            no_keyring(),
         )
     }
 
     #[cfg(feature = "session-lock")]
     fn with_session_lock(settings: rusthorse::session_lock::Settings) -> Harness {
-        Harness::build(Duration::ZERO, Duration::from_secs(10), None, settings)
+        Harness::build(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            None,
+            settings,
+            no_keyring(),
+        )
+    }
+
+    /// An agent that finds the Secret Service on the bus at `address`.
+    #[cfg(feature = "fake-keyring")]
+    fn with_keyring(address: &str) -> Harness {
+        Harness::build(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            None,
+            rusthorse::session_lock::Settings::default(),
+            rusthorse::keyring::Settings {
+                address: Some(address.into()),
+                plain: true,
+            },
+        )
     }
 
     fn build(
@@ -142,6 +165,7 @@ impl Harness {
         request_timeout: Duration,
         send_buffer: Option<usize>,
         session_lock: rusthorse::session_lock::Settings,
+        keyring: rusthorse::keyring::Settings,
     ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
@@ -163,6 +187,7 @@ impl Harness {
             send_buffer,
             session_lock,
             new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+            keyring,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -245,6 +270,15 @@ impl Harness {
 
     fn audit_text(&self) -> String {
         std::fs::read_to_string(&self.audit).unwrap_or_default()
+    }
+}
+
+/// A keyring setting that reaches no Secret Service: a bus address where
+/// nothing listens, so that no test ever reads the real keyring.
+fn no_keyring() -> rusthorse::keyring::Settings {
+    rusthorse::keyring::Settings {
+        address: Some("unix:path=/nonexistent/rusthorse-test-bus".into()),
+        plain: true,
     }
 }
 
@@ -618,7 +652,8 @@ fn import_dotenv_edit_and_remove() {
     let h = Harness::new();
     let env_file = h.dir.path().join("app.env");
     std::fs::write(&env_file, "A_KEY=aaaa1111\nB_KEY='bbbb 2222'\n").expect("write");
-    h.decide(&[Decision::AllowOnce]);
+    // One approval to show the names, one to import.
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
     let out = h.run(&[
         "import",
         "dotenv",
@@ -925,6 +960,120 @@ fn an_unwritable_audit_log_creates_no_vault() {
 }
 
 #[test]
+fn init_with_another_spelling_of_the_agents_vault_still_uses_the_agent() {
+    // The commands run in the harness's directory, where the vault would be.
+    for spelling in ["vault.kdbx", "./sub/../vault.kdbx"] {
+        let h = without_vault();
+        std::fs::create_dir(h.dir.path().join("sub")).expect("mkdir");
+        let out = h.run(&["init", "--vault", spelling]);
+        assert!(out.status.success(), "{spelling}: {}", text(&out.stderr));
+        assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 2, "{spelling}");
+        assert!(h.vault_path().exists(), "{spelling}");
+    }
+}
+
+#[test]
+fn the_agent_reports_its_vault_as_an_absolute_path() {
+    // The real program, with a relative --vault, on private paths; it
+    // watches no bus and shows no dialog.
+    struct Stop(std::process::Child);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("run").join("agent.sock");
+    let _agent = Stop(
+        Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args([
+                "agent",
+                "--vault",
+                "relative.kdbx",
+                "--no-lock-on-suspend",
+                "--no-lock-on-screen-lock",
+            ])
+            .current_dir(dir.path())
+            .env("RUSTHORSE_SOCKET", &socket)
+            .env("RUSTHORSE_AUDIT_LOG", dir.path().join("audit.jsonl"))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the agent"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "the agent did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["status", "--json"])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .finish();
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        status["vault"],
+        dir.path().join("relative.kdbx").display().to_string()
+    );
+}
+
+#[test]
+fn init_stops_when_the_agent_cannot_be_asked() {
+    // Something listens on the socket but never answers properly: `init`
+    // must not decide that no agent runs and ask for the password itself.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("mute.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let mute = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        drop(stream);
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["init", "--vault"])
+        .arg(dir.path().join("vault.kdbx"))
+        .env("RUSTHORSE_SOCKET", &socket)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .stdin(Stdio::null())
+        .finish();
+    mute.join().expect("mute agent");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot ask the agent"), "{stderr}");
+    assert!(!stderr.contains("dialog"), "{stderr}");
+    assert!(!dir.path().join("vault.kdbx").exists());
+}
+
+#[test]
+fn a_new_vault_is_refused_while_one_is_open_whose_file_is_gone() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    let h = Harness::new();
+    h.add_secret("KEEP", "fake-keep-value", &[]);
+    std::fs::rename(h.vault_path(), h.dir.path().join("moved.kdbx")).expect("move the file");
+    match h.call(&Request::CreateVault) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::InvalidRequest);
+            assert!(message.contains("no longer at"), "{message}");
+        }
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert!(!h.vault_path().exists(), "a new vault was created");
+    // Locked, the request goes ahead.
+    assert!(h.run(&["lock"]).status.success());
+    assert!(h.run(&["init"]).status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
+    assert_eq!(status["locked"], false);
+    assert!(!text(&h.run(&["list"]).stdout).contains("KEEP"));
+}
+
+#[test]
 fn creating_a_vault_where_one_exists_shows_no_dialog() {
     use rusthorse::protocol::{ErrorCode, Request, Response};
     let h = Harness::new();
@@ -1121,7 +1270,9 @@ fn large_imports_are_split_into_readable_batches() {
         .collect();
     std::fs::write(&env_file, lines).expect("write");
     assert!(h.run(&["unlock"]).status.success());
-    // Dry run: names and their status, nothing imported, nothing asked.
+    // Dry run: names and their status, nothing imported; only showing the
+    // names is asked.
+    h.decide(&[Decision::AllowOnce]);
     let out = h.run(&[
         "import",
         "dotenv",
@@ -1136,12 +1287,13 @@ fn large_imports_are_split_into_readable_batches() {
             .count(),
         60
     );
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
-    // Real run: several batches, one approval each, everything imported.
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+    // Real run: the names, then several batches, one approval each,
+    // everything imported.
     h.decide(&[Decision::AllowOnce; 10]);
     let out = h.run(&["import", "dotenv", env_file.to_str().expect("utf8")]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(h.ui.approvals_asked.load(Ordering::SeqCst) >= 2);
+    assert!(h.ui.approvals_asked.load(Ordering::SeqCst) >= 4);
     let listing = text(&h.run(&["list"]).stdout);
     assert_eq!(
         listing.lines().filter(|l| l.contains("_XXXXXXXX")).count(),
@@ -2492,6 +2644,8 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
     let env_file = h.dir.path().join("dup.env");
     std::fs::write(&env_file, "DUP=first\nOTHER=x1234\nDUP=second\n").expect("write");
     let file = env_file.to_str().expect("utf8");
+    // Each run asks only to show the names.
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
     let preview = h.run(&["import", "dotenv", file, "--dry-run"]);
     assert!(
         text(&preview.stdout)
@@ -2500,7 +2654,7 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
     let out = h.run(&["import", "dotenv", file, "--replace"]);
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("appear more than once"));
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
     assert!(!text(&h.run(&["list"]).stdout).contains("OTHER"));
     // The agent refuses such a batch too.
     let item = |value: &str| ImportedEntry {
@@ -2522,11 +2676,12 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
         Response::Error { message, .. } => assert!(message.contains("more than once"), "{message}"),
         other => panic!("expected a refusal, got {other:?}"),
     }
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
 }
 
-/// A fake agent that answers `status`, then answers each `import` with the
-/// next raw JSON reply (`None`: the answer is lost), then stops listening.
+/// A fake agent that answers `status` and `dotenv_names` (the names in the
+/// file), then answers each `import_from` with the next raw JSON reply
+/// (`None`: the answer is lost), then stops listening.
 fn fake_import_agent(
     socket: &Path,
     replies: Vec<Option<&'static str>>,
@@ -2563,7 +2718,15 @@ fn fake_import_agent(
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }
-                Request::Import { .. } => {
+                Request::DotenvNames { path } => {
+                    let text = std::fs::read_to_string(&path).expect("the .env file");
+                    let names = rusthorse::import::parse_dotenv(&text)
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect();
+                    send_frame(&stream, &Response::Names { names }, &[]).expect("names");
+                }
+                Request::ImportFrom { .. } => {
                     let Some(reply) = replies.next() else {
                         panic!("more batches than expected");
                     };
@@ -3224,14 +3387,14 @@ mod session_lock {
     /// A `dbus-daemon` with a configuration of its own: anyone may own any
     /// name, nothing is activated, it listens in a private directory. (Its
     /// policy must allow receiving too, or replies never arrive.)
-    struct Bus {
+    pub(super) struct Bus {
         daemon: Option<std::process::Child>,
-        address: String,
+        pub(super) address: String,
         dir: tempfile::TempDir,
     }
 
     impl Bus {
-        fn available() -> bool {
+        pub(super) fn available() -> bool {
             let there = Path::new("/usr/bin/dbus-daemon").exists();
             if !there {
                 eprintln!("skipped: dbus-daemon is not installed");
@@ -3250,7 +3413,7 @@ mod session_lock {
             }
         }
 
-        fn started() -> Bus {
+        pub(super) fn started() -> Bus {
             let mut bus = Bus::new();
             bus.start();
             bus
@@ -4184,5 +4347,230 @@ mod session_lock {
             shown.contains("suspend: not watched — turned off"),
             "{shown}"
         );
+    }
+}
+
+/// Imports that the agent reads itself (ADR 0012).
+mod import_from {
+    use super::*;
+    use rusthorse::protocol::{ErrorCode, ImportSource, Request, Response};
+
+    /// The value of `name` in the vault file (the harness's password).
+    fn value_in_file(h: &Harness, name: &str) -> String {
+        let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.to_string()))
+            .expect("open the vault file");
+        let id = vault.find(name).expect("the entry");
+        vault.secret(id).expect("a value").to_string()
+    }
+
+    fn last_approval(h: &Harness) -> String {
+        let request =
+            h.ui.last_approval
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("a dialog");
+        rusthorse::ui::approval_text(&request)
+    }
+
+    #[test]
+    fn a_dotenv_file_is_read_by_the_agent_after_two_approvals() {
+        let h = Harness::new();
+        let file = h.dir.path().join("app.env");
+        std::fs::write(
+            &file,
+            "# fake values\nFAKE_ONE=fake-one-value\nexport FAKE_TWO=\"fake two\"\n",
+        )
+        .unwrap();
+        assert!(h.run(&["unlock"]).status.success());
+        h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+        let out = h.run(&[
+            "import", "dotenv", "app.env", "--prefix", "p_", "--tag", "migrated",
+        ]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+        // The second dialog says where the agent read the values.
+        let dialog = last_approval(&h);
+        assert!(dialog.contains("from a .env file"), "{dialog}");
+        assert!(dialog.contains(&file.display().to_string()), "{dialog}");
+        assert!(dialog.contains("P_FAKE_ONE, P_FAKE_TWO"), "{dialog}");
+        assert!(!dialog.contains("fake-one-value"), "{dialog}");
+        assert_eq!(value_in_file(&h, "P_FAKE_ONE"), "fake-one-value");
+        assert_eq!(value_in_file(&h, "P_FAKE_TWO"), "fake two");
+        let audit = h.audit_text();
+        assert!(audit.contains("\"action\":\"dotenv_names\""), "{audit}");
+        assert!(audit.contains("\"action\":\"import_from\""), "{audit}");
+        assert!(!audit.contains("fake-one-value"));
+    }
+
+    #[test]
+    fn a_dry_run_shows_the_names_and_imports_nothing() {
+        let h = Harness::new();
+        std::fs::write(h.dir.path().join("app.env"), "FAKE_ONE=fake\n").unwrap();
+        h.decide(&[Decision::AllowOnce]);
+        let out = h.run(&["import", "dotenv", "app.env", "--dry-run"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(text(&out.stdout).contains("FAKE_ONE"));
+        assert!(!text(&out.stdout).contains("fake\n"));
+        assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+        assert!(!h.audit_text().contains("import_from"));
+    }
+
+    #[test]
+    fn denied_listings_show_nothing() {
+        let h = Harness::new();
+        std::fs::write(h.dir.path().join("app.env"), "FAKE_ONE=fake\n").unwrap();
+        h.decide(&[Decision::Deny]);
+        let out = h.run(&["import", "dotenv", "app.env", "--dry-run"]);
+        assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+        assert!(!text(&out.stdout).contains("FAKE_ONE"));
+        h.decide(&[Decision::Deny]);
+        match h.call(&Request::KeyringItems) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            other => panic!("unexpected {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn the_agent_reads_only_regular_files_by_absolute_path_and_only_names_in_them() {
+        let h = Harness::new();
+        let fifo = h.dir.path().join("fifo.env");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let file = h.dir.path().join("app.env");
+        std::fs::write(&file, "FAKE_ONE=fake\nFAKE_ONE=again\n").unwrap();
+        let dotenv = |path: &Path, names: &[&str]| Request::ImportFrom {
+            source: ImportSource::Dotenv {
+                path: path.display().to_string(),
+                prefix: None,
+                names: names.iter().map(|n| n.to_string()).collect(),
+            },
+            tags: Vec::new(),
+            replace: false,
+        };
+        let refused = |request: Request, expected: &str| match h.call(&request) {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                assert!(message.contains(expected), "{message}");
+            }
+            other => panic!("unexpected {}", other.kind()),
+        };
+        // A FIFO is refused without waiting for a writer.
+        refused(dotenv(&fifo, &["FAKE_ONE"]), "not a regular file");
+        refused(dotenv(Path::new("app.env"), &["FAKE_ONE"]), "absolute");
+        refused(dotenv(&file, &["FAKE_TWO"]), "is not in");
+        refused(dotenv(&file, &["FAKE_ONE"]), "more than once in");
+        refused(
+            Request::DotenvNames {
+                path: "relative.env".into(),
+            },
+            "absolute",
+        );
+        assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(all(feature = "fake-keyring", feature = "session-lock"))]
+    mod keyring {
+        use super::*;
+        use crate::session_lock::Bus;
+        use rusthorse::keyring::fake::{self, Item};
+
+        fn keyring(items: Vec<Item>) -> Option<(Bus, zbus::blocking::Connection)> {
+            if !Bus::available() {
+                return None;
+            }
+            let bus = Bus::started();
+            let service = fake::serve(Some(&bus.address), items).expect("serve the fake keyring");
+            Some((bus, service))
+        }
+
+        fn segredo(name: &str, value: &str) -> Item {
+            Item::new(
+                &format!("segredo: {name}"),
+                &[("aplicacao", "segredo"), ("nome", name)],
+                value,
+            )
+        }
+
+        #[test]
+        fn the_cli_imports_keyring_items_that_the_agent_reads() {
+            let Some((bus, _service)) = keyring(vec![
+                segredo("FAKE_A", "fake-a-value"),
+                segredo("FAKE_B", "fake-b-value"),
+                Item::new("another program", &[("application", "other")], "not-this"),
+            ]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            assert!(h.run(&["unlock"]).status.success());
+            h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+            let out = h.run(&[
+                "import",
+                "secret-service",
+                "-a",
+                "aplicacao=segredo",
+                "--name-from",
+                "nome",
+                "--tag",
+                "migrated",
+            ]);
+            assert!(out.status.success(), "{}", text(&out.stderr));
+            let dialog = last_approval(&h);
+            assert!(
+                dialog.contains("Import 2 secrets from GNOME Keyring?"),
+                "{dialog}"
+            );
+            assert!(dialog.contains("FAKE_A, FAKE_B"), "{dialog}");
+            assert_eq!(value_in_file(&h, "FAKE_A"), "fake-a-value");
+            assert_eq!(value_in_file(&h, "FAKE_B"), "fake-b-value");
+            let list = text(&h.run(&["list"]).stdout);
+            assert!(!list.contains("another program"), "{list}");
+            assert!(!h.audit_text().contains("fake-a-value"));
+        }
+
+        #[test]
+        fn listing_shows_metadata_and_a_locked_item_is_refused() {
+            let mut locked = segredo("FAKE_LOCKED", "fake-locked");
+            locked.locked = true;
+            let Some((bus, _service)) = keyring(vec![segredo("FAKE_A", "fake-a-value"), locked])
+            else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            h.decide(&[Decision::AllowOnce]);
+            let Response::KeyringItems { items } = h.call(&Request::KeyringItems) else {
+                panic!("no items");
+            };
+            assert_eq!(items.len(), 2);
+            let locked = items.iter().find(|i| i.locked).expect("the locked item");
+            assert_eq!(locked.attributes["nome"], "FAKE_LOCKED");
+            let serialized = serde_json::to_string(&items).unwrap();
+            assert!(!serialized.contains("fake-a-value"), "{serialized}");
+            assert!(h.run(&["unlock"]).status.success());
+            let request = Request::ImportFrom {
+                source: ImportSource::Keyring {
+                    items: items
+                        .iter()
+                        .map(|i| rusthorse::protocol::KeyringPick {
+                            id: i.id.clone(),
+                            name: i.attributes["nome"].clone(),
+                        })
+                        .collect(),
+                },
+                tags: Vec::new(),
+                replace: false,
+            };
+            match h.call(&request) {
+                Response::Error { message, .. } => {
+                    assert!(
+                        message.contains("is locked; unlock the keyring"),
+                        "{message}"
+                    )
+                }
+                other => panic!("unexpected {}", other.kind()),
+            }
+            // Nothing asked, nothing imported.
+            assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+            assert!(!text(&h.run(&["list"]).stdout).contains("FAKE_A"));
+        }
     }
 }

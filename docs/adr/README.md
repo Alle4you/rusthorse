@@ -18,6 +18,7 @@ supersedes the old one, which is marked as such.
 | [0009](0009-lock-on-screen-lock-and-suspend.md) | The agent locks when the screen locks or the computer suspends | Proposed |
 | [0010](0010-debian-package.md) | A Debian package that installs and removes cleanly | Proposed |
 | [0011](0011-first-start-from-the-manager.md) | The first start happens in the manager; the agent creates the vault | Proposed |
+| [0012](0012-import-read-by-the-agent.md) | Imports are read by the agent, and the manager can start them | Proposed |
 
 ## Writing a new ADR
 

@@ -171,7 +171,7 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); built from a clone with `packaging/build-deb.sh` until releases are published. |
 | Published releases: the `.deb`, static binaries, signed checksums; `.rpm` | Planned | Static binaries with `install.sh` / `uninstall.sh` (or `rusthorse setup`) for other distributions. |
 | First start from the manager: start the agent, create the vault | Done (unreleased) | [ADR 0011](adr/0011-first-start-from-the-manager.md); the agent asks for the master password (`create_vault`). |
-| Import from the manager (GNOME Keyring, `.env`) | Planned | Next: M3 of ADR 0007. |
+| Import from the manager (GNOME Keyring, `.env`), read by the agent | Done (unreleased) | [ADR 0012](adr/0012-import-read-by-the-agent.md). |
 | Socket activation of the agent | Idea | Would start the agent on first use without a button; the agent must still run before anything connects, to lock on screen lock and suspend (ADR 0011). |
 | Man page | Planned | Generated from the CLI definition; the Debian package has none yet. |
 | Build identifier in `status` and `doctor` | Later | Needs a build script to embed it. |

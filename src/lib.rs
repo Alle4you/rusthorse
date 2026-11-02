@@ -26,7 +26,9 @@
 //! - [`peer`]: identifying the process on the other end of the socket.
 //! - [`audit`]: the append-only audit log.
 //! - [`generate`]: generating random secret values.
-//! - [`import`]: importing secrets from `.env` files and Secret Service.
+//! - [`import`]: parsing `.env` files for imports.
+//! - [`keyring`]: the items of GNOME Keyring (any Secret Service), for imports
+//!   the agent reads itself.
 //! - [`paths`]: default file locations.
 //! - [`util`]: small shared helpers.
 
@@ -38,6 +40,7 @@ pub mod dialog_protocol;
 pub mod exec;
 pub mod generate;
 pub mod import;
+pub mod keyring;
 pub mod paths;
 pub mod peer;
 pub mod protocol;

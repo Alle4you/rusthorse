@@ -13,13 +13,13 @@ use rusthorse::client::Client;
 use rusthorse::dialog_program::DesktopUi;
 use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
-    Binding, EntryChanges, EntryFields, EntryInfo, EntryKind, ErrorCode, Field, ImportedEntry,
+    Binding, EntryChanges, EntryFields, EntryInfo, EntryKind, ErrorCode, Field, ImportSource,
     NewEntry, Request, Response, RunRequest, SecretString, ValueChange,
 };
 use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
-use rusthorse::{audit, import, paths};
+use rusthorse::{audit, paths};
 
 /// Exit status for `run` when Rusthorse refused or failed and the command
 /// did not run (as `env` and `docker run` do).
@@ -546,23 +546,90 @@ fn init(client: &Client, vault: PathBuf) -> anyhow::Result<u8> {
     }
     // An agent that serves this vault creates it, asking for the master
     // password in its own dialogs: the password then never enters this
-    // process, which an AI agent may have started and could inspect.
-    if let Ok(Response::Status(info)) = client.call(&Request::Status)
-        && Path::new(&info.vault) == vault
-    {
-        client.check_compatible()?;
-        eprintln!("The agent asks for the new master password in a dialog.");
-        let status = simple(client, &Request::CreateVault)?;
-        eprintln!("Next: `rusthorse add NAME`, or open Rusthorse from the applications menu.");
-        return Ok(status);
+    // process, which an AI agent may have started and could inspect. Only
+    // when no agent runs, or one serves another file, does this process ask.
+    match client.call(&Request::Status) {
+        Ok(Response::Status(info)) if same_vault(Path::new(&info.vault), &vault) => {
+            client.check_compatible()?;
+            eprintln!("The agent asks for the new master password in a dialog.");
+            let status = simple(client, &Request::CreateVault)?;
+            eprintln!("Next: `rusthorse add NAME`, or open Rusthorse from the applications menu.");
+            return Ok(status);
+        }
+        // An agent that serves another vault cannot create this one.
+        Ok(Response::Status(_)) => {}
+        Err(e) if agent_not_running(&e) => {}
+        Ok(other) => bail!(
+            "the agent answered {} to a status request; is it a Rusthorse agent?",
+            other.kind()
+        ),
+        Err(e) => {
+            return Err(e.context(
+                "cannot ask the agent whether it serves this vault, so the vault is not created \
+                 here (this command would read the master password itself)",
+            ));
+        }
     }
     let password = new_master_password()?;
-    Vault::create(&vault, password, KdfParams::DEFAULT)?;
+    Vault::create(&vault, password, KdfParams::DEFAULT).map_err(created_locally)?;
     println!("Created {}", vault.display());
     println!(
         "Next: start the agent (`systemctl --user enable --now rusthorse-agent`), then `rusthorse add NAME`."
     );
     Ok(0)
+}
+
+/// Whether `a` and `b` name the same vault file: compared after making them
+/// absolute and resolving the links of their nearest existing directory
+/// (the file itself does not exist yet).
+fn same_vault(a: &Path, b: &Path) -> bool {
+    match (resolved(a), resolved(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let absolute = std::path::absolute(path).ok()?;
+    let name = absolute.file_name()?.to_owned();
+    let mut dir = absolute.parent()?.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match dir.canonicalize() {
+            Ok(mut found) => {
+                found.extend(missing.iter().rev());
+                found.push(name);
+                return Some(found);
+            }
+            Err(_) => {
+                missing.push(dir.file_name()?.to_owned());
+                dir = dir.parent()?.to_path_buf();
+            }
+        }
+    }
+}
+
+/// Whether `e` says that nothing listens on the agent's socket.
+fn agent_not_running(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
+}
+
+/// The error of a vault this process created: one that is in place but may
+/// not survive a crash is an unknown outcome (exit 124), as for the agent.
+fn created_locally(e: rusthorse::vault::VaultError) -> anyhow::Error {
+    match e {
+        rusthorse::vault::VaultError::NotDurable(_) => {
+            anyhow::Error::new(rusthorse::client::OutcomeUnknown(e.to_string()))
+        }
+        other => other.into(),
+    }
 }
 
 fn new_master_password() -> anyhow::Result<SecretString> {
@@ -588,8 +655,18 @@ fn new_master_password() -> anyhow::Result<SecretString> {
                     confirm: "OK".into(),
                 })? {
                     Typed::Value(value) => Ok(value),
-                    Typed::Cancelled => bail!("cancelled"),
-                    Typed::TimedOut => bail!("nobody answered the dialog in time"),
+                    // A dialog cancelled or not answered: exit 4, as with the
+                    // agent's dialogs.
+                    Typed::Cancelled => {
+                        eprintln!("rusthorse: cancelled; no vault was created");
+                        Err(Exit(EXIT_DENIED).into())
+                    }
+                    Typed::TimedOut => {
+                        eprintln!(
+                            "rusthorse: nobody answered the dialog in time; no vault was created"
+                        );
+                        Err(Exit(EXIT_DENIED).into())
+                    }
                 }
             };
         (
@@ -630,8 +707,12 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
              inside another program's process tree (see docs/threat-model.md)."
         );
     }
+    // Absolute, so that `status` names the file wherever a client runs.
+    let vault = args.vault.unwrap_or_else(paths::vault);
+    let vault = std::path::absolute(&vault)
+        .with_context(|| format!("cannot resolve the vault path {}", vault.display()))?;
     let config = AgentConfig {
-        vault: args.vault.unwrap_or_else(paths::vault),
+        vault,
         socket,
         audit_log: args.audit_log.unwrap_or_else(paths::audit_log),
         idle_timeout: args.idle_timeout,
@@ -645,6 +726,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
             refresh_every: None,
         },
         new_vault_kdf: KdfParams::DEFAULT,
+        keyring: Default::default(),
     };
     let ui = DesktopUi {
         remember_for: args.remember,
@@ -1104,15 +1186,20 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     }
 }
 
-/// Most entries sent to the agent in one batch (each batch is one approval).
-const IMPORT_BATCH: usize = 50;
-/// Most lines the entry names of one batch may take in the approval dialog,
-/// counting each name as if it started a line, so that the dialog lists all
-/// of them and still fits on the screen (see `ui::approval_height`).
-const IMPORT_BATCH_LINES: usize = 24;
+/// Where `rusthorse import` asks the agent to read the values.
+enum ImportFrom {
+    Dotenv {
+        path: String,
+        prefix: Option<String>,
+    },
+    #[cfg(feature = "secret-service")]
+    Keyring,
+}
 
 fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
-    let (pairs, tags, replace) = match command {
+    // The agent reads the values (ADR 0012): this process only names what
+    // to import and the entries' names; it never holds a value.
+    let (picks, source, tags, replace) = match command {
         ImportCommand::Dotenv {
             file,
             prefix,
@@ -1120,19 +1207,28 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             replace,
             dry_run,
         } => {
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("cannot read {}", file.display()))?;
-            let text = SecretString::new(text);
-            let prefix = prefix.unwrap_or_default().to_uppercase();
-            let pairs: Vec<(String, SecretString)> = import::parse_dotenv(&text)
+            let path = std::path::absolute(&file)
+                .with_context(|| format!("cannot resolve {}", file.display()))?
+                .to_str()
+                .context("the file's path is not valid UTF-8")?
+                .to_string();
+            eprintln!("The agent asks before it shows the names in the file to this command.");
+            let Response::Names { names } =
+                check(client.call(&Request::DotenvNames { path: path.clone() })?)?
+            else {
+                bail!("unexpected response from the agent");
+            };
+            let prefix = prefix.map(|p| p.to_uppercase()).filter(|p| !p.is_empty());
+            let names: Vec<String> = names
                 .into_iter()
-                .map(|(name, value)| (format!("{prefix}{name}"), value))
+                .map(|name| format!("{}{name}", prefix.as_deref().unwrap_or_default()))
                 .collect();
             if dry_run {
-                let names = pairs.iter().map(|(n, _)| n.clone()).collect();
                 return import_preview(client, names, replace);
             }
-            (pairs, tags, replace)
+            let picks: Vec<(String, Option<String>)> =
+                names.into_iter().map(|name| (name, None)).collect();
+            (picks, ImportFrom::Dotenv { path, prefix }, tags, replace)
         }
         #[cfg(feature = "secret-service")]
         ImportCommand::SecretService {
@@ -1150,19 +1246,38 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                         .with_context(|| format!("{a:?}: expected KEY=VALUE"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            eprintln!("The agent asks before it shows the keyring's items to this command.");
+            let Response::KeyringItems { items } = check(client.call(&Request::KeyringItems)?)?
+            else {
+                bail!("unexpected response from the agent");
+            };
+            let mut picks = Vec::new();
+            for item in items.into_iter().filter(|item| {
+                attributes
+                    .iter()
+                    .all(|(k, v)| item.attributes.get(k) == Some(v))
+            }) {
+                let name = match &name_from {
+                    Some(attr) => item.attributes.get(attr).cloned().with_context(|| {
+                        format!("the item {:?} has no {attr:?} attribute", item.label)
+                    })?,
+                    None => item.label.clone(),
+                };
+                picks.push((name, Some(item.id)));
+            }
+            picks.sort_by(|a, b| a.0.cmp(&b.0));
             if dry_run {
-                let names = import::list_secret_service(&attributes, name_from.as_deref())?;
+                let names = picks.into_iter().map(|(name, _)| name).collect();
                 return import_preview(client, names, replace);
             }
-            let pairs = import::read_secret_service(&attributes, name_from.as_deref())?;
-            (pairs, tags, replace)
+            (picks, ImportFrom::Keyring, tags, replace)
         }
     };
-    if pairs.is_empty() {
+    if picks.is_empty() {
         bail!("nothing found to import");
     }
     let mut seen = std::collections::HashSet::new();
-    let duplicates: std::collections::BTreeSet<&str> = pairs
+    let duplicates: std::collections::BTreeSet<&str> = picks
         .iter()
         .filter(|(name, _)| !seen.insert(name.as_str()))
         .map(|(name, _)| name.as_str())
@@ -1174,43 +1289,38 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             duplicates.into_iter().collect::<Vec<_>>().join(", ")
         );
     }
-    let entries: Vec<ImportedEntry> = pairs
-        .into_iter()
-        .map(|(name, value)| ImportedEntry {
-            entry: NewEntry {
-                name,
-                fields: EntryFields {
-                    tags: tags.clone(),
-                    ..EntryFields::default()
-                },
-                ..NewEntry::default()
-            },
-            value,
-        })
-        .collect();
     // Split into batches small enough for one dialog each.
-    let mut batches: Vec<Vec<ImportedEntry>> = Vec::new();
-    let mut lines = 0;
-    for item in entries {
-        let cost = rusthorse::ui::mono_lines(&format!("{}, ", item.entry.name));
-        match batches.last_mut() {
-            Some(batch) if batch.len() < IMPORT_BATCH && lines + cost <= IMPORT_BATCH_LINES => {
-                lines += cost;
-                batch.push(item);
-            }
-            _ => {
-                lines = cost;
-                batches.push(vec![item]);
-            }
-        }
-    }
+    let sizes = rusthorse::import::batch_sizes(picks.iter().map(|(name, _)| name.as_str()));
+    let mut rest = picks.into_iter();
+    let batches: Vec<Vec<(String, Option<String>)>> = sizes
+        .into_iter()
+        .map(|size| rest.by_ref().take(size).collect())
+        .collect();
     let total = batches.len();
     for (i, batch) in batches.into_iter().enumerate() {
         if total > 1 {
             eprintln!("batch {} of {total} ({} entries):", i + 1, batch.len());
         }
-        let answer = client.call(&Request::Import {
-            entries: batch,
+        let source = match &source {
+            ImportFrom::Dotenv { path, prefix } => ImportSource::Dotenv {
+                path: path.clone(),
+                prefix: prefix.clone(),
+                names: batch.into_iter().map(|(name, _)| name).collect(),
+            },
+            #[cfg(feature = "secret-service")]
+            ImportFrom::Keyring => ImportSource::Keyring {
+                items: batch
+                    .into_iter()
+                    .map(|(name, id)| rusthorse::protocol::KeyringPick {
+                        id: id.unwrap_or_default(),
+                        name,
+                    })
+                    .collect(),
+            },
+        };
+        let answer = client.call(&Request::ImportFrom {
+            source,
+            tags: tags.clone(),
             replace,
         });
         let done = if i == 0 {
@@ -1730,6 +1840,60 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equivalent_vault_paths_are_the_same_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).expect("symlink");
+        let vault = real.join("vault.kdbx");
+        for same in [
+            dir.path().join("link/vault.kdbx"),
+            dir.path().join("real/./vault.kdbx"),
+            dir.path().join("link/../real/vault.kdbx"),
+        ] {
+            assert!(same_vault(&vault, &same), "{}", same.display());
+        }
+        // Relative to the working directory.
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative = Path::new("relative-vault.kdbx");
+        assert!(same_vault(&cwd.join(relative), relative));
+        // Directories that do not exist yet are compared as written.
+        assert!(same_vault(
+            &dir.path().join("link/new/sub/vault.kdbx"),
+            &real.join("new/sub/vault.kdbx")
+        ));
+        assert!(!same_vault(&vault, &real.join("other.kdbx")));
+        assert!(!same_vault(&vault, &dir.path().join("vault.kdbx")));
+    }
+
+    #[test]
+    fn a_vault_created_here_that_may_not_survive_a_crash_is_an_unknown_outcome() {
+        let e = created_locally(rusthorse::vault::VaultError::NotDurable(
+            std::io::Error::other("injected"),
+        ));
+        assert!(
+            e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                .is_some()
+        );
+        let e = created_locally(rusthorse::vault::VaultError::Exists("/x".into()));
+        assert!(
+            e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_a_missing_or_refusing_socket_means_that_no_agent_runs() {
+        let io = |kind| anyhow::Error::new(std::io::Error::from(kind)).context("cannot reach");
+        assert!(agent_not_running(&io(std::io::ErrorKind::NotFound)));
+        assert!(agent_not_running(&io(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(!agent_not_running(&io(std::io::ErrorKind::TimedOut)));
+        assert!(!agent_not_running(&anyhow::anyhow!("an unexpected answer")));
+    }
 
     #[test]
     fn doctor_warns_when_nothing_locks_on_suspend_or_screen_lock() {

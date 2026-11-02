@@ -38,28 +38,19 @@ details.
 On Debian systems, the full text of the GNU General Public License version 3
 can be found in /usr/share/common-licenses/GPL-3."""
 
-# For a crate that ships no license file but is (also) under MIT: the MIT
-# text, with its authors as the copyright holders.
-MIT_TEXT = """\
-Copyright (c) {holders}
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE."""
+# Crates whose package ships no license file, checked by hand. A notice is
+# never made up from the `authors` field: either the crate's own license
+# file, fetched from the upstream revision it was published from, is kept in
+# packaging/licenses/, or the crate is shown to contain no code. Any other
+# crate without a license file stops the build.
+EXCEPTIONS = {
+    # Published from oconnor663/blake2_simd at 47714dc3 (.cargo_vcs_info.json);
+    # its LICENSE there.
+    ("blake2b_simd", "1.0.5"): "blake2b_simd-1.0.5.LICENSE",
+    # A deprecation stub: its src/lib.rs is a single doc comment, so nothing
+    # of it is compiled into the programs.
+    ("block-modes", "0.9.1"): None,
+}
 
 LICENSE_FILE = re.compile(r"(?i)^(licen[sc]e|copying|copyright|notice|unlicense)")
 
@@ -117,14 +108,17 @@ def license_texts(crate):
             texts.append((os.path.basename(name), normalized(f.read())))
     if texts:
         return texts
-    expression = crate.get("license") or ""
-    if re.search(r"\bMIT\b", expression):
-        holders = "the {} authors: {}".format(
-            crate["name"], ", ".join(crate.get("authors") or ["unnamed"]))
-        return [("(no license file in the crate; MIT text for its authors)",
-                 MIT_TEXT.format(holders=holders))]
-    sys.exit(f"copyright.py: {crate['name']} {crate['version']} ships no license file "
-             f"and its license ({expression or 'none'}) has no text here; add one")
+    key = (crate["name"], crate["version"])
+    if key in EXCEPTIONS:
+        kept = EXCEPTIONS[key]
+        if kept is None:
+            return [("(no license file; the crate contains no code)", "")]
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "licenses", kept),
+                  encoding="utf-8") as f:
+            return [(f"{kept}, its upstream license file", normalized(f.read()))]
+    sys.exit(f"copyright.py: {crate['name']} {crate['version']} ships no license file; "
+             f"find its license at the revision it was published from, keep it in "
+             f"packaging/licenses/ and list it in EXCEPTIONS")
 
 
 def notices(texts):
@@ -133,7 +127,11 @@ def notices(texts):
     for _, text in texts:
         for line in text.split("\n"):
             stripped = line.strip()
-            if re.match(r"(?i)^(copyright\b|\(c\)|©)", stripped) and "[yyyy]" not in stripped:
+            # Notices, not the sentences of license texts about them ("the
+            # copyright notice", "copyright owner", "[yyyy]").
+            if re.match(r"(?i)^(copyright\b|(\(c\)|©)\s*\d{4})", stripped) and not re.search(
+                r"(?i)\[|notice|license|owner|holder|permission", stripped
+            ):
                 if stripped not in found:
                     found.append(stripped)
     return found
@@ -154,6 +152,8 @@ def main():
         texts = license_texts(crate)
         listing.append((crate, notices(texts)))
         for name, text in texts:
+            if not text:
+                continue
             if text not in shippers:
                 shippers[text] = []
                 order.append(text)

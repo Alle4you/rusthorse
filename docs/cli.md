@@ -59,18 +59,25 @@ rusthorse init [--vault PATH]
 ```
 
 When the agent is running and serves that vault (the path `rusthorse status`
-shows — with the default settings, always), the agent creates it: it asks
+shows — with the default settings, always; paths are compared after
+resolving links, so `--vault ./vault.kdbx` in that directory is the same
+file), the agent creates it: it asks
 for the master password twice in its own dialogs, so that the password never
 enters the `rusthorse` process — which an AI agent may have started — and
 leaves the new vault unlocked. The manager's **Create vault…** does the same.
 
-Otherwise — no agent, or one that serves another vault — `init` creates the
+Otherwise — no agent runs, or one serves another vault — `init` creates the
 file itself and asks for the master password twice, in the terminal or, without
 a terminal, in dialogs: the only time the CLI itself handles a master
-password. Run it in your own terminal, not through an AI agent.
+password. Run it in your own terminal, not through an AI agent. When an
+agent's socket exists but the agent cannot be asked (it does not answer, or
+answers something else), `init` stops instead of asking for the password
+itself.
 
 Either way it fails if the file exists, and never replaces a file that
-appears while it works. Exits 4 when a dialog is cancelled or not answered.
+appears while it works. Exits 4 when a dialog is cancelled or not answered,
+124 when the file was written but its directory could not be synced (it may
+not survive a crash).
 New vaults use Argon2id with 64 MiB and 20 passes (about 0.7 s per unlock on
 a desktop CPU).
 
@@ -464,14 +471,21 @@ rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry
 ```
 
 Imports `NAME=value` lines (optional `export`, `#` comments, quoted values).
-`--prefix` is upper-cased and prepended to each name. Existing entries are
-skipped unless `--replace` is given. Entries are sent in batches of at most 50
-(fewer if the names are long), one approval each; a name that appears twice
-stops the import before anything is sent. If a batch fails, the summary says
-which batches were imported and whether the failed one was not imported (exit
-1, or 4 if denied) or may or may not have been (exit 124: check with
-`rusthorse list` before running the import again). `--dry-run` lists the names
-and whether each is new, exists or is not allowed, and imports nothing.
+The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):
+this command never holds a value. It first asks the agent for the names in
+the file — the agent asks you in a dialog before it shows them — then sends
+the names to import. `--prefix` is upper-cased and prepended to each name.
+Existing entries are skipped unless `--replace` is given. Entries are
+imported in batches of at most 24 lines of names, one approval each; the
+dialog says that the agent read the values from the file. A name that
+appears twice stops the import before anything is imported. If a batch
+fails, the summary says which batches were imported and whether the failed
+one was not imported (exit 1, or 4 if denied) or may or may not have been
+(exit 124: check with `rusthorse list` before running the import again).
+`--dry-run` lists the names and whether each is new, exists or is not
+allowed, and imports nothing.
+
+The file must be a regular file of at most 1 MiB, in UTF-8.
 
 ## `rusthorse import secret-service`
 
@@ -481,12 +495,16 @@ rusthorse import secret-service --attribute KEY=VALUE... [--name-from ATTR]
 ```
 
 Imports items from the freedesktop Secret Service (GNOME Keyring, KWallet)
-whose attributes match all `--attribute` filters. The entry name comes from
-the attribute named by `--name-from`, or from the item label. The desktop
-keyring may ask you to unlock it. Batches and `--dry-run` work as for
-`import dotenv`; a dry run reads only the items' attributes, never their
-secrets. See [installation.md](installation.md#migrating-existing-secrets)
-for a safe migration procedure.
+whose attributes match all `--attribute` filters. The agent lists the
+keyring's items — after asking you, since this command then sees their
+labels and attributes — and reads the chosen items' secrets itself: this
+command never holds a value. The entry name comes from the attribute named
+by `--name-from`, or from the item label. A locked item stops the import:
+unlock the keyring first. Batches and `--dry-run` work as for `import
+dotenv`; a dry run reads no secret. See
+[installation.md](installation.md#migrating-existing-secrets) for a safe
+migration procedure; the manager's **Import & backup** page does the same
+with a window to choose the items.
 
 Not available in builds without the default `secret-service` feature.
 

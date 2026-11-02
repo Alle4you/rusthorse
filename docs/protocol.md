@@ -14,7 +14,7 @@ Protocol version: **6** (`PROTOCOL_VERSION` in
 | 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`. |
 | 4 | `reveal.purpose` (`show`, `copy`): what the client says it will do with a revealed value, named in the approval dialog and the audit log. Unreleased builds that reported protocol 3 had this field with another meaning for `copy` (one paste, then cleared); clients of protocol 4 refuse those agents. |
 | 5 | The entry `kind` (see [Entry kinds](#entry-kinds)): in `NewEntry.fields`, `EntryInfo`, `EntryChanges.kind`, and `"kind"` in `EntryChanges.clear`. An agent of version 4 would silently drop it, so the version changed. |
-| 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. |
+| 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. Imports read by the agent: `keyring_items`, `dotenv_names`, `import_from` (see [Imports read by the agent](#imports-read-by-the-agent)). |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -113,6 +113,9 @@ Every request is an object with a `type` field.
 | `change_password` | — | `ok` |
 | `backup` | `path` (absolute, must not exist) | `ok` |
 | `run` | see [Run](#run) | `exited` |
+| `keyring_items` | — | `keyring_items` |
+| `dotenv_names` | `path` (absolute) | `names` |
+| `import_from` | `source` (see [Imports read by the agent](#imports-read-by-the-agent)), `tags` (array, optional), `replace` (bool, optional) | `ok` |
 
 Any request can also be answered with an [`error`](#errors).
 
@@ -135,8 +138,10 @@ approval. `change_password` makes the agent ask for the current and the new
 master password in its own dialogs.
 
 `create_vault` creates the vault file at the agent's vault path (the one
-`status` reports), which must not exist: if it does, the answer is
-`already_exists` and no dialog is shown. Otherwise the agent asks the human
+`status` reports, absolute), which must not exist: if it does, the answer is
+`already_exists` and no dialog is shown. While a vault is unlocked whose
+file is gone (moved or deleted), it is refused with `invalid_request`: lock
+first. Otherwise the agent asks the human
 for the new master password twice, in its own dialogs, so that it never
 passes through a client; at least 8 characters, and both must match
 (`invalid_request` otherwise, `cancelled` when a dialog is cancelled or not
@@ -147,6 +152,42 @@ and leaves the new vault unlocked — unless the vault was locked while the
 dialogs were open (by `lock`, a screen lock or a suspend),
 in which case it is created locked and the `ok` message says so. Requests
 are handled one at a time: of two, the second gets `already_exists`.
+
+### Imports read by the agent
+
+`import` carries the values: the client read them, and the dialog says that
+the requester supplied them. `import_from` carries only *where* the values
+are and the entry names; the agent reads the values itself, so no client
+holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-the-agent.md)).
+
+```json
+{"type": "keyring_items"}
+{"type": "dotenv_names", "path": "/home/me/app/.env"}
+{"type": "import_from", "source": {"keyring": {"items": [{"id": "/org/freedesktop/secrets/collection/login/7", "name": "OPENAI_API_KEY"}]}}, "tags": ["migrated"]}
+{"type": "import_from", "source": {"dotenv": {"path": "/home/me/app/.env", "prefix": "APP_", "names": ["APP_TOKEN"]}}}
+```
+
+- `keyring_items` answers `{"type": "keyring_items", "items": [...]}`: for
+  each item of GNOME Keyring (any freedesktop Secret Service), its `id` (the
+  D-Bus object path), `label`, `attributes` (object of strings) and `locked`.
+  No secret is read and nothing is unlocked. The agent asks the human first
+  — the requester learns the labels and attributes — and refuses a keyring
+  of more than 10 000 items.
+- `dotenv_names` answers `{"type": "names", "names": [...]}`: the variable
+  names of the file, in its order (a name can appear twice). The agent asks
+  the human first, then reads the file and drops the values.
+- `import_from` imports at most 100 entries, after one approval. Keyring
+  items are read by `id` and imported under `name`; a locked or unknown item,
+  or a secret that is not UTF-8 text, refuses the whole request. For a
+  `.env` file, `prefix` (upper-cased) is put before every variable name, and
+  each of `names` must appear exactly once in the file with the prefix.
+  Tags apply to every new entry; existing entries are skipped unless
+  `replace`.
+- A `.env` path must be absolute and name a regular file of at most 1 MiB,
+  in UTF-8. The agent opens it without waiting (a FIFO is refused, not
+  waited on) and reads it as the user it runs as.
+- Every call to the Secret Service is limited to 10 seconds. Without the
+  `secret-service` build feature, the keyring requests fail with `internal`.
 
 ### Reveal
 
@@ -261,6 +302,8 @@ All fields are optional; omitted fields are left unchanged.
 | `entries` | `entries`: array of [EntryInfo](#entryinfo), sorted by group and name |
 | `entry` | `entry`: [EntryInfo](#entryinfo) |
 | `secret` | `value` (string) |
+| `keyring_items` | `items`: array of `{id, label, attributes, locked}`, sorted by label |
+| `names` | `names`: array of strings |
 | `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome |
 | `error` | `code` (see [Errors](#errors)), `message` (string) |
 
@@ -366,8 +409,8 @@ a valid `Kind`; their values are not disclosed.
 changed and no command was started.** (The audit log may record the attempt,
 the vault may have been locked, and a `backup` whose copy does not verify
 leaves that copy, which the message names.) A client that sends a request
-with effects — `create_vault`, `add`, `import`, `edit`, `remove`,
-`change_password`, `backup`, `run` — and gets no answer, or one it cannot parse, must likewise
+with effects — `create_vault`, `add`, `import`, `import_from`, `edit`,
+`remove`, `change_password`, `backup`, `run` — and gets no answer, or one it cannot parse, must likewise
 treat the outcome as unknown.
 
 ## Compatibility
@@ -384,6 +427,7 @@ treat the outcome as unknown.
 `rusthorse-manager` uses the version-6 requests above, with the same
 approvals as the CLI. It targets entries by UUID, sends `reveal` with purpose
 `show` or `copy` for its Show and Copy actions, sends `create_vault` when
-there is no vault yet, and never sends a master password. See [ADR 0007](adr/0007-visual-manager.md); the configuration,
+there is no vault yet, imports with `keyring_items`, `dotenv_names` and
+`import_from`, and never sends a master password or a value it read. See [ADR 0007](adr/0007-visual-manager.md); the configuration,
 grant, history and restore requests it proposes for later milestones do not
 exist yet.

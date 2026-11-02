@@ -83,11 +83,12 @@ Breaking one of these is a security bug, whatever the tests say.
 
 1. **Only the agent handles secrets taken from the vault.** A client — the
    CLI or the manager — holds a secret only when the user supplies one —
-   `init` without an agent (the new master password), `add --stdin`,
-   `import` (values read from a `.env` file or the Secret Service, sent to
-   the agent) — or asked for one: `reveal`, after approval (the manager's
-   Show and Copy are reveals). The manager's forms carry metadata only: they never ask for a
-   master password or a value.
+   `init` without an agent (the new master password), `add --stdin` — or
+   asked for one: `reveal`, after approval (the manager's Show and Copy are
+   reveals). Imports are read by the agent (`import_from`, ADR 0012): the
+   CLI and the manager send names, never values; the `import` request, which
+   carries values, is left for other clients. The manager's forms carry
+   metadata only: they never ask for a master password or a value.
 2. **Never** log, audit or put in an error message a secret value, the master
    password or notes. A value leaves a client only where the human asked for
    it: printed by `reveal`, shown in the manager's Show window, or put on the
@@ -202,6 +203,8 @@ present and capture only its window, in a dark and a light theme
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/session_lock.rs` | Locking on suspend and screen lock (D-Bus watchers, ADR 0009) |
+| `src/keyring.rs`, `src/import.rs` | Imports the agent reads: GNOME Keyring (and a fake one for tests), `.env` parsing, batches (ADR 0012) |
+| `manager/src/import_window.rs` | The manager's import windows |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
 | `tests/agent.rs` | End-to-end tests |

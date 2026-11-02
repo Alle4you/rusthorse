@@ -67,10 +67,10 @@ And check the following by hand:
 
 - Secrets taken from the vault are only ever handled by the agent. A client
   — the CLI or the manager — holds a secret only when the user supplies one
-  — `init` without an agent (the new master password), `add --stdin`,
-  `import` (values read from a `.env` file or the Secret Service, sent to the
-  agent) — or asked for one: `reveal`, after approval (the manager's Show and
-  Copy are reveals).
+  — `init` without an agent (the new master password), `add --stdin` — or
+  asked for one: `reveal`, after approval (the manager's Show and Copy are
+  reveals). Imports are read by the agent (`import_from`): the CLI and the
+  manager send names, never values.
   The manager's forms carry metadata only and approve nothing.
 - Never log, include in error messages or put in the audit log a secret
   value, a master password or notes. A value leaves a client only where the

@@ -64,8 +64,12 @@ Build a Debian package with [cargo-deb](https://github.com/kornelski/cargo-deb)
    require their notices to go with the binaries.
    `packaging/copyright.py` lists each crate that Cargo.lock resolves for
    the three programs — version, license, source and copyright notices —
-   followed by the license texts the crates ship, each text once; it fails
-   on a crate with no license text it can give. The installed documentation
+   followed by the license texts the crates ship, each text once. A crate
+   whose package ships no license file is listed in the script's exceptions,
+   checked by hand: its license file from the upstream revision it was
+   published from is kept in `packaging/licenses/`, or the crate is shown to
+   contain no code. A notice is never made up from the `authors` field, and
+   any other such crate stops the build. The installed documentation
    is copied by `packaging/docs.py`, which points links to files the package
    does not install (the source code) to GitHub at the revision built, and
    fails on any link that leads nowhere. A Debian changelog

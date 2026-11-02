@@ -11,6 +11,17 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **Import from the manager** ([ADR 0012](docs/adr/0012-import-read-by-the-agent.md)):
+  **Import & backup → From GNOME Keyring…** and **From a .env file…** list
+  the items or names (after the agent asks you), mark each name new,
+  existing, not allowed, repeated or locked, and import the ticked ones in
+  batches.
+- **Imports are read by the agent**: new requests `keyring_items`,
+  `dotenv_names` and `import_from`. The client names keyring items or
+  variables and the entry names; the agent reads the values, and its dialog
+  says from where. `rusthorse import dotenv` and `import secret-service` use
+  them, so they no longer hold values; listing the keyring or a file's names
+  now asks for approval.
 - **First start from the manager**
   ([ADR 0011](docs/adr/0011-first-start-from-the-manager.md)): with no
   vault, the window offers **Create vault…**; with no agent running, **Start
@@ -110,6 +121,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- The manager keeps showing what a change reported (for example a warning
+  of `passwd`) after the status check that follows it; before, that check
+  erased the message at once.
 - Creating a vault never replaces a file that appeared meanwhile (another
   `init` or agent): the file is linked into place instead of renamed.
 - The service file (`contrib/systemd/rusthorse-agent.service`) lets systemd

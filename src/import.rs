@@ -1,11 +1,37 @@
-//! Reading secrets from other places, for `rusthorse import`.
-//!
-//! Importers only *read*. The entries they produce are sent to the agent as a
-//! single [`Request::Import`](crate::protocol::Request::Import), which the
-//! human approves as a batch.
+//! Parsing `.env` files for imports. The agent reads the files itself
+//! ([`Request::ImportFrom`](crate::protocol::Request::ImportFrom)); GNOME
+//! Keyring is read by [`keyring`](crate::keyring).
 
 use crate::protocol::SecretString;
 use crate::util::is_valid_env_name;
+
+/// Most entries sent to the agent in one batch (each batch is one approval).
+pub const BATCH: usize = 50;
+/// Most lines the entry names of one batch may take in the approval dialog,
+/// counting each name as if it started a line, so that the dialog lists all
+/// of them and still fits on the screen (see `ui::approval_height`).
+pub const BATCH_LINES: usize = 24;
+
+/// How many of `names`, in order, go into each batch of an import: at most
+/// [`BATCH`] names, and at most [`BATCH_LINES`] lines of them in the dialog.
+pub fn batch_sizes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut lines = 0;
+    for name in names {
+        let cost = crate::ui::mono_lines(&format!("{name}, "));
+        match sizes.last_mut() {
+            Some(size) if *size < BATCH && lines + cost <= BATCH_LINES => {
+                lines += cost;
+                *size += 1;
+            }
+            _ => {
+                lines = cost;
+                sizes.push(1);
+            }
+        }
+    }
+    sizes
+}
 
 /// Parse a `.env` file: `NAME=value` lines, optional `export ` prefix,
 /// `#` comments, and matching single or double quotes around the value.
@@ -37,92 +63,23 @@ pub fn parse_dotenv(text: &str) -> Vec<(String, SecretString)> {
     pairs
 }
 
-/// Names of the Secret Service items matching `attributes`, without reading
-/// any secret (attributes are not secret, so locked items need no unlock).
-#[cfg(feature = "secret-service")]
-pub fn list_secret_service(
-    attributes: &[(String, String)],
-    name_from: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    use anyhow::Context;
-    use secret_service::EncryptionType;
-    use secret_service::blocking::SecretService;
-    use std::collections::HashMap;
-
-    let service = SecretService::connect(EncryptionType::Dh)
-        .context("cannot connect to the Secret Service (is GNOME Keyring or KWallet running?)")?;
-    let filter: HashMap<&str, &str> = attributes
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let found = service
-        .search_items(filter)
-        .context("Secret Service search failed")?;
-    let mut names = Vec::new();
-    for item in found.unlocked.iter().chain(found.locked.iter()) {
-        let name = match name_from {
-            Some(attr) => item
-                .get_attributes()?
-                .get(attr)
-                .cloned()
-                .with_context(|| format!("an item has no {attr:?} attribute"))?,
-            None => item.get_label()?,
-        };
-        names.push(name);
-    }
-    names.sort();
-    Ok(names)
-}
-
-/// Read items from the freedesktop Secret Service (GNOME Keyring, KWallet, …)
-/// whose attributes match all of `attributes`. Each item's name comes from the
-/// attribute `name_from`, or from its label when `name_from` is `None`.
-#[cfg(feature = "secret-service")]
-pub fn read_secret_service(
-    attributes: &[(String, String)],
-    name_from: Option<&str>,
-) -> anyhow::Result<Vec<(String, SecretString)>> {
-    use anyhow::Context;
-    use secret_service::EncryptionType;
-    use secret_service::blocking::SecretService;
-    use std::collections::HashMap;
-
-    let service = SecretService::connect(EncryptionType::Dh)
-        .context("cannot connect to the Secret Service (is GNOME Keyring or KWallet running?)")?;
-    let filter: HashMap<&str, &str> = attributes
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let found = service
-        .search_items(filter)
-        .context("Secret Service search failed")?;
-    let mut out = Vec::new();
-    for item in found.unlocked.iter().chain(found.locked.iter()) {
-        item.ensure_unlocked()
-            .context("an item is locked and unlocking was refused")?;
-        let name = match name_from {
-            Some(attr) => item
-                .get_attributes()?
-                .get(attr)
-                .cloned()
-                .with_context(|| format!("an item has no {attr:?} attribute"))?,
-            None => item.get_label()?,
-        };
-        let bytes = item.get_secret()?;
-        let value = String::from_utf8(bytes).map_err(|e| {
-            let mut bytes = e.into_bytes();
-            zeroize::Zeroize::zeroize(&mut bytes);
-            anyhow::anyhow!("the secret of {name:?} is not UTF-8 text")
-        })?;
-        out.push((name, SecretString::new(value)));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batches_hold_at_most_twenty_four_lines_of_names() {
+        assert!(batch_sizes([]).is_empty());
+        // Each name counts as a line of its own.
+        let short: Vec<String> = (0..60).map(|i| format!("K{i}")).collect();
+        assert_eq!(batch_sizes(short.iter().map(String::as_str)), [24, 24, 12]);
+        let long: Vec<String> = (0..30)
+            .map(|i| format!("{}{i:03}", "X".repeat(70)))
+            .collect();
+        let sizes = batch_sizes(long.iter().map(String::as_str));
+        assert_eq!(sizes.iter().sum::<usize>(), 30);
+        assert!(sizes.len() > 1, "{sizes:?}");
+    }
 
     #[test]
     fn dotenv_parsing() {

@@ -18,6 +18,8 @@ nix = { version = "0.31.3", features = ["socket", "fs"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"
+# The widget tests serve a fake GNOME Keyring on their private session bus.
+rusthorse = { path = "..", default-features = false, features = ["fake-keyring"] }
 tempfile = "3.27.0"
 
 [lints.rust]

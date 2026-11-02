@@ -97,7 +97,10 @@ you will see `[REDACTED:OPENAI_API_KEY]` instead.
 
 ## 5. Bring your existing secrets
 
-From a `.env` file:
+In the manager: **Import & backup → From GNOME Keyring…** or **From a .env
+file…**, tick what to import ([manager guide](manager.md#import-from-gnome-keyring-or-a-env-file)).
+Or in a terminal — either way the agent reads the values itself, after
+asking you. From a `.env` file:
 
 ```sh
 rusthorse import dotenv ~/project/.env --prefix MYAPP_ --tag myapp
@@ -110,7 +113,9 @@ From GNOME Keyring or KWallet, by attribute (see
 rusthorse import secret-service -a service=myapp --name-from key
 ```
 
-Then tell your AI agent how to use them — paste the snippet from
+Once each entry works, delete the originals: while they stay in the keyring
+or the file, any program of your session can still read them there. Then
+tell your AI agent how to use them — paste the snippet from
 [ai-agents.md](ai-agents.md#setting-up-an-agent) into its `CLAUDE.md` or
 `AGENTS.md`.
 

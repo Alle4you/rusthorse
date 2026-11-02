@@ -221,6 +221,8 @@ fn validate(request: &Request, response: Response) -> Result<Response, Failure> 
         Request::List => "entries",
         Request::Show { .. } => "entry",
         Request::Reveal { .. } => "secret",
+        Request::KeyringItems => "keyring_items",
+        Request::DotenvNames { .. } => "names",
         _ => "ok",
     };
     if response.kind() != expected {

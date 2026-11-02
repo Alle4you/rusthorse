@@ -20,12 +20,15 @@ default-members = ["."]
 
 [features]
 default = ["secret-service", "session-lock"]
-# `rusthorse import secret-service`: read items from GNOME Keyring / KWallet
-# (any freedesktop Secret Service provider) over D-Bus.
-secret-service = ["dep:secret-service"]
+# Imports from GNOME Keyring / KWallet (any freedesktop Secret Service
+# provider), which the agent reads over D-Bus (ADR 0012).
+secret-service = ["dep:secret-service", "dep:zbus"]
 # The agent locks the vault when the screen locks or the computer suspends,
 # told by logind and the screensavers over D-Bus (ADR 0009).
 session-lock = ["dep:zbus"]
+# For tests only, never in a release: a fake Secret Service
+# (`keyring::fake`) that tests serve on a private bus.
+fake-keyring = ["secret-service"]
 
 [dependencies]
 anyhow = "1.0.104"

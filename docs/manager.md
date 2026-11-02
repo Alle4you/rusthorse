@@ -21,7 +21,8 @@ awaiting an independent review: try it with fake entries first.
 | Create, edit, rename and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
-| The command that gives a value to a program (`rusthorse run`) | Import from `.env` or GNOME Keyring, restore a backup, a safe hand-off to KeePassXC (M3) |
+| The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
+| Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
 
 Pages for the later features are in the window already; they say what is
@@ -81,7 +82,7 @@ What the window shows depends on what is missing
   starts only at your next login. **Start agent** asks systemd to start the
   service (`systemctl --user start rusthorse-agent.service`), so the agent
   runs outside the manager, as at login. If systemctl fails, the window
-  shows why; a source installation needs the service file of the
+  shows why (one that has not finished after 30 seconds is stopped); a source installation needs the service file of the
   [installation guide](installation.md#2-run-the-agent-as-a-systemd-user-service).
 - **No vault**, and "Create your vault" with the file's path: **Create
   vault…** makes the agent ask you, in its own dialog, to choose the master
@@ -235,6 +236,32 @@ cleared it after 20 seconds, but Cinnamon takes every copy at once (so the
 single paste was always the desktop's) and restores it later anyway; and a
 user who cannot copy a long key will photograph it, which is worse. See
 [ADR 0007](adr/0007-visual-manager.md#copy).
+
+### Import from GNOME Keyring or a .env file
+
+**Import & backup → From GNOME Keyring…** or **From a .env file…** (with the
+vault unlocked, so that the window can tell which names exist). The agent
+asks you before it shows this window the keyring's items or the file's
+names; the window then lists them, with what each would become:
+
+- **GNOME Keyring**: each item's label and attributes, never its secret.
+  **Names from** chooses where the entry names come from — the label or an
+  attribute (for items of a tool that names them by attribute, choose that
+  attribute). Type in **Filter** to show some items only, **Tick shown** to
+  tick them. A locked item cannot be ticked: unlock the keyring first.
+- **A .env file**: the variable names, and an optional **Prefix**.
+- For both: a **Tag** for the new entries (`imported` unless you change it),
+  and **Replace entries that already exist** (off: they are skipped). Each
+  ticked name is marked new, existing, not allowed or repeated; **Import**
+  stays off while a ticked one cannot be imported.
+
+**Import N** sends the names in batches, one dialog each: the agent reads
+the values itself — from the keyring or the file — and its dialog says
+where. The window never holds a value. When a batch fails, the message says
+which batches were imported and whether that one was not imported or may
+have been (look at the entries before importing again). Follow the
+[migration steps](installation.md#migrating-existing-secrets): one item
+first, use each entry, then delete the originals.
 
 ### Back up the vault
 

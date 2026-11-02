@@ -32,7 +32,8 @@ use zeroize::Zeroizing;
 /// 5: the entry `kind` (in entries, `edit.kind`, and `kind` in
 /// `edit.clear`). A version-4 agent would drop it without a word.
 ///
-/// 6: `create_vault`, and `already_exists` also for the vault file.
+/// 6: `create_vault`, and `already_exists` also for the vault file;
+/// `keyring_items`, `dotenv_names` and `import_from`.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
@@ -166,6 +167,74 @@ pub enum Request {
     },
     /// Run a command with secrets in its environment (requires approval).
     Run(RunRequest),
+    /// The metadata of the items of GNOME Keyring (any Secret Service), to
+    /// choose what to import (requires approval: the requester learns their
+    /// labels and attributes). No secret is read.
+    KeyringItems,
+    /// The names of the variables in a `.env` file, to choose what to import
+    /// (requires approval: the requester learns them). The agent reads the
+    /// file and drops the values at once.
+    DotenvNames {
+        /// Absolute path of the file.
+        path: String,
+    },
+    /// Import secrets that the agent reads itself, from GNOME Keyring or a
+    /// `.env` file (requires approval). The values never pass through the
+    /// client.
+    ImportFrom {
+        /// Where the values are, and the names to give them.
+        source: ImportSource,
+        /// Tags of every new entry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        /// Overwrite existing entries with the same names.
+        #[serde(default)]
+        replace: bool,
+    },
+}
+
+/// Where [`Request::ImportFrom`] reads the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSource {
+    /// Items of GNOME Keyring (any Secret Service).
+    Keyring {
+        /// The items, and the entry name for each.
+        items: Vec<KeyringPick>,
+    },
+    /// Lines of a `.env` file.
+    Dotenv {
+        /// Absolute path of the file.
+        path: String,
+        /// Prepended (upper-cased) to each variable's name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+        /// The entries to import: variable names with the prefix.
+        names: Vec<String>,
+    },
+}
+
+/// One keyring item to import, and the entry name to give it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyringPick {
+    /// The item's D-Bus object path ([`KeyringItem::id`]).
+    pub id: String,
+    /// The entry name.
+    pub name: String,
+}
+
+/// An item of GNOME Keyring (any Secret Service): its metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyringItem {
+    /// The item's D-Bus object path.
+    pub id: String,
+    /// Its label (what Passwords and Keys shows).
+    pub label: String,
+    /// Its attributes (the keys that programs look it up by).
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// Whether it is locked: its secret cannot be read until the keyring is
+    /// unlocked.
+    pub locked: bool,
 }
 
 /// What a client says it will do with a revealed value
@@ -200,7 +269,9 @@ impl Request {
             | Request::ChangePassword
             | Request::CreateVault
             | Request::Backup { .. }
+            | Request::ImportFrom { .. }
             | Request::Run(_) => true,
+            Request::KeyringItems | Request::DotenvNames { .. } => false,
         }
     }
 }
@@ -501,6 +572,16 @@ pub enum Response {
         /// The secret value.
         value: SecretString,
     },
+    /// Answer to [`Request::KeyringItems`].
+    KeyringItems {
+        /// The items, sorted by label.
+        items: Vec<KeyringItem>,
+    },
+    /// Answer to [`Request::DotenvNames`].
+    Names {
+        /// The variable names, in the file's order.
+        names: Vec<String>,
+    },
     /// The command started by [`Request::Run`] finished.
     Exited {
         /// Exit code, when the command exited normally.
@@ -527,6 +608,8 @@ impl Response {
             Response::Entries { .. } => "entries",
             Response::Entry { .. } => "entry",
             Response::Secret { .. } => "secret",
+            Response::KeyringItems { .. } => "keyring_items",
+            Response::Names { .. } => "names",
             Response::Exited { .. } => "exited",
             Response::Error { .. } => "error",
         }

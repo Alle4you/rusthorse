@@ -41,6 +41,7 @@ impl Ui for Scripted {
     }
 }
 
+#[track_caller]
 fn spin_until(check: impl Fn() -> bool) {
     let until = Instant::now() + Duration::from_secs(10);
     while !check() {
@@ -52,6 +53,7 @@ fn spin_until(check: impl Fn() -> bool) {
     }
 }
 
+#[track_caller]
 fn settle(s: &Rc<Manager>) {
     spin_until(|| s.job.borrow().is_none());
 }
@@ -212,8 +214,8 @@ fn snapshot_window(window: &impl IsA<gtk::Window>, name: &str) {
 /// and D-Bus session with an empty environment; returns true in that child,
 /// where the test itself runs. `systemctl` on the child's `PATH` is a
 /// stand-in that only records its arguments in `$HOME/systemctl.calls` (and
-/// fails while `$HOME/systemctl.fails` exists): no test starts a real
-/// service.
+/// fails while `$HOME/systemctl.fails` exists, hangs while
+/// `$HOME/systemctl.hangs` does): no test starts a real service.
 fn on_xvfb(name: &str) -> bool {
     if std::env::var_os("RUSTHORSE_MANAGER_XVFB_CHILD").is_some() {
         return true;
@@ -230,6 +232,7 @@ fn on_xvfb(name: &str) -> bool {
         bin.join("systemctl"),
         "#!/bin/sh\n\
          echo \"$*\" >> \"$HOME/systemctl.calls\"\n\
+         [ -e \"$HOME/systemctl.hangs\" ] && exec sleep 30\n\
          if [ -e \"$HOME/systemctl.fails\" ]; then\n\
          echo 'Failed to start rusthorse-agent.service: Unit rusthorse-agent.service not found.' >&2\n\
          exit 5\n\
@@ -326,6 +329,7 @@ fn desktop_flow() {
             send_buffer: None,
             session_lock: Default::default(),
             new_vault_kdf: rusthorse::vault::KdfParams::INSECURE_FOR_TESTS,
+            keyring: Default::default(),
         },
         Box::new(Scripted(
             Arc::clone(&allowed),
@@ -903,13 +907,20 @@ fn first_start() {
     );
     assert!(s.message.has_css_class("error"));
     std::fs::remove_file(home.join("systemctl.fails")).unwrap();
+    // systemctl hangs: it is stopped after the deadline (2 s in tests).
+    std::fs::write(home.join("systemctl.hangs"), "").unwrap();
+    s.lock.emit_clicked();
+    spin_until(|| !s.starting.get());
+    assert!(
+        s.message.text().contains("did not finish"),
+        "{}",
+        s.message.text()
+    );
+    std::fs::remove_file(home.join("systemctl.hangs")).unwrap();
     // It works: the agent is asked of systemd, never started by the window.
     s.lock.emit_clicked();
     spin_until(|| !s.starting.get());
-    assert_eq!(
-        calls(),
-        "--user start rusthorse-agent.service\n--user start rusthorse-agent.service\n"
-    );
+    assert_eq!(calls(), "--user start rusthorse-agent.service\n".repeat(3));
     // The stand-in starts nothing; this test's agent stands in for the one
     // systemd would start.
     let agent = Agent::new(
@@ -922,6 +933,7 @@ fn first_start() {
             send_buffer: None,
             session_lock: Default::default(),
             new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+            keyring: Default::default(),
         },
         Box::new(Scripted(
             Arc::new(AtomicBool::new(true)),
@@ -959,10 +971,255 @@ fn first_start() {
     spin_until(|| s.pill.text() == "Unlocked");
     assert!(vault.exists());
     assert!(s.entries.borrow().is_empty());
+    // What the agent reported stays after the refresh that follows.
+    settle(&s);
+    assert!(
+        s.message.text().contains("vault created at"),
+        "{}",
+        s.message.text()
+    );
     assert_eq!(s.lock.label().as_deref(), Some("Lock now"));
     assert_ne!(
         first_step(&s).map(|(title, _)| title).as_deref(),
         Some("Create your vault")
     );
+    s.window.close();
+}
+
+/// Importing from a fake GNOME Keyring, served on this test's private
+/// session bus, and from a `.env` file: the window sees names only, the
+/// agent reads the values.
+#[test]
+fn import_windows() {
+    if !on_xvfb("import_windows") {
+        return;
+    }
+    use rusthorse::keyring::fake::{self, Item};
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let segredo = |name: &str, value: &str| {
+        Item::new(
+            &format!("segredo: {name}"),
+            &[("aplicacao", "segredo"), ("nome", name)],
+            value,
+        )
+    };
+    let mut locked = segredo("FAKE_LOCKED", "fake-locked");
+    locked.locked = true;
+    let _keyring = fake::serve(
+        None,
+        vec![
+            segredo("FAKE_A", "fake-a-value"),
+            segredo("FAKE_B", "fake-b-value"),
+            locked,
+            Item::new("another program", &[("application", "other")], "not-this"),
+        ],
+    )
+    .expect("the fake keyring on the private session bus");
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("import.kdbx");
+    Vault::create(
+        &vault,
+        "fake master password".to_string().into(),
+        KdfParams::INSECURE_FOR_TESTS,
+    )
+    .unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let allowed = Arc::new(AtomicBool::new(true));
+    let agent = Agent::new(
+        AgentConfig {
+            vault: vault.clone(),
+            socket: socket.clone(),
+            audit_log: dir.path().join("import.jsonl"),
+            idle_timeout: Duration::ZERO,
+            request_timeout: Duration::from_secs(5),
+            send_buffer: None,
+            session_lock: Default::default(),
+            new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+            keyring: rusthorse::keyring::Settings {
+                address: None,
+                plain: true,
+            },
+        },
+        Box::new(Scripted(
+            Arc::clone(&allowed),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&approvals),
+        )),
+    );
+    let listener = Agent::bind(&socket).unwrap();
+    // This thread exists only in this test's subprocess; no daemon outlives it.
+    std::thread::spawn(move || {
+        agent.serve(listener).unwrap();
+    });
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket.clone());
+    s.window.present();
+    s.refresh();
+    settle(&s);
+
+    // Locked: the window asks to unlock first, and asks the agent nothing.
+    button(&s.window, "From GNOME Keyring…").emit_clicked();
+    assert!(s.message.text().contains("Unlock the vault first"));
+    assert!(s.job.borrow().is_none());
+    button(&s.window, "Unlock").emit_clicked();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Unlocked");
+
+    // The agent asks before listing (approved here), then the window opens.
+    button(&s.window, "From GNOME Keyring…").emit_clicked();
+    settle(&s);
+    assert_eq!(approvals.load(Ordering::SeqCst), 1);
+    let picker = s.editor.borrow().as_ref().unwrap().clone();
+    let shown = |root: &adw::Window| -> String {
+        descendants(root)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        !shown(&picker).contains("fake-a-value"),
+        "a value in the window"
+    );
+    // Names from the attribute "nome"; only the segredo items, ticked.
+    let from = descendants(&picker)
+        .into_iter()
+        .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+        .expect("names from");
+    let labels: Vec<String> = (0..from.model().unwrap().n_items())
+        .map(|i| {
+            from.model()
+                .unwrap()
+                .item(i)
+                .and_downcast::<gtk::StringObject>()
+                .unwrap()
+                .string()
+                .to_string()
+        })
+        .collect();
+    let nome = labels
+        .iter()
+        .position(|l| l == "Attribute nome")
+        .expect("nome");
+    from.set_selected(nome as u32);
+    // (The drop-down has a search entry of its own.)
+    let search = descendants(&picker)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::SearchEntry>().ok())
+        .find(|e| e.placeholder_text().as_deref() == Some("Filter"))
+        .expect("filter");
+    search.set_text("segredo");
+    spin_until(|| {
+        descendants(&picker)
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+            .any(|r| r.title() == "another program" && !r.is_visible())
+    });
+    button(&picker, "Tick shown").emit_clicked();
+    // Names from an attribute they share: repeated, so Import stays off.
+    let aplicacao = labels
+        .iter()
+        .position(|l| l == "Attribute aplicacao")
+        .expect("aplicacao");
+    from.set_selected(aplicacao as u32);
+    let text = shown(&picker);
+    assert!(text.contains("segredo — repeated"), "{text}");
+    assert!(text.contains("cannot be imported as they are"), "{text}");
+    assert!(!button(&picker, "Import 2").is_sensitive());
+    from.set_selected(nome as u32);
+    let text = shown(&picker);
+    assert!(text.contains("FAKE_A — new"), "{text}");
+    assert!(text.contains("locked"), "{text}");
+    assert!(text.contains("2 ticked: 2 new, 0 existing."), "{text}");
+    let locked_check = descendants(&picker)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+        .find(|r| r.title() == "segredo: FAKE_LOCKED")
+        .and_then(|r| {
+            descendants(&r)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::CheckButton>().ok())
+        })
+        .expect("the locked item's box");
+    assert!(!locked_check.is_sensitive() && !locked_check.is_active());
+    button(&picker, "Import 2").emit_clicked();
+    settle(&s);
+    spin_until(|| {
+        let names: Vec<String> = s.entries.borrow().iter().map(|e| e.name.clone()).collect();
+        names.contains(&"FAKE_A".to_string()) && names.contains(&"FAKE_B".to_string())
+    });
+    assert!(
+        s.message.text().starts_with("Imported."),
+        "{}",
+        s.message.text()
+    );
+    assert_eq!(approvals.load(Ordering::SeqCst), 2);
+
+    // A .env file: the agent asks before showing the names; a prefix.
+    let env = dir.path().join("app.env");
+    std::fs::write(&env, "FAKE_C=fake-c-value\n").unwrap();
+    let path = env.display().to_string();
+    s.submit(
+        Request::DotenvNames { path: path.clone() },
+        Pending::DotenvNames { path },
+    );
+    settle(&s);
+    assert_eq!(approvals.load(Ordering::SeqCst), 3);
+    let picker = s.editor.borrow().as_ref().unwrap().clone();
+    let prefix = entry_rows(&picker)
+        .into_iter()
+        .find(|r| r.title().starts_with("Prefix"))
+        .expect("prefix");
+    prefix.set_text("app_");
+    button(&picker, "Tick shown").emit_clicked();
+    assert!(shown(&picker).contains("APP_FAKE_C — new"));
+    // Denied: the message says that nothing was imported.
+    allowed.store(false, Ordering::SeqCst);
+    button(&picker, "Import 1").emit_clicked();
+    settle(&s);
+    let message = s.message.text();
+    assert!(message.contains("Stopped at batch 1 of 1"), "{message}");
+    assert!(
+        message.contains("no batch before it was imported"),
+        "{message}"
+    );
+    assert!(!s.entries.borrow().iter().any(|e| e.name == "APP_FAKE_C"));
+    // Again, allowed.
+    allowed.store(true, Ordering::SeqCst);
+    let path = env.display().to_string();
+    s.submit(
+        Request::DotenvNames { path: path.clone() },
+        Pending::DotenvNames { path },
+    );
+    settle(&s);
+    let picker = s.editor.borrow().as_ref().unwrap().clone();
+    entry_rows(&picker)
+        .into_iter()
+        .find(|r| r.title().starts_with("Prefix"))
+        .expect("prefix")
+        .set_text("app_");
+    button(&picker, "Tick shown").emit_clicked();
+    button(&picker, "Import 1").emit_clicked();
+    settle(&s);
+    spin_until(|| s.entries.borrow().iter().any(|e| e.name == "APP_FAKE_C"));
+
+    // The values are in the vault file, read by the agent.
+    let file = Vault::open(&vault, "fake master password".to_string().into()).unwrap();
+    for (name, value) in [
+        ("FAKE_A", "fake-a-value"),
+        ("FAKE_B", "fake-b-value"),
+        ("APP_FAKE_C", "fake-c-value"),
+    ] {
+        let id = file.find(name).unwrap();
+        assert_eq!(file.secret(id).unwrap().as_str(), value);
+    }
+    assert!(file.find("FAKE_LOCKED").is_err());
     s.window.close();
 }
