@@ -123,9 +123,9 @@ fn named_row(root: &impl IsA<gtk::Widget>, name: &str) -> adw::ActionRow {
         .unwrap_or_else(|| panic!("no row {name}"))
 }
 
-/// The value choices of an entry form: each row's title and its check
-/// button.
-fn value_choices(root: &impl IsA<gtk::Widget>) -> Vec<(String, gtk::CheckButton)> {
+/// The value choices of an entry form: each row's title, its check button
+/// and the row.
+fn value_choices(root: &impl IsA<gtk::Widget>) -> Vec<(String, gtk::CheckButton, adw::ActionRow)> {
     descendants(root)
         .into_iter()
         .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
@@ -134,7 +134,7 @@ fn value_choices(root: &impl IsA<gtk::Widget>) -> Vec<(String, gtk::CheckButton)
             let check = descendants(&r)
                 .into_iter()
                 .find_map(|w| w.downcast::<gtk::CheckButton>().ok())?;
-            Some((r.title().to_string(), check))
+            Some((r.title().to_string(), check, r))
         })
         .collect()
 }
@@ -205,6 +205,15 @@ fn focus(name: &str) {
         let pause = Instant::now() + Duration::from_millis(100);
         spin_until(|| Instant::now() >= pause);
     }
+}
+
+/// Press `key` in the window that has the X11 input focus, as a person
+/// would: through the server, so that GTK's own key handling runs.
+fn press(key: &str) {
+    assert!(
+        x11(&["/usr/bin/xdotool", "key", key]).0,
+        "xdotool key {key}"
+    );
 }
 
 /// What another program gets when it pastes; `None` when it gets nothing
@@ -402,7 +411,7 @@ fn desktop_flow() {
     assert_eq!(inputs[0].title(), "Name");
     // How the value is made: every choice in view, typing it chosen.
     let choices = value_choices(&editor);
-    let titles: Vec<_> = choices.iter().map(|(t, _)| t.as_str()).collect();
+    let titles: Vec<_> = choices.iter().map(|(t, ..)| t.as_str()).collect();
     assert_eq!(titles, ["Type the value", "Generate a random value"]);
     assert!(choices[0].1.is_active() && !choices[1].1.is_active());
     inputs[0].set_text("FAKE_DESKTOP_KEY");
@@ -832,7 +841,7 @@ fn desktop_flow() {
     inputs[0].set_text("RENAMED_FAKE");
     // The value: kept unless another choice is made, one choice at a time.
     let choices = value_choices(&editor);
-    let titles: Vec<_> = choices.iter().map(|(t, _)| t.as_str()).collect();
+    let titles: Vec<_> = choices.iter().map(|(t, ..)| t.as_str()).collect();
     assert_eq!(
         titles,
         [
@@ -842,10 +851,15 @@ fn desktop_flow() {
         ]
     );
     assert!(choices[0].1.is_active());
-    choices[1].1.set_active(true);
-    assert!(!choices[0].1.is_active() && !choices[2].1.is_active());
-    choices[2].1.set_active(true);
-    assert!(!choices[1].1.is_active());
+    // Chosen with the keyboard, as a person would: the row takes the key.
+    focus("^Edit entry$");
+    for (i, key) in [(1, "space"), (2, "Return")] {
+        choices[i].2.grab_focus();
+        press(key);
+        spin_until(|| choices[i].1.is_active());
+        let others = (0..3).filter(|j| *j != i);
+        assert!(others.into_iter().all(|j| !choices[j].1.is_active()), "{i}");
+    }
     drop(choices);
     button(&editor, "Send to agent…").emit_clicked();
     settle(&s);
@@ -862,7 +876,11 @@ fn desktop_flow() {
     // form, and no approval before it.
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     let asked = approvals.load(Ordering::SeqCst);
-    ActionRowExt::activate(&named_row(&s.detail, "change-value"));
+    // With the keyboard, as a person would.
+    focus("^Rusthorse$");
+    named_row(&s.detail, "change-value").grab_focus();
+    press("Return");
+    spin_until(|| s.job.borrow().is_some());
     settle(&s);
     assert_eq!(approvals.load(Ordering::SeqCst), asked);
     assert!(s.message.text().contains("updated"), "{}", s.message.text());

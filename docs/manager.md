@@ -168,8 +168,10 @@ shown value is hidden.
 Emptying a field removes it. Renaming keeps the entry's UUID and its KeePass
 history. A field the file marks as *protected* is withheld from the manager
 and cannot be edited here. The form's **Value** rows keep the current value
-unless you choose **Type a new value** or **Generate a random value**, which
-change it in the same approval. **Delete** removes the entry and its
+unless you choose **Type a new value** or **Generate a random value**. With
+other changes, the agent asks for your approval of all of them first, then,
+for a typed value, for the value; **Type a new value** alone opens the
+agent's dialog for the value at once, like **Change the value…**. **Delete** removes the entry and its
 history from the vault — it does not revoke the credential at its provider.
 
 ### Give a secret to a program

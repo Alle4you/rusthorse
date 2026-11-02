@@ -1405,3 +1405,23 @@ redirection (`'2'>/dev/null`) for a descriptor, which the shell passes as an
 argument — a quoted word now stays an argument (checked against the mistake,
 2 of 2); and the guide said that 125 and 124 come with a message, which
 holds only when standard error can be written — it now says so.
+
+**Change the value from the manager (2026-11-02).** At the maintainer's
+request: changing a value was hidden in **Edit**, behind a drop-down that
+kept the current value. The **Secret** section now has **Change the
+value…** — a prompt-only edit, so the agent opens its dialog for the new
+value at once, as `rusthorse edit NAME --value` does — and **Replace with a
+random value…**; the form shows the value choices as one row each. The
+agent's policy is unchanged.
+
+Review (Codex, AI-assisted, 2026-11-02): **ready.** No security finding:
+the rows act on the entry shown (the panel is rebuilt on each selection),
+not while a request runs, and a prompt-only edit asks for no approval
+before the agent's own value dialog, which names the entry and the
+requester. One low finding: the tests set the choices and activated the
+rows in code, so rows that a click or a key no longer activates passed —
+**fixed**: the widget test chooses with Space and Enter and changes the
+value with Enter, through the X server of its virtual display (2 of 2
+mutations caught). The reviewer also saw a test of the run dialog's height
+fail when the temporary directory's path is long (889 estimated pixels
+against 880); it passes with the usual short path, and is recorded as such.
