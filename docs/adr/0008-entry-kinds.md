@@ -88,7 +88,7 @@ sends with the run request — exactly what typing `VAR=https://… rusthorse
 run …` does. The agent needs no change for it.
 
 The URL is not a secret: it is not redacted. The approval dialog lists it
-under "Connects to" when its name says it is an endpoint (`OPENAI_BASE_URL`),
+under "Destinations" when its name says it is an endpoint (`OPENAI_BASE_URL`),
 as it lists any such variable of the requester's — it does not tell the two
 apart.
 `--url` is refused before the run is approved when the entry has no URL (or
@@ -130,8 +130,8 @@ rusthorse run OPENAI_API_KEY=<uuid> \
   in the dialog). It would show the endpoint in the dialog, but the
   requester's environment already sets any variable it likes, so a listed
   endpoint would suggest a control that does not exist. The real gap is the
-  general one: the dialog lists no variable that redirects where a program
-  sends its credentials (see Consequences). Rejected in favour of a
+  general one: at the time, the dialog listed no variable that redirects
+  where a program sends its credentials (see Consequences). Rejected in favour of a
   client-side option and fixing that gap for every variable.
 - **More kinds** (database, SSH key, certificate, note). They can be added
   later — each is a new word in the same field, under a protocol bump. Four

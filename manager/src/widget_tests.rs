@@ -388,8 +388,11 @@ fn desktop_flow() {
     let settle_frame = Instant::now() + Duration::from_millis(200);
     spin_until(|| Instant::now() >= settle_frame);
     snapshot_window(&editor, "editor.png");
+    let (kind_gone, all_gone) = (kind.downgrade(), all.downgrade());
+    drop((kind, all));
     button(&editor, "Send to agent…").emit_clicked();
     settle(&s);
+    drop(editor);
     assert_eq!(s.entries.borrow().len(), 1);
     assert_eq!(s.entries.borrow()[0].fields.kind, Some(EntryKind::ApiKey));
     let id = s.entries.borrow()[0].id.clone();
@@ -748,6 +751,9 @@ fn desktop_flow() {
     // Metadata edit uses UUID, keeps the password, and refreshes the list.
     s.edit(s.current());
     let editor = s.editor.borrow().as_ref().unwrap().clone();
+    // The new form replaced the closed one, which leaves nothing alive: no
+    // handler keeps its widgets in a cycle.
+    spin_until(|| kind_gone.upgrade().is_none() && all_gone.upgrade().is_none());
     let settle_frame = Instant::now() + Duration::from_millis(300);
     spin_until(|| Instant::now() >= settle_frame);
     let inputs = entry_rows(&editor);

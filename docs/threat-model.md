@@ -194,15 +194,19 @@ address they send a key to from the environment (`OPENAI_BASE_URL`,
 `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, …), and the requester's environment is
 passed to the command: a requester can make an approved `python app.py` send
 the key to a server of its choosing. The dialog therefore lists, under
-**Connects to**, the variables whose names say where a program connects
+**Destinations**, the variables whose names say where a program connects
 (`*_URL`, `*_BASE_URL`, `*_HOST`, …), and warns about proxies, certificate
 authorities, switches that disable certificate checks, and name resolution
-([cli.md](cli.md#rusthorse-run)); the audit record names them too. Limits:
-the lists go by name and cannot be complete (`MY_SERVICE=https://…`, a
-configuration file or an argument escape them); a URL is shown by scheme,
-host and port only, so a different path on the same host is not visible;
-and `run --url`, which takes the address from the entry's metadata, looks
-the same as a variable the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
+([cli.md](cli.md#rusthorse-run)); the audit record names them too. A value
+that programs could read differently — a backslash, two `@`, an unusual
+host — is not shown but warned about, so that the dialog never names a host
+the program will not use. Limits: the lists go by name and cannot be
+complete (`MY_SERVICE=https://…`, a configuration file or an argument escape
+them); a URL is shown by scheme, host and port only, so a different path on
+the same host is not visible; the forms judged unambiguous are those of
+common URL parsers, not a proof about every program; and `run --url`, which
+takes the address from the entry's metadata, looks the same as a variable
+the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
 *Mitigation:* read the dialog — check the host of every destination; prefer
 well-known binaries with explicit arguments; review recent changes to scripts
 before approving them. The planned credential broker would remove the
@@ -896,7 +900,7 @@ which may ask for the master password. The maintainer then asked for the
 
 **Destinations in the run dialog (2026-11-01).** At the maintainer's
 request, closing the L4 gap above as far as a dialog can: the run dialog
-lists, under "Connects to", the variables whose names say where the program
+lists, under "Connects to" (renamed "Destinations" after review), the variables whose names say where the program
 connects (`*_URL`, `*_URI`, `*_API_BASE`, `*_ENDPOINT`, `*_HOST`, `*_ADDR`,
 `*_REGISTRY`, `PGHOST`…), and warns about proxies, certificate authorities,
 disabled certificate checks and name resolution. Values are shortened to
@@ -905,7 +909,7 @@ dialog and in the audit record; the command gets them unchanged. Two
 choices made against warning fatigue, both tested: a certificate variable
 that names the system's own store (`SSL_CERT_DIR=/usr/lib/ssl/certs`, which
 Claude Code's environment sets) is not listed — judged on the text, absolute
-and without `..`, so that no symlink can be swapped after the check — and
+and without `..`; what lies inside a store only root can change — and
 `NO_PROXY`, which only bypasses a proxy, is not either. Rendering the real
 dialog on a virtual display showed a defect of `rusthorse-dialog` that
 predates this change: keys of detail rows broke inside words with a hyphen
@@ -913,4 +917,20 @@ predates this change: keys of detail rows broke inside words with a hyphen
 including a command or a path being approved. Keys now break between words
 only, a parenthesized qualifier moves under its key, and no dialog label
 inserts hyphens; a widget test on Xvfb checks it. Thirteen mutations each
-made a test fail. Awaiting review.
+made a test fail.
+
+Review of the destinations, the "show all fields" switch and the `--url`
+ordering (Codex, AI-assisted, 2026-11-01; verdict: not ready), and what was
+done:
+
+| Finding | Disposition |
+|---|---|
+| High — a backslash made the dialog name the wrong host: with `OPENAI_BASE_URL=http://127.0.0.1:PORT\@provider.invalid/v1` it showed `provider.invalid`, while Node, which reads `\` as `/`, sent the (fake) token to the local server (reproduced end to end) | **Fixed:** only unambiguous forms are shown. A backslash or a control character anywhere, two `@`, a host with characters other than letters, digits, `.`, `-` and `_`, or a malformed URL (`https:/host`) makes the value `(not shown)`, and a warning names the variable. |
+| High — lists and malformed values leaked credentials: `GOPROXY=user:PASSWORD@private,https://proxy.golang.org` kept the password (the scheme of the second item was taken for the whole), and `https:/hooks…/TOKEN?key=…` kept its path and query — in the dialog and, after a denial, in the audit log | **Fixed:** values are read item by item (`,`, `|`, spaces), each shortened on its own; an item without an unambiguous form is not shown at all. |
+| Medium — `SSL_CERT_DIR=/etc/ssl/certs:/tmp/fake-ca` counted as the system store, though OpenSSL then trusts the second directory (verified with a fake authority) | **Fixed:** every `:`-separated element must lie inside a store; certificate variables are shown as paths. |
+| Medium — `AWS_ENDPOINT_URL_S3`, which the AWS SDKs prefer to `AWS_ENDPOINT_URL`, was not listed | **Fixed:** `AWS_ENDPOINT_URL_<SERVICE>` is an endpoint. |
+| Medium — the entry form's Kind and switch rows kept each other alive through their handlers: twelve forms opened and closed left twelve pairs alive | **Fixed:** the handler holds weak references; the widget test checks that the closed form's rows are freed once another form replaces it. |
+| Low — a variable given twice was shown twice, sorted, though the command gets only the last value | **Fixed:** the dialog is built from the same last-wins view as the environment. |
+| Documentation — "credentials are left out" was false in those cases; "no symlink can be swapped" claimed more than a text check; "shows where the program will connect" overstated what the dialog knows; ADR 0008 still said the dialog lists no such variable | **Fixed:** each statement corrected; the row is now called **Destinations**, settings found in the environment, not connections. |
+
+Each fix was reverted in a copy of the tree to see a test fail.

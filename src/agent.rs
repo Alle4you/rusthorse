@@ -1410,6 +1410,14 @@ impl Agent {
                  trusts; with them a requester can send your secrets elsewhere: {routes}"
             ));
         }
+        if !prepared.unusual.is_empty() {
+            warnings.push(format!(
+                "These destination settings hold values that are not plain URLs, host names or \
+                 paths; programs may read them differently, so they are not shown: {}. Deny \
+                 unless you know why they are set.",
+                prepared.unusual.join(", ")
+            ));
+        }
         if !run.redact {
             warnings.push(
                 "Output is NOT redacted: secret values printed by the command reach the requester."
@@ -1444,10 +1452,10 @@ impl Agent {
                 ("Requested by (unverified)".into(), peer.describe()),
             ]
             .into_iter()
-            // Where the program will send what it sends (threat model L4).
+            // The destinations its environment sets (threat model L4).
             .chain(
                 (!endpoints.is_empty())
-                    .then(|| ("Connects to (environment)".to_string(), endpoints.clone())),
+                    .then(|| ("Destinations (environment)".to_string(), endpoints.clone())),
             )
             .collect(),
             facts: vec![
@@ -1481,7 +1489,7 @@ impl Agent {
         ))
         .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
         let mut event = run_event(peer, &run, &identities);
-        let audited: Vec<String> = [("connects to", &endpoints), ("routes", &routes)]
+        let audited: Vec<String> = [("destinations", &endpoints), ("routes", &routes)]
             .into_iter()
             .filter(|(_, vars)| !vars.is_empty())
             .map(|(what, vars)| format!("{what}: {vars}"))

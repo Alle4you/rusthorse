@@ -119,11 +119,14 @@ sequenceDiagram
 Cleaning the environment (`exec::prepare_env`) removes `LD_*` variables and
 sorts the others the dialog must show: variables that can make the program
 run other code (`RISKY_VARS`), variables that name where it connects
-(`exec::destination`: `*_URL`, `*_HOST`, …, shown under "Connects to") and
+(`exec::destination`: `*_URL`, `*_HOST`, …, shown under "Destinations") and
 variables that route its connections or change which servers it trusts
-(proxies, certificate authorities, shown as a warning). Destination values
+(proxies, certificate authorities, shown as a warning). A later duplicate
+replaces an earlier one, as in the command's environment. Destination values
 are shortened for the dialog and the audit record (`shown_destination`:
-scheme, host and port of a URL); the command gets them unchanged.
+scheme, host and port of a URL, item by item in a list); a value without an
+unambiguous form is replaced by `(not shown)` and named in a warning. The
+command gets the values unchanged.
 
 When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is

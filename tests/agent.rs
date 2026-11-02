@@ -2884,7 +2884,7 @@ fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
 }
 
 #[test]
-fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
+fn the_run_dialog_shows_destination_settings_without_credentials() {
     let h = Harness::new();
     h.add_secret(
         "OPENAI_API_KEY",
@@ -2910,6 +2910,12 @@ fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
         ])
         .env("https_proxy", "http://u:FAKE-proxy-pw@proxy.invalid:3128")
         .env("SSL_CERT_FILE", "/tmp/fake-ca.pem")
+        // Node reads `\` as `/` and would connect to 127.0.0.1, while the
+        // text after the `@` names another host: never shown.
+        .env(
+            "ANTHROPIC_BASE_URL",
+            "http://127.0.0.1:9\\@provider.invalid/FAKE-path-token",
+        )
         .finish()
     };
 
@@ -2926,8 +2932,9 @@ fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
         request
             .details
             .iter()
-            .any(|(k, v)| k == "Connects to (environment)"
-                && v == "OPENAI_BASE_URL=https://api.example.invalid/…"),
+            .any(|(k, v)| k == "Destinations (environment)"
+                && v.contains("ANTHROPIC_BASE_URL=(not shown)")
+                && v.contains("OPENAI_BASE_URL=https://api.example.invalid/…")),
         "{:?}",
         request.details
     );
@@ -2943,8 +2950,16 @@ fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
     ] {
         assert!(warning.contains(part), "{warning}");
     }
+    assert!(
+        request
+            .warnings
+            .iter()
+            .any(|w| w.contains("so they are not shown") && w.contains("ANTHROPIC_BASE_URL")),
+        "{:?}",
+        request.warnings
+    );
     let shown = format!("{:?}", request);
-    assert!(!shown.contains("FAKE-proxy-pw"), "{shown}");
+    assert!(!shown.contains("FAKE"), "{shown}");
 
     // Allowed: the command gets the variables unchanged.
     let out = run(
@@ -2965,7 +2980,9 @@ fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
     assert_eq!(runs.len(), 2, "{audit}");
     for record in runs {
         for part in [
-            "connects to: OPENAI_BASE_URL=https://api.example.invalid/…",
+            "destinations: ",
+            "ANTHROPIC_BASE_URL=(not shown)",
+            "OPENAI_BASE_URL=https://api.example.invalid/…",
             "; routes: ",
             "SSL_CERT_FILE=/tmp/fake-ca.pem",
             "https_proxy=http://…@proxy.invalid:3128",
@@ -2973,5 +2990,5 @@ fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
             assert!(record.contains(part), "{record}");
         }
     }
-    assert!(!audit.contains("FAKE-proxy-pw"));
+    assert!(!audit.contains("FAKE"), "{audit}");
 }

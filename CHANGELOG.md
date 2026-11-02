@@ -22,12 +22,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   API's endpoint, in variable `VAR`. The URL is not a secret: it is not
   redacted. The manager's command for an API key with an endpoint includes
   it.
-- The `run` dialog shows where the program will connect: a **Connects to**
-  row for the variables that name an endpoint (`OPENAI_BASE_URL`,
-  `DATABASE_URL`, `DOCKER_HOST`, …), and a warning for proxies, certificate
-  authorities, disabled certificate checks and name resolution — with which a
-  requester could send a secret to a server of its own. URLs are shown by
-  scheme, host and port only; the audit record names the same variables.
+- The `run` dialog shows the destination settings of the environment: a
+  **Destinations** row for the variables that name an endpoint
+  (`OPENAI_BASE_URL`, `DATABASE_URL`, `DOCKER_HOST`, …), and a warning for
+  proxies, certificate authorities, disabled certificate checks and name
+  resolution — with which a requester could send a secret to a server of its
+  own. URLs are shown by scheme, host and port only; a value that programs
+  could read differently is not shown and is warned about; the audit record
+  names the same variables.
 - `rusthorse-manager`, first milestone ([ADR 0007](docs/adr/0007-visual-manager.md),
   [guide](docs/manager.md)): a GTK 4 and libadwaita window, client of the
   agent, to browse, search and filter entries by group; create, edit, rename

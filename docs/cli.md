@@ -225,7 +225,7 @@ metadata before sending the request, as `rusthorse show` would, and adds it to
 the environment it sends, exactly as if you had written
 `VAR=https://… rusthorse run …`. The URL is not a secret: it is not redacted
 from the output. Like any variable that names where the program connects, it
-appears in the dialog under **Connects to** when its name says so
+appears in the dialog under **Destinations** when its name says so
 (`OPENAI_BASE_URL` does; see below).
 
 `--url` is refused before anything is asked when it lacks `=`, when `VAR` is
@@ -247,10 +247,12 @@ Requires approval; the dialog shows:
 - that the command runs as you, outside any sandbox the requester is in;
 - warnings about removed variables (`LD_*`) and variables that can make the
   program run other code (`NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND`, …);
-- **Connects to (environment)**: the variables that name where the program
+- **Destinations (environment)**: the variables that name where the program
   connects — names ending in `_URL`, `_URI`, `_API_BASE`, `_ENDPOINT`,
   `_HOST`, `_ADDR` or `_REGISTRY` (`OPENAI_BASE_URL`, `DATABASE_URL`,
-  `DOCKER_HOST`, `VAULT_ADDR`, …) and `PGHOST`-style names;
+  `DOCKER_HOST`, `VAULT_ADDR`, …), `AWS_ENDPOINT_URL_<SERVICE>` and
+  `PGHOST`-style names. If a name appears twice, the last value — the one
+  the command gets — is shown;
 - a warning for the variables that route its connections or change which
   servers it trusts: proxies (`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
   `GOPROXY`, …), certificate authorities (`SSL_CERT_FILE`,
@@ -262,11 +264,27 @@ Requires approval; the dialog shows:
 
 The requester sets these variables, and with them it can make an approved,
 well-known program send your secret to a server of its own: check the host
-of every one. A URL is shown by its scheme, host and port only
-(`https://…@proxy:3128/…`): user names, passwords, paths and queries —
-where credentials and webhook tokens travel — are left out of the dialog and
-the audit log. The variables reach the command unchanged. The lists are not
-complete; a program can also read an address from a file or its arguments.
+of every one. They are settings found in the environment, not the
+connections the program will make. Only unambiguous values are shown, each
+item of a list (`,`, `|` or spaces) on its own terms:
+
+- a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
+  names, passwords, paths, queries and fragments — where credentials and
+  webhook tokens travel — are left out;
+- `user:password@host` without a scheme as `…@host`; a host name, an IP
+  address or a word (`direct`, `0`) as it is;
+- the paths of certificate variables, and absolute paths, as they are.
+
+Anything else — a backslash or a control character anywhere, two `@`, a
+host with characters other than letters, digits, `.`, `-` and `_`,
+`https:/host` — appears as `(not shown)`, and a warning names the variable:
+programs read such values differently (a parser that takes `\` for `/`
+connects to the host before the `@`, while the text after it names
+another), so no host drawn from them can be trusted, and copying them could
+disclose a credential. The audit log gets the same shortened text. The
+variables reach the command unchanged. The lists are not complete; a
+program can also read an address from a file or its arguments, and a name
+outside them (`MY_SERVICE=https://…`) is not listed.
 
 Requests whose command line, program path or directory is longer than 1000
 characters are refused (put the command in a script): the dialog never
@@ -413,7 +431,7 @@ Prints the last records of the audit log (default 20). `--json` prints the
 raw JSON Lines. Records contain the time, action, outcome, entry names,
 requester chain and, for `run`, the command line and directory — never values.
 A `run` record's `detail` names the variables the dialog listed under
-**Connects to** and in its routing warning, shortened the same way.
+**Destinations** and in its routing warning, shortened the same way.
 The time is when the record was written, after the decision — for an
 approval or a denial, after you answered the dialog, not when the request
 arrived. It is usually within a moment of your answer, but can be later when

@@ -561,8 +561,8 @@ mod tests {
             ("Requested by", Some("unverified"))
         );
         assert_eq!(
-            key_parts("Connects to (environment)"),
-            ("Connects to", Some("environment"))
+            key_parts("Destinations (environment)"),
+            ("Destinations", Some("environment"))
         );
         for plain in ["Program", "(only)", "Odd ()", "Ends with )", ""] {
             assert_eq!(key_parts(plain), (plain, None), "{plain}");
@@ -627,7 +627,7 @@ mod tests {
         let rows = [
             ("Directory".to_string(), "/tmp/a-long-path".to_string()),
             (
-                "Connects to (environment)".to_string(),
+                "Destinations (environment)".to_string(),
                 "OPENAI_BASE_URL=https://api.example.invalid/…".to_string(),
             ),
         ];
@@ -653,7 +653,7 @@ mod tests {
         };
         assert!(labels.iter().all(hyphenless));
         assert_eq!(text("Directory").wrap_mode(), pango::WrapMode::Word);
-        assert_eq!(text("Connects to").wrap_mode(), pango::WrapMode::Word);
+        assert_eq!(text("Destinations").wrap_mode(), pango::WrapMode::Word);
         assert!(text("environment").has_css_class("caption"));
         assert!(!labels.iter().any(|l| l.text().contains('(')));
     }

@@ -1537,9 +1537,20 @@ impl Manager {
             fields.push(row);
         }
         let hidden_by_file = ["UserName", "URL", "Host", "Port"].map(withheld);
+        // Weak references: the closure is stored in the handlers of `kind`
+        // and `all`, so strong ones would keep both (and the rows) alive in
+        // a cycle after the form closes.
         let reshape = {
-            let (rows, kind, all) = (fields.clone(), kind.clone(), all.clone());
+            let rows: Vec<_> = fields.iter().map(|r| r.downgrade()).collect();
+            let (kind, all) = (kind.downgrade(), all.downgrade());
             move || {
+                let (Some(kind), Some(all)) = (kind.upgrade(), all.upgrade()) else {
+                    return;
+                };
+                let Some(rows) = rows.iter().map(|r| r.upgrade()).collect::<Option<Vec<_>>>()
+                else {
+                    return;
+                };
                 let chosen = model::KIND_CHOICES[kind.selected() as usize];
                 // "Other" shows every field already.
                 all.set_visible(chosen.is_some());

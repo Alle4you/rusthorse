@@ -76,7 +76,7 @@ pub const ROUTE_VARS: &[&str] = &[
 pub const ROUTE_SUFFIXES: &[&str] = &["_PROXY"];
 
 /// Of the [`ROUTE_VARS`], those that name a certificate file or directory.
-const TRUST_PATH_VARS: &[&str] = &[
+pub const TRUST_PATH_VARS: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
@@ -104,19 +104,25 @@ pub const SYSTEM_TRUST_STORES: &[&str] = &[
 ];
 
 /// Whether variable `name` names a certificate file or directory inside a
-/// [`SYSTEM_TRUST_STORES`] entry. Judged on the text only — an absolute path
-/// without `..` — so that nothing can be swapped after the check; a symlink
-/// elsewhere that points into a store does not count.
+/// [`SYSTEM_TRUST_STORES`] entry. Judged on the text only — absolute paths
+/// without `..` — and never by following links: a link elsewhere that
+/// points into a store does not count, and what lies inside a store only
+/// root can change.
 fn system_trust_store(name: &str, value: &str) -> bool {
-    let path = Path::new(value);
+    // `SSL_CERT_DIR` is a list (`/etc/ssl/certs:/tmp/ca`): every element must
+    // be inside a store. Other variables name one path; one with a `:` is
+    // judged the same way, which only ever lists more.
     TRUST_PATH_VARS.contains(&name.to_ascii_uppercase().as_str())
-        && path.is_absolute()
-        && !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        && SYSTEM_TRUST_STORES
-            .iter()
-            .any(|store| path.starts_with(store))
+        && value.split(':').all(|part| {
+            let path = Path::new(part);
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                && SYSTEM_TRUST_STORES
+                    .iter()
+                    .any(|store| path.starts_with(store))
+        })
 }
 
 /// Variables that name the server a program connects to, without one of
@@ -128,6 +134,11 @@ pub const ENDPOINT_VARS: &[&str] = &[
     "PGSERVICE",
     "PGSERVICEFILE",
 ];
+
+/// Prefixes of endpoint variable families without a usual suffix: the AWS
+/// SDKs read `AWS_ENDPOINT_URL_<SERVICE>` (`AWS_ENDPOINT_URL_S3`) before
+/// `AWS_ENDPOINT_URL`.
+pub const ENDPOINT_PREFIXES: &[&str] = &["AWS_ENDPOINT_URL_"];
 
 /// Suffixes of variables that name where a program connects:
 /// `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `AZURE_OPENAI_ENDPOINT`,
@@ -167,33 +178,161 @@ pub fn destination(name: &str) -> Option<Destination> {
     };
     if listed(ROUTE_VARS, ROUTE_SUFFIXES) {
         Some(Destination::Route)
-    } else if listed(ENDPOINT_VARS, ENDPOINT_SUFFIXES) {
+    } else if listed(ENDPOINT_VARS, ENDPOINT_SUFFIXES)
+        || ENDPOINT_PREFIXES.iter().any(|p| name.starts_with(p))
+    {
         Some(Destination::Endpoint)
     } else {
         None
     }
 }
 
-/// A destination variable's value as dialogs and the audit log show it: a
-/// URL keeps its scheme, host and port, and loses its user name, password,
-/// path, query and fragment (`https://…@proxy:3128/…`), where credentials and
-/// tokens travel (a webhook URL is a secret); `user:password@host:port`
-/// without a scheme loses its user part; anything else is shown as it is.
-pub fn shown_destination(value: &str) -> String {
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return match value.rsplit_once('@') {
-            Some((user, host)) if !user.contains('/') => format!("…@{host}"),
-            _ => value.to_string(),
+/// Shown instead of a destination value, or a part of one, that is not a
+/// plain URL, host name or path.
+pub const NOT_SHOWN: &str = "(not shown)";
+
+/// A destination variable's value as dialogs and the audit log show it, and
+/// whether part of it was [`NOT_SHOWN`].
+///
+/// Only unambiguous forms are shown, item by item in a list separated by
+/// `,`, `|` or spaces (`GOPROXY`, `PIP_EXTRA_INDEX_URL`): a URL keeps its
+/// scheme, host and port and loses its user name, password, path, query and
+/// fragment, where credentials and tokens travel (`https://…@proxy:3128/…`;
+/// a webhook URL is a secret); `user:password@host` loses its user part; a
+/// host name, a word (`direct`, `0`) and absolute paths without `..`
+/// (`/etc/ssl/certs:/tmp/ca`) are shown as they are. Anything else — a
+/// backslash or a control character anywhere, several `@`, a host with
+/// characters outside letters, digits, `.`, `-` and `_`, `https:/host` — is
+/// not shown at all: programs disagree on what such a value means (a URL
+/// parser that reads `\` as `/` connects to the host *before* the `@`), so
+/// no host drawn from it can be trusted, and copying it could disclose a
+/// credential.
+pub fn shown_destination(value: &str) -> (String, bool) {
+    if value.chars().any(|c| c == '\\' || c.is_control()) {
+        return (NOT_SHOWN.to_string(), true);
+    }
+    let mut shown = String::new();
+    let mut unusual = false;
+    let mut item = String::new();
+    let mut flush = |item: &mut String, shown: &mut String| {
+        match shown_item(item) {
+            Some(text) => shown.push_str(&text),
+            None => {
+                shown.push_str(NOT_SHOWN);
+                unusual = true;
+            }
+        }
+        item.clear();
+    };
+    for c in value.chars() {
+        if matches!(c, ',' | '|' | ' ') {
+            flush(&mut item, &mut shown);
+            shown.push(c);
+        } else {
+            item.push(c);
+        }
+    }
+    flush(&mut item, &mut shown);
+    (shown, unusual)
+}
+
+/// A certificate variable's value ([`TRUST_PATH_VARS`]): paths, shown as they
+/// are when made of ordinary characters (a `..` included: it shows where the
+/// path leads), [`NOT_SHOWN`] otherwise.
+pub fn shown_paths(value: &str) -> (String, bool) {
+    let ordinary = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+@~:".contains(&b));
+    if ordinary {
+        (value.to_string(), false)
+    } else {
+        (NOT_SHOWN.to_string(), true)
+    }
+}
+
+/// One item of a destination value, or `None` when it has no unambiguous
+/// form (see [`shown_destination`]).
+fn shown_item(item: &str) -> Option<String> {
+    let more = |tail: &str| if tail.is_empty() { "" } else { "/…" };
+    if item.is_empty() {
+        return Some(String::new());
+    }
+    if let Some((scheme, rest)) = item.split_once("://") {
+        let mut chars = scheme.chars();
+        let scheme_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if !scheme_ok {
+            return None;
+        }
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        if authority.is_empty() {
+            // A local socket or file (`unix:///run/docker.sock`): the path
+            // is the destination.
+            return absolute_paths(tail).then(|| format!("{scheme}://{tail}"));
+        }
+        let (user, host) = split_user(authority)?;
+        return host_port(host).then(|| format!("{scheme}://{user}{host}{}", more(tail)));
+    }
+    if item.starts_with('/') {
+        return absolute_paths(item).then(|| item.to_string());
+    }
+    let end = item.find('/').unwrap_or(item.len());
+    let (authority, tail) = item.split_at(end);
+    let (user, host) = split_user(authority)?;
+    host_port(host).then(|| format!("{user}{host}{}", more(tail)))
+}
+
+/// `user@host` → `("…@", "host")`; `host` → `("", "host")`; `None` for
+/// several `@`, which parsers resolve differently.
+fn split_user(authority: &str) -> Option<(&'static str, &str)> {
+    match authority.split_once('@') {
+        None => Some(("", authority)),
+        Some((_, host)) if !host.contains('@') => Some(("…@", host)),
+        Some(_) => None,
+    }
+}
+
+/// A host name, IPv4 or bracketed IPv6 address, with an optional port of
+/// digits: nothing that a URL parser could decode or reinterpret.
+fn host_port(text: &str) -> bool {
+    let port_ok =
+        |port: &str| (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = text.strip_prefix('[') {
+        let Some((address, after)) = rest.split_once(']') else {
+            return false;
         };
+        let address_ok = !address.is_empty()
+            && address
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'));
+        return address_ok && (after.is_empty() || after.strip_prefix(':').is_some_and(port_ok));
+    }
+    let (host, port) = match text.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (text, None),
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let host = match authority.rsplit_once('@') {
-        Some((_, host)) => format!("…@{host}"),
-        None => authority.to_string(),
-    };
-    let more = if tail.is_empty() { "" } else { "/…" };
-    format!("{scheme}://{host}{more}")
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && port.is_none_or(port_ok)
+}
+
+/// Absolute paths separated by `:`, none with `..`, made of ordinary
+/// characters.
+fn absolute_paths(text: &str) -> bool {
+    !text.is_empty()
+        && text.split(':').all(|path| {
+            path.starts_with('/')
+                && !Path::new(path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/._-+@~".contains(&b))
+        })
 }
 
 /// The environment an approved command will receive (before secrets are added).
@@ -211,6 +350,9 @@ pub struct PreparedEnv {
     /// Variables that route its connections or change what it trusts, shown
     /// the same way.
     pub routes: Vec<(String, String)>,
+    /// Names of the endpoint and route variables whose value, or part of it,
+    /// is [`NOT_SHOWN`].
+    pub unusual: Vec<String>,
 }
 
 /// Whether `name` belongs to [`RISKY_VARS`] or [`RISKY_PREFIXES`].
@@ -221,43 +363,58 @@ pub fn is_risky(name: &str) -> bool {
 /// Remove loader variables and the variables that secrets will override, and
 /// collect the risky ones for the approval dialog.
 pub fn prepare_env(client_env: &[(String, String)], secret_vars: &[&str]) -> PreparedEnv {
-    let mut prepared = PreparedEnv {
-        vars: Vec::new(),
-        removed: Vec::new(),
-        risky: Vec::new(),
-        endpoints: Vec::new(),
-        routes: Vec::new(),
-    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut vars = Vec::new();
+    let mut removed = BTreeSet::new();
+    // By name, so that a later duplicate replaces an earlier one, as it does
+    // in the command's environment: the dialog shows what the command gets.
+    let mut risky = BTreeMap::new();
+    let mut endpoints = BTreeMap::new();
+    let mut routes = BTreeMap::new();
+    let mut unusual = BTreeMap::new();
     for (name, value) in client_env {
         if name.is_empty() || name.contains('=') || secret_vars.contains(&name.as_str()) {
             continue;
         }
         if name.starts_with(LOADER_PREFIX) {
-            prepared.removed.push(name.clone());
+            removed.insert(name.clone());
             continue;
         }
+        // (`insert` replaces what an earlier duplicate left.)
+        unusual.insert(name.clone(), false);
         if is_risky(name) {
-            prepared.risky.push((name.clone(), value.clone()));
+            risky.insert(name.clone(), value.clone());
         } else {
-            match destination(name) {
-                Some(Destination::Endpoint) => prepared
-                    .endpoints
-                    .push((name.clone(), shown_destination(value))),
-                Some(Destination::Route) if !system_trust_store(name, value) => prepared
-                    .routes
-                    .push((name.clone(), shown_destination(value))),
-                Some(Destination::Route) => {}
-                None => {}
+            let list = match destination(name) {
+                Some(Destination::Endpoint) => Some(&mut endpoints),
+                Some(Destination::Route) if !system_trust_store(name, value) => Some(&mut routes),
+                _ => None,
+            };
+            if let Some(list) = list {
+                let (shown, odd) = if TRUST_PATH_VARS.contains(&name.to_ascii_uppercase().as_str())
+                {
+                    shown_paths(value)
+                } else {
+                    shown_destination(value)
+                };
+                list.insert(name.clone(), shown);
+                unusual.insert(name.clone(), odd);
             }
         }
-        prepared.vars.push((name.clone(), value.clone()));
+        vars.push((name.clone(), value.clone()));
     }
-    prepared.removed.sort();
-    prepared.removed.dedup();
-    prepared.risky.sort();
-    prepared.endpoints.sort();
-    prepared.routes.sort();
-    prepared
+    PreparedEnv {
+        vars,
+        removed: removed.into_iter().collect(),
+        risky: risky.into_iter().collect(),
+        endpoints: endpoints.into_iter().collect(),
+        routes: routes.into_iter().collect(),
+        unusual: unusual
+            .into_iter()
+            .filter(|(_, odd)| *odd)
+            .map(|(name, _)| name)
+            .collect(),
+    }
 }
 
 /// A program found for `run`.
@@ -371,6 +528,8 @@ mod tests {
         let prepared = prepare_env(
             &env(&[
                 ("PATH", "/usr/bin"),
+                // A later duplicate wins, in the command and in the dialog.
+                ("OPENAI_BASE_URL", "https://z.invalid"),
                 ("OPENAI_BASE_URL", "https://api.example.invalid/v1"),
                 ("https_proxy", "http://user:pw@proxy.invalid:3128"),
                 ("SSL_CERT_FILE", "/tmp/fake-ca.pem"),
@@ -383,15 +542,33 @@ mod tests {
                     "DATABASE_URL",
                     "postgres://u:FAKE-pw@db.invalid:5432/app?ssl=1",
                 ),
+                ("DOCKER_HOST", "unix:///run/docker.sock"),
+                ("AWS_ENDPOINT_URL", "https://expected.invalid"),
+                ("AWS_ENDPOINT_URL_S3", "https://other.invalid"),
+                // A list, whose first element has credentials and no scheme.
+                (
+                    "GOPROXY",
+                    "user:FAKE-pw@private.invalid,https://proxy.golang.org",
+                ),
+                // Read differently by different parsers: never shown.
+                (
+                    "OPENAI_API_BASE",
+                    "http://127.0.0.1:1\\@provider.invalid/v1",
+                ),
+                (
+                    "HOOK2_URL",
+                    "https:/hooks.example.invalid/FAKE-token?key=FAKE",
+                ),
                 // A secret's own variable is never shown: it is replaced.
                 ("API_URL", "client-supplied"),
                 ("HOSTALIASES", "/tmp/hosts"),
                 // The system's own certificate authorities: nothing to warn of.
-                ("SSL_CERT_DIR", "/usr/lib/ssl/certs"),
+                ("SSL_CERT_DIR", "/usr/lib/ssl/certs:/etc/ssl/certs"),
                 ("CURL_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"),
                 // Not inside a store, whatever the path looks like.
                 ("GIT_SSL_CAINFO", "/etc/ssl/../../tmp/fake-ca.pem"),
                 ("PIP_CERT", "etc/ssl/fake-ca.pem"),
+                ("REQUESTS_CA_BUNDLE", "/etc/ssl/certs:/tmp/fake-ca"),
                 ("NO_PROXY", "localhost"),
             ]),
             &["API_URL"],
@@ -399,8 +576,13 @@ mod tests {
         assert_eq!(
             prepared.endpoints,
             env(&[
+                ("AWS_ENDPOINT_URL", "https://expected.invalid"),
+                ("AWS_ENDPOINT_URL_S3", "https://other.invalid"),
                 ("DATABASE_URL", "postgres://…@db.invalid:5432/…"),
+                ("DOCKER_HOST", "unix:///run/docker.sock"),
+                ("HOOK2_URL", "(not shown)"),
                 ("HOOK_URL", "https://hooks.example.invalid/…"),
+                ("OPENAI_API_BASE", "(not shown)"),
                 ("OPENAI_BASE_URL", "https://api.example.invalid/…"),
                 ("PGHOST", "db.invalid"),
             ])
@@ -409,11 +591,16 @@ mod tests {
             prepared.routes,
             env(&[
                 ("GIT_SSL_CAINFO", "/etc/ssl/../../tmp/fake-ca.pem"),
+                ("GOPROXY", "…@private.invalid,https://proxy.golang.org"),
                 ("PIP_CERT", "etc/ssl/fake-ca.pem"),
+                ("REQUESTS_CA_BUNDLE", "/etc/ssl/certs:/tmp/fake-ca"),
                 ("SSL_CERT_FILE", "/tmp/fake-ca.pem"),
                 ("https_proxy", "http://…@proxy.invalid:3128"),
             ])
         );
+        assert_eq!(prepared.unusual, vec!["HOOK2_URL", "OPENAI_API_BASE"]);
+        let listed = format!("{:?} {:?}", prepared.endpoints, prepared.routes);
+        assert!(!listed.contains("FAKE"), "{listed}");
         // Already a risky variable: warned about once, as such.
         assert_eq!(prepared.risky, env(&[("HOSTALIASES", "/tmp/hosts")]));
         // Passed through unchanged: only the dialog's copy is shortened.
@@ -432,6 +619,7 @@ mod tests {
             ("VAULT_ADDR", Some(Destination::Endpoint)),
             ("npm_config_registry", Some(Destination::Endpoint)),
             ("MONGODB_URI", Some(Destination::Endpoint)),
+            ("AWS_ENDPOINT_URL_DYNAMODB", Some(Destination::Endpoint)),
             ("HOSTNAME", None),
             ("DBUS_SESSION_BUS_ADDRESS", None),
             ("PATH", None),
@@ -442,14 +630,33 @@ mod tests {
             ("https://h.invalid", "https://h.invalid"),
             ("https://h.invalid/", "https://h.invalid/…"),
             ("https://h.invalid?k=FAKE", "https://h.invalid/…"),
-            ("http://a@b@h.invalid:1/x", "http://…@h.invalid:1/…"),
+            ("http://[::1]:8080/x", "http://[::1]:8080/…"),
             ("db.invalid:5432", "db.invalid:5432"),
             ("u:FAKE@proxy.invalid:3128", "…@proxy.invalid:3128"),
             ("/home/me/ca@2.pem", "/home/me/ca@2.pem"),
+            (
+                "https://a.invalid https://b.invalid",
+                "https://a.invalid https://b.invalid",
+            ),
+            ("https://h.invalid|direct", "https://h.invalid|direct"),
             ("1", "1"),
+            // Ambiguous: never shown, whole or in part.
+            ("http://a@b@h.invalid:1/x", "(not shown)"),
+            ("http://h.invalid\\@other.invalid", "(not shown)"),
+            ("http://h.inv\talid", "(not shown)"),
+            ("https://h%2einvalid", "(not shown)"),
+            ("https://ex\u{e4}mple.invalid", "(not shown)"),
+            ("https://h.invalid:", "(not shown)"),
+            ("https:h.invalid", "(not shown)"),
+            ("1http://h.invalid", "(not shown)"),
+            ("file:///etc/../tmp", "(not shown)"),
+            ("ok.invalid,https:/x.invalid/FAKE", "ok.invalid,(not shown)"),
         ] {
-            assert_eq!(shown_destination(value), shown, "{value}");
+            let (text, unusual) = shown_destination(value);
+            assert_eq!(text, shown, "{value}");
+            assert_eq!(unusual, shown.contains(NOT_SHOWN), "{value}");
         }
+        assert_eq!(shown_paths("/a b"), ("(not shown)".to_string(), true));
     }
 
     #[test]
