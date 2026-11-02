@@ -400,6 +400,27 @@ would require changing file flags shared with the caller. Without `--stdin`
 nothing is read before the command has started: a denied request leaves the
 input untouched.
 
+### L20 — Locking with the screen depends on the desktop's signals
+
+The agent locks the vault when the computer is about to sleep and when the
+session is locked or its screensaver starts, told over D-Bus by logind and
+the Cinnamon, GNOME, MATE and freedesktop screensavers
+([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). It cannot lock on
+what it is not told: a locker that emits none of these signals (some
+standalone X11 lockers such as `i3lock` or `slock`), a system without logind,
+or a missing bus leave only the idle timer; `rusthorse status` and `doctor`
+say which sources are watched. Without a delay inhibitor (logind refusing
+it), the lock may come only after the computer wakes, and a suspend is
+noticed by logind's signal only. A dialog already on the screen when the vault
+locks stays until it is answered or times out; whatever it would approve then
+finds the vault locked and does nothing. Hibernation writes RAM to disk: the
+vault is locked first, but memory that held it is not guaranteed to have been
+overwritten (L7). Forged signals — any program of the session can emit a
+screensaver's — can only lock: nothing unlocks but the master password.
+*Mitigation:* keep both behaviours on; check `rusthorse doctor`; with a
+locker that emits no signal, run `rusthorse lock` from its hook, and keep
+`--idle-timeout` short.
+
 ## 8. Running AI agents in isolation
 
 To make Rusthorse resist a hostile requester (A2), deny the AI everything that
@@ -423,8 +444,8 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - Prefer a Wayland session; use full-disk encryption.
 - Give AI agents narrowly scoped, revocable credentials (per-repository
   tokens, API keys with spending limits), stored as separate entries.
-- Keep `--idle-timeout` short; lock when you step away; leave `--remember`
-  off unless you need it.
+- Keep `--idle-timeout` short; lock the screen when you step away (the agent
+  locks with it, L20); leave `--remember` off unless you need it.
 - Read every dialog; be suspicious of `sh -c`, scripts the agent just edited,
   unexpected programs or directories, and risky-variable warnings.
 - Edit the vault in other programs only while the agent is locked.
@@ -565,7 +586,7 @@ gaps it listed:
 | Master password change, KeePassXC coexistence | **Fixed:** `rusthorse passwd`; documented KeePassXC procedure; a test runs Rusthorse's edits on a KeePassXC 2.7.12 file and checks untouched entries are identical. |
 | Notes could be stored but not read | **Fixed:** `reveal --notes` (approval). |
 | Search, `open`, generated values, `doctor`, completions, protocol-version check | **Done.** |
-| Clipboard, lock on screen lock or suspend, man page, packages | **Later** (clipboard deliberately omitted on X11; see the roadmap). |
+| Clipboard, lock on screen lock or suspend, man page, packages | **Later** (clipboard deliberately omitted on X11; see the roadmap). Lock on screen lock and suspend came later: [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md). |
 | CI never ran; no rehearsal on the real desktop | **Open:** runs once the repository is published; the desktop rehearsal is the owner's first test. |
 | MSRV | The declared minimum Rust version (1.89) was checked with that toolchain. |
 | Coverage | A mutation run reverted each of 41 fixes in turn: 39 make the suite fail (one only after a test that corrupts a backup before it is verified was added); the two not caught are the ones described in the sixth table. |
@@ -779,7 +800,8 @@ Open risks, by design or for later milestones:
   master password; the manager does not answer or retry it.
 - A plain lock is not exclusive access for KeePassXC; an automated handoff
   waits for a maintenance mode (ADR 0007, M3). Locking on screen lock and
-  suspend is not implemented yet (M2).
+  suspend was not implemented yet (M2); it is now, in the agent
+  ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md), L20).
 - No keyboard and accessibility review yet, and no tests at other display
   scales.
 
@@ -1006,3 +1028,18 @@ control where the credential is sent (the planned credential broker). One
 low finding, noise: `sqlite:///:memory:` was not shown — **fixed**
 (`sqlite://` and `sqlite:///:memory:` are in-memory databases; tested,
 and reverting it made the test fail).
+
+**Lock on screen lock and suspend (2026-11-02).** At the maintainer's
+request, as planned by ADR 0007 (section 6):
+[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md), `session_lock`, L20.
+Tested end to end on two private `dbus-daemon` buses with a fake logind (its
+inhibitor a pipe, to see the agent release it before the "suspend" and take
+a new one after the "resume"; sessions of two users) and a fake Cinnamon
+screensaver: each source locks; another user's session lock does not;
+`LockedHint` turning false, `ActiveChanged(false)` and a resume never
+unlock; repeated signals record one lock; the loss of the session bus shows
+in `status`. A unit test checks that a lock from a signal changes the
+generation of a vault already locked (an unlock under way does nothing) and
+records nothing then. Building the test showed that a `dbus-daemon` policy
+without receive rules accepts connections but never delivers replies.
+Eleven mutations each made a test fail. Awaiting review.

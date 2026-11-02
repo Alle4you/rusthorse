@@ -206,8 +206,23 @@ display in full are refused outright.
 
 The decrypted vault is dropped after `--idle-timeout` (default 15 minutes)
 without an *approved* use (`status`, `list`, `show` and denied requests do
-not count), on `rusthorse lock`, when a save fails, and when the agent stops.
-A command that is already running keeps the secrets it was given.
+not count), on `rusthorse lock`, when a save fails, when the agent stops, and
+when the session is locked or the computer is about to sleep. A command that
+is already running keeps the secrets it was given.
+
+The last two come from `session_lock`
+([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)): three threads,
+each with its own D-Bus connection (`zbus`, blocking API), watch logind's
+`PrepareForSleep` on the system bus — holding a *delay* inhibitor, taken at
+start and after each resume and released once the vault is locked, so that
+logind waits for the lock before the computer sleeps —, logind's session
+`Lock` signal and `LockedHint` for sessions of the agent's user, and the
+screensavers' `ActiveChanged` on the session bus. A lock from them is the same
+as `rusthorse lock` and changes the generation even when the vault is already
+locked, so an unlock under way does nothing. Signals only lock; no signal
+unlocks. A watcher whose bus goes away reports itself inactive in `status`
+and connects again every five seconds. The watchers exist only with the
+`session-lock` Cargo feature (on by default).
 
 ## Storage format
 
@@ -392,6 +407,7 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/main.rs`](../src/main.rs) | Command-line parsing and output formatting. |
 | [`src/agent.rs`](../src/agent.rs) | The agent: socket server, policy, unlock, approvals, `run`. |
 | [`src/vault.rs`](../src/vault.rs) | KDBX4 access, field mapping, atomic saves. |
+| [`src/session_lock.rs`](../src/session_lock.rs) | Locking on suspend and screen lock: the D-Bus watchers. |
 | [`src/protocol.rs`](../src/protocol.rs) | Request and response types, framing, fd passing. |
 | [`src/client.rs`](../src/client.rs) | Client side of the protocol; relays a `run`'s input and output. |
 | [`src/ui.rs`](../src/ui.rs) | The `Ui` trait, `dialog_text`, and the zenity implementation. |

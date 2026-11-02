@@ -123,6 +123,26 @@ impl Harness {
         request_timeout: Duration,
         send_buffer: Option<usize>,
     ) -> Harness {
+        // Never the real buses: tests of locking start private ones.
+        Harness::build(
+            idle_timeout,
+            request_timeout,
+            send_buffer,
+            rusthorse::session_lock::Settings::default(),
+        )
+    }
+
+    #[cfg(feature = "session-lock")]
+    fn with_session_lock(settings: rusthorse::session_lock::Settings) -> Harness {
+        Harness::build(Duration::ZERO, Duration::from_secs(10), None, settings)
+    }
+
+    fn build(
+        idle_timeout: Duration,
+        request_timeout: Duration,
+        send_buffer: Option<usize>,
+        session_lock: rusthorse::session_lock::Settings,
+    ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
         Vault::create(
@@ -141,6 +161,7 @@ impl Harness {
             idle_timeout,
             request_timeout,
             send_buffer,
+            session_lock,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -2107,6 +2128,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     agent_executable_id: None,
                     agent_executable_replaced: None,
                     dialogs: None,
+                    lock_triggers: vec![],
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -2159,6 +2181,7 @@ fn fake_agent(
                     agent_executable_id: None,
                     agent_executable_replaced: None,
                     dialogs: None,
+                    lock_triggers: vec![],
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -2355,6 +2378,7 @@ fn fake_import_agent(
                         agent_executable_id: None,
                         agent_executable_replaced: None,
                         dialogs: None,
+                        lock_triggers: vec![],
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }
@@ -2991,4 +3015,374 @@ fn the_run_dialog_shows_destination_settings_without_credentials() {
         }
     }
     assert!(!audit.contains("FAKE"), "{audit}");
+}
+
+/// Private D-Bus buses and a fake logind and screensaver, to see the agent
+/// lock on their signals (ADR 0009). Never the real buses.
+#[cfg(feature = "session-lock")]
+mod session_lock {
+    use super::*;
+    use std::io::BufRead;
+    use std::os::fd::{AsFd, OwnedFd};
+
+    use rusthorse::session_lock::Settings;
+    use zbus::blocking::{Connection, connection};
+    use zbus::zvariant::{OwnedObjectPath, Value};
+
+    const LOGIND: &str = "org.freedesktop.login1";
+    const MANAGER_PATH: &str = "/org/freedesktop/login1";
+    const OURS: &str = "/org/freedesktop/login1/session/_31";
+    const OTHERS: &str = "/org/freedesktop/login1/session/_32";
+
+    /// A `dbus-daemon` with a configuration of its own: anyone may own any
+    /// name, nothing is activated, it listens in a private directory. (Its
+    /// policy must allow receiving too, or replies never arrive.)
+    struct Bus {
+        daemon: std::process::Child,
+        address: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Bus {
+        fn start() -> Option<Bus> {
+            let daemon = Path::new("/usr/bin/dbus-daemon");
+            if !daemon.exists() {
+                eprintln!("skipped: dbus-daemon is not installed");
+                return None;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("bus.conf");
+            std::fs::write(
+                &config,
+                format!(
+                    "<busconfig><type>session</type><auth>EXTERNAL</auth>\
+                     <listen>unix:dir={}</listen><policy context=\"default\">\
+                     <allow send_destination=\"*\" eavesdrop=\"true\"/>\
+                     <allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>",
+                    dir.path().display()
+                ),
+            )
+            .unwrap();
+            let mut daemon = Command::new(daemon)
+                .arg(format!("--config-file={}", config.display()))
+                .args(["--nofork", "--print-address=1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut address = String::new();
+            std::io::BufReader::new(daemon.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            Some(Bus {
+                daemon,
+                address: address.trim().to_string(),
+                _dir: dir,
+            })
+        }
+
+        fn stop(&mut self) {
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+
+    impl Drop for Bus {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// logind's manager: every inhibitor handed out is a pipe whose read
+    /// end stays here, to see when the agent lets it go.
+    struct FakeManager {
+        inhibitors: Arc<Mutex<Vec<OwnedFd>>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.login1.Manager")]
+    impl FakeManager {
+        fn inhibit(
+            &self,
+            what: &str,
+            _who: &str,
+            _why: &str,
+            mode: &str,
+        ) -> zbus::fdo::Result<zbus::zvariant::OwnedFd> {
+            assert_eq!((what, mode), ("sleep", "delay"));
+            let (read, write) =
+                nix::unistd::pipe().map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            self.inhibitors.lock().unwrap().push(read);
+            Ok(write.into())
+        }
+    }
+
+    /// A logind session of user `uid`.
+    struct FakeSession {
+        uid: u32,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.login1.Session")]
+    impl FakeSession {
+        #[zbus(property)]
+        fn user(&self) -> (u32, OwnedObjectPath) {
+            (
+                self.uid,
+                OwnedObjectPath::try_from("/org/freedesktop/login1/user/_0").unwrap(),
+            )
+        }
+    }
+
+    fn emit(
+        conn: &Connection,
+        path: &str,
+        interface: &str,
+        member: &str,
+        body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+    ) {
+        conn.emit_signal(
+            None::<zbus::names::BusName<'_>>,
+            path,
+            interface,
+            member,
+            body,
+        )
+        .unwrap();
+    }
+
+    /// Whether the other end of a pipe has been closed everywhere.
+    fn released(fd: &OwnedFd) -> bool {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+        poll(&mut fds, PollTimeout::ZERO).unwrap() == 1
+            && fds[0]
+                .revents()
+                .is_some_and(|r| r.contains(PollFlags::POLLHUP))
+    }
+
+    fn wait_for(what: &str, check: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !check() {
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn status(h: &Harness) -> serde_json::Value {
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).unwrap()
+    }
+
+    fn locked(h: &Harness) -> bool {
+        status(h)["locked"] == true
+    }
+
+    fn trigger(h: &Harness, event: &str, source: &str) -> Option<serde_json::Value> {
+        status(h)["lock_triggers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["event"] == event && t["source"] == source)
+            .cloned()
+    }
+
+    fn unlock(h: &Harness) {
+        assert!(h.run(&["unlock"]).status.success());
+        assert!(!locked(h));
+    }
+
+    fn lock_records(h: &Harness, outcome: &str) -> usize {
+        h.audit_text()
+            .lines()
+            .filter(|l| {
+                l.contains(r#""action":"lock""#) && l.contains(&format!(r#""outcome":"{outcome}""#))
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_vault_locks_on_suspend_and_screen_lock_never_unlocks() {
+        let (Some(system), Some(mut session)) = (Bus::start(), Bus::start()) else {
+            return;
+        };
+        let uid = nix::unistd::getuid().as_raw();
+        let inhibitors = Arc::new(Mutex::new(Vec::new()));
+        let logind = connection::Builder::address(system.address.as_str())
+            .unwrap()
+            .name(LOGIND)
+            .unwrap()
+            .serve_at(
+                MANAGER_PATH,
+                FakeManager {
+                    inhibitors: Arc::clone(&inhibitors),
+                },
+            )
+            .unwrap()
+            .serve_at(OURS, FakeSession { uid })
+            .unwrap()
+            .serve_at(OTHERS, FakeSession { uid: uid + 1 })
+            .unwrap()
+            .build()
+            .unwrap();
+        let screensaver = connection::Builder::address(session.address.as_str())
+            .unwrap()
+            .name("org.cinnamon.ScreenSaver")
+            .unwrap()
+            .build()
+            .unwrap();
+        let h = Harness::with_session_lock(Settings {
+            on_suspend: true,
+            on_screen_lock: true,
+            system_bus: Some(system.address.clone()),
+            session_bus: Some(session.address.clone()),
+        });
+
+        // Every watcher reports itself, and logind was asked to wait.
+        wait_for("the watchers", || {
+            [
+                ("suspend", "logind"),
+                ("screen_lock", "logind"),
+                ("screen_lock", "org.cinnamon.ScreenSaver"),
+            ]
+            .iter()
+            .all(|(e, s)| trigger(&h, e, s).is_some_and(|t| t["active"] == true))
+        });
+        assert_eq!(
+            trigger(&h, "suspend", "logind").unwrap()["note"],
+            "locks before the computer sleeps"
+        );
+        assert_eq!(inhibitors.lock().unwrap().len(), 1);
+        let shown = text(&h.run(&["status"]).stdout);
+        assert!(
+            shown.contains("locks on:   suspend: logind (locks before the computer sleeps)"),
+            "{shown}"
+        );
+        assert!(shown.contains("org.cinnamon.ScreenSaver"), "{shown}");
+
+        // Suspend: locked, then the inhibitor is let go so that the
+        // computer can sleep; after the resume, logind is asked again.
+        unlock(&h);
+        emit(
+            &logind,
+            MANAGER_PATH,
+            "org.freedesktop.login1.Manager",
+            "PrepareForSleep",
+            &(true,),
+        );
+        wait_for("the suspend lock", || locked(&h));
+        wait_for("the inhibitor's release", || {
+            released(&inhibitors.lock().unwrap()[0])
+        });
+        assert_eq!(lock_records(&h, "suspend"), 1);
+        emit(
+            &logind,
+            MANAGER_PATH,
+            "org.freedesktop.login1.Manager",
+            "PrepareForSleep",
+            &(false,),
+        );
+        wait_for("a new inhibitor", || inhibitors.lock().unwrap().len() == 2);
+        assert!(locked(&h), "a resume never unlocks");
+
+        // Our session's `Lock` locks; another user's does not.
+        unlock(&h);
+        emit(
+            &logind,
+            OTHERS,
+            "org.freedesktop.login1.Session",
+            "Lock",
+            &(),
+        );
+        emit(&logind, OURS, "org.freedesktop.login1.Session", "Lock", &());
+        wait_for("the session lock", || locked(&h));
+        assert_eq!(lock_records(&h, "screen_locked"), 1);
+        unlock(&h);
+        emit(
+            &logind,
+            OTHERS,
+            "org.freedesktop.login1.Session",
+            "Lock",
+            &(),
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!locked(&h), "another user's session lock locked this vault");
+
+        // `LockedHint` turning true locks; turning false does not unlock.
+        let hint = |on: bool| {
+            let changed: std::collections::HashMap<&str, Value<'_>> =
+                [("LockedHint", Value::from(on))].into();
+            emit(
+                &logind,
+                OURS,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &(
+                    "org.freedesktop.login1.Session",
+                    changed,
+                    Vec::<&str>::new(),
+                ),
+            );
+        };
+        hint(true);
+        wait_for("the locked hint", || locked(&h));
+        hint(false);
+
+        // The screensaver starting locks; repeated signals record once.
+        unlock(&h);
+        for _ in 0..3 {
+            emit(
+                &screensaver,
+                "/org/cinnamon/ScreenSaver",
+                "org.cinnamon.ScreenSaver",
+                "ActiveChanged",
+                &(true,),
+            );
+        }
+        wait_for("the screensaver lock", || locked(&h));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(lock_records(&h, "screen_locked"), 3);
+        assert!(h.audit_text().contains("org.cinnamon.ScreenSaver"));
+        emit(
+            &screensaver,
+            "/org/cinnamon/ScreenSaver",
+            "org.cinnamon.ScreenSaver",
+            "ActiveChanged",
+            &(false,),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(locked(&h), "a screensaver stopping never unlocks");
+
+        // The session bus goes away: the screensaver watcher says so.
+        session.stop();
+        wait_for("the lost bus to show", || {
+            trigger(&h, "screen_lock", "screensaver").is_some_and(|t| {
+                t["active"] == false
+                    && t["note"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("trying again")
+            }) && trigger(&h, "screen_lock", "org.cinnamon.ScreenSaver").is_none()
+        });
+        // logind still watches the session.
+        assert_eq!(
+            trigger(&h, "screen_lock", "logind").unwrap()["active"],
+            true
+        );
+    }
+
+    #[test]
+    fn turned_off_watchers_say_so() {
+        let h = Harness::with_session_lock(Settings::default());
+        for (event, source) in [("suspend", "logind"), ("screen_lock", "logind")] {
+            let t = trigger(&h, event, source).unwrap();
+            assert_eq!(
+                (t["active"].clone(), t["note"].clone()),
+                (false.into(), "turned off".into())
+            );
+        }
+        let shown = text(&h.run(&["status"]).stdout);
+        assert!(
+            shown.contains("suspend: not watched — turned off"),
+            "{shown}"
+        );
+    }
 }

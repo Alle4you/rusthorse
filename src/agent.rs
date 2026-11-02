@@ -49,6 +49,7 @@ use crate::protocol::{
     RunRequest, SecretString, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
+use crate::session_lock;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
 use crate::vault::{Vault, VaultError};
@@ -94,6 +95,9 @@ pub struct AgentConfig {
     /// system default. Only tests set it, to make back-pressure happen after a
     /// few frames instead of after hundreds of kilobytes.
     pub send_buffer: Option<usize>,
+    /// Lock when the screen locks or the computer suspends, and which buses
+    /// to watch (ADR 0009). The default watches nothing.
+    pub session_lock: crate::session_lock::Settings,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -195,6 +199,32 @@ pub struct Agent {
     waiting_for_dialog: AtomicUsize,
     connections: Arc<AtomicUsize>,
     audit: AuditLog,
+    /// What else locks the vault, for `status` (ADR 0009).
+    lock_triggers: Arc<session_lock::Triggers>,
+}
+
+impl session_lock::Locker for Agent {
+    /// Lock as `rusthorse lock` does. The generation changes even when the
+    /// vault is already locked, so that an unlock whose password is being
+    /// typed now does nothing when it completes.
+    fn lock_for(&self, event: &str, source: &str) {
+        let mut state = self.state();
+        let was_open = state.vault.is_some() || !state.remembered.is_empty();
+        state.lock();
+        drop(state);
+        if was_open {
+            let outcome = if event == session_lock::SUSPEND {
+                "suspend"
+            } else {
+                "screen_locked"
+            };
+            let _ = self.audit.record(
+                &AuditEvent::new("lock", &Peer::agent())
+                    .outcome(outcome)
+                    .detail(source),
+            );
+        }
+    }
 }
 
 impl Agent {
@@ -214,6 +244,7 @@ impl Agent {
             waiting_for_dialog: AtomicUsize::new(0),
             connections: Arc::new(AtomicUsize::new(0)),
             audit,
+            lock_triggers: Arc::default(),
         })
     }
 
@@ -243,6 +274,11 @@ impl Agent {
     /// Accept connections forever, one thread per connection.
     pub fn serve(self: &Arc<Self>, listener: UnixListener) -> anyhow::Result<()> {
         self.start_idle_timer();
+        session_lock::start(
+            Arc::downgrade(self),
+            self.config.session_lock.clone(),
+            Arc::clone(&self.lock_triggers),
+        );
         for connection in listener.incoming() {
             match connection {
                 Ok(stream) => {
@@ -447,6 +483,7 @@ impl Agent {
                 crate::dialog_program::Located::Absent(_) => "zenity".into(),
                 crate::dialog_program::Located::Unusable(why) => format!("none: {why}"),
             }),
+            lock_triggers: self.lock_triggers.snapshot(),
         }
     }
 
@@ -2320,6 +2357,7 @@ mod tests {
                 idle_timeout: Duration::ZERO,
                 request_timeout: Duration::from_secs(10),
                 send_buffer: None,
+                session_lock: Default::default(),
             },
             Box::new(NoDialogs),
         );
@@ -2348,6 +2386,50 @@ mod tests {
         assert!(agent.state().vault.is_none(), "locked, to reload from disk");
         let on_disk = Vault::open(&path, password()).expect("reopen");
         assert!(on_disk.find("X").is_ok(), "the change is in the file");
+    }
+
+    #[test]
+    fn a_session_lock_cancels_an_unlock_under_way_and_records_only_an_open_vault() {
+        use crate::session_lock::{Locker, SCREEN_LOCK, SUSPEND};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        let vault = Vault::create(
+            &path,
+            SecretString::new("correct horse".into()),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("create");
+        let audit = dir.path().join("audit.jsonl");
+        let agent = Agent::new(
+            AgentConfig {
+                vault: path,
+                socket: dir.path().join("agent.sock"),
+                audit_log: audit.clone(),
+                idle_timeout: Duration::ZERO,
+                request_timeout: Duration::from_secs(10),
+                send_buffer: None,
+                session_lock: Default::default(),
+            },
+            Box::new(NoDialogs),
+        );
+        // Locked already, an unlock under way (its password being typed):
+        // the generation changes, so the unlock does nothing when it
+        // completes. Nothing was open, so nothing is recorded.
+        let before = agent.state().generation;
+        agent.lock_for(SCREEN_LOCK, "org.cinnamon.ScreenSaver");
+        assert_eq!(agent.state().generation, before + 1);
+        assert!(
+            std::fs::read_to_string(&audit)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        // Open: locked, and recorded with the event and the source.
+        agent.state().vault = Some(vault);
+        agent.lock_for(SUSPEND, "logind");
+        assert!(agent.state().vault.is_none());
+        let records = std::fs::read_to_string(&audit).expect("audit");
+        assert!(records.contains(r#""outcome":"suspend""#), "{records}");
+        assert!(records.contains(r#""detail":"logind""#), "{records}");
     }
 
     #[test]

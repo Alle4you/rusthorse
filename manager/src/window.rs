@@ -929,6 +929,19 @@ impl Manager {
         ] {
             agent.add(&fact_row(key, &value));
         }
+        // What else locks the vault (ADR 0009), one line per event, each
+        // line filtered on its own: the breaks are this app's.
+        let triggers = label("");
+        triggers.set_text(
+            &rusthorse::session_lock::summary(&info.lock_triggers)
+                .iter()
+                .map(|line| rusthorse::ui::dialog_text(line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        triggers.set_selectable(true);
+        triggers.set_hexpand(true);
+        agent.add(&key_row("Also locks on", &triggers));
         self.status_page.append(&agent);
         if info.agent_executable_replaced == Some(true) {
             let warn = group(

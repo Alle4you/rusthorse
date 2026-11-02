@@ -211,6 +211,7 @@ cannot disable it. Observe the session's logind and supported screensaver
 D-Bus signals; use a delay inhibitor to lock before suspend where available.
 Status must report unavailable backends instead of promising protection.
 Test duplicate signals, resume, bus loss and pending unlock cancellation.
+(Specified and implemented by [ADR 0009](0009-lock-on-screen-lock-and-suspend.md).)
 
 A plain `lock` does not reserve the vault: another requester can unlock it.
 Therefore automatic KeePassXC handoff waits for an agent maintenance mode

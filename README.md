@@ -87,7 +87,8 @@ and keeps the value out of the agent's reach in the common case.
   and anything it leaves running in the background is stopped when it exits.
 - **The master password never touches the client.** The agent asks for it in
   its own dialog (only `rusthorse init` reads the password of a new vault
-  itself) and locks itself after 15 minutes without an approved use.
+  itself) and locks itself after 15 minutes without an approved use, when
+  the screen locks, and before the computer sleeps.
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
   (without values). If the log cannot be written, the vault stays locked and
   approval-gated requests are refused.

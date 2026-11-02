@@ -15,6 +15,7 @@ supersedes the old one, which is marked as such.
 | [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Accepted |
 | [0007](0007-visual-manager.md) | A visual manager that remains a client of the agent | Proposed |
 | [0008](0008-entry-kinds.md) | Entry kinds, and an API key's endpoint for `run` | Proposed |
+| [0009](0009-lock-on-screen-lock-and-suspend.md) | The agent locks when the screen locks or the computer suspends | Proposed |
 
 ## Writing a new ADR
 

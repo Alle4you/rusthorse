@@ -570,6 +570,26 @@ pub struct StatusInfo {
     /// be used. Left out by agents that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogs: Option<String>,
+    /// What makes the agent lock by itself besides the idle timer: one entry
+    /// per event and source (ADR 0009). Left out by agents that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lock_triggers: Vec<LockTrigger>,
+}
+
+/// An event that locks the vault, and where the agent learns of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockTrigger {
+    /// `suspend` (the computer is about to sleep) or `screen_lock` (the
+    /// session is locked or its screensaver starts).
+    pub event: String,
+    /// Where the agent learns of it: `logind`, or a screensaver's D-Bus name
+    /// such as `org.cinnamon.ScreenSaver`.
+    pub source: String,
+    /// Whether the agent is watching it now.
+    pub active: bool,
+    /// Why not, or a remark (`locks before the computer sleeps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Why a request failed.
@@ -939,6 +959,7 @@ mod tests {
             agent_executable_id: None,
             agent_executable_replaced: None,
             dialogs: None,
+            lock_triggers: vec![],
         };
         let json = serde_json::to_value(&status).expect("json");
         assert!(json.get("agent_executable_replaced").is_none(), "{json}");

@@ -72,6 +72,7 @@ Run the agent in the foreground. Normally started by the systemd unit
 rusthorse agent [--vault PATH] [--audit-log PATH]
                 [--idle-timeout DURATION] [--remember DURATION]
                 [--dialog-timeout DURATION]
+                [--no-lock-on-suspend] [--no-lock-on-screen-lock]
 ```
 
 | Option | Default | Meaning |
@@ -79,8 +80,19 @@ rusthorse agent [--vault PATH] [--audit-log PATH]
 | `--idle-timeout` | `15m` | Lock after this much inactivity; `0` never locks. |
 | `--remember` | `0` (off) | Offer "Allow for DURATION" in `run` dialogs. Off by default; read [ADR 0005](adr/0005-remembered-approvals-opt-in.md) before enabling it. |
 | `--dialog-timeout` | `2m` | Unanswered dialogs are denied (or cancelled) after this long. |
+| `--no-lock-on-suspend` | off | Do not lock when the computer is about to sleep. |
+| `--no-lock-on-screen-lock` | off | Do not lock when the session is locked or its screensaver starts. |
 
 Durations are a number followed by `s`, `m` or `h`, or `0`.
+
+Besides the idle timer, the agent locks the vault when the computer is about
+to suspend or hibernate — logind waits for it, thanks to a delay inhibitor
+the agent holds — and when your session is locked or its screensaver starts
+(logind's session lock, Cinnamon's, GNOME's, MATE's and the freedesktop
+screensaver). Nothing ever unlocks the vault but the master password: a
+screen unlock or a resume does not. `rusthorse status` and `rusthorse doctor`
+say what is being watched. See
+[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md).
 
 ## `rusthorse status`
 
@@ -90,9 +102,18 @@ rusthorse status [--json]
 
 Shows the agent version, the vault path, whether it is locked, when it will
 lock itself, how many approvals are remembered, which program shows its
-dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why) and
-the program file the agent runs (with a note if it was replaced since the
-agent started).
+dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why), what
+else locks the vault, and the program file the agent runs (with a note if it
+was replaced since the agent started). For example:
+
+```
+locks on:   suspend: logind (locks before the computer sleeps)
+            screen lock: logind (session lock signals of this user), org.cinnamon.ScreenSaver
+```
+
+`not watched` and the reason appear when a source is unavailable (no system
+bus, no session bus, turned off, a build without the `session-lock`
+feature); a watcher whose bus goes away connects again every few seconds.
 
 ## `rusthorse unlock` / `rusthorse lock`
 
@@ -102,7 +123,8 @@ password there and click **Unlock**. You get three attempts; clicking Unlock
 with the field empty asks again without counting as a wrong password, and if
 nothing is ever typed the unlock counts as cancelled. Wrong passwords are
 recorded in the audit log; after three attempts the request fails. `lock`
-discards the decrypted vault and all remembered approvals immediately.
+discards the decrypted vault and all remembered approvals immediately; so do
+a suspend and a screen lock (see [`rusthorse agent`](#rusthorse-agent)).
 
 ## `rusthorse list`
 
@@ -461,7 +483,10 @@ Prints the last records of the audit log (default 20). `--json` prints the
 raw JSON Lines. Records contain the time, action, outcome, entry names,
 requester chain and, for `run`, the command line and directory — never values.
 A `run` record's `detail` names the variables the dialog listed under
-**Destinations** and in its routing warning, shortened the same way.
+**Destinations** and in its routing warning, shortened the same way. A `lock`
+record's outcome says why: `requested`, `idle_timeout`, `suspend` or
+`screen_locked` (its `detail` naming the source, e.g. `logind` or
+`org.cinnamon.ScreenSaver`).
 The time is when the record was written, after the decision — for an
 approval or a denial, after you answered the dialog, not when the request
 arrived. It is usually within a moment of your answer, but can be later when
@@ -488,7 +513,9 @@ protocol, under the same supervision as dialogs and a 5-second limit; the
 program is the one the agent reports using, run by its path in `doctor`'s own
 mount namespace, which is the agent's in a normal installation; missing is a
 warning, since zenity then shows the dialogs; unusable
-or incompatible is an error), the systemd service is enabled, zenity is
+or incompatible is an error), whether the vault locks when the computer
+suspends and when the screen locks (a warning when nothing watches either:
+the idle timer still locks it), the systemd service is enabled, zenity is
 installed (only a warning when `rusthorse-dialog` is), the session type (X11
 is reported as a warning — see the threat model), Yama `ptrace_scope`, the
 vault's format and permissions, and the socket directory's permissions. Exits

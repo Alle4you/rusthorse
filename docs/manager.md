@@ -15,7 +15,7 @@ awaiting an independent review: try it with fake entries first.
 
 | Available | Comes later (ADR 0007) |
 |---|---|
-| Status of the agent; unlock and lock | Lock when the screen locks or the computer suspends (M2) |
+| Status of the agent, including what else locks it; unlock and lock | |
 | Browse, search and filter entries by group | Moving an entry to another group; editing notes |
 | Create, edit, rename and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
@@ -76,7 +76,10 @@ the vault, so it never postpones the automatic lock.
 **Unlock** makes the agent ask for the master password in its own dialog.
 **Lock now** makes the agent forget the decrypted vault and every remembered
 approval; commands already running keep the secrets they were given. Closing
-the manager does **not** lock the vault.
+the manager does **not** lock the vault. The agent itself also locks it when
+the screen locks or the computer suspends, whether the manager is open or
+not; the Status page shows what it watches ("Also locks on"), see
+[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md).
 
 If the vault is locked by something else — the agent's idle timer,
 `rusthorse lock` — the manager notices at its next check (every five

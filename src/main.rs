@@ -224,6 +224,12 @@ struct AgentArgs {
     /// How long dialogs wait for an answer before denying.
     #[arg(long, default_value = "2m", value_parser = parse_duration, value_name = "DURATION")]
     dialog_timeout: Duration,
+    /// Do not lock when the computer is about to sleep (logind).
+    #[arg(long)]
+    no_lock_on_suspend: bool,
+    /// Do not lock when the session is locked or its screensaver starts.
+    #[arg(long)]
+    no_lock_on_screen_lock: bool,
 }
 
 /// What an entry is for (see `EntryKind`); `other` is no particular kind.
@@ -618,6 +624,12 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         idle_timeout: args.idle_timeout,
         request_timeout: Duration::from_secs(10),
         send_buffer: None,
+        session_lock: rusthorse::session_lock::Settings {
+            on_suspend: !args.no_lock_on_suspend,
+            on_screen_lock: !args.no_lock_on_screen_lock,
+            system_bus: None,
+            session_bus: None,
+        },
     };
     let ui = DesktopUi {
         remember_for: args.remember,
@@ -625,7 +637,8 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
     };
     let listener = Agent::bind(&config.socket)?;
     eprintln!(
-        "rusthorse agent {} listening on {} (vault {}, auto-lock {})",
+        "rusthorse agent {} listening on {} (vault {}, auto-lock {}, lock on suspend {}, \
+         lock on screen lock {})",
         env!("CARGO_PKG_VERSION"),
         config.socket.display(),
         config.vault.display(),
@@ -633,7 +646,17 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
             "off".into()
         } else {
             format_duration(config.idle_timeout)
-        }
+        },
+        if config.session_lock.on_suspend {
+            "on"
+        } else {
+            "off"
+        },
+        if config.session_lock.on_screen_lock {
+            "on"
+        } else {
+            "off"
+        },
     );
     let agent = Agent::new(config, Box::new(ui));
     agent.serve(listener)
@@ -671,6 +694,12 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     println!("remembered: {} approval(s)", info.remembered_approvals);
     if let Some(dialogs) = &info.dialogs {
         println!("dialogs:    {dialogs}");
+    }
+    for (i, line) in rusthorse::session_lock::summary(&info.lock_triggers)
+        .iter()
+        .enumerate()
+    {
+        println!("{:<11} {line}", if i == 0 { "locks on:" } else { "" });
     }
     if !info.agent_executable.is_empty() {
         println!(
@@ -1348,6 +1377,45 @@ enum Check {
 /// checked the program in its own mount namespace), and whether the program
 /// runs: `rusthorse-dialog --check`, under supervision and a 5-second limit,
 /// reports its version and protocol without opening a window.
+/// Whether the vault locks when the computer suspends and when the screen
+/// locks (ADR 0009). Not watching is a warning: the idle timer still locks.
+fn lock_trigger_checks(triggers: &[rusthorse::protocol::LockTrigger]) -> Vec<Check> {
+    use rusthorse::session_lock::{SCREEN_LOCK, SUSPEND};
+    if triggers.is_empty() {
+        return vec![Check::Warn(
+            "the agent does not report locking on suspend or screen lock: it predates it \
+             (upgrade it and run `systemctl --user restart rusthorse-agent`)"
+                .into(),
+        )];
+    }
+    [
+        (SUSPEND, "when the computer suspends"),
+        (SCREEN_LOCK, "when the screen locks"),
+    ]
+    .into_iter()
+    .map(|(event, when)| {
+        let of_event: Vec<_> = triggers.iter().filter(|t| t.event == event).collect();
+        let active: Vec<&str> = of_event
+            .iter()
+            .filter(|t| t.active)
+            .map(|t| t.source.as_str())
+            .collect();
+        if active.is_empty() {
+            let why: Vec<&str> = of_event.iter().filter_map(|t| t.note.as_deref()).collect();
+            Check::Warn(format!(
+                "the vault does not lock {when}: {} (the idle timer still locks it)",
+                why.join("; ")
+            ))
+        } else {
+            Check::Ok(format!(
+                "the vault locks {when} (told by {})",
+                active.join(", ")
+            ))
+        }
+    })
+    .collect()
+}
+
 fn dialog_check(info: &rusthorse::protocol::StatusInfo) -> Check {
     use rusthorse::dialog_program::{Located, PROGRAM, check_program, locate_in};
     let program = match info.dialogs.as_deref() {
@@ -1483,6 +1551,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
             let dialogs = dialog_check(&info);
             dialog_program = matches!(dialogs, Check::Ok(_));
             checks.push(dialogs);
+            checks.extend(lock_trigger_checks(&info.lock_triggers));
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
                     "no vault at {} — run `rusthorse init`",
@@ -1636,6 +1705,43 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_warns_when_nothing_locks_on_suspend_or_screen_lock() {
+        use rusthorse::protocol::LockTrigger;
+        let trigger = |event: &str, source: &str, active: bool, note: Option<&str>| LockTrigger {
+            event: event.into(),
+            source: source.into(),
+            active,
+            note: note.map(Into::into),
+        };
+        let checks = lock_trigger_checks(&[
+            trigger(
+                "suspend",
+                "logind",
+                true,
+                Some("locks before the computer sleeps"),
+            ),
+            trigger(
+                "screen_lock",
+                "logind",
+                false,
+                Some("no system bus; trying again"),
+            ),
+            trigger("screen_lock", "screensaver", false, Some("turned off")),
+        ]);
+        assert!(
+            matches!(&checks[0], Check::Ok(m) if m.contains("when the computer suspends (told by logind)"))
+        );
+        assert!(matches!(&checks[1], Check::Warn(m)
+            if m.contains("does not lock when the screen locks")
+                && m.contains("no system bus; trying again")
+                && m.contains("turned off")));
+        // An agent that predates the field.
+        assert!(
+            matches!(&lock_trigger_checks(&[])[..], [Check::Warn(m)] if m.contains("predates"))
+        );
+    }
 
     #[test]
     fn doctor_notices_an_agent_running_a_replaced_binary() {

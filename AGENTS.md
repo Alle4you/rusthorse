@@ -200,6 +200,7 @@ present and capture only its window, in a dark and a light theme
 | `manager/` | The GTK metadata client; Show requires agent approval (ADR 0007). |
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
+| `src/session_lock.rs` | Locking on suspend and screen lock (D-Bus watchers, ADR 0009) |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
 | `tests/agent.rs` | End-to-end tests |

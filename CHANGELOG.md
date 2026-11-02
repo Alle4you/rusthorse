@@ -11,6 +11,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- The agent **locks the vault when the screen locks or the computer
+  suspends** ([ADR 0009](docs/adr/0009-lock-on-screen-lock-and-suspend.md)):
+  it watches logind — holding a delay inhibitor so that the lock happens
+  before the computer sleeps — and the Cinnamon, GNOME, MATE and
+  freedesktop screensavers over D-Bus. No signal ever unlocks. `status`,
+  `doctor` and the manager's Status page say what is watched;
+  `--no-lock-on-suspend` and `--no-lock-on-screen-lock` turn it off. Builds
+  without the new default feature `session-lock` have no D-Bus watchers.
 - Entry **kinds** ([ADR 0008](docs/adr/0008-entry-kinds.md)): `api-key`,
   `login`, `server` or `device`, set with `add --kind` and `edit --kind`
   (`--kind other` or `--clear kind` removes it), shown by `show`, filtered by

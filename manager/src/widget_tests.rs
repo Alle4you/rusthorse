@@ -297,6 +297,7 @@ fn desktop_flow() {
             idle_timeout: Duration::ZERO,
             request_timeout: Duration::from_secs(5),
             send_buffer: None,
+            session_lock: Default::default(),
         },
         Box::new(Scripted(
             Arc::clone(&allowed),
@@ -326,6 +327,13 @@ fn desktop_flow() {
     button(&s.window, "Unlock").emit_clicked();
     settle(&s);
     assert_eq!(s.pill.text(), "Unlocked");
+    // The Status page says what else locks the vault, one event per line
+    // (this test's agent watches nothing).
+    assert!(descendants(&s.status_page).iter().any(|w| {
+        w.clone().downcast::<gtk::Label>().is_ok_and(|l| {
+            l.text() == "suspend: not watched — turned off\nscreen lock: not watched — turned off"
+        })
+    }));
 
     // Fill the real form; no manager password entry exists.
     button(&s.window, "New entry").emit_clicked();

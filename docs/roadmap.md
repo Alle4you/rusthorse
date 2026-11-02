@@ -140,7 +140,7 @@ approved command.
 | Item | Status | Notes |
 |---|---|---|
 | **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | Done — [ADR 0006](adr/0006-own-dialog-program.md) | `rusthorse-dialog`, a separate process started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until the end of a long request has been reached (no height limit), a distinct password dialog. Next: a grants panel to inspect and revoke remembered approvals and broker tokens. |
-| **Lock on screen lock and suspend** | Planned | Listen to logind and the screensaver over D-Bus. |
+| **Lock on screen lock and suspend** | Done — [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md) | The agent watches logind (with a delay inhibitor before a suspend) and the Cinnamon, GNOME, MATE and freedesktop screensavers over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Entry kinds** | Done — [ADR 0008](adr/0008-entry-kinds.md) | `api-key`, `login`, `server`, `device`: labels and form fields, never policy. `run --url` passes an API key's endpoint. More kinds (database, SSH key) can follow. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |

@@ -265,9 +265,23 @@ All fields are optional; omitted fields are left unchanged.
   "agent_executable": "/home/me/.cargo/bin/rusthorse",
   "agent_executable_id": [66306, 1835012],
   "agent_executable_replaced": false,
-  "dialogs": "/home/me/.cargo/bin/rusthorse-dialog"
+  "dialogs": "/home/me/.cargo/bin/rusthorse-dialog",
+  "lock_triggers": [
+    {"event": "screen_lock", "source": "logind", "active": true,
+     "note": "session lock signals of this user"},
+    {"event": "screen_lock", "source": "org.cinnamon.ScreenSaver", "active": true},
+    {"event": "suspend", "source": "logind", "active": true,
+     "note": "locks before the computer sleeps"}
+  ]
 }
 ```
+
+`lock_triggers` (optional; left out by agents that predate it) lists what
+else locks the vault ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)):
+`event` is `suspend` or `screen_lock`, `source` where the agent learns of it,
+`active` whether it is watched now, and `note` why not or a remark
+(`turned off`, `connecting`, the bus error). Clients that find it missing
+should say it is not reported, not that nothing locks.
 
 `locks_in_secs` is omitted when the vault is locked or auto-lock is off.
 `agent_executable` is the program file the agent runs, as the kernel reports
