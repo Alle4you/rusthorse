@@ -168,7 +168,9 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | Item | Status | Notes |
 |---|---|---|
 | Publish on GitHub, CI on every pull request | Planned | After the clean reinstall and the owner's approval. |
-| Packaged releases: `.deb`, static binaries, signed checksums | Planned | |
+| Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); built from a clone with `packaging/build-deb.sh` until releases are published. |
+| Published releases: the `.deb`, static binaries, signed checksums; `.rpm` | Planned | Static binaries with `install.sh` / `uninstall.sh` (or `rusthorse setup`) for other distributions. |
+| Create the vault and import from the manager | Planned | Next: the manager's first start offers to create a vault (the agent asks for the master password); import from GNOME Keyring and `.env` (M3 of ADR 0007). |
 | Man page | Planned | Generated from the CLI definition. |
 | Build identifier in `status` and `doctor` | Later | Needs a build script to embed it. |
 | Tests for relay-thread creation failures | Later | Needs a preloaded `pthread_create` shim; verified by review until then. |

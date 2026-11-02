@@ -3,7 +3,8 @@ name = "rusthorse"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A local KeePass (KDBX4) secrets vault with an approval-gated agent that lets AI coding agents use credentials without seeing them."
+# Also the Debian package's one-line description: under 80 characters.
+description = "KeePass vault whose agent lets AI agents use secrets without seeing them"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Alle4you/rusthorse"
 readme = "README.md"
@@ -44,6 +45,44 @@ zeroize = { version = "1.9.1", features = ["serde", "derive"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The Debian package, built by packaging/build-deb.sh with cargo-deb: the
+# three programs, the agent's systemd user service (enabled for every user
+# by packaging/deb/postinst), the manager's menu entry and icon, shell
+# completions and the documentation. See docs/installation.md.
+[package.metadata.deb]
+maintainer = "Alle4you <56454046+Alle4you@users.noreply.github.com>"
+copyright = "2026 The Rusthorse contributors"
+license-file = ["LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto"
+suggests = "keepassxc"
+extended-description = """\
+Rusthorse keeps secrets in a KeePass (KDBX4) file and runs an agent, a \
+systemd user service, through which programs — AI coding agents above all — \
+use a secret without seeing it: the agent asks you in a dialog before each \
+use, runs the approved command with the secret in its environment and hides \
+the value in its output. It locks the vault when the screen locks or the \
+computer suspends. The package contains the command-line program and the \
+agent, the agent's dialogs and the visual manager."""
+maintainer-scripts = "packaging/deb/"
+assets = [
+    ["target/release/rusthorse", "usr/bin/", "755"],
+    ["target/release/rusthorse-dialog", "usr/bin/", "755"],
+    ["target/release/rusthorse-manager", "usr/bin/", "755"],
+    ["packaging/deb/rusthorse-agent.service", "usr/lib/systemd/user/", "644"],
+    ["data/io.github.alle4you.Rusthorse.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/scalable/apps/io.github.alle4you.Rusthorse.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["target/release/packaging/completions/rusthorse", "usr/share/bash-completion/completions/", "644"],
+    ["target/release/packaging/completions/_rusthorse", "usr/share/zsh/vendor-completions/", "644"],
+    ["target/release/packaging/completions/rusthorse.fish", "usr/share/fish/vendor_completions.d/", "644"],
+    ["README.md", "usr/share/doc/rusthorse/", "644"],
+    ["CHANGELOG.md", "usr/share/doc/rusthorse/", "644"],
+    ["SECURITY.md", "usr/share/doc/rusthorse/", "644"],
+    ["docs/*.md", "usr/share/doc/rusthorse/docs/", "644"],
+    ["docs/adr/*.md", "usr/share/doc/rusthorse/docs/adr/", "644"],
+]
 
 [lints.rust]
 unsafe_code = "deny"

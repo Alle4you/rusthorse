@@ -96,24 +96,24 @@ and keeps the value out of the agent's reach in the common case.
 
 ## Quick start
 
-Requirements: Linux with a graphical session (X11 or Wayland), systemd user
-services, GTK 4 and libadwaita for Rusthorse's own dialogs (or `zenity`), and
-Rust 1.92 or newer (1.89 without the dialogs). Full instructions, including
-uninstalling, are in [docs/installation.md](docs/installation.md).
+Requirements: Linux with a graphical session (X11 or Wayland) and systemd
+user services; to build, Rust 1.92 or newer and the GTK 4 and libadwaita
+development packages. On Ubuntu 24.04, Linux Mint 22, Debian 13 or later,
+build and install the Debian package; elsewhere, install from source. Full
+instructions, including uninstalling, are in
+[docs/installation.md](docs/installation.md).
 
 ```sh
-# 1. Build and install the binaries into ~/.cargo/bin
-cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse
-#    and Rusthorse's own dialogs (without them, the agent uses zenity)
+# 1. Build the Debian package (no release is published yet) and install it:
+#    the programs, the agent's service (enabled for every user), the manager
 sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
-cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-dialog
-chmod go-w ~/.cargo/bin/rusthorse ~/.cargo/bin/rusthorse-dialog
+cargo install --locked cargo-deb
+git clone https://github.com/Alle4you/rusthorse && cd rusthorse
+./packaging/build-deb.sh
+sudo apt install ./target/debian/rusthorse_0.1.0-1_amd64.deb
 
-# 2. Start the agent as a systemd user service
-curl -fsSLo ~/.config/systemd/user/rusthorse-agent.service --create-dirs \
-  https://raw.githubusercontent.com/Alle4you/rusthorse/main/contrib/systemd/rusthorse-agent.service
-systemctl --user daemon-reload
-systemctl --user enable --now rusthorse-agent
+# 2. Start the agent now (it starts by itself at your next login)
+systemctl --user start rusthorse-agent
 
 # 3. Create the vault (choose a strong master password)
 rusthorse init
@@ -133,6 +133,9 @@ groups, create, edit, delete, generate values, back up. When you approve it
 in the agent's dialog, it shows a value for 30 seconds or copies it to the
 clipboard. Like the CLI, it never opens the vault and never sees the master
 password.
+
+The package puts it in the applications menu as **Rusthorse**. From a
+clone, without installing anything:
 
 ```sh
 cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4+
@@ -206,7 +209,7 @@ limitation.
 ## Documentation
 
 - [Getting started](docs/getting-started.md) — the first ten minutes
-- [Installation](docs/installation.md) — build, install, systemd, migration, uninstall
+- [Installation](docs/installation.md) — the Debian package, building from source, systemd, migration, uninstall
 - [CLI reference](docs/cli.md) — commands, options, environment, exit statuses
 - [Using Rusthorse with AI agents](docs/ai-agents.md)
 - [Architecture](docs/architecture.md) — components, request flow, storage format

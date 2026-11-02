@@ -10,7 +10,7 @@ using a credential it never sees. It assumes you have followed
 $ rusthorse doctor
   ok    rusthorse 0.1.0 (protocol 5)
   ok    agent 0.1.0 is running (locked)
-  ok    the agent runs the same program file as this rusthorse (/home/me/.cargo/bin/rusthorse)
+  ok    the agent runs the same program file as this rusthorse (/usr/bin/rusthorse)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
   ok    the systemd user service is enabled
   ok    zenity is installed

@@ -11,6 +11,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- A **Debian package** ([ADR 0010](docs/adr/0010-debian-package.md)),
+  built with `packaging/build-deb.sh` (cargo-deb) for Ubuntu 24.04, Linux
+  Mint 22, Debian 13 or later: the three programs in `/usr/bin`, the agent's
+  user service enabled for every user, the manager in the applications menu,
+  shell completions and the documentation. `apt remove` stops the agents of
+  logged-in users and removes everything but users' vaults and audit logs;
+  upgrades do not restart running agents.
 - The agent **locks the vault when the screen locks or the computer
   suspends** ([ADR 0009](docs/adr/0009-lock-on-screen-lock-and-suspend.md)):
   it watches logind — holding a delay inhibitor so that the lock happens
@@ -91,6 +98,15 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   125 for "did not run".
 
 ### Changed
+
+- The service file (`contrib/systemd/rusthorse-agent.service`) lets systemd
+  create the socket's directory and remove it, with the socket, when the
+  agent stops (`RuntimeDirectory=rusthorse`); before, a stopped agent left
+  its socket file behind. Copy it again over an installed one.
+- The installation guide puts the package first; uninstalling a source
+  installation now also removes `rusthorse-dialog` and the `~/.local/bin`
+  link, which the guide forgot.
+- The crate's one-line description is shorter (it is also the package's).
 
 - `rusthorse-dialog` draws no hyphen where it wraps a long word (a hyphen
   that is not in a command or a path could mislead), and the keys of detail

@@ -146,6 +146,9 @@ Locking, unlocking and any saved change invalidate remembered approvals.
 It can replace the `rusthorse` binary, the systemd unit or your shell startup
 files, wait for you to unlock, and capture the master password or the
 decrypted data. No program running with your privileges can prevent this.
+The Debian package's programs belong to root, but that does not change it: a
+service file of the user's in `~/.config/systemd/user/` takes precedence over
+the package's ([ADR 0010](adr/0010-debian-package.md)).
 *Mitigation:* keep the account clean; run AI agents isolated (§8).
 
 ### L2 — X11 lets any program act on your dialogs
@@ -682,7 +685,7 @@ chain (`… ← codex ← claude ← …`), `backup` and an `import secret-servi
 | Finding | Disposition |
 |---|---|
 | R1 — an approval's audit record carried the time the request arrived, 23 seconds before the owner answered | **Fixed:** records are dated when they are written, after the decision. |
-| R2 — the AI's non-interactive shell did not have `~/.cargo/bin` on its `PATH`, so it could not find `rusthorse` | **Fixed (documentation):** [installation.md](installation.md#1-build-and-install) explains the check and the fix; the last setup step in [ai-agents.md](ai-agents.md#setting-up-an-agent) is `rusthorse doctor` from the AI's own shell. |
+| R2 — the AI's non-interactive shell did not have `~/.cargo/bin` on its `PATH`, so it could not find `rusthorse` | **Fixed (documentation):** [installation.md](installation.md#from-source) explains the check and the fix; the last setup step in [ai-agents.md](ai-agents.md#setting-up-an-agent) is `rusthorse doctor` from the AI's own shell. |
 | R3 — the owner took the master-password dialog for an approval and clicked Unlock three times with the field empty, which was recorded and reported as three wrong passwords | **Fixed:** the dialog starts with "Type the master password"; an empty field asks again without counting as wrong, and an unlock where nothing was typed is cancelled. [getting-started.md](getting-started.md) tells the two kinds of dialog apart. |
 | R4 — a dialog nobody answered was reported as a denial or a cancellation by the human | **Fixed:** it is `timed_out` in the audit log and "nobody answered … in time" in the message, so "nobody looked" is not mistaken for "the human said no". Exit statuses are unchanged. |
 | R5 — a backup to an existing file failed with "File exists (os error 17)" | **Fixed:** the message says a backup never replaces a file and asks for a new name. |

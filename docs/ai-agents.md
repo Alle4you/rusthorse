@@ -76,7 +76,7 @@ from the vault straight into the approved program.
 
 4. Ask the AI to run `rusthorse doctor`. This checks, from the AI's own shell,
    that it finds `rusthorse` (if not, see
-   [installation.md](installation.md#1-build-and-install)) and reaches the
+   [installation.md](installation.md#from-source)) and reaches the
    agent.
 
 ## Approving requests

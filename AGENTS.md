@@ -159,7 +159,7 @@ Breaking one of these is a security bug, whatever the tests say.
 | what is protected or how | `docs/threat-model.md` |
 | a significant design decision | a new ADR in `docs/adr/` |
 | a planned or proposed feature | `docs/roadmap.md` |
-| installation or setup | `docs/installation.md`, `docs/getting-started.md` |
+| installation or setup | `docs/installation.md`, `docs/getting-started.md`; the package (`packaging/`) when it installs files or services |
 | advice to users of AI agents | `docs/ai-agents.md` |
 
 Documentation must be true and no stronger than the code: state assumptions
@@ -204,5 +204,7 @@ present and capture only its window, in a dark and a light theme
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
 | `tests/agent.rs` | End-to-end tests |
+| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): service file, maintainer scripts, `build-deb.sh` |
+| `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
 | `docs/roadmap.md` | Planned work, led by the credential broker |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

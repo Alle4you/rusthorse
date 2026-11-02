@@ -6,6 +6,9 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now rusthorse-agent
 #
+# The Debian package installs packaging/deb/rusthorse-agent.service instead,
+# which differs from this file only in its comments and in ExecStart.
+#
 # The agent must be started by systemd, not from a shell that an AI agent
 # controls: see docs/threat-model.md ("Who starts the agent").
 #
@@ -24,6 +27,10 @@ ExecStart=%h/.cargo/bin/rusthorse agent
 Restart=on-failure
 RestartSec=2
 LimitCORE=0
+# The directory of the agent's socket ($XDG_RUNTIME_DIR/rusthorse): created
+# private when the agent starts, removed with the socket when it stops.
+RuntimeDirectory=rusthorse
+RuntimeDirectoryMode=0700
 # Stop approved commands together with the agent.
 KillMode=control-group
 

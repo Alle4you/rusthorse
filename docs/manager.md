@@ -31,8 +31,9 @@ missing and what to do meanwhile.
 - The agent must be running (`rusthorse status` answers) and the vault must
   exist (`rusthorse init`). The manager does not install, start or restart
   anything.
-- Building needs Rust 1.92 or later and the GTK 4.12+ and libadwaita 1.4+
-  development packages — the same as `rusthorse-dialog`
+- The Debian package installs it: open **Rusthorse** from the applications
+  menu. Building it from source needs Rust 1.92 or later and the GTK 4.12+
+  and libadwaita 1.4+ development packages — the same as `rusthorse-dialog`
   ([installation.md](installation.md#optional-visual-manager)).
 
 To try it without installing, from the source tree, when you are at the

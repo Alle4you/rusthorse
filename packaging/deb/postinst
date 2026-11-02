@@ -1,0 +1,33 @@
+#!/bin/sh
+# Debian package: after the files are installed or upgraded.
+#
+# Enables the agent's user service for every user, as debhelper's
+# dh_installsystemduser would: it starts at each user's next login, or at
+# once with `systemctl --user start rusthorse-agent` (the manager has a
+# button for it). On an upgrade, deb-systemd-helper keeps what the
+# administrator chose: a service disabled with `systemctl --global disable`
+# stays disabled. A user who does not want the agent runs
+# `systemctl --user mask rusthorse-agent`.
+#
+# Agents already running are not restarted: a restart would lock their
+# vaults and stop the commands they started. `rusthorse doctor` says when an
+# agent still runs the replaced program.
+set -e
+
+unit=rusthorse-agent.service
+
+case "$1" in
+configure | abort-upgrade | abort-deconfigure | abort-remove)
+    if [ -x /usr/bin/deb-systemd-helper ]; then
+        # was-enabled is true for a unit it has never seen, so a first
+        # installation enables it.
+        if deb-systemd-helper --quiet --user was-enabled "$unit"; then
+            deb-systemd-helper --user enable "$unit" >/dev/null || true
+        else
+            deb-systemd-helper --user update-state "$unit" >/dev/null || true
+        fi
+    fi
+    ;;
+esac
+
+exit 0

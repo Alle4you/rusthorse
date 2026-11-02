@@ -1,8 +1,8 @@
 # Installation
 
-This guide covers building Rusthorse, running the agent as a systemd user
-service, creating or adopting a vault, migrating existing secrets and
-uninstalling.
+This guide covers installing Rusthorse — from the Debian package or from
+source —, running the agent as a systemd user service, creating or adopting
+a vault, migrating existing secrets and uninstalling.
 
 ## Requirements
 
@@ -12,13 +12,74 @@ uninstalling.
 | A graphical session (X11 or Wayland) | The agent shows its dialogs on your desktop. |
 | GTK 4.12 and libadwaita 1.4 or newer (recommended) | For `rusthorse-dialog`, Rusthorse's own dialogs: Ubuntu 24.04, Linux Mint 22, Fedora 39, Debian 13 and later. |
 | `zenity` | The fallback when `rusthorse-dialog` is not installed. Tested with 3.44. Install with `sudo apt install zenity`. |
-| Rust 1.89 or newer (1.92 for `rusthorse-dialog`) | Only to build. Install with [rustup](https://rustup.rs). |
+| Rust 1.89 or newer (1.92 for `rusthorse-dialog` and the manager) | Only to build from source, or to build the package. Install with [rustup](https://rustup.rs). |
 | A Secret Service provider (optional) | Only for `rusthorse import secret-service` (GNOME Keyring, KWallet). |
 
-Rusthorse does not need root, does not use Flatpak or Snap, and installs two
-binaries: `rusthorse` and, if your system has GTK 4, `rusthorse-dialog`.
+Rusthorse does not use Flatpak or Snap ([ADR 0004](adr/0004-native-distribution.md)).
+It installs three programs: `rusthorse` (the command-line program and the
+agent), `rusthorse-dialog` (the agent's dialogs) and `rusthorse-manager`
+(the visual manager). Installed from source, it needs no root.
 
-## 1. Build and install
+## 1. Install
+
+### Debian, Ubuntu, Linux Mint: the package
+
+The package installs the three programs, enables the agent for every user
+and puts **Rusthorse** in the applications menu; apt removes it again
+([ADR 0010](adr/0010-debian-package.md)). It needs Ubuntu 24.04, Linux
+Mint 22, Debian 13 or later: it depends on GTK 4.12, libadwaita 1.4 and
+glibc 2.39.
+
+No release has been published yet, so build the package from a clone. That
+needs what building from source needs (Rust, and the GTK 4 and libadwaita
+development packages, below) and cargo-deb:
+
+```sh
+sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
+cargo install --locked cargo-deb
+git clone https://github.com/Alle4you/rusthorse
+cd rusthorse
+./packaging/build-deb.sh     # → target/debian/rusthorse_0.1.0-1_amd64.deb
+```
+
+Install it with apt, or by opening the file in your desktop's package
+installer:
+
+```sh
+sudo apt install ./target/debian/rusthorse_0.1.0-1_amd64.deb
+```
+
+| Installed | What |
+|---|---|
+| `/usr/bin/rusthorse`, `rusthorse-dialog`, `rusthorse-manager` | The programs |
+| `/usr/lib/systemd/user/rusthorse-agent.service` | The agent's service, enabled for every user |
+| `/usr/share/applications/`, `/usr/share/icons/` | The menu entry and icon of the manager |
+| `/usr/share/bash-completion/`, `zsh/`, `fish/` | Shell completions |
+| `/usr/share/doc/rusthorse/` | This documentation |
+
+The agent starts at your next login. To start it now:
+
+```sh
+systemctl --user start rusthorse-agent
+```
+
+Then [create a vault](#3-create-a-vault) — section 2 is done for you.
+
+- The programs in `/usr/bin` belong to root, so `chmod go-w` is not needed,
+  and AI agents' shells find `rusthorse` on their `PATH`.
+- If you installed Rusthorse with `cargo` before, [remove that
+  installation](#a-source-installation) first: a service file in
+  `~/.config/systemd/user/` takes precedence over the package's and would
+  keep starting the old program.
+- To keep the agent from starting for one user, that user runs
+  `systemctl --user mask rusthorse-agent` (`unmask` undoes it).
+- Upgrading is installing a newer package the same way. Agents that are
+  running keep the program they started with until your next login, or until
+  `systemctl --user restart rusthorse-agent` (which locks the vault and stops
+  the commands the agent started); `rusthorse doctor` says when one runs a
+  replaced program.
+
+### From source
 
 From a clone:
 
@@ -86,6 +147,8 @@ cargo install --locked --path . --no-default-features
 
 ## 2. Run the agent as a systemd user service
 
+The package does this for you. After installing from source:
+
 ```sh
 install -Dm644 contrib/systemd/rusthorse-agent.service \
     ~/.config/systemd/user/rusthorse-agent.service
@@ -115,6 +178,7 @@ systemctl --user edit rusthorse-agent
 # Different vault location
 Environment=RUSTHORSE_VAULT=%h/Sync/passwords.kdbx
 # Clear the original ExecStart, then set a new one
+# (with the package, the program is /usr/bin/rusthorse)
 ExecStart=
 ExecStart=%h/.cargo/bin/rusthorse agent --idle-timeout 30m
 ```
@@ -278,8 +342,10 @@ identical).
 
 ## Upgrading
 
-Install a specific release, then restart the agent so that both sides run
-the same version:
+With the package, install the newer package as in
+[section 1](#debian-ubuntu-linux-mint-the-package), then restart the agent
+(or log in again). From source, install a specific release, then restart the
+agent so that both sides run the same version:
 
 ```sh
 cargo install --locked --git https://github.com/Alle4you/rusthorse --tag v0.1.0 --force
@@ -300,20 +366,50 @@ upgrading.
 | Previous vault | `vault.kdbx.bak`, next to the vault | — |
 | Agent socket | `$XDG_RUNTIME_DIR/rusthorse/agent.sock` (`/run/user/<uid>/…`) | `RUSTHORSE_SOCKET`, `--socket` |
 | Audit log | `$XDG_STATE_HOME/rusthorse/audit.jsonl` (`~/.local/state/…`) | `RUSTHORSE_AUDIT_LOG`, `--audit-log` |
+| Programs | `/usr/bin` (package) or `~/.cargo/bin` (source) | — |
+| Service file | `/usr/lib/systemd/user/` (package) or `~/.config/systemd/user/` (source) | A drop-in: `systemctl --user edit rusthorse-agent` |
 
-Directories are created with mode `0700` and files with `0600`.
+Directories are created with mode `0700` and files with `0600`. systemd
+creates the socket's directory when the agent starts and removes it, with the
+socket, when the agent stops (`RuntimeDirectory=` in the service file); an
+agent started otherwise creates the directory itself and leaves it.
 
 ## Uninstalling
+
+Uninstalling never deletes your vault or your audit log.
+
+### The package
+
+```sh
+sudo apt remove rusthorse
+```
+
+This removes the programs, the service file, the menu entry, the completions
+and the documentation, and first stops the agent of every user who is logged
+in (which locks their vaults and stops the commands their agents started).
+Like any package, it keeps the record of whether the service is enabled, so
+that installing the package again keeps that choice; `sudo apt purge
+rusthorse` deletes that record too, and nothing of the package is left
+outside home directories.
+
+### A source installation
 
 ```sh
 systemctl --user disable --now rusthorse-agent
 rm ~/.config/systemd/user/rusthorse-agent.service
 systemctl --user daemon-reload
-cargo uninstall rusthorse
+cargo uninstall rusthorse rusthorse-dialog
+rm -f ~/.local/bin/rusthorse       # if you linked it there
 ```
 
-This leaves your vault and audit log in place. Delete them only once you are
-sure you no longer need the secrets:
+If you also installed the manager, remove it as in [its
+section](#optional-visual-manager).
+
+### Your data
+
+The vault, its previous version and the audit log stay in place. Delete them
+only once you are sure you no longer need the secrets — the vault is an
+ordinary KeePass file, which KeePassXC opens, so keep a copy if in doubt:
 
 ```sh
 rm -r ~/.local/share/rusthorse ~/.local/state/rusthorse
@@ -321,7 +417,11 @@ rm -r ~/.local/share/rusthorse ~/.local/state/rusthorse
 
 ## Optional visual manager
 
-`rusthorse-manager` ([guide](manager.md)) is a separate program, built like
+The package includes `rusthorse-manager` ([guide](manager.md)): open
+**Rusthorse** from the applications menu. The rest of this section is for
+source installations.
+
+`rusthorse-manager` is a separate program, built like
 `rusthorse-dialog`: Rust 1.92 or later and the GTK 4 and libadwaita
 development packages (`libgtk-4-dev`, `libadwaita-1-dev`). Plain `cargo`
 commands in the source tree do not build it.

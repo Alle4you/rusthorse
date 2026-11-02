@@ -1,0 +1,17 @@
+#!/bin/sh
+# Debian package: after the files are removed.
+#
+# `apt remove` keeps the record of whether the service is enabled, as for
+# any Debian package, so that installing the package again keeps that
+# choice; `apt purge` deletes it too, and with it the links in
+# /etc/systemd/user/. Neither touches the vaults and audit logs in users'
+# home directories.
+set -e
+
+unit=rusthorse-agent.service
+
+if [ "$1" = purge ] && [ -x /usr/bin/deb-systemd-helper ]; then
+    deb-systemd-helper --user purge "$unit" >/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,36 @@
+# Rusthorse agent as a systemd user service — the copy installed by the
+# Debian package in /usr/lib/systemd/user/. The package enables it for every
+# user (`deb-systemd-helper --user`), so it starts at each login; until
+# then, `systemctl --user start rusthorse-agent` starts it.
+#
+# It differs from contrib/systemd/rusthorse-agent.service (for `cargo
+# install`) only in its comments and in ExecStart; a test checks this.
+#
+# The agent must be started by systemd, not from a shell that an AI agent
+# controls: see /usr/share/doc/rusthorse/docs/threat-model.md ("Who starts
+# the agent").
+#
+# Approved commands run as children of this service, so hardening options here
+# (PrivateTmp=, NoNewPrivileges=, ProtectHome=, ...) would also apply to them
+# and break ordinary commands such as `sudo` or tools that use /tmp. They are
+# deliberately not set; the agent hardens its own process at startup instead.
+
+[Unit]
+Description=Rusthorse secrets agent
+Documentation=https://github.com/Alle4you/rusthorse/blob/main/docs/installation.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rusthorse agent
+Restart=on-failure
+RestartSec=2
+LimitCORE=0
+# The directory of the agent's socket ($XDG_RUNTIME_DIR/rusthorse): created
+# private when the agent starts, removed with the socket when it stops.
+RuntimeDirectory=rusthorse
+RuntimeDirectoryMode=0700
+# Stop approved commands together with the agent.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Debian package: before the files are removed (not before an upgrade).
+#
+# Stops the agent in the sessions of the users who are logged in, so that no
+# agent keeps running a program that is no longer installed. Stopping an
+# agent locks its vault and stops the commands it started. Each user's vault
+# and audit log stay in their home directory: removing the package never
+# deletes them.
+set -e
+
+unit=rusthorse-agent.service
+
+if [ "$1" = remove ] && command -v loginctl >/dev/null 2>&1; then
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{ print $1 }'); do
+        user=$(id -nu "$uid" 2>/dev/null) || continue
+        systemctl --user --machine="$user@" stop "$unit" >/dev/null 2>&1 || true
+    done
+fi
+
+exit 0
