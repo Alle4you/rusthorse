@@ -171,31 +171,44 @@ and cannot be edited here. The form's **Value** rows keep the current value
 unless you choose **Type a new value** or **Generate a random value**. With
 other changes, the agent asks for your approval of all of them first, then,
 for a typed value, for the value; **Type a new value** alone opens the
-agent's dialog for the value at once, like **Change the value…**. **Delete** removes the entry and its
-history from the vault — it does not revoke the credential at its provider.
+agent's dialog for the value at once, like **Change the value…**. Choosing
+another **Group** moves the entry (see [Choose a group](#choose-a-group)).
+**Delete** removes the entry and its history from the vault — it does not
+revoke the credential at its provider.
 
-To **move** an entry, write another group in the form's **Group** row: a
-path such as `Work/Servers`, with `/` between the groups. A group that does
-not exist yet is created. Spaces around each group's name and empty names
-are left out, so ` Work / Servers ` is `Work/Servers`, and the same group
-written differently moves nothing. **Emptying the row moves the entry to the
-top level**, outside any group. A group's name follows the rules for an
-entry's name (for example at most 128 characters, no control or invisible
-characters): the form says which rule a name breaks before it sends
-anything. Left as it is, the row moves nothing, even for a group named by
-another KeePass client with spaces or a `/` in its name. Edited, the row is
-sent and the agent decides whether it is a move by the group itself: a
-group named `Work/Servers` by another client is not the nested `Work` →
-`Servers`, though both read the same, and a path to the group the entry is
-in moves nothing. The agent's approval dialog shows the destination as a
-path from the top and says which group it is — `/Work/Servers (existing
-group 8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)`, by its whole UUID, or what it
-creates, `/Work/Servers (creates Servers in /Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)` — or `/ (the top level)`. A path through two groups of the same
-name side by side is refused, since which one is meant cannot be told. A move keeps the entry's
-UUID, so the command of **Use it from a command**, which names the entry by
-UUID, still works; a command that names it by its old `Group/Name` path no
-longer finds it. The agent refuses to move an entry into the recycle bin;
-use **Delete** to remove it.
+### Choose a group
+
+The form's **Group** is a list, so that a typo does not make a new group
+(names are case-sensitive: `home` and `Home` are two groups). It offers
+**No group** (the top level), every group that holds an entry and the groups
+above it — `home/routers` also brings `home` — and, last, **New group…**,
+which opens a row for a path such as `home/firewalls`: `/` separates the
+groups, and the ones that do not exist yet are created inside the ones that
+do. Spaces around each name and empty names are left out, so
+` home / firewalls ` is `home/firewalls`. A name follows the rules for an
+entry's name (at most 128 characters, no control or invisible characters):
+the form says which rule a name breaks before it sends anything, and warns
+when a new path differs from an existing group only in case. A group that
+holds no entry is not in the list; type its path after **New group…**.
+
+A new entry starts in the group the entry list is filtered on, or in **No
+group**. To **move** an entry, choose another group in **Edit**; **No
+group** moves it to the top level. Left as it is, the list moves nothing,
+even for a group named by another KeePass client with spaces or a `/` in its
+name. A group chosen or typed is sent, and the agent decides whether it is a
+move by the group itself: a group named `Work/Servers` by another client is
+not the nested `Work` → `Servers`, though both read the same, and the group
+the entry is already in moves nothing. The agent's approval dialog shows the
+destination as a path from the top and says which group it is —
+`/home/routers (existing group 8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)`, by its
+whole UUID, or what it creates, `/home/firewalls (creates firewalls in /home,
+group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)` — or `/ (the top level)`. A
+path through two groups of the same name side by side is refused, since
+which one is meant cannot be told. A move keeps the entry's UUID, so the
+command of **Use it from a command**, which names the entry by UUID, still
+works; a command that names it by its old `Group/Name` path no longer finds
+it. The agent refuses to move an entry into the recycle bin; use **Delete**
+to remove it.
 
 ### Give a secret to a program
 

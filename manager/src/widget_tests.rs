@@ -114,6 +114,36 @@ fn entry_rows(root: &impl IsA<gtk::Widget>) -> Vec<adw::EntryRow> {
 }
 
 /// The text a revealed value shows: one plain label, never split.
+/// The form's list of groups.
+fn group_list(root: &impl IsA<gtk::Widget>) -> adw::ComboRow {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ComboRow>().ok())
+        .find(|c| c.title() == "Group")
+        .expect("group list")
+}
+
+/// The labels a list offers, and the selected one.
+fn offered_groups(list: &adw::ComboRow) -> (Vec<String>, String) {
+    let model = list
+        .model()
+        .and_downcast::<gtk::StringList>()
+        .expect("strings");
+    let labels: Vec<String> = (0..model.n_items())
+        .filter_map(|i| model.string(i))
+        .map(|l| l.to_string())
+        .collect();
+    let selected = labels[list.selected() as usize].clone();
+    (labels, selected)
+}
+
+/// Choose `label` in a form's list of groups.
+fn pick_group(list: &adw::ComboRow, label: &str) {
+    let (labels, _) = offered_groups(list);
+    let i = labels.iter().position(|l| l == label).expect(label);
+    list.set_selected(i as u32);
+}
+
 /// The activatable row named `name` under `root`.
 fn named_row(root: &impl IsA<gtk::Widget>, name: &str) -> adw::ActionRow {
     descendants(root)
@@ -415,6 +445,23 @@ fn desktop_flow() {
     assert_eq!(titles, ["Type the value", "Generate a random value"]);
     assert!(choices[0].1.is_active() && !choices[1].1.is_active());
     inputs[0].set_text("FAKE_DESKTOP_KEY");
+    // The group: chosen from a list; a new one is typed in the row that
+    // "New group…" opens.
+    let groups = group_list(&editor);
+    assert_eq!(
+        offered_groups(&groups),
+        (
+            vec!["No group".into(), "New group…".into()],
+            "No group".into()
+        )
+    );
+    assert!(!inputs[1].is_visible());
+    pick_group(&groups, "New group…");
+    assert!(inputs[1].is_visible());
+    assert_eq!(
+        inputs[1].title(),
+        "New group (a path such as home/firewalls)"
+    );
     inputs[1].set_text("AI");
     // The kind decides which rows are offered and what the URL is called;
     // a row with a value is never hidden.
@@ -837,10 +884,15 @@ fn desktop_flow() {
     spin_until(|| Instant::now() >= settle_frame);
     let inputs = entry_rows(&editor);
     assert_eq!(inputs[0].title(), "Name");
-    // The group can be changed, which moves the entry (see below).
-    assert_eq!(inputs[1].title(), "Group (empty for none)");
-    assert!(inputs[1].is_sensitive());
-    assert_eq!(inputs[1].text(), "AI");
+    // The form starts on the entry's group (moving: see below).
+    assert_eq!(
+        offered_groups(&group_list(&editor)),
+        (
+            vec!["No group".into(), "AI".into(), "New group…".into()],
+            "AI".into()
+        )
+    );
+    assert!(!inputs[1].is_visible());
     inputs[0].set_text("RENAMED_FAKE");
     // The value: kept unless another choice is made, one choice at a time.
     let choices = value_choices(&editor);
@@ -901,13 +953,13 @@ fn desktop_flow() {
     // Moving: the Edit form's Group row takes a path, created if missing,
     // with spaces around a `/` left out; emptying it moves the entry to the
     // top level. Each move asks for approval and keeps the UUID.
-    let move_to = |typed: &str| {
+    let move_to = |pick: &str, typed: &str| {
         s.rows.select_row(s.rows.row_at_index(0).as_ref());
         s.edit(s.current());
         let editor = s.editor.borrow().as_ref().unwrap().clone();
+        pick_group(&group_list(&editor), pick);
         let group = entry_rows(&editor).remove(1);
-        assert_eq!(group.title(), "Group (empty for none)");
-        assert!(group.is_sensitive());
+        assert_eq!(group.is_visible(), pick == "New group…");
         group.set_text(typed);
         let asked = approvals.load(Ordering::SeqCst);
         button(&editor, "Send to agent…").emit_clicked();
@@ -940,7 +992,7 @@ fn desktop_flow() {
             .collect::<Vec<_>>()
     };
     assert_eq!(heading(&s).as_deref(), Some("AI"));
-    move_to(" Work / Servers ");
+    move_to("New group…", " Work / Servers ");
     assert_eq!(s.entries.borrow()[0].group.as_deref(), Some("Work/Servers"));
     assert_eq!(heading(&s).as_deref(), Some("Work/Servers"));
     assert!(descendants(&s.detail).iter().any(|w| {
@@ -956,12 +1008,64 @@ fn desktop_flow() {
         s.rows.row_at_index(0).map(|r| r.widget_name().to_string()),
         Some(id.clone())
     );
+    // A new entry starts in the group the list is filtered on.
+    s.edit(None);
+    let editor = s.editor.borrow().as_ref().unwrap().clone();
+    assert_eq!(offered_groups(&group_list(&editor)).1, "Work/Servers");
+    button(&editor, "Cancel").emit_clicked();
+    spin_until(|| !editor.is_visible());
+    drop(editor);
     s.groups.set_selected(0);
+    s.edit(None);
+    let editor = s.editor.borrow().as_ref().unwrap().clone();
+    assert_eq!(offered_groups(&group_list(&editor)).1, "No group");
+    button(&editor, "Cancel").emit_clicked();
+    spin_until(|| !editor.is_visible());
+    drop(editor);
     // A group name the agent would refuse is refused by the form: nothing
     // is sent and the form stays open with the reason.
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     s.edit(s.current());
     let editor = s.editor.borrow().as_ref().unwrap().clone();
+    // The list offers the new group and the group above it.
+    let groups = group_list(&editor);
+    assert_eq!(
+        offered_groups(&groups),
+        (
+            vec![
+                "No group".into(),
+                "Work".into(),
+                "Work/Servers".into(),
+                "New group…".into()
+            ],
+            "Work/Servers".into()
+        )
+    );
+    // A new group that differs from an existing one only in case: a warning.
+    pick_group(&groups, "New group…");
+    let warned = |editor: &adw::Window| {
+        descendants(editor)
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+            .find(|r| r.has_css_class("warning") && r.is_visible())
+            .map(|r| r.title().to_string())
+    };
+    entry_rows(&editor)[1].set_text("work / servers");
+    assert_eq!(
+        warned(&editor).as_deref(),
+        Some("There is already a group named Work/Servers; names are case-sensitive.")
+    );
+    entry_rows(&editor)[1].set_text("Work/Servers/New");
+    assert_eq!(warned(&editor), None);
+    // "New group…" with nothing typed sends nothing.
+    entry_rows(&editor)[1].set_text(" / ");
+    button(&editor, "Send to agent…").emit_clicked();
+    assert!(s.job.borrow().is_none() && editor.is_visible());
+    assert!(descendants(&editor).iter().any(|w| {
+        w.clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|l| l.has_css_class("error") && l.text().starts_with("Type the new group"))
+    }));
     entry_rows(&editor)[1].set_text("Work/Bad\u{200b}Name");
     let asked = approvals.load(Ordering::SeqCst);
     button(&editor, "Send to agent…").emit_clicked();
@@ -975,8 +1079,11 @@ fn desktop_flow() {
     spin_until(|| !editor.is_visible());
     drop(editor);
     assert_eq!(approvals.load(Ordering::SeqCst), asked);
+    // To an existing group, chosen from the list: the group above.
+    move_to("Work", "");
+    assert_eq!(s.entries.borrow()[0].group.as_deref(), Some("Work"));
     // Back to the top level.
-    move_to("");
+    move_to("No group", "");
     assert_eq!(s.entries.borrow()[0].group, None);
     assert_eq!(heading(&s).as_deref(), Some("No group"));
     assert_eq!(offered(&s), ["All groups", "No group"]);

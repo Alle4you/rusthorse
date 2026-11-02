@@ -11,6 +11,9 @@ pub(crate) struct Form {
     pub kind: Option<EntryKind>,
     pub name: String,
     pub group: String,
+    /// Whether the human chose another group in the form's list. `None`:
+    /// decided by comparing `group` with the entry's group as text.
+    pub group_edited: Option<bool>,
     pub username: String,
     pub url: String,
     pub host: String,
@@ -24,6 +27,7 @@ impl Form {
             kind: entry.fields.kind,
             name: entry.name.clone(),
             group: entry.group.clone().unwrap_or_default(),
+            group_edited: None,
             username: entry.fields.username.clone().unwrap_or_default(),
             url: entry.fields.url.clone().unwrap_or_default(),
             host: entry.fields.host.clone().unwrap_or_default(),
@@ -96,7 +100,7 @@ impl Form {
         // alone cannot tell a group named `Work/Servers` from `Work` →
         // `Servers`.
         let group = group_path(&self.group);
-        if self.group != before.group {
+        if self.group_edited.unwrap_or(self.group != before.group) {
             for component in group.split('/').filter(|c| !c.is_empty()) {
                 rusthorse::vault::validate_name(component).map_err(|e| format!("Group: {e}"))?;
             }
@@ -206,7 +210,23 @@ pub(crate) fn kind_label(kind: Option<EntryKind>) -> &'static str {
 
 /// A group path as the agent reads it: each component trimmed, empty ones
 /// dropped, joined with `/`. The top level is the empty path.
-fn group_path(text: &str) -> String {
+/// The groups an entry form offers: every group that holds an entry, and the
+/// groups above it (`home` for `home/routers`), sorted; the top level is not
+/// one of them. Paths as the agent shows them (names joined by `/`).
+pub(crate) fn group_choices(entries: &[EntryInfo]) -> Vec<String> {
+    let mut groups = std::collections::BTreeSet::new();
+    for path in entries.iter().filter_map(|e| e.group.as_deref()) {
+        let parts: Vec<&str> = path.split('/').collect();
+        for end in 1..=parts.len() {
+            groups.insert(parts[..end].join("/"));
+        }
+    }
+    groups.into_iter().collect()
+}
+
+/// A typed group path as the agent reads it: each part trimmed, empty parts
+/// left out, joined by `/`; empty is the top level.
+pub(crate) fn group_path(text: &str) -> String {
     text.split('/')
         .map(str::trim)
         .filter(|c| !c.is_empty())
@@ -486,6 +506,47 @@ pub(crate) mod tests {
         form.group = "Work".into();
         let sent = changes(&form, &entry).expect("edit");
         assert_eq!(sent.group.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn the_form_offers_every_group_and_the_groups_above_it() {
+        let mut entries = Vec::new();
+        for group in [
+            Some("home/routers"),
+            Some("home/firewalls"),
+            Some("AI"),
+            None,
+            Some("AI"),
+        ] {
+            let mut e = entry();
+            e.group = group.map(str::to_string);
+            entries.push(e);
+        }
+        assert_eq!(
+            group_choices(&entries),
+            ["AI", "home", "home/firewalls", "home/routers"]
+        );
+        assert!(group_choices(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_group_chosen_in_the_list_is_sent_even_when_it_reads_the_same() {
+        // The entry is in a group of another client named `Work/Servers`;
+        // the human chose "New group…" and typed `Work/Servers`, meaning the
+        // nested groups: sent, for the agent to decide by the group itself.
+        let mut entry = entry();
+        entry.group = Some("Work/Servers".into());
+        let mut form = Form::from_entry(&entry);
+        form.group_edited = Some(true);
+        let sent = changes(&form, &entry).expect("sent");
+        assert_eq!(sent.group.as_deref(), Some("Work/Servers"));
+        // Not chosen: not sent, whatever the text.
+        form.group = "Elsewhere".into();
+        form.group_edited = Some(false);
+        assert_eq!(
+            changes(&form, &entry).expect_err("untouched"),
+            "Nothing changed."
+        );
     }
 
     #[test]

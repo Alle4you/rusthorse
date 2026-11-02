@@ -1758,6 +1758,35 @@ impl Manager {
             .build();
         let body = column(24);
         let initial = old.as_ref().map(Form::from_entry).unwrap_or_default();
+        // The group is chosen from a list — No group, the groups that hold
+        // entries and the groups above them, then "New group…", which opens
+        // a row for a path — so that a typo does not make a new group. The
+        // form starts on the entry's group, or for a new entry on the group
+        // the list is filtered on.
+        let known = model::group_choices(&self.entries.borrow());
+        let start_group = match &old {
+            Some(_) => initial.group.clone(),
+            None => {
+                let filtered = self.groups.selected() as usize;
+                self.group_names
+                    .borrow()
+                    .get(filtered.wrapping_sub(1))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        };
+        let start_index = known
+            .iter()
+            .position(|g| !start_group.is_empty() && *g == start_group)
+            .map_or(0, |i| i as u32 + 1);
+        let new_group_index = known.len() as u32 + 1;
+        let group_list = adw::ComboRow::builder().title("Group").build();
+        let group_warning = adw::ActionRow::builder()
+            .title("")
+            .use_markup(false)
+            .visible(false)
+            .build();
+        group_warning.add_css_class("warning");
         let fields_group = group(
             "Entry",
             Some(
@@ -1814,11 +1843,20 @@ impl Manager {
             ("Tags (comma separated)", &initial.tags, ""),
         ] {
             let withheld = withheld(protected);
+            let is_group = name == "Group";
+            if is_group {
+                let mut labels = vec!["No group".to_string()];
+                labels.extend(known.iter().map(|g| rusthorse::ui::dialog_text(g)));
+                labels.push("New group…".to_string());
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                group_list.set_model(Some(&gtk::StringList::new(&refs)));
+                group_list.set_selected(start_index);
+                fields_group.add(&group_list);
+            }
             let title = if withheld {
                 format!("{name} (protected; unchanged)")
-            } else if name == "Group" && old.is_some() {
-                // Emptying the row moves the entry to the top level.
-                "Group (empty for none)".to_string()
+            } else if is_group {
+                "New group (a path such as home/firewalls)".to_string()
             } else {
                 name.to_string()
             };
@@ -1826,10 +1864,55 @@ impl Manager {
                 .title(title)
                 .use_markup(false)
                 .build();
-            row.set_text(value);
+            // The group row is for a new group only; the list holds the rest.
+            row.set_text(if is_group { "" } else { value });
+            row.set_visible(!is_group);
             row.set_sensitive(!withheld);
             fields_group.add(&row);
+            if is_group {
+                fields_group.add(&group_warning);
+            }
             fields.push(row);
+        }
+        {
+            // Weak references: these closures are stored on the form's own
+            // widgets.
+            let (row, warning) = (fields[1].downgrade(), group_warning.downgrade());
+            group_list.connect_selected_notify(move |list| {
+                let (Some(row), Some(warning)) = (row.upgrade(), warning.upgrade()) else {
+                    return;
+                };
+                let new = list.selected() == new_group_index;
+                row.set_visible(new);
+                if new {
+                    row.grab_focus();
+                } else {
+                    warning.set_visible(false);
+                }
+            });
+            // A new group that differs from an existing one only in case is
+            // most likely a typo: names are case-sensitive.
+            let names = known.clone();
+            let warning = group_warning.downgrade();
+            fields[1].connect_changed(move |row| {
+                let Some(warning) = warning.upgrade() else {
+                    return;
+                };
+                let typed = model::group_path(&row.text());
+                match names
+                    .iter()
+                    .find(|g| **g != typed && g.to_lowercase() == typed.to_lowercase())
+                {
+                    Some(existing) => {
+                        warning.set_title(&format!(
+                            "There is already a group named {}; names are case-sensitive.",
+                            rusthorse::ui::dialog_text(existing)
+                        ));
+                        warning.set_visible(true);
+                    }
+                    None => warning.set_visible(false),
+                }
+            });
         }
         let hidden_by_file = ["UserName", "URL", "Host", "Port"].map(withheld);
         // Weak references: the closure is stored in the handlers of `kind`
@@ -1937,10 +2020,26 @@ impl Manager {
         let weak = Rc::downgrade(self);
         let w = window.downgrade();
         save.connect_clicked(move |_| {
+            let picked = group_list.selected();
+            let group = match picked {
+                0 => String::new(),
+                i if i < new_group_index => known[i as usize - 1].clone(),
+                _ => {
+                    let typed = fields[1].text().to_string();
+                    if model::group_path(&typed).is_empty() {
+                        error.set_text(
+                            "Type the new group's path, such as home/firewalls, or choose a group from the list.",
+                        );
+                        return;
+                    }
+                    typed
+                }
+            };
             let form = Form {
                 kind: model::KIND_CHOICES[kind.selected() as usize],
                 name: fields[0].text().into(),
-                group: fields[1].text().into(),
+                group,
+                group_edited: Some(picked != start_index),
                 username: fields[2].text().into(),
                 url: fields[3].text().into(),
                 host: fields[4].text().into(),

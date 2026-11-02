@@ -12,8 +12,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 ### Added
 
 - **Move an entry to another group**: `rusthorse edit NAME --group PATH`
-  (`/` for the top level) and the **Group** field of the manager's **Edit**
-  form, which used to be locked. The group is created if needed, and the
+  (`/` for the top level) and the **Group** of the manager's **Edit** form,
+  which used to be locked. In the manager's forms the group is chosen from a
+  list (No group, the groups in use and the groups above them, **New
+  group…** to type a path), with a warning for a new path that differs from
+  an existing group only in case; a new entry starts in the group the list
+  is filtered on. The group is created if needed, and the
   agent's approval dialog shows the destination as a path from the top with
   the group's UUID, or what it creates (`/Work/Servers (existing group
   8d2f6c1e-…)`, `/ (the top level)`); a path through two
