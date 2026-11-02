@@ -1288,7 +1288,6 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
         }
         let request = RunRequest {
             bindings,
-            brokered: Vec::new(),
             argv: args.command,
             cwd,
             env,

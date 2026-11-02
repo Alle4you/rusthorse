@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use zeroize::Zeroizing;
 
-use crate::protocol::{self, Frame, Request, Response, RunRequest};
+use crate::protocol::{self, BrokerRunRequest, Frame, Request, Response, RunRequest};
 
 /// The request was sent, but no usable answer came back (the connection was
 /// lost, or the answer could not be understood): the request may or may not
@@ -173,18 +173,37 @@ impl Client {
     /// Without redaction, the three descriptors are handed to the command.
     /// With redaction, see [`Client::run_with`].
     pub fn run(&self, request: RunRequest) -> anyhow::Result<Response> {
-        if !request.redact {
+        let (redact, forward_stdin) = (request.redact, request.forward_stdin);
+        self.run_here(Request::Run(request), redact, forward_stdin)
+    }
+
+    /// [`Client::run`] for a run with broker bindings
+    /// ([`Request::BrokerRun`]); a run without any is a [`RunRequest`].
+    pub fn broker_run(&self, request: BrokerRunRequest) -> anyhow::Result<Response> {
+        let (redact, forward_stdin) = (request.run.redact, request.run.forward_stdin);
+        self.run_here(Request::BrokerRun(request), redact, forward_stdin)
+    }
+
+    /// [`Client::run`] for `request`, a [`Request::Run`] or a
+    /// [`Request::BrokerRun`] whose run has these `redact` and
+    /// `forward_stdin`.
+    fn run_here(
+        &self,
+        request: Request,
+        redact: bool,
+        forward_stdin: bool,
+    ) -> anyhow::Result<Response> {
+        if !redact {
             let stream = self.connect()?;
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let fds = [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()];
-            protocol::send_frame(&stream, &Request::Run(request), &fds)
-                .context("cannot send the request")?;
+            protocol::send_frame(&stream, &request, &fds).context("cannot send the request")?;
             return protocol::read_message(&stream)
                 .map_err(|e| anyhow::Error::new(OutcomeUnknown(e.to_string())));
         }
-        let input = if request.forward_stdin {
+        let input = if forward_stdin {
             Some(
                 std::io::stdin()
                     .as_fd()
@@ -194,8 +213,9 @@ impl Client {
         } else {
             None
         };
-        self.run_with(
+        self.relay(
             request,
+            forward_stdin,
             RunIo {
                 input,
                 stdout: Box::new(std::io::stdout()),
@@ -223,6 +243,30 @@ impl Client {
             bail!("run_with relays output and needs redaction; use `run` to pass descriptors");
         }
         let forward = request.forward_stdin;
+        self.relay(Request::Run(request), forward, io)
+    }
+
+    /// [`Client::run_with`] for a run with broker bindings
+    /// ([`Request::BrokerRun`]); a run without any is a [`RunRequest`].
+    pub fn broker_run_with(
+        &self,
+        request: BrokerRunRequest,
+        io: RunIo,
+    ) -> anyhow::Result<Response> {
+        if !request.run.redact {
+            bail!(
+                "broker_run_with relays output and needs redaction; use `broker_run` to pass \
+                 descriptors"
+            );
+        }
+        let forward = request.run.forward_stdin;
+        self.relay(Request::BrokerRun(request), forward, io)
+    }
+
+    /// Send `request`, a [`Request::Run`] or a [`Request::BrokerRun`] with
+    /// redaction, and relay its output and (with `forward`) its input, as
+    /// [`Client::run_with`] says.
+    fn relay(&self, request: Request, forward: bool, io: RunIo) -> anyhow::Result<Response> {
         let stream = self.connect()?;
         // Everything that can fail locally is prepared before the request is
         // sent: once it is, a failure means the outcome is unknown.
@@ -274,8 +318,7 @@ impl Client {
             Ok(())
         })();
         let sent = prepared.and_then(|()| {
-            protocol::send_frame(&stream, &Request::Run(request), &[])
-                .context("cannot send the request")
+            protocol::send_frame(&stream, &request, &[]).context("cannot send the request")
         });
         if let Err(e) = sent {
             // Nothing reached the agent: stop the threads and report it.

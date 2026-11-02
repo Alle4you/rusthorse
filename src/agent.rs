@@ -430,6 +430,11 @@ impl Agent {
 
         let result = match request {
             Request::Run(run) => self.run(stream, &peer, run, fds),
+            // Placeholder until the agent serves grants (ADR 0013): never
+            // run the command without the grants it asked for, nor with the
+            // values instead. (A `run` that carries broker bindings does not
+            // parse: see `Request::Run`.)
+            Request::BrokerRun(_) => Err(Failure::invalid("broker grants are not available yet")),
             _ if !fds.is_empty() => Err(Failure::invalid(
                 "only run requests may carry file descriptors",
             )),
@@ -469,7 +474,20 @@ impl Agent {
             } => self.add(peer, entry, value, generate, replace),
             Request::ChangePassword => self.change_password(peer),
             Request::Import { entries, replace } => self.import(peer, entries, replace),
+            // An older agent would apply the rest of such an edit and drop
+            // the profile: a change to it is a `broker_edit` (ADR 0013).
+            Request::Edit { changes, .. } if changes.touches_broker() => Err(Failure::invalid(
+                "a change to the broker profile is a broker_edit request, not an edit",
+            )),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
+            // Placeholder until the agent serves grants (ADR 0013): the
+            // dialog must show the whole new profile and how many grants the
+            // edit ends, which this one cannot. Clearing a profile is shown
+            // as it is ("Clear: broker"), and there is no grant to end yet.
+            Request::BrokerEdit { changes, .. } if changes.broker.is_some() => {
+                Err(Failure::invalid("broker profiles cannot be set yet"))
+            }
+            Request::BrokerEdit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
             Request::Reveal {
                 name,
@@ -484,7 +502,9 @@ impl Agent {
                 tags,
                 replace,
             } => self.import_from(peer, source, tags, replace),
-            Request::Run(_) => Err(Failure::invalid("run requests carry file descriptors")),
+            Request::Run(_) | Request::BrokerRun(_) => {
+                Err(Failure::invalid("run requests carry file descriptors"))
+            }
             // Placeholders until the agent serves grants (ADR 0013).
             Request::Grants | Request::RevokeGrant { .. } => {
                 Err(Failure::invalid("broker grants are not available yet"))
@@ -1256,12 +1276,6 @@ impl Agent {
         if changes.is_empty() {
             return Err(Failure::invalid("nothing to change"));
         }
-        // Placeholder until the agent serves grants (ADR 0013): the dialog
-        // must show the whole new profile and how many grants the edit ends,
-        // which this one cannot. (Clearing a profile is shown as it is.)
-        if changes.broker.is_some() {
-            return Err(Failure::invalid("broker profiles cannot be set yet"));
-        }
         let generation = self.generation(peer)?;
         let (current, destination) = self.with_vault(peer, |v| {
             let id = v.find(name)?;
@@ -1734,11 +1748,6 @@ impl Agent {
         };
         if run.argv.is_empty() {
             return Err(Failure::invalid("empty command"));
-        }
-        // Placeholder until the agent serves grants (ADR 0013): never run
-        // the command without the grants it asked for, or with the values.
-        if !run.brokered.is_empty() {
-            return Err(Failure::invalid("broker grants are not available yet"));
         }
         if run.bindings.is_empty() {
             return Err(Failure::invalid("no secrets requested"));

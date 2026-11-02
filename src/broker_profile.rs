@@ -14,8 +14,10 @@
 //!
 //! The rules a grant enforces are pure functions here, shared by the agent
 //! and `rusthorse-broker` so that both decide alike: the presets' routes and
-//! header rules ([`PresetSpec`]), route matching ([`match_route`]) and the
-//! check of the token a client presents ([`check_inbound_token`]).
+//! header rules ([`PresetSpec`]), route matching ([`is_origin_form`],
+//! [`match_route`]), the check of the token a client presents
+//! ([`check_inbound_token`]) and of the credential a broker presents
+//! ([`is_valid_credential`]).
 
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -41,9 +43,18 @@ pub const MAX_LIFETIME_MINUTES_RANGE: RangeInclusive<u32> = 1..=1440;
 /// The request limits a profile may set.
 pub const MAX_REQUESTS_RANGE: RangeInclusive<u64> = 1..=1_000_000;
 
-/// Longest credential, in bytes, that a broker presents to a destination
-/// ([`is_valid_credential`]).
-pub const MAX_CREDENTIAL_BYTES: usize = 8192;
+/// Shortest credential, in characters, that a broker presents to a
+/// destination ([`is_valid_credential`]). It is above the length under which
+/// the redactor ignores a secret ([`crate::redact::MIN_REDACT_LEN`]): the
+/// redactor replaces literal copies of any credential the broker accepts.
+pub const MIN_CREDENTIAL_CHARS: usize = 8;
+
+/// Longest credential, in characters, that a broker presents to a
+/// destination ([`is_valid_credential`]): it travels in a header.
+pub const MAX_CREDENTIAL_CHARS: usize = 4096;
+
+// A credential the broker accepts is never too short for the redactor.
+const _: () = assert!(MIN_CREDENTIAL_CHARS >= crate::redact::MIN_REDACT_LEN);
 
 /// Longest host name of an origin, as DNS allows.
 const MAX_HOST_CHARS: usize = 253;
@@ -887,11 +898,13 @@ pub fn latest(preset: Preset) -> &'static PresetSpec {
 /// Why [`match_route`] refused a request target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteRefusal {
-    /// Not in the exact form routes are written in: a local `400`.
+    /// Not a request target in origin form ([`is_origin_form`]): a local
+    /// `400`, like the other framing errors (ADR 0013, step 1).
     Malformed,
-    /// Well formed, but not a route of the preset after the base path (or
-    /// not with that method, or with a query it does not allow): a local
-    /// `404`.
+    /// In origin form, but not exactly a route of the preset after the base
+    /// path: an escape, `\`, `;` or `#`, an empty or dot segment, a
+    /// malformed query or a parameter given twice, another path or method,
+    /// or a query the route does not allow. A local `404` (step 3).
     NotAllowed,
 }
 
@@ -917,19 +930,30 @@ pub struct MatchedRoute {
     pub path_and_query: String,
 }
 
+/// Whether `target` is a request target in origin form: it starts with `/`
+/// (it is not `https://…`, `host:port` or `*`), and every byte is visible
+/// ASCII (`0x21`–`0x7e`), as in any request target; the HTTP library
+/// refuses most other bytes before this. The broker answers any other
+/// target `400` while it checks the framing, before the token (ADR 0013,
+/// step 1); [`match_route`] refuses it too.
+pub fn is_origin_form(target: &str) -> bool {
+    target.starts_with('/') && target.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// Match a request against a preset's routes.
 ///
 /// `target` is the raw request target, path and optional query, exactly as
 /// it arrived; `method` the method, compared exactly (`post` is not
-/// `POST`). The target is refused as [`RouteRefusal::Malformed`] unless it
-/// starts with `/` and is made of visible ASCII (`0x21`–`0x7e`) without `%`
-/// (no escapes at all), `\`, `;` or `#`, with no empty segment (`//`, a
-/// trailing `/`), no segment made only of dots (`.`, `..`), and a query, if
-/// any, of non-empty `name=value` pairs joined by `&`, no name twice. It is
-/// [`RouteRefusal::NotAllowed`] unless its path is the base path — whole
-/// segments — followed by a route of the preset for that method, and every
-/// query parameter is one the route allows, `beta` with the value `true`
-/// and the others with 1 to 128 letters, digits, `.`, `_`, `~` and `-`.
+/// `POST`). A target that is not in origin form ([`is_origin_form`]) is
+/// [`RouteRefusal::Malformed`]. Any other is [`RouteRefusal::NotAllowed`]
+/// unless it is in the exact form routes are written in — no `%` (no
+/// escapes at all), `\`, `;` or `#`, no empty segment (`//`, a trailing
+/// `/`), no segment made only of dots (`.`, `..`), and a query, if any, of
+/// non-empty `name=value` pairs joined by `&`, no name twice — its path is
+/// the base path, as whole segments, followed by a route of the preset for
+/// that method, and every query parameter is one the route allows, `beta`
+/// with the value `true` and the others with 1 to 128 letters, digits, `.`,
+/// `_`, `~` and `-`.
 ///
 /// The path the broker checks is the path it sends:
 /// [`MatchedRoute::path_and_query`] is `target` itself.
@@ -966,16 +990,18 @@ pub fn match_route(
     })
 }
 
-/// The path and query of a well-formed origin-form target.
+/// The path and query of a target in origin form, if it is in the exact
+/// form routes are written in.
 fn split_target(target: &str) -> Result<(&str, Option<&str>), RouteRefusal> {
-    if !target.starts_with('/') {
+    if !is_origin_form(target) {
         return Err(RouteRefusal::Malformed);
     }
+    // No escapes at all, and nothing that servers may read differently.
     if target
         .bytes()
-        .any(|b| !(0x21..=0x7e).contains(&b) || matches!(b, b'%' | b'\\' | b';' | b'#'))
+        .any(|b| matches!(b, b'%' | b'\\' | b';' | b'#'))
     {
-        return Err(RouteRefusal::Malformed);
+        return Err(RouteRefusal::NotAllowed);
     }
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path, Some(query)),
@@ -983,23 +1009,23 @@ fn split_target(target: &str) -> Result<(&str, Option<&str>), RouteRefusal> {
     };
     for segment in path[1..].split('/') {
         if segment.is_empty() || segment.bytes().all(|b| b == b'.') {
-            return Err(RouteRefusal::Malformed);
+            return Err(RouteRefusal::NotAllowed);
         }
     }
     Ok((path, query))
 }
 
 /// The `name=value` pairs of a query; an empty query, an empty pair, a pair
-/// without `=` or with an empty name, and a name given twice are malformed.
+/// without `=` or with an empty name, and a name given twice are refused.
 fn parse_query(query: Option<&str>) -> Result<Vec<(&str, &str)>, RouteRefusal> {
     let Some(query) = query else {
         return Ok(Vec::new());
     };
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     for pair in query.split('&') {
-        let (name, value) = pair.split_once('=').ok_or(RouteRefusal::Malformed)?;
+        let (name, value) = pair.split_once('=').ok_or(RouteRefusal::NotAllowed)?;
         if name.is_empty() || pairs.iter().any(|(seen, _)| *seen == name) {
-            return Err(RouteRefusal::Malformed);
+            return Err(RouteRefusal::NotAllowed);
         }
         pairs.push((name, value));
     }
@@ -1139,11 +1165,16 @@ pub fn tokens_equal(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(difference) == 0
 }
 
-/// Whether an entry's value can be presented to a destination in a header:
-/// 1 to [`MAX_CREDENTIAL_BYTES`] bytes of visible ASCII (no spaces, line
-/// breaks or other control characters, which could end or split a header).
+/// Whether an entry's value can be used with the broker (ADR 0013):
+/// [`MIN_CREDENTIAL_CHARS`] to [`MAX_CREDENTIAL_CHARS`] characters, all
+/// visible ASCII (`!` to `~`): no spaces, line breaks or other control
+/// characters, which could end or split the header it travels in. The
+/// agent checks it before the approval dialog; a broker checks it again
+/// ([`Install::validate`](crate::broker_protocol::Install::validate)).
 pub fn is_valid_credential(value: &str) -> bool {
-    (1..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+    // Visible ASCII only, so its length in bytes is its length in
+    // characters.
+    (MIN_CREDENTIAL_CHARS..=MAX_CREDENTIAL_CHARS).contains(&value.len())
         && value.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
@@ -1695,8 +1726,9 @@ mod tests {
     /// The attack table, one case per line: the preset, the base path (`-`
     /// for none), the method, the target, and what [`match_route`] says —
     /// the route audit records name, or the status of the refusal (`400`
-    /// for malformed, `404` for not a route). Targets with spaces, control
-    /// characters or computed lengths are checked in the test itself.
+    /// for a target not in origin form, `404` for any other that is not
+    /// exactly a route). Targets with spaces, control characters or computed
+    /// lengths are checked in the test itself.
     const ROUTE_CASES: &str = r"
         // Routes, and what audit records call them.
         anthropic          -        POST     /v1/messages                                 POST /v1/messages
@@ -1718,30 +1750,30 @@ mod tests {
         openai-compatible  /v1      POST     /v1/embeddings                               POST /embeddings
         openai-compatible  /api/v1  GET      /api/v1/models                               GET /models
 
-        // Escapes, and characters that servers may read differently.
-        anthropic          -        POST     /v1/messages/%2e%2e/batches                  400
-        anthropic          -        POST     /v1/%2e%2e/v1/messages                       400
-        anthropic          -        POST     /v1%2fmessages                               400
-        anthropic          -        POST     /v1/%6dessages                               400
-        anthropic          -        GET      /v1/models/a%20b                             400
-        anthropic          -        POST     /v1/messages?beta=%74rue                     400
-        anthropic          -        POST     //v1/messages                                400
-        anthropic          -        POST     /v1//messages                                400
-        anthropic          -        POST     /v1/messages;x=1                             400
-        anthropic          -        POST     /v1;/messages                                400
-        anthropic          -        POST     /v1\messages                                 400
-        anthropic          -        POST     /v1/messages\                                400
-        anthropic          -        POST     /v1/messages/                                400
-        anthropic          -        POST     /v1/./messages                               400
-        anthropic          -        POST     /v1/../v1/messages                           400
-        anthropic          -        POST     /v1/messages/..                              400
-        anthropic          -        GET      /v1/models/...                               400
-        anthropic          -        POST     /v1/messages#x                               400
-        anthropic          -        POST     /v1/messages?beta=true#x                     400
-        anthropic          -        POST     /v1/méssages                                 400
-        anthropic          -        POST     /                                            400
-        openai             /v1      POST     /v1/chat/completions/                        400
-        openai             /v1      POST     /v1/chat//completions                        400
+        // Escapes, and characters that servers may read differently: in
+        // origin form, but not in the exact form routes are written in.
+        anthropic          -        POST     /v1/messages/%2e%2e/batches                  404
+        anthropic          -        POST     /v1/%2e%2e/v1/messages                       404
+        anthropic          -        POST     /v1%2fmessages                               404
+        anthropic          -        POST     /v1/%6dessages                               404
+        anthropic          -        GET      /v1/models/a%20b                             404
+        anthropic          -        POST     /v1/messages?beta=%74rue                     404
+        anthropic          -        POST     //v1/messages                                404
+        anthropic          -        POST     /v1//messages                                404
+        anthropic          -        POST     /v1/messages;x=1                             404
+        anthropic          -        POST     /v1;/messages                                404
+        anthropic          -        POST     /v1\messages                                 404
+        anthropic          -        POST     /v1/messages\                                404
+        anthropic          -        POST     /v1/messages/                                404
+        anthropic          -        POST     /v1/./messages                               404
+        anthropic          -        POST     /v1/../v1/messages                           404
+        anthropic          -        POST     /v1/messages/..                              404
+        anthropic          -        GET      /v1/models/...                               404
+        anthropic          -        POST     /v1/messages#x                               404
+        anthropic          -        POST     /v1/messages?beta=true#x                     404
+        anthropic          -        POST     /                                            404
+        openai             /v1      POST     /v1/chat/completions/                        404
+        openai             /v1      POST     /v1/chat//completions                        404
 
         // Not in origin form.
         anthropic          -        POST     https://api.anthropic.com/v1/messages        400
@@ -1749,16 +1781,17 @@ mod tests {
         anthropic          -        CONNECT  api.anthropic.com:443                        400
         anthropic          -        OPTIONS  *                                            400
         anthropic          -        POST     v1/messages                                  400
+        anthropic          -        POST     /v1/méssages                                 400
 
-        // Malformed queries.
-        anthropic          -        POST     /v1/messages?                                400
-        anthropic          -        POST     /v1/messages?beta=true&beta=true             400
-        anthropic          -        GET      /v1/models?limit=1&limit=2                   400
-        anthropic          -        POST     /v1/messages?beta                            400
-        anthropic          -        POST     /v1/messages?=true                           400
-        anthropic          -        POST     /v1/messages?beta=true&                      400
-        anthropic          -        POST     /v1/messages?&beta=true                      400
-        anthropic          -        POST     /v1/messages?beta=true&&x=1                  400
+        // Malformed queries, and a parameter given twice.
+        anthropic          -        POST     /v1/messages?                                404
+        anthropic          -        POST     /v1/messages?beta=true&beta=true             404
+        anthropic          -        GET      /v1/models?limit=1&limit=2                   404
+        anthropic          -        POST     /v1/messages?beta                            404
+        anthropic          -        POST     /v1/messages?=true                           404
+        anthropic          -        POST     /v1/messages?beta=true&                      404
+        anthropic          -        POST     /v1/messages?&beta=true                      404
+        anthropic          -        POST     /v1/messages?beta=true&&x=1                  404
 
         // Well formed, but not a route.
         anthropic          -        POST     /v1/messages/batches                         404
@@ -1825,6 +1858,13 @@ mod tests {
     fn check_route(spec: &PresetSpec, base: &str, method: &str, target: &str, expected: &str) {
         let got = match_route(spec, base, method, target);
         let case = format!("{} {base:?} {method} {target:?}", spec.preset);
+        // `400` exactly when the broker refuses the target as it checks the
+        // framing, before the token.
+        assert_eq!(
+            got == Err(RouteRefusal::Malformed),
+            !is_origin_form(target),
+            "{case}"
+        );
         match expected {
             "400" => assert_eq!(got, Err(RouteRefusal::Malformed), "{case}"),
             "404" => assert_eq!(got, Err(RouteRefusal::NotAllowed), "{case}"),
@@ -1879,6 +1919,23 @@ mod tests {
         }
         assert_eq!(RouteRefusal::Malformed.status(), 400);
         assert_eq!(RouteRefusal::NotAllowed.status(), 404);
+
+        // Origin form: a path, then anything visible.
+        for target in ["/", "/v1/messages", "/v1/%2e%2e", "/v1\\x", "/a#b", "/?"] {
+            assert!(is_origin_form(target), "{target:?}");
+        }
+        for target in [
+            "",
+            "*",
+            "v1/messages",
+            "https://api.anthropic.com/v1/messages",
+            "api.anthropic.com:443",
+            "/v1 messages",
+            "/v1/m\u{e9}ssages",
+            "/v1/messages\r\n",
+        ] {
+            assert!(!is_origin_form(target), "{target:?}");
+        }
     }
 
     /// Redundant with route matching today (every route starts with `/`),
@@ -2129,20 +2186,43 @@ mod tests {
     }
 
     #[test]
-    fn credentials_must_fit_in_a_header() {
+    fn credentials_fit_in_a_header_and_are_long_enough_to_redact() {
+        assert_eq!((MIN_CREDENTIAL_CHARS, MAX_CREDENTIAL_CHARS), (8, 4096));
         assert!(is_valid_credential("sk-ant-api03-abc_DEF-123"));
-        assert!(is_valid_credential(&"k".repeat(MAX_CREDENTIAL_BYTES)));
+        assert!(is_valid_credential(&"k".repeat(8)));
+        assert!(is_valid_credential(&"k".repeat(4096)));
+        // Every visible ASCII character.
+        let visible: String = (0x21u8..=0x7e).map(char::from).collect();
+        assert!(is_valid_credential(&visible));
         for bad in [
             String::new(),
+            "x".into(),
+            "abc".into(),
+            "k9".into(),
+            "k".repeat(7),
+            "k".repeat(4097),
             "sk-1\r\nX-Injected: 1".into(),
-            "sk-1\n".into(),
-            "sk 1".into(),
-            "sk-1\t".into(),
-            "sk-\u{e9}".into(),
-            "\0".into(),
-            "k".repeat(MAX_CREDENTIAL_BYTES + 1),
+            "sk-12345\n".into(),
+            "sk 12345".into(),
+            "sk-12345\t".into(),
+            "sk-12345\u{7f}".into(),
+            // Eight characters, nine bytes: not ASCII.
+            "sk-1234\u{e9}".into(),
+            "\0".repeat(8),
         ] {
             assert!(!is_valid_credential(&bad), "{bad:?}");
         }
+        // The shortest credential accepted is replaced by the redactor; the
+        // redactor ignores shorter secrets, and would let them through.
+        for shortest in ["k".repeat(8), "a1b2c3d4".into()] {
+            let mut redactor = crate::redact::Redactor::new([("credential", shortest.as_bytes())]);
+            let mut out = redactor.push(format!(r#"{{"echo":"{shortest}"}}"#).as_bytes());
+            out.extend(redactor.finish());
+            assert_eq!(out, br#"{"echo":"[REDACTED:credential]"}"#);
+        }
+        let mut redactor = crate::redact::Redactor::new([("credential", b"abc".as_slice())]);
+        let mut out = redactor.push(br#"{"echo":"abc"}"#);
+        out.extend(redactor.finish());
+        assert_eq!(out, br#"{"echo":"abc"}"#, "too short to redact");
     }
 }

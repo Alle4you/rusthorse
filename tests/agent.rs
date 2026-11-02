@@ -1860,7 +1860,6 @@ fn descriptors_go_with_unredacted_runs_only() {
                 var: "T".into(),
                 entry: "T".into(),
             }],
-            brokered: Vec::new(),
             argv: vec!["true".into()],
             cwd: "/".into(),
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -1924,7 +1923,6 @@ fn raw_run(h: &Harness, argv: &[&str], forward_stdin: bool) -> std::os::unix::ne
             var: "T".into(),
             entry: "T".into(),
         }],
-        brokered: Vec::new(),
         argv: argv.iter().map(|a| a.to_string()).collect(),
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -2045,7 +2043,6 @@ fn the_library_input_reader_stops_when_the_run_returns() {
             var: "T".into(),
             entry: "T".into(),
         }],
-        brokered: Vec::new(),
         argv: vec!["true".into()],
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -2082,7 +2079,6 @@ fn run_request(h: &Harness, argv: &[&str], forward_stdin: bool) -> rusthorse::pr
             var: "T".into(),
             entry: "T".into(),
         }],
-        brokered: Vec::new(),
         argv: argv.iter().map(|a| a.to_string()).collect(),
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -3506,6 +3502,225 @@ fn descriptors_on_other_requests_are_rejected() {
             ..
         }
     ));
+}
+
+/// Whether the agent understood the request and refused it with
+/// `invalid_request` (a request it cannot read gets that code too, with a
+/// message that says so).
+fn is_invalid(response: &rusthorse::protocol::Response) -> bool {
+    matches!(
+        response,
+        rusthorse::protocol::Response::Error {
+            code: rusthorse::protocol::ErrorCode::InvalidRequest,
+            message,
+        } if !message.starts_with("malformed request")
+    )
+}
+
+/// A run with broker bindings starts nothing until the agent serves grants
+/// (ADR 0013), and neither does a plain `run` that carries them: no dialog,
+/// no command, no `run` record, and never the values instead.
+#[test]
+fn runs_with_broker_bindings_start_nothing_until_grants_are_served() {
+    use rusthorse::client::{Client, RunIo};
+    use rusthorse::protocol::{
+        BrokerBinding, BrokerRunRequest, ErrorCode, Request, Response, read_message, send_frame,
+    };
+    use std::os::unix::net::UnixStream;
+    let h = Harness::new();
+    h.add_secret("T", "abcdefgh", &[]);
+    h.add_secret("KEY", "key-value-12345678", &[]);
+    // Had the agent asked, the run would be allowed, and the command would
+    // leave this file behind.
+    h.decide(&[Decision::AllowOnce]);
+    let marker = h.dir.path().join("ran");
+    let script = format!("touch {}", marker.display());
+    let argv = ["sh", "-c", script.as_str()];
+    let brokered = vec![BrokerBinding {
+        var: "KEY".into(),
+        entry: "KEY".into(),
+        url_var: Some("KEY_URL".into()),
+    }];
+    let client = Client::new(h.socket.clone());
+    let sinks = || RunIo {
+        input: None,
+        stdout: Box::new(std::io::sink()),
+        stderr: Box::new(std::io::sink()),
+    };
+
+    // A binding by value beside the broker binding, with redaction.
+    let request = BrokerRunRequest {
+        run: run_request(&h, &argv, false),
+        brokered: brokered.clone(),
+    };
+    let response = client.broker_run_with(request, sinks()).expect("an answer");
+    assert!(is_invalid(&response), "{}", response.kind());
+    // Without redaction: the descriptors travel with the request, as with
+    // `run`.
+    let mut run = run_request(&h, &argv, false);
+    run.redact = false;
+    let request = BrokerRunRequest {
+        run,
+        brokered: brokered.clone(),
+    };
+    let response = client.broker_run(request).expect("an answer");
+    assert!(is_invalid(&response), "{}", response.kind());
+    // Through the broker only.
+    let mut run = run_request(&h, &argv, false);
+    run.bindings.clear();
+    let request = BrokerRunRequest {
+        run,
+        brokered: brokered.clone(),
+    };
+    let response = client.broker_run_with(request, sinks()).expect("an answer");
+    assert!(is_invalid(&response), "{}", response.kind());
+
+    // A plain run that carries broker bindings is refused, not run without
+    // them.
+    let mut plain =
+        serde_json::to_value(Request::Run(run_request(&h, &argv, false))).expect("json");
+    plain["brokered"] = serde_json::to_value(&brokered).expect("json");
+    let stream = UnixStream::connect(&h.socket).expect("connect");
+    send_frame(&stream, &plain, &[]).expect("send");
+    match read_message::<Response>(&stream).expect("an answer") {
+        Response::Error {
+            code: ErrorCode::InvalidRequest,
+            message,
+        } => assert!(message.contains("broker_run"), "{message}"),
+        other => panic!("unexpected {}", other.kind()),
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the command ran");
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        h.ui.decisions.lock().unwrap().len(),
+        1,
+        "an approval was used"
+    );
+    assert!(audit_outcomes(&h, "run").is_empty(), "{}", h.audit_text());
+}
+
+/// Until the agent serves grants, it lists and revokes none, and says so.
+/// Neither needs the vault, nor a dialog.
+#[test]
+fn grant_requests_are_refused_until_grants_are_served() {
+    use rusthorse::protocol::Request;
+    let h = Harness::new();
+    for request in [
+        Request::Grants,
+        Request::RevokeGrant { id: None },
+        Request::RevokeGrant {
+            id: Some("g0123456789abcdef".into()),
+        },
+    ] {
+        let response = h.call(&request);
+        assert!(is_invalid(&response), "{}", response.kind());
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(
+        h.ui.password_prompts.lock().unwrap().is_empty(),
+        "the vault was unlocked"
+    );
+}
+
+/// A change to the broker profile is a request of its own, `broker_edit`
+/// (ADR 0013): a plain `edit` that sets or clears the profile is refused
+/// before any dialog, and nothing changes. Until the agent serves grants,
+/// `broker_edit` clears a profile, once approved, and does not set one yet:
+/// its dialog cannot show the profile.
+#[test]
+fn only_broker_edit_changes_the_broker_profile() {
+    use rusthorse::broker_profile::{Preset, ProfileRequest};
+    use rusthorse::protocol::{EntryChanges, ErrorCode, Field, NewEntry, Request, Response};
+    let h = Harness::new();
+    // An entry with a profile, written before the agent opens the vault.
+    {
+        let mut vault =
+            Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+        let entry = NewEntry {
+            name: "KEY".into(),
+            ..NewEntry::default()
+        };
+        let value = SecretString::new("key-value-12345678".into());
+        vault.add(&entry, &value, false).expect("add");
+        let id = vault.find("KEY").expect("find");
+        let set = EntryChanges {
+            broker: Some(ProfileRequest::new(Preset::Anthropic)),
+            ..EntryChanges::default()
+        };
+        vault.edit(id, &set, None).expect("set the profile");
+        vault.save().expect("save");
+    }
+    let on_disk = std::fs::read(h.vault_path()).expect("read");
+    let set = || EntryChanges {
+        username: Some("me".into()),
+        broker: Some(ProfileRequest::new(Preset::Openai)),
+        ..EntryChanges::default()
+    };
+    let clear = || EntryChanges {
+        username: Some("me".into()),
+        clear: vec![Field::Broker],
+        ..EntryChanges::default()
+    };
+
+    // An edit that sets or clears the profile, with another change: an
+    // older agent would make that change and drop the profile's.
+    for changes in [set(), clear()] {
+        let request = Request::Edit {
+            name: "KEY".into(),
+            changes,
+        };
+        match h.call(&request) {
+            Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message,
+            } => assert!(message.contains("broker_edit"), "{message}"),
+            other => panic!("unexpected {}", other.kind()),
+        }
+    }
+    // Setting a profile waits for a dialog that can show it.
+    let response = h.call(&Request::BrokerEdit {
+        name: "KEY".into(),
+        changes: set(),
+    });
+    assert!(is_invalid(&response), "{}", response.kind());
+    // Refused before anything: no dialog, not even to unlock, no record,
+    // the file as it was.
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(
+        h.ui.password_prompts.lock().unwrap().is_empty(),
+        "the vault was unlocked"
+    );
+    assert!(audit_outcomes(&h, "edit").is_empty());
+    assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
+
+    // `broker_edit` clears it, with the rest of the edit, once approved.
+    let show = || match h.call(&Request::Show { name: "KEY".into() }) {
+        Response::Entry { entry } => entry,
+        other => panic!("unexpected {}", other.kind()),
+    };
+    let anthropic = ProfileRequest::new(Preset::Anthropic)
+        .resolve()
+        .expect("profile");
+    assert_eq!(show().broker, Some(anthropic));
+    h.decide(&[Decision::AllowOnce]);
+    let response = h.call(&Request::BrokerEdit {
+        name: "KEY".into(),
+        changes: clear(),
+    });
+    assert!(
+        matches!(response, Response::Ok { .. }),
+        "{}",
+        response.kind()
+    );
+    assert_eq!(approval_detail(&h, "Clear").as_deref(), Some("broker"));
+    assert_eq!(approval_detail(&h, "New username").as_deref(), Some("me"));
+    let entry = show();
+    assert_eq!(entry.broker, None);
+    assert!(entry.other_fields.is_empty(), "{:?}", entry.other_fields);
+    assert_eq!(entry.fields.username.as_deref(), Some("me"));
+    assert_eq!(audit_outcomes(&h, "edit"), ["allowed_once"]);
 }
 
 #[test]

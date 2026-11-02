@@ -59,17 +59,32 @@ pub const MAX_IN_FLIGHT: u32 = 16;
 /// Most open client connections of one grant.
 pub const MAX_CONNECTIONS: u32 = 64;
 
-/// The `retry-after` of a `429` for too many requests in flight, in
-/// seconds.
+/// The `retry-after` of a local `429` (too many requests in flight) or
+/// `503` (no room for the body, [`REQUEST_BODY_BUDGET_BYTES`]), in seconds.
 pub const RETRY_AFTER_SECS: u64 = 1;
 
 /// Largest request head (request line and headers), in bytes; a larger one
 /// gets `431`.
 pub const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
 
+/// How long a request's whole head (request line and headers) may take to
+/// arrive, from the moment the connection was opened or the previous
+/// response on it was sent.
+pub const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Largest request body, in bytes; a larger one gets `413`. The body is read
 /// whole into memory before anything is sent.
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most bytes of request bodies one broker holds at once. A broker reserves
+/// a request's declared length against it before it asks for the request's
+/// admission, and releases it once it no longer holds that body; a request
+/// that does not fit gets `503` with `retry-after: 1` ([`RETRY_AFTER_SECS`]),
+/// and nothing was admitted or sent.
+pub const REQUEST_BODY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+// The largest body fits the budget on its own.
+const _: () = assert!(MAX_REQUEST_BODY_BYTES <= REQUEST_BODY_BUDGET_BYTES);
 
 /// How long a request body may take to arrive whole.
 pub const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -77,8 +92,12 @@ pub const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a client connection may stay idle before it is closed.
 pub const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the destination has to accept the TCP connection.
+/// How long the broker has to resolve the origin's host and connect to one
+/// of the addresses it checked, both together.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most host names one broker resolves at a time.
+pub const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
 
 /// How long the TLS handshake with the destination may take.
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -92,9 +111,18 @@ pub const RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Largest response body relayed, in bytes.
 pub const MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How long a broker has to answer [`ToBroker::Install`] with
+/// [`FromBroker::Ready`] before the agent gives up on it, and on its run.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long a broker has to confirm a revocation ([`FromBroker::Revoked`])
 /// before the agent kills it.
 pub const REVOKE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long after the control channel ends the agent kills a broker's
+/// process group if it is still there (a broker exits at once when the
+/// channel ends, without waiting for work in progress).
+pub const EXIT_KILL_DELAY: Duration = Duration::from_secs(1);
 
 /// Where the broker reads its certificate authorities: the first of these
 /// files that exists, which must be owned by root and not writable by group
@@ -357,6 +385,10 @@ pub enum EndReason {
     Revoked,
     /// The grant's entry changed or was removed.
     EntryChanged,
+    /// The vault file was changed by another program while the vault was
+    /// locked, as the agent found when it was unlocked again (the unlock
+    /// barrier): every grant that survived the lock ends.
+    VaultChanged,
     /// Its maximum lifetime passed.
     Expired,
     /// Its broker process failed.
@@ -372,8 +404,8 @@ pub enum EndReason {
 impl EndReason {
     /// The form audit records use: `command_ended`, `locked`,
     /// `screen_locked`, `suspend`, `idle_timeout`, `revoked`,
-    /// `entry_changed`, `expired`, `broker_failed`, `save_failed`,
-    /// `agent_stopped`, `audit_failed`.
+    /// `entry_changed`, `vault_changed`, `expired`, `broker_failed`,
+    /// `save_failed`, `agent_stopped`, `audit_failed`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CommandEnded => "command_ended",
@@ -383,6 +415,7 @@ impl EndReason {
             Self::IdleTimeout => "idle_timeout",
             Self::Revoked => "revoked",
             Self::EntryChanged => "entry_changed",
+            Self::VaultChanged => "vault_changed",
             Self::Expired => "expired",
             Self::BrokerFailed => "broker_failed",
             Self::SaveFailed => "save_failed",
@@ -931,8 +964,19 @@ mod tests {
             ("grant case", |i| i.grant = i.grant.to_uppercase()),
             ("token", |i| i.token = SecretString::new("rh_123".into())),
             ("no credential", |i| i.credential = SecretString::default()),
+            // Too short for the redactor (shorter than 4), or than phase 1
+            // allows (8): an echo would reach the client as it is.
+            ("3 characters", |i| {
+                i.credential = SecretString::new("abc".into())
+            }),
+            ("7 characters", |i| {
+                i.credential = SecretString::new("k".repeat(7))
+            }),
+            ("4097 characters", |i| {
+                i.credential = SecretString::new("k".repeat(4097))
+            }),
             ("line break", |i| {
-                i.credential = SecretString::new("a\r\nb".into())
+                i.credential = SecretString::new("sk-1234\r\nb".into())
             }),
             ("profile", |i| i.profile.max_lifetime_minutes = 0),
             ("revision", |i| i.profile.revision = 99),
@@ -956,6 +1000,10 @@ mod tests {
         other.credential = secret("sk-ant-api03-FAKE_x-y.z~1");
         other.token = secret(&format!("rh_{}", "f".repeat(64)));
         assert_eq!(other.validate(), Ok(()));
+        for length in [8, 4096] {
+            other.credential = secret(&"k".repeat(length));
+            assert_eq!(other.validate(), Ok(()), "{length} characters");
+        }
     }
 
     #[test]
@@ -1028,6 +1076,7 @@ mod tests {
             EndReason::IdleTimeout,
             EndReason::Revoked,
             EndReason::EntryChanged,
+            EndReason::VaultChanged,
             EndReason::Expired,
             EndReason::BrokerFailed,
             EndReason::SaveFailed,
@@ -1038,6 +1087,42 @@ mod tests {
                 serde_json::to_value(reason).expect("json"),
                 serde_json::json!(reason.as_str())
             );
+        }
+        // Every reason ADR 0013's audit records name, and every outcome:
+        // each one is a value both sides of the channel read.
+        for name in [
+            "command_ended",
+            "locked",
+            "screen_locked",
+            "suspend",
+            "idle_timeout",
+            "revoked",
+            "entry_changed",
+            "vault_changed",
+            "expired",
+            "broker_failed",
+            "save_failed",
+            "agent_stopped",
+            "audit_failed",
+        ] {
+            let reason: EndReason = serde_json::from_value(serde_json::json!(name)).expect(name);
+            assert_eq!(reason.as_str(), name);
+            let frame = format!(r#"{{"type":"revoke","reason":"{name}"}}"#);
+            assert!(matches!(
+                decode::<ToBroker>(frame.as_bytes()),
+                Ok(ToBroker::Revoke { reason: got }) if got == reason
+            ));
+        }
+        for name in [
+            "completed",
+            "not_forwarded",
+            "client_closed",
+            "revoked",
+            "unknown",
+        ] {
+            let outcome: RequestOutcome =
+                serde_json::from_value(serde_json::json!(name)).expect(name);
+            assert_eq!(outcome.as_str(), name);
         }
         for outcome in [
             RequestOutcome::Completed,
@@ -1071,22 +1156,33 @@ mod tests {
         );
     }
 
+    /// ADR 0013's numbers, section by section: changing one changes the ADR.
     #[test]
     fn the_limits_are_those_of_phase_1() {
+        // Requests and responses.
+        assert_eq!(MAX_REQUEST_HEADER_BYTES, 32 * 1024);
+        assert_eq!(REQUEST_HEADER_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
+        assert_eq!(REQUEST_BODY_BUDGET_BYTES, 64 * 1024 * 1024);
+        assert_eq!(RETRY_AFTER_SECS, 1);
+        assert_eq!(REQUEST_BODY_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(MAX_CONCURRENT_RESOLUTIONS, 4);
+        assert_eq!(MAX_RESPONSE_BODY_BYTES, 64 * 1024 * 1024);
+        // Admission, revocation and the agent's registry.
+        assert_eq!(READY_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REVOKE_CONFIRM_TIMEOUT, Duration::from_secs(1));
         assert_eq!(MAX_GRANTS, 16);
         assert_eq!(MAX_IN_FLIGHT, 16);
         assert_eq!(MAX_CONNECTIONS, 64);
-        assert_eq!(MAX_REQUEST_HEADER_BYTES, 32 * 1024);
-        assert_eq!(MAX_REQUEST_BODY_BYTES, 32 * 1024 * 1024);
-        assert_eq!(REQUEST_BODY_TIMEOUT, Duration::from_secs(60));
         assert_eq!(IDLE_CONNECTION_TIMEOUT, Duration::from_secs(60));
-        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
         assert_eq!(RESPONSE_HEADERS_TIMEOUT, Duration::from_secs(600));
         assert_eq!(RESPONSE_BODY_IDLE_TIMEOUT, Duration::from_secs(300));
-        assert_eq!(MAX_RESPONSE_BODY_BYTES, 64 * 1024 * 1024);
-        assert_eq!(REVOKE_CONFIRM_TIMEOUT, Duration::from_secs(1));
+        assert_eq!(EXIT_KILL_DELAY, Duration::from_secs(1));
+        // The control channel, and the token.
         assert_eq!(MAX_FRAME, 64 * 1024);
         assert_eq!(TOKEN_LEN, 67);
+        assert_eq!(GRANT_ID_LEN, 17);
     }
 }

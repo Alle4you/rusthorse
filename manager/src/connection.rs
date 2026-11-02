@@ -224,6 +224,7 @@ fn validate(request: &Request, response: Response) -> Result<Response, Failure> 
         Request::KeyringItems => "keyring_items",
         Request::DotenvNames { .. } => "names",
         Request::Grants => "grants",
+        // Changes (`broker_edit` among them), `lock` and `revoke_grant`.
         _ => "ok",
     };
     if response.kind() != expected {
@@ -285,6 +286,45 @@ mod tests {
             .err()
             .expect("failure")
             .uncertain
+        );
+    }
+
+    #[test]
+    fn the_requests_of_the_broker_expect_their_own_answers() {
+        use rusthorse::protocol::{EntryChanges, Field};
+        let ok = || Response::Ok {
+            message: "done".into(),
+        };
+        let grants = || Response::Grants { grants: vec![] };
+        let clear = || Request::BrokerEdit {
+            name: "fake-uuid".into(),
+            changes: EntryChanges {
+                clear: vec![Field::Broker],
+                ..EntryChanges::default()
+            },
+        };
+        assert!(validate(&clear(), ok()).is_ok());
+        assert!(validate(&Request::Grants, grants()).is_ok());
+        assert!(validate(&Request::RevokeGrant { id: None }, ok()).is_ok());
+        // An edit of the profile has effects: another answer leaves its
+        // outcome unknown. The grants and their revocation do not.
+        assert!(
+            validate(&clear(), grants())
+                .err()
+                .expect("failure")
+                .uncertain
+        );
+        assert!(
+            !validate(&Request::Grants, ok())
+                .err()
+                .expect("failure")
+                .uncertain
+        );
+        assert!(
+            !validate(&Request::RevokeGrant { id: None }, grants())
+                .err()
+                .expect("failure")
+                .uncertain
         );
     }
 

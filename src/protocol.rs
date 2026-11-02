@@ -2,8 +2,9 @@
 //!
 //! Each connection carries exactly one request and its response. A message is
 //! a *frame*: a 4-byte big-endian length followed by that many bytes of JSON.
-//! A [`Request::Run`] frame additionally carries the client's stdin, stdout
-//! and stderr as `SCM_RIGHTS` ancillary data attached to its first byte.
+//! A [`Request::Run`] or [`Request::BrokerRun`] frame additionally carries
+//! the client's stdin, stdout and stderr (when output is not redacted) as
+//! `SCM_RIGHTS` ancillary data attached to its first byte.
 //!
 //! The full specification, with examples, is in `docs/protocol.md`.
 
@@ -13,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
 
 use crate::broker_profile::{AutomaticLocks, BrokerProfile, Preset, ProfileRequest};
@@ -40,11 +41,14 @@ use crate::broker_profile::{AutomaticLocks, BrokerProfile, Preset, ProfileReques
 /// 7: `edit.group` moves an entry to another group. A version-6 agent would
 /// drop it without a word and report the edit done.
 ///
-/// 8: the credential broker (ADR 0013): `run.brokered`, the entry's `broker`
-/// profile, `edit.broker` and `broker` in `edit.clear`, the `grants` and
-/// `revoke_grant` requests and the `grants` response, `status.broker` and
-/// `status.grants`. A version-7 agent would drop `run.brokered` and
-/// `edit.broker` without a word.
+/// 8: the credential broker (ADR 0013): the `broker_run` and `broker_edit`
+/// requests, the entry's `broker` profile, the `grants` and `revoke_grant`
+/// requests and the `grants` response, `status.broker` and `status.grants`.
+/// A run with broker bindings and an edit that sets or clears a profile are
+/// requests of their own, not fields of `run` and `edit`: a version-7 agent
+/// met after the version check (restarted between two connections) refuses
+/// them whole, where it would drop the bindings or the profile without a
+/// word and act on the rest.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
@@ -142,7 +146,9 @@ pub enum Request {
         /// Overwrite existing entries with the same names.
         replace: bool,
     },
-    /// Change an entry (requires approval).
+    /// Change an entry (requires approval). An edit that sets or clears the
+    /// broker profile ([`EntryChanges::touches_broker`]) is a
+    /// [`Request::BrokerEdit`]; the agent refuses it as an `edit`.
     Edit {
         /// Entry name or `Group/Name` path.
         name: String,
@@ -178,6 +184,10 @@ pub enum Request {
         path: String,
     },
     /// Run a command with secrets in its environment (requires approval).
+    /// A run with broker bindings is a [`Request::BrokerRun`]: a `run` that
+    /// carries them (a non-empty `brokered` list) does not parse, so it is
+    /// refused rather than run without them.
+    #[serde(deserialize_with = "plain_run")]
     Run(RunRequest),
     /// The metadata of the items of GNOME Keyring (any Secret Service), to
     /// choose what to import (requires approval: the requester learns their
@@ -202,6 +212,24 @@ pub enum Request {
         /// Overwrite existing entries with the same names.
         #[serde(default)]
         replace: bool,
+    },
+    /// Run a command with secrets in its environment, some or all of them
+    /// through the credential broker (requires approval, ADR 0013): for
+    /// each broker binding the command gets the token of a grant, never the
+    /// entry's value. It carries descriptors as [`Request::Run`] does. A
+    /// request of its own, so that an agent of protocol 7 refuses it whole.
+    /// Since protocol 8.
+    BrokerRun(BrokerRunRequest),
+    /// Change an entry and its broker profile (requires approval, ADR
+    /// 0013): an edit that sets or clears the profile, with or without other
+    /// changes. A request of its own, so that an agent of protocol 7 refuses
+    /// it whole rather than apply the other changes and drop the profile.
+    /// Since protocol 8.
+    BrokerEdit {
+        /// Entry name or `Group/Name` path.
+        name: String,
+        /// What to change, the profile included.
+        changes: EntryChanges,
     },
     /// List the grants of the credential broker (ADR 0013); never a token.
     /// Needs no approval.
@@ -292,7 +320,9 @@ impl Request {
             | Request::CreateVault
             | Request::Backup { .. }
             | Request::ImportFrom { .. }
-            | Request::Run(_) => true,
+            | Request::Run(_)
+            | Request::BrokerRun(_)
+            | Request::BrokerEdit { .. } => true,
             Request::KeyringItems | Request::DotenvNames { .. } => false,
             // Like `lock`: ending a grant twice does no harm.
             Request::Grants | Request::RevokeGrant { .. } => false,
@@ -427,7 +457,7 @@ pub enum Field {
     /// The kind (the entry becomes of no particular kind).
     Kind,
     /// The broker profile (the entry can no longer be used through the
-    /// credential broker).
+    /// credential broker); only in a [`Request::BrokerEdit`].
     Broker,
 }
 
@@ -443,7 +473,8 @@ pub enum ValueChange {
     Generate(crate::generate::Spec),
 }
 
-/// The changes requested by [`Request::Edit`]. Unset fields stay as they are.
+/// The changes requested by [`Request::Edit`] and [`Request::BrokerEdit`].
+/// Unset fields stay as they are.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct EntryChanges {
     /// New entry name.
@@ -485,12 +516,19 @@ pub struct EntryChanges {
     pub value: Option<ValueChange>,
     /// New broker profile (ADR 0013), from the defaults of the latest
     /// revision of its preset (to remove it, put [`Field::Broker`] in
-    /// `clear`). Since protocol 8.
+    /// `clear`); only in a [`Request::BrokerEdit`]. Since protocol 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker: Option<ProfileRequest>,
 }
 
 impl EntryChanges {
+    /// Whether the edit sets or clears the broker profile: such an edit is
+    /// a [`Request::BrokerEdit`], and the agent refuses it as a
+    /// [`Request::Edit`].
+    pub fn touches_broker(&self) -> bool {
+        self.broker.is_some() || self.clear.contains(&Field::Broker)
+    }
+
     /// Whether anything other than the secret value would change.
     pub fn touches_metadata(&self) -> bool {
         self.rename.is_some()
@@ -594,11 +632,6 @@ pub struct BrokerBinding {
 pub struct RunRequest {
     /// Which secrets go into which variables.
     pub bindings: Vec<Binding>,
-    /// Which entries the command uses through the credential broker, each
-    /// with a grant of its own (ADR 0013). An entry is either here or in
-    /// `bindings`, never both. Since protocol 8.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub brokered: Vec<BrokerBinding>,
     /// The command line; `argv[0]` is resolved against the client's `PATH`.
     pub argv: Vec<String>,
     /// Absolute working directory.
@@ -612,6 +645,42 @@ pub struct RunRequest {
     /// gets the client's stdin directly.
     #[serde(default)]
     pub forward_stdin: bool,
+}
+
+/// A run whose command uses entries through the credential broker
+/// ([`Request::BrokerRun`], ADR 0013): the fields of a run and, beside
+/// them, the broker bindings (`{"type": "broker_run", "bindings": [],
+/// "brokered": [...], "argv": [...], ...}`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerRunRequest {
+    /// The run: its bindings by value (none for a command that uses the
+    /// broker only), command line, directory, environment and output.
+    #[serde(flatten)]
+    pub run: RunRequest,
+    /// Which entries the command uses through the credential broker, each
+    /// with a grant of its own; at least one. An entry is either here or in
+    /// the run's `bindings`, never both.
+    pub brokered: Vec<BrokerBinding>,
+}
+
+/// Read the content of a [`Request::Run`], refusing broker bindings. They
+/// belong in a [`Request::BrokerRun`]; [`RunRequest`] alone would ignore
+/// them, and the command would run without the grants it asked for.
+fn plain_run<'de, D: Deserializer<'de>>(deserializer: D) -> Result<RunRequest, D::Error> {
+    #[derive(Deserialize)]
+    struct PlainRun {
+        #[serde(flatten)]
+        run: RunRequest,
+        #[serde(default)]
+        brokered: Option<Vec<serde::de::IgnoredAny>>,
+    }
+    let plain = PlainRun::deserialize(deserializer)?;
+    if plain.brokered.is_some_and(|bindings| !bindings.is_empty()) {
+        return Err(serde::de::Error::custom(
+            "a run with broker bindings is a broker_run request, not a run",
+        ));
+    }
+    Ok(plain.run)
 }
 
 /// The agent's answer to a [`Request`].
@@ -1500,26 +1569,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn protocol_8_fields_are_left_out_when_empty_and_older_json_still_parses() {
-        // A run request of protocol 7 has no broker bindings.
-        let old: Request = serde_json::from_value(serde_json::json!({
-            "type": "run",
-            "bindings": [{"var": "KEY", "entry": "k"}],
-            "argv": ["true"],
-            "cwd": "/",
-            "env": [],
-            "redact": true
-        }))
-        .expect("a protocol-7 run request");
-        let Request::Run(run) = old else {
-            panic!("not a run request")
-        };
-        assert!(run.brokered.is_empty());
-        let json = serde_json::to_value(Request::Run(run)).expect("json");
-        assert!(json.get("brokered").is_none(), "{json}");
-        let run = RunRequest {
-            bindings: vec![],
+    /// A run of protocol 8 with a binding by value and two broker bindings,
+    /// one of which also receives the broker's address.
+    fn mixed_run() -> BrokerRunRequest {
+        BrokerRunRequest {
+            run: RunRequest {
+                bindings: vec![Binding {
+                    var: "DB_PASSWORD".into(),
+                    entry: "db".into(),
+                }],
+                argv: vec!["claude".into()],
+                cwd: "/".into(),
+                env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                redact: false,
+                forward_stdin: false,
+            },
             brokered: vec![
                 BrokerBinding {
                     var: "ANTHROPIC_AUTH_TOKEN".into(),
@@ -1532,47 +1596,306 @@ mod tests {
                     url_var: None,
                 },
             ],
-            argv: vec!["claude".into()],
-            cwd: "/".into(),
-            env: vec![],
-            redact: false,
-            forward_stdin: false,
-        };
-        let json = serde_json::to_value(&run).expect("json");
-        assert_eq!(
-            json["brokered"],
-            serde_json::json!([
-                {"var": "ANTHROPIC_AUTH_TOKEN", "entry": "AI/anthropic", "url_var": "ANTHROPIC_BASE_URL"},
-                {"var": "OPENAI_API_KEY", "entry": "openai"}
-            ])
-        );
-        let back: RunRequest = serde_json::from_value(json).expect("back");
-        assert_eq!(back.brokered, run.brokered);
+        }
+    }
 
-        // An edit of protocol 7 has no profile; one of protocol 8 may set
-        // or clear it, and setting one is a change of metadata.
-        let old: EntryChanges =
-            serde_json::from_value(serde_json::json!({"rename": "x"})).expect("old edit");
-        assert!(old.broker.is_none());
-        let json = serde_json::to_value(&old).expect("json");
-        assert!(json.get("broker").is_none(), "{json}");
-        let set = EntryChanges {
-            broker: Some(ProfileRequest::new(Preset::Anthropic)),
+    /// An edit of protocol 8 that sets a profile and changes the user name.
+    fn profile_edit() -> EntryChanges {
+        EntryChanges {
+            username: Some("me".into()),
+            broker: Some(ProfileRequest {
+                automatic_locks: Some(AutomaticLocks::End),
+                max_requests: Some(10),
+                ..ProfileRequest::new(Preset::Anthropic)
+            }),
             ..EntryChanges::default()
-        };
-        assert!(set.touches_metadata() && !set.is_empty());
+        }
+    }
+
+    #[test]
+    fn broker_runs_and_profile_edits_are_requests_of_their_own() {
+        // A run with broker bindings: the run's fields, and the bindings
+        // beside them.
+        let json = serde_json::to_value(Request::BrokerRun(mixed_run())).expect("json");
         assert_eq!(
-            serde_json::to_value(&set).expect("json")["broker"],
-            serde_json::json!({"preset": "anthropic"})
+            json,
+            serde_json::json!({
+                "type": "broker_run",
+                "bindings": [{"var": "DB_PASSWORD", "entry": "db"}],
+                "brokered": [
+                    {"var": "ANTHROPIC_AUTH_TOKEN", "entry": "AI/anthropic", "url_var": "ANTHROPIC_BASE_URL"},
+                    {"var": "OPENAI_API_KEY", "entry": "openai"}
+                ],
+                "argv": ["claude"],
+                "cwd": "/",
+                "env": [["PATH", "/usr/bin:/bin"]],
+                "redact": false,
+                "forward_stdin": false
+            })
         );
+        let Request::BrokerRun(back) = serde_json::from_value(json.clone()).expect("back") else {
+            panic!("not a broker run")
+        };
+        assert_eq!(back.brokered, mixed_run().brokered);
+        assert_eq!(back.run.bindings, mixed_run().run.bindings);
+        assert_eq!(back.run.argv, ["claude"]);
+        assert_eq!(back.run.env, mixed_run().run.env);
+        // The broker bindings are required: without them it is no
+        // broker_run, and nothing is guessed.
+        let mut without = json.clone();
+        without.as_object_mut().expect("object").remove("brokered");
+        assert!(serde_json::from_value::<Request>(without).is_err());
+
+        // A plain run that carries broker bindings is refused, not run
+        // without them; an empty list or null carries none.
+        let mut plain = json;
+        plain["type"] = "run".into();
+        let err = serde_json::from_value::<Request>(plain.clone()).expect_err("refused");
+        assert!(err.to_string().contains("broker_run"), "{err}");
+        for none in [serde_json::json!([]), serde_json::Value::Null] {
+            plain["brokered"] = none;
+            let Request::Run(run) = serde_json::from_value(plain.clone()).expect("a run") else {
+                panic!("not a run")
+            };
+            assert_eq!(run.bindings, mixed_run().run.bindings);
+        }
+        // A plain run never sends the field.
+        let json = serde_json::to_value(Request::Run(mixed_run().run)).expect("json");
+        assert_eq!(json["type"], "run");
+        assert!(json.get("brokered").is_none(), "{json}");
+
+        // An edit that sets or clears the profile is a broker_edit, which
+        // has the shape of an edit.
+        let set = profile_edit();
+        assert!(set.touches_broker() && set.touches_metadata() && !set.is_empty());
+        let json = serde_json::to_value(Request::BrokerEdit {
+            name: "anthropic".into(),
+            changes: profile_edit(),
+        })
+        .expect("json");
+        assert_eq!(json["type"], "broker_edit");
+        assert_eq!(json["name"], "anthropic");
+        assert_eq!(json["changes"]["username"], "me");
+        assert_eq!(
+            json["changes"]["broker"],
+            serde_json::json!({"preset": "anthropic", "automatic_locks": "end", "max_requests": 10})
+        );
+        let Request::BrokerEdit { name, changes } = serde_json::from_value(json).expect("back")
+        else {
+            panic!("not a broker edit")
+        };
+        assert_eq!(name, "anthropic");
+        assert_eq!(changes.username.as_deref(), Some("me"));
+        assert_eq!(changes.broker, profile_edit().broker);
         let clear = EntryChanges {
-            clear: vec![Field::Broker],
+            clear: vec![Field::Port, Field::Broker],
             ..EntryChanges::default()
         };
-        assert!(clear.touches_metadata());
+        assert!(clear.touches_broker() && clear.touches_metadata());
         assert_eq!(
             serde_json::to_value(&clear).expect("json")["clear"],
-            serde_json::json!(["broker"])
+            serde_json::json!(["port", "broker"])
+        );
+        // Nothing else is a change of the profile.
+        let others = [
+            EntryChanges::default(),
+            EntryChanges {
+                rename: Some("x".into()),
+                clear: vec![Field::Username, Field::Url, Field::Kind],
+                ..EntryChanges::default()
+            },
+            EntryChanges {
+                value: Some(ValueChange::Prompt),
+                ..EntryChanges::default()
+            },
+        ];
+        for (i, other) in others.iter().enumerate() {
+            assert!(!other.touches_broker(), "case {i}");
+        }
+
+        // Both have effects: an answer that is lost leaves the outcome
+        // unknown.
+        assert!(Request::BrokerRun(mixed_run()).has_effects());
+        assert!(
+            Request::BrokerEdit {
+                name: "x".into(),
+                changes: profile_edit(),
+            }
+            .has_effects()
+        );
+    }
+
+    /// The requests of protocol 7, as `aff56e1` defines them: an internally
+    /// tagged enum of these variants, with no catch-all, that ignores
+    /// fields it does not know. Their contents do not matter here, except
+    /// those of `run` and `edit`, which are read as protocol 7 read them.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum Protocol7Request {
+        Status,
+        Unlock,
+        CreateVault,
+        Lock,
+        List,
+        Show(serde::de::IgnoredAny),
+        Add(serde::de::IgnoredAny),
+        Import(serde::de::IgnoredAny),
+        Edit {
+            name: String,
+            changes: Protocol7Changes,
+        },
+        Remove(serde::de::IgnoredAny),
+        ChangePassword,
+        Reveal(serde::de::IgnoredAny),
+        Backup(serde::de::IgnoredAny),
+        Run(Protocol7Run),
+        KeyringItems,
+        DotenvNames(serde::de::IgnoredAny),
+        ImportFrom(serde::de::IgnoredAny),
+    }
+
+    /// Protocol 7's run request.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct Protocol7Run {
+        bindings: Vec<Binding>,
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+        redact: bool,
+        #[serde(default)]
+        forward_stdin: bool,
+    }
+
+    /// Protocol 7's edit: the fields of [`EntryChanges`] without the
+    /// profile, and its fields to clear without `broker`.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct Protocol7Changes {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        clear: Vec<Protocol7Field>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum Protocol7Field {
+        Username,
+        Url,
+        Host,
+        Port,
+        Notes,
+        Kind,
+    }
+
+    /// The reason for `broker_run` and `broker_edit`: a client that checked
+    /// the version on one connection can meet an agent of protocol 7 on the
+    /// next one, after a restart. Such an agent refuses both whole, where
+    /// it would have run the command without its grants, or applied an edit
+    /// without its profile.
+    #[test]
+    fn a_protocol_7_agent_refuses_broker_runs_and_profile_edits_whole() {
+        let refused = |request: &Request| {
+            let json = serde_json::to_value(request).expect("json");
+            serde_json::from_value::<Protocol7Request>(json)
+                .expect_err("refused by protocol 7")
+                .to_string()
+        };
+        let run = refused(&Request::BrokerRun(mixed_run()));
+        assert!(run.contains("unknown variant `broker_run`"), "{run}");
+        // The variants protocol 7's own type names in this error, in its
+        // order, as a build of `aff56e1` printed it: the mirror is faithful.
+        assert!(
+            run.contains(
+                "expected one of `status`, `unlock`, `create_vault`, `lock`, `list`, `show`, \
+                 `add`, `import`, `edit`, `remove`, `change_password`, `reveal`, `backup`, \
+                 `run`, `keyring_items`, `dotenv_names`, `import_from`"
+            ),
+            "{run}"
+        );
+        let edit = Request::BrokerEdit {
+            name: "anthropic".into(),
+            changes: profile_edit(),
+        };
+        assert!(refused(&edit).contains("unknown variant `broker_edit`"));
+        let clear = Request::BrokerEdit {
+            name: "anthropic".into(),
+            changes: EntryChanges {
+                clear: vec![Field::Broker],
+                ..EntryChanges::default()
+            },
+        };
+        assert!(refused(&clear).contains("unknown variant `broker_edit`"));
+
+        // What protocol 7 does with the shapes these requests replace:
+        // broker bindings in a run, and a profile in an edit, are dropped
+        // without a word and the rest is acted on.
+        let mut run = serde_json::to_value(Request::BrokerRun(mixed_run())).expect("json");
+        run["type"] = "run".into();
+        let Ok(Protocol7Request::Run(old)) = serde_json::from_value(run) else {
+            panic!("protocol 7 refused the run")
+        };
+        assert_eq!(old.argv, ["claude"]);
+        assert_eq!(old.bindings, mixed_run().run.bindings);
+        let mut edit = serde_json::to_value(edit).expect("json");
+        edit["type"] = "edit".into();
+        let Ok(Protocol7Request::Edit { changes, .. }) = serde_json::from_value(edit) else {
+            panic!("protocol 7 refused the edit")
+        };
+        assert_eq!(changes.username.as_deref(), Some("me"));
+
+        // The requests this build sends without broker bindings or a
+        // profile are still those protocol 7 knows.
+        for request in [
+            Request::Run(mixed_run().run),
+            Request::Edit {
+                name: "x".into(),
+                changes: EntryChanges {
+                    username: Some("me".into()),
+                    clear: vec![Field::Port],
+                    ..EntryChanges::default()
+                },
+            },
+            Request::Status,
+            Request::Lock,
+        ] {
+            let json = serde_json::to_value(&request).expect("json");
+            assert!(
+                serde_json::from_value::<Protocol7Request>(json.clone()).is_ok(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_8_fields_are_left_out_when_empty_and_older_json_still_parses() {
+        // A run request of protocol 7 is a run of protocol 8.
+        let old: Request = serde_json::from_value(serde_json::json!({
+            "type": "run",
+            "bindings": [{"var": "KEY", "entry": "k"}],
+            "argv": ["true"],
+            "cwd": "/",
+            "env": [],
+            "redact": true
+        }))
+        .expect("a protocol-7 run request");
+        let Request::Run(run) = old else {
+            panic!("not a run request")
+        };
+        assert_eq!(run.argv, ["true"]);
+
+        // An edit of protocol 7 has no profile, and leaves the field out.
+        let old: EntryChanges =
+            serde_json::from_value(serde_json::json!({"rename": "x"})).expect("old edit");
+        assert!(old.broker.is_none() && !old.touches_broker());
+        let json = serde_json::to_value(&old).expect("json");
+        assert!(json.get("broker").is_none(), "{json}");
+        assert_eq!(
+            serde_json::to_value(profile_edit()).expect("json")["broker"],
+            serde_json::json!({"preset": "anthropic", "automatic_locks": "end", "max_requests": 10})
         );
         // A profile request with a field this build does not know is
         // refused, not applied in part.
