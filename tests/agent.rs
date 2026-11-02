@@ -724,7 +724,7 @@ fn edit_moves_an_entry_to_another_group_only_when_allowed() {
     assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
     assert_eq!(
         approval_detail(&h, "Move to group").as_deref(),
-        Some("/Work/Servers")
+        Some("/Work/Servers (creates Work/Servers at the top level)")
     );
     assert!(
         approval_detail(&h, "Entry")
@@ -741,7 +741,17 @@ fn edit_moves_an_entry_to_another_group_only_when_allowed() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         approval_detail(&h, "Move to group").as_deref(),
-        Some("/Work/Servers")
+        Some("/Work/Servers (creates Work/Servers at the top level)")
+    );
+    // The audit log says from where to where.
+    let moved = audit_records(&h)
+        .into_iter()
+        .rev()
+        .find(|r| r["action"] == "edit")
+        .expect("edit record");
+    assert_eq!(
+        moved["detail"],
+        "move from /Home to /Work/Servers (creates Work/Servers at the top level)"
     );
     assert_eq!(
         listed_group(&h, "DB_PASSWORD").as_deref(),
@@ -768,15 +778,128 @@ fn edit_moves_an_entry_to_another_group_only_when_allowed() {
     h.decide(&[Decision::AllowOnce]);
     let out = h.run(&["edit", "DB_PASSWORD", "--group", "/"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(approval_detail(&h, "Move to group").as_deref(), Some("/"));
+    assert_eq!(
+        approval_detail(&h, "Move to group").as_deref(),
+        Some("/ (the top level)")
+    );
+    // An existing group is named by the start of its UUID: names alone can
+    // look alike.
+    let work = {
+        let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+        vault.resolve_group("Work").expect("work")
+    };
+    let uuid = work.existing_uuid.clone().expect("an existing group");
+    h.decide(&[Decision::Deny]);
+    let out = h.run(&["edit", "DB_PASSWORD", "--group", "Work"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        approval_detail(&h, "Move to group"),
+        Some(format!("/Work (existing group {})", &uuid[..8]))
+    );
+    h.decide(&[Decision::Deny]);
+    let out = h.run(&["edit", "DB_PASSWORD", "--group", "Work/Servers/Db"]);
+    assert_eq!(out.status.code(), Some(4));
+    let servers = {
+        let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+        vault.resolve_group("Work/Servers").expect("servers")
+    };
+    assert_eq!(
+        approval_detail(&h, "Move to group"),
+        Some(format!(
+            "/Work/Servers/Db (creates Db in /Work/Servers, group {})",
+            &servers.existing_uuid.expect("existing")[..8]
+        ))
+    );
     assert_eq!(listed_group(&h, "DB_PASSWORD"), None);
     assert!(h.run(&["show", "DB_PASSWORD"]).status.success());
 
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 3);
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 5);
     assert_eq!(
         audit_outcomes(&h, "edit"),
-        ["denied", "allowed_once", "allowed_once"]
+        ["denied", "allowed_once", "allowed_once", "denied", "denied"]
     );
+}
+
+#[test]
+fn a_move_goes_to_the_group_the_path_leads_to_and_only_one() {
+    use keepass::db::fields;
+    use keepass::{Database, DatabaseKey};
+    let h = Harness::new();
+    // Groups of another KeePass client, written before the agent opens the
+    // vault: two named `Shared` side by side, one named `Work/Servers`
+    // holding the entry, and the nested `Work` → `Servers`.
+    let mut db = Database::open(
+        &mut std::fs::File::open(h.vault_path()).expect("open"),
+        DatabaseKey::new().with_password(PASSWORD),
+    )
+    .expect("decrypt");
+    {
+        let mut root = db.root_mut();
+        root.add_group().name = "Shared".into();
+        root.add_group().name = "Shared".into();
+        let mut literal = root.add_group();
+        literal.name = "Work/Servers".into();
+        let mut entry = literal.add_entry();
+        entry.set_unprotected(fields::TITLE, "API_KEY");
+        entry.set_protected(fields::PASSWORD, "key-value-1234");
+        let mut work = root.add_group();
+        work.name = "Work".into();
+        work.add_group().name = "Servers".into();
+    }
+    db.save(
+        &mut std::fs::File::create(h.vault_path()).expect("create"),
+        DatabaseKey::new().with_password(PASSWORD),
+    )
+    .expect("save");
+
+    // `Shared` could be either group: refused before anyone is asked, for
+    // a move and for a new entry (before its value is asked for).
+    let out = h.run(&["edit", "API_KEY", "--group", "Shared", "--host", "h.lan"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("several groups named"),
+        "{}",
+        text(&out.stderr)
+    );
+    h.ui.values
+        .lock()
+        .unwrap()
+        .push_back(Some("other-value-1234".into()));
+    let out = h.run(&["add", "OTHER", "--group", "Shared/Sub"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        h.ui.values.lock().unwrap().len(),
+        1,
+        "the value was asked for"
+    );
+    h.ui.values.lock().unwrap().clear();
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+
+    // The path `Work/Servers` leads to the nested group, not to the group
+    // whose name reads the same: a move, shown with that group's UUID.
+    let nested = {
+        let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+        vault.resolve_group("Work/Servers").expect("nested")
+    };
+    let uuid = nested.existing_uuid.clone().expect("existing");
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "API_KEY", "--group", "Work/Servers"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        approval_detail(&h, "Move to group"),
+        Some(format!("/Work/Servers (existing group {})", &uuid[..8]))
+    );
+    let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+    let id = vault.find("API_KEY").expect("entry");
+    assert!(
+        !vault.moves(id, &vault.resolve_group("Work/Servers").expect("again")),
+        "the entry is not in the nested group"
+    );
+    // Now it is there: a move to it moves nothing.
+    let out = h.run(&["edit", "API_KEY", "--group", "Work/Servers"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("already in that group"));
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1060,6 +1183,13 @@ fn without_vault() -> Harness {
 }
 
 /// The outcomes of the audit records of `action`, in order.
+fn audit_records(h: &Harness) -> Vec<serde_json::Value> {
+    h.audit_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
 fn audit_outcomes(h: &Harness, action: &str) -> Vec<String> {
     h.audit_text()
         .lines()

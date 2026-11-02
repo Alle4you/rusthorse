@@ -252,14 +252,26 @@ kept in the entry's KeePass history.
 `--group` moves the entry to the group at `PATH` (`Work/Servers`), creating
 the group if needed; `/` (or an empty path) moves it to the top level. Spaces
 around each part of the path and empty parts are dropped, and each part
-follows the rules for names. The dialog shows the destination as a path from
-the top, `/Work/Servers`, or `/` for the top level. The agent checks the path
-before it asks for approval: an invalid path, or one into the recycle bin, is
-refused without an approval dialog. A move to the group the entry is already
-in is left out of the request (the dialog does not show it); alone, it is
-refused with "nothing to change". The entry records its previous group and when it moved (the KDBX
-fields `PreviousParentGroup` and `LocationChanged`), and its previous version
-goes to its history, as with every edit.
+follows the rules for names. The agent checks the path before it asks for
+approval: an invalid path, one into the recycle bin, or one through two
+groups of the same name side by side (another KeePass client allows them;
+which one is meant cannot be told) is refused without an approval dialog.
+The dialog shows the destination as a path from the top, and which group
+that is, since names alone can look alike:
+
+- `/Work/Servers (existing group 8d2f6c1e)` — an existing group, by the
+  start of its UUID;
+- `/Work/Servers (creates Servers in /Work, group 1a2b3c4d)` or
+  `/Work/Servers (creates Work/Servers at the top level)` — what is created,
+  and where;
+- `/ (the top level)`.
+
+A move to the group the entry is already in — that very group, whatever its
+name looks like — is left out of the request (the dialog does not show it);
+alone, it is refused with "nothing to change". The audit log records where
+the entry moved from and to. The entry records its previous group and when
+it moved (the KDBX fields `PreviousParentGroup` and `LocationChanged`), and
+its previous version goes to its history, as with every edit.
 
 ## `rusthorse remove`
 

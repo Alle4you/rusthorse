@@ -294,15 +294,19 @@ All fields are optional; omitted fields are left unchanged.
 `group` is split at `/`; spaces around each part and empty parts are
 dropped, and each part must be a valid entry name (no control or invisible
 formatting characters, at most 128 characters). The path is followed from
-the top through the existing groups (the first child with each name),
-creating what is missing. The agent checks it before the approval dialog:
-an invalid path, or one that leads into the recycle bin (where an entry
-would be hidden from every listing), is refused with `invalid_request`
-without an approval dialog. The dialog shows the destination normalized and
-from the top (`/Work/Servers`; `/` for the top level). A path naming the
-group the entry is already in is dropped from the request before the dialog;
-if nothing else changes, the request fails with `invalid_request` ("nothing
-to change"). A move records the previous group and the
+the top through the existing groups, creating what is missing. The agent
+checks it before the approval dialog: an invalid path, one that leads into
+the recycle bin (where an entry would be hidden from every listing), or one
+through two groups of the same name side by side is refused with
+`invalid_request` without an approval dialog. The dialog shows the
+destination normalized and from the top, with the start of the UUID of the
+deepest existing group and what would be created (`/Work/Servers (existing
+group 8d2f6c1e)`, `/Work/Servers (creates Servers in /Work, group
+1a2b3c4d)`, `/ (the top level)`). A path that leads to the group the entry
+is already in — compared by identity, not by how its path reads — is
+dropped from the request before the dialog; if nothing else changes, the
+request fails with `invalid_request` ("nothing to change"). The audit
+record's `detail` says from where to where. A move records the previous group and the
 time of the move in the entry (KDBX `PreviousParentGroup`,
 `LocationChanged`), and the entry's previous version goes to its history, as
 with every edit.

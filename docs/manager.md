@@ -182,8 +182,13 @@ written differently moves nothing. **Emptying the row moves the entry to the
 top level**, outside any group. A group's name follows the rules for an
 entry's name (for example at most 128 characters, no control or invisible
 characters): the form says which rule a name breaks before it sends
-anything. The agent's approval dialog shows the destination as a path from
-the top, `/Work/Servers`, or `/` for the top level. A move keeps the entry's
+anything. Left as it is, the row moves nothing, even for a group named by
+another KeePass client with spaces or a `/` in its name. The agent's
+approval dialog shows the destination as a path from the top and says which
+group it is — `/Work/Servers (existing group 8d2f6c1e)`, by the start of its
+UUID, or what it creates, `/Work/Servers (creates Servers in /Work, group
+1a2b3c4d)` — or `/ (the top level)`. A path through two groups of the same
+name side by side is refused, since which one is meant cannot be told. A move keeps the entry's
 UUID, so the command of **Use it from a command**, which names the entry by
 UUID, still works; a command that names it by its old `Group/Name` path no
 longer finds it. The agent refuses to move an entry into the recycle bin;

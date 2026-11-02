@@ -472,7 +472,7 @@ its own dialog.
   dialogs. With nothing listening on the socket, it offers **Start agent**,
   which runs `systemctl --user start rusthorse-agent.service` — systemd, not
   the manager, starts the agent ([ADR 0011](adr/0011-first-start-from-the-manager.md)).
-- **Requests.** It uses the protocol-6 requests and targets entries by UUID.
+- **Requests.** It uses the protocol-7 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
   started by the human runs at a time, on a worker thread, with bounded
   waits; closing the window shuts the connection down. A lost answer to a

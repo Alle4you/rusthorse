@@ -89,10 +89,13 @@ impl Form {
             rusthorse::vault::validate_name(&self.name).map_err(|e| e.to_string())?;
             changes.rename = Some(self.name.clone());
         }
-        // Compared as the agent reads a path, so that spaces around a `/`
-        // or a doubled `/` are no move. The empty path is the top level.
+        // Untouched, the row is no move: a group of another client keeps
+        // its exact name (` Work `, or a `/` in it). Edited, the row is read
+        // as the agent reads a path; spaces around a `/` or a doubled `/`
+        // that lead back to the same text are no move. The empty path is the
+        // top level. (The agent decides by the group itself, not its text.)
         let group = group_path(&self.group);
-        if group != group_path(&before.group) {
+        if self.group != before.group && group != before.group {
             for component in group.split('/').filter(|c| !c.is_empty()) {
                 rusthorse::vault::validate_name(component).map_err(|e| format!("Group: {e}"))?;
             }
@@ -464,6 +467,22 @@ pub(crate) mod tests {
             changes(&form, &top).expect("move").group.as_deref(),
             Some("AI")
         );
+    }
+
+    #[test]
+    fn a_group_with_spaces_from_another_client_can_be_left_or_changed() {
+        let mut entry = entry();
+        entry.group = Some(" Work ".into());
+        // Left as it is: another change does not move the entry.
+        let mut form = Form::from_entry(&entry);
+        form.port = "22".into();
+        let sent = changes(&form, &entry).expect("edit");
+        assert!(sent.group.is_none());
+        // Changed to `Work`, which is another group: a move.
+        let mut form = Form::from_entry(&entry);
+        form.group = "Work".into();
+        let sent = changes(&form, &entry).expect("edit");
+        assert_eq!(sent.group.as_deref(), Some("Work"));
     }
 
     #[test]

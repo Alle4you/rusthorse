@@ -1425,3 +1425,26 @@ value with Enter, through the X server of its virtual display (2 of 2
 mutations caught). The reviewer also saw a test of the run dialog's height
 fail when the temporary directory's path is long (889 estimated pixels
 against 880); it passes with the usual short path, and is recorded as such.
+
+**Move entries between groups (2026-11-02).** At the maintainer's request —
+groups keep related entries together, a device's API token and its web
+login, say — `edit.group` (protocol 7) moves an entry; the CLI has
+`edit --group` and the manager's Group field is editable. Built by two
+agents in parallel and reviewed once, as a whole.
+
+Review (Codex, AI-assisted, 2026-11-02; verdict: not ready). No value
+leaves the agent and no approval is bypassed; a nested recycle bin is
+refused even when the bin is turned off, a partly invalid import leaves no
+group behind, and a moved entry opens in KeePassXC 2.7.6. Findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — the destination did not identify one group: with two sibling groups named `Shared` (another KeePass client allows them), the dialog showed `/Shared` and the entry went to the first; a group named `東京` and one named literally `\u{6771}\u{4eac}` were two destinations drawn alike | **Fixed:** a path through two groups of the same name side by side is refused, before any dialog (also for `add --group`); the dialog says which group the destination is — the start of the UUID of the deepest existing group — and what is created: `/Work/Servers (existing group 8d2f6c1e)`, `/Work/Servers (creates Servers in /Work, group 1a2b3c4d)`, `/ (the top level)`. Names that look alike stay a limit of every dialog (L9); the UUID tells existing groups apart. The audit record says from where to where. |
+| Medium — whether a move was needed was decided by comparing paths as text: an entry in a group named `Work/Servers` (with a `/` in its name) was taken to be in the nested `Work` → `Servers` already, so a move there was dropped and the edit reported done | **Fixed:** the path is resolved to a group and compared with the entry's group by identity, in the agent before the dialog and in the vault when saving. |
+| Low — the manager's form compared normalized paths on both sides, so changing a group named ` Work ` to `Work` (another group) changed nothing | **Fixed:** a row left as it is moves nothing; an edited row is compared, normalized, with the group's exact name. |
+| Low — `docs/architecture.md` and `docs/getting-started.md` still said protocol 6 | **Fixed.** |
+
+Each fix was checked against the mistake it must catch, made in a copy of
+the tree (5 of 5: the first of two same-named groups taken, a move decided
+by the path's text, the destination shown without its group, no audit of
+the move, the manager comparing normalized names).

@@ -880,7 +880,7 @@ impl Agent {
             // the dialogs. (With `replace`, an existing entry stays where it
             // is and the group is not used.)
             if !exists && let Some(group) = &entry.group {
-                v.check_group(group)?;
+                v.resolve_group(group)?;
             }
             Ok(exists)
         })?;
@@ -1250,25 +1250,31 @@ impl Agent {
             return Err(Failure::invalid("nothing to change"));
         }
         let generation = self.generation(peer)?;
-        let current = self.with_vault(peer, |v| {
-            let current = v.info(v.find(name)?);
-            // Checked before anyone is asked: an invalid path, or one into
-            // the recycle bin, fails here. The dialog shows the destination
-            // as it will be: normalized, from the top. A move to the group
-            // the entry is in moves nothing, so the dialog does not offer it.
-            if let Some(path) = &changes.group {
-                let path = v.check_group(path)?;
-                let here = current.group.as_deref().unwrap_or_default();
-                changes.group = (path != here).then_some(path);
-            }
-            Ok(current)
+        let (current, destination) = self.with_vault(peer, |v| {
+            let id = v.find(name)?;
+            // Checked before anyone is asked: an invalid path, one into the
+            // recycle bin or through two groups of the same name fails here.
+            // A path to the group the entry is in (that very group, not one
+            // with the same path) moves nothing: the dialog does not offer it.
+            let target = match &changes.group {
+                Some(path) => Some(v.resolve_group(path)?).filter(|t| v.moves(id, t)),
+                None => None,
+            };
+            Ok((v.info(id), target))
         })?;
+        // The vault resolves the same path the same way when it saves: any
+        // change in between bumps the generation, which cancels the request.
+        changes.group = destination.as_ref().map(|t| t.path.clone());
         if changes.is_empty() {
             return Err(Failure::invalid(
                 "nothing to change: the entry is already in that group",
             ));
         }
-        let event = AuditEvent::new("edit", peer).entries(vec![current.identity()]);
+        let mut event = AuditEvent::new("edit", peer).entries(vec![current.identity()]);
+        if let Some(target) = &destination {
+            let from = current.group.as_deref().unwrap_or_default();
+            event = event.detail(format!("move from /{from} to {}", target.describe()));
+        }
 
         let prompt_for_value = matches!(changes.value, Some(ValueChange::Prompt));
         if changes.touches_metadata()
@@ -1278,6 +1284,9 @@ impl Agent {
             )
         {
             let mut details = vec![("Entry".into(), current.identity())];
+            if let Some(target) = &destination {
+                details.push(("Move to group".into(), target.describe()));
+            }
             details.extend(describe_changes(&changes));
             details.push(("Requested by (unverified)".into(), peer.describe()));
             let request = ApprovalRequest {
@@ -2369,12 +2378,8 @@ fn describe_fields(entry: &NewEntry) -> String {
 }
 
 fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
+    // A move is described by the caller, which knows where the path leads.
     let mut out: Vec<(String, String)> = Vec::new();
-    // Always from the top, `/` alone for the top level: no group name
-    // (which cannot contain `/`) can pass for another destination.
-    if let Some(group) = &changes.group {
-        out.push(("Move to group".into(), format!("/{group}")));
-    }
     let mut set = |label: &str, value: &Option<String>| {
         if let Some(v) = value {
             out.push((format!("New {label}"), v.clone()));

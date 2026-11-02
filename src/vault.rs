@@ -773,26 +773,15 @@ impl Vault {
             username: changes.username.clone(),
             ..EntryFields::default()
         })?;
-        // A group is identified by its path: an entry already in a group
-        // with that path stays where it is. `ensure_group` checks the path,
-        // the recycle bin included, before it creates anything — the first
-        // change this edit makes; nothing after it can fail.
+        // An entry already in the group the path leads to stays where it
+        // is (compared by identity). `ensure_group` checks the path — the
+        // recycle bin, groups of the same name — before it creates anything:
+        // the first change this edit makes; nothing after it can fail.
         let target = match &changes.group {
-            Some(path) => {
-                let components = group_components(path)?;
-                let current = self
-                    .db
-                    .entry(id)
-                    .expect("entry id comes from this database")
-                    .parent()
-                    .id();
-                if self.group_path(current) == components {
-                    None
-                } else {
-                    Some(self.ensure_group(Some(path))?)
-                }
+            Some(path) if self.moves(id, &self.resolve_group(path)?) => {
+                Some(self.ensure_group(Some(path))?)
             }
-            None => None,
+            _ => None,
         };
         let mut entry = self
             .db
@@ -871,69 +860,128 @@ impl Vault {
         }
     }
 
-    /// The normalized form of a group path: its components (see
-    /// [`group_components`]) joined by `/`, empty for the top level. Refuses
-    /// an invalid component and a path into the recycle bin, as
-    /// [`Vault::edit`] and [`Vault::add`] would; nothing is created.
-    pub fn check_group(&self, path: &str) -> Result<String, VaultError> {
+    /// Where `path` leads: its normalized form, the deepest group of it that
+    /// exists, and what would be created. Refuses an invalid component, a
+    /// path into the recycle bin and a path through two groups of the same
+    /// name (another KeePass client allows them; which one is meant cannot
+    /// be told, nor shown). Nothing is created.
+    pub fn resolve_group(&self, path: &str) -> Result<GroupTarget, VaultError> {
         let components = group_components(path)?;
-        self.refuse_recycle_bin(&components)?;
-        Ok(components.join("/"))
-    }
-
-    /// The first child of `parent` named `name`: the one a path leads to.
-    fn child_group(&self, parent: GroupId, name: &str) -> Option<GroupId> {
-        self.db
-            .group(parent)?
-            .groups()
-            .find(|child| child.name == name)
-            .map(|child| child.id())
-    }
-
-    /// Refuse a group path that leads into the recycle bin. The path is
-    /// followed through the existing groups from the root, as
-    /// [`Vault::ensure_group`] follows it: an entry put there would vanish
-    /// from every listing, as if deleted, without being deleted.
-    fn refuse_recycle_bin(&self, components: &[String]) -> Result<(), VaultError> {
-        let mut current = Some(self.db.root().id());
-        let mut remaining = components.iter();
-        while let Some(group) = current {
-            if self.in_recycle_bin(group) {
+        let root = self.db.root().id();
+        let mut existing = root;
+        let mut found = 0;
+        loop {
+            if self.in_recycle_bin(existing) {
                 return Err(VaultError::Invalid(
                     "entries cannot be put in the recycle bin; delete them with `rusthorse \
                      remove`"
                         .into(),
                 ));
             }
-            current = remaining
-                .next()
-                .and_then(|name| self.child_group(group, name));
+            let Some(name) = components.get(found) else {
+                break;
+            };
+            match self.child_group(existing, name)? {
+                Some(child) => {
+                    existing = child;
+                    found += 1;
+                }
+                None => break,
+            }
         }
-        Ok(())
+        let uuid = (existing != root).then(|| existing.uuid().to_string());
+        Ok(GroupTarget {
+            path: components.join("/"),
+            existing,
+            existing_path: components[..found].join("/"),
+            existing_uuid: uuid,
+            created: components[found..].to_vec(),
+        })
+    }
+
+    /// Whether moving entry `id` to `target` would move it: the entry is
+    /// not already in that very group. Compared by identity, not by path: a
+    /// group of another client may have a `/` in its name.
+    pub fn moves(&self, id: EntryId, target: &GroupTarget) -> bool {
+        let current = self.db.entry(id).map(|e| e.parent().id());
+        !target.created.is_empty() || current != Some(target.existing)
+    }
+
+    /// The child of `parent` named `name`, if there is one; two are refused.
+    fn child_group(&self, parent: GroupId, name: &str) -> Result<Option<GroupId>, VaultError> {
+        let Some(group) = self.db.group(parent) else {
+            return Ok(None);
+        };
+        let mut matching = group.groups().filter(|child| child.name == name);
+        let first = matching.next().map(|child| child.id());
+        if matching.next().is_some() {
+            let mut at = self.group_path(parent).join("/");
+            at.insert(0, '/');
+            return Err(VaultError::Invalid(format!(
+                "{at} has several groups named {name:?}, so the path is ambiguous; rename \
+                 or merge them (in KeePassXC, say) first"
+            )));
+        }
+        Ok(first)
     }
 
     /// The group at `path` (`A/B/C`), created if missing. `None`, an empty
-    /// path and `/` are the root. A path into the recycle bin is refused
-    /// before anything is created.
+    /// path and `/` are the root. Everything [`Vault::resolve_group`]
+    /// refuses is refused before anything is created.
     fn ensure_group(&mut self, path: Option<&str>) -> Result<GroupId, VaultError> {
-        let components = group_components(path.unwrap_or_default())?;
-        self.refuse_recycle_bin(&components)?;
-        let mut current = self.db.root().id();
-        for component in components {
-            current = match self.child_group(current, &component) {
-                Some(id) => id,
-                None => {
-                    let mut parent = self
-                        .db
-                        .group_mut(current)
-                        .expect("group id comes from this database");
-                    let mut child = parent.add_group();
-                    child.name = component;
-                    child.id()
-                }
-            };
+        let target = self.resolve_group(path.unwrap_or_default())?;
+        let mut current = target.existing;
+        for component in target.created {
+            let mut parent = self
+                .db
+                .group_mut(current)
+                .expect("group id comes from this database");
+            let mut child = parent.add_group();
+            child.name = component;
+            current = child.id();
         }
         Ok(current)
+    }
+}
+
+/// Where a group path leads in a vault ([`Vault::resolve_group`]).
+#[derive(Debug, Clone)]
+pub struct GroupTarget {
+    /// The path, normalized: its components joined by `/`, empty for the top
+    /// level.
+    pub path: String,
+    /// The deepest group of the path that exists (the root if none does).
+    existing: GroupId,
+    /// That group's path, normalized ("" for the root).
+    pub existing_path: String,
+    /// That group's UUID; `None` for the root.
+    pub existing_uuid: Option<String>,
+    /// The groups below it that would be created, top first.
+    pub created: Vec<String>,
+}
+
+impl GroupTarget {
+    /// The destination as a dialog shows it: a path from the top (`/` alone
+    /// for the top level), which group of the vault that is — by the start
+    /// of its UUID, since names alone can look alike — or what is created
+    /// and where.
+    pub fn describe(&self) -> String {
+        let short = |uuid: &str| uuid.chars().take(8).collect::<String>();
+        let path = format!("/{}", self.path);
+        match (&self.existing_uuid, self.created.is_empty()) {
+            (None, true) => "/ (the top level)".to_string(),
+            (Some(uuid), true) => format!("{path} (existing group {})", short(uuid)),
+            (None, false) => format!(
+                "{path} (creates {} at the top level)",
+                self.created.join("/")
+            ),
+            (Some(uuid), false) => format!(
+                "{path} (creates {} in /{}, group {})",
+                self.created.join("/"),
+                self.existing_path,
+                short(uuid)
+            ),
+        }
     }
 }
 
@@ -1221,7 +1269,11 @@ mod tests {
             ("/", ""),
             (" // ", ""),
         ] {
-            assert_eq!(vault.check_group(path).expect(path), normalized, "{path:?}");
+            assert_eq!(
+                vault.resolve_group(path).expect(path).path,
+                normalized,
+                "{path:?}"
+            );
         }
         assert_eq!(group_components("/A / B").expect("components"), ["A", "B"]);
         assert!(group_components("/").expect("top level").is_empty());
@@ -1328,7 +1380,7 @@ mod tests {
                 }
                 other => panic!("{path:?}: {:?}", other.map(|_| ())),
             };
-            refused(vault.check_group(path).map(|_| ()));
+            refused(vault.resolve_group(path).map(|_| ()));
             let changes = EntryChanges {
                 rename: Some("renamed".into()),
                 host: Some("10.0.0.9".into()),
@@ -1352,13 +1404,104 @@ mod tests {
         assert!(matches!(vault.find("other"), Err(VaultError::NotFound(_))));
         // A group that only has the same name, elsewhere, is not the bin.
         assert_eq!(
-            vault.check_group("Home/Recycle Bin").expect("not the bin"),
+            vault
+                .resolve_group("Home/Recycle Bin")
+                .expect("not the bin")
+                .path,
             "Home/Recycle Bin"
         );
         vault
             .edit(id, &move_to("Home/Recycle Bin"), None)
             .expect("move");
         assert_eq!(vault.find("Home/Recycle Bin/router").expect("find"), id);
+    }
+
+    /// Groups of another KeePass client: two with the same name side by
+    /// side, and one with a `/` in its name. A path that could mean either
+    /// of two groups is refused; a move is decided by the group itself, not
+    /// by how its path reads.
+    #[test]
+    fn moves_are_decided_by_the_group_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let (literal, nested) = {
+            let mut root = vault.db.root_mut();
+            root.add_group().name = "Shared".into();
+            root.add_group().name = "Shared".into();
+            let mut literal = root.add_group();
+            literal.name = "Work/Servers".into();
+            let literal = literal.id();
+            let mut work = root.add_group();
+            work.name = "Work".into();
+            let mut servers = work.add_group();
+            servers.name = "Servers".into();
+            (literal, servers.id())
+        };
+        let id = add_in(&mut vault, "router", "Home");
+        vault
+            .db
+            .entry_mut(id)
+            .expect("entry")
+            .move_to(literal)
+            .expect("into the literal group");
+        let groups = vault.db.num_groups();
+
+        // Two groups named `Shared`: which one is meant cannot be told.
+        for path in ["Shared", "/Shared/Sub"] {
+            let refused = |result: Result<(), VaultError>| match result {
+                Err(VaultError::Invalid(message)) => {
+                    assert!(message.contains("several groups named"), "{message}")
+                }
+                other => panic!("{path:?}: {other:?}"),
+            };
+            refused(vault.resolve_group(path).map(|_| ()));
+            refused(vault.edit(id, &move_to(path), None));
+            let mut new = entry("other");
+            new.group = Some(path.into());
+            refused(vault.add(&new, &secret("efgh"), false).map(|_| ()));
+        }
+        assert_eq!(vault.db.num_groups(), groups);
+
+        // The entry is in the group named `Work/Servers`, whose path reads
+        // like the nested `Work` → `Servers`, where the path leads: a move.
+        let target = vault.resolve_group("Work/Servers").expect("resolve");
+        assert_eq!(target.existing, nested);
+        assert!(vault.moves(id, &target));
+        vault
+            .edit(id, &move_to("Work/Servers"), None)
+            .expect("move");
+        let parent = vault.db.entry(id).expect("entry").parent().id();
+        assert_eq!(parent, nested);
+        assert!(!vault.moves(id, &vault.resolve_group("Work/Servers").expect("again")));
+        assert_eq!(vault.db.num_groups(), groups);
+    }
+
+    #[test]
+    fn a_destination_says_which_group_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        add_in(&mut vault, "router", "Work");
+        let work = vault.resolve_group("Work").expect("work");
+        let uuid = work.existing_uuid.clone().expect("existing");
+        assert_eq!(
+            work.describe(),
+            format!("/Work (existing group {})", &uuid[..8])
+        );
+        assert_eq!(
+            vault.resolve_group("Work/Servers").expect("new").describe(),
+            format!(
+                "/Work/Servers (creates Servers in /Work, group {})",
+                &uuid[..8]
+            )
+        );
+        assert_eq!(
+            vault.resolve_group("New/Deeper").expect("new").describe(),
+            "/New/Deeper (creates New/Deeper at the top level)"
+        );
+        assert_eq!(
+            vault.resolve_group("/").expect("top").describe(),
+            "/ (the top level)"
+        );
     }
 
     #[test]
@@ -1379,7 +1522,7 @@ mod tests {
                 }
                 other => panic!("{path:?}: {other:?}"),
             };
-            refused(vault.check_group(&path).map(|_| ()));
+            refused(vault.resolve_group(&path).map(|_| ()));
             let changes = EntryChanges {
                 rename: Some("renamed".into()),
                 ..move_to(&path)

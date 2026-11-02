@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 6)
+  ok    rusthorse 0.1.0 (protocol 7)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/usr/bin/rusthorse)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
