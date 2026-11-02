@@ -199,12 +199,15 @@ the key to a server of its choosing. The dialog therefore lists, under
 authorities, switches that disable certificate checks, and name resolution
 ([cli.md](cli.md#rusthorse-run)); the audit record names them too. A value
 that programs could read differently — a backslash, two `@`, an unusual
-host — is not shown but warned about, so that the dialog never names a host
-the program will not use. Limits: the lists go by name and cannot be
-complete (`MY_SERVICE=https://…`, a configuration file or an argument escape
-them); a URL is shown by scheme, host and port only, so a different path on
-the same host is not visible; the forms judged unambiguous are those of
-common URL parsers, not a proof about every program; and `run --url`, which
+host, a numeric host other than `a.b.c.d`, a query naming another server
+(libpq's `hostaddr`) — is not shown but warned about, so that the dialog
+does not name a host that common parsers would not use. Limits: the lists go
+by name and cannot be complete (`MY_SERVICE=https://…`, a configuration file
+or an argument escape them); a URL is shown by scheme, host and port only,
+so a different path on the same host is not visible; the forms judged
+unambiguous are those known for common URL parsers and libpq, not a proof
+about every program, which may take its destination from elsewhere; and
+`run --url`, which
 takes the address from the entry's metadata, looks the same as a variable
 the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
 *Mitigation:* read the dialog — check the host of every destination; prefer
@@ -932,5 +935,26 @@ done:
 | Medium — the entry form's Kind and switch rows kept each other alive through their handlers: twelve forms opened and closed left twelve pairs alive | **Fixed:** the handler holds weak references; the widget test checks that the closed form's rows are freed once another form replaces it. |
 | Low — a variable given twice was shown twice, sorted, though the command gets only the last value | **Fixed:** the dialog is built from the same last-wins view as the environment. |
 | Documentation — "credentials are left out" was false in those cases; "no symlink can be swapped" claimed more than a text check; "shows where the program will connect" overstated what the dialog knows; ADR 0008 still said the dialog lists no such variable | **Fixed:** each statement corrected; the row is now called **Destinations**, settings found in the environment, not connections. |
+
+Each fix was reverted in a copy of the tree to see a test fail.
+
+Verification of those fixes (Codex, AI-assisted, 2026-11-01; verdict: not
+ready). Confirmed fixed: the backslash case, `SSL_CERT_DIR` lists,
+`AWS_ENDPOINT_URL_S3`, the manager form's cycle. (A first request for this
+verification was refused by the reviewer's provider as a possible
+cybersecurity risk, being phrased as a search for bypasses; it was asked
+again as a verification of the display's correctness.) New findings, and
+what was done:
+
+| Finding | Disposition |
+|---|---|
+| High — list separators were the same for every list variable: pip reads `PIP_EXTRA_INDEX_URL` at spaces only, so `https://user:1234,5678@packages/…` is one URL whose password contains a comma, and the dialog and the audit log showed part of it | **Fixed:** each list variable has the separators its program uses (`GOPROXY`: `,` and `|`; pip and uv: spaces). |
+| High — an empty authority was taken for a local path: `https:///hooks.invalid/TOKEN` was shown whole (Node and curl connect to `hooks.invalid`), and so was `//TOKEN@host/path` | **Fixed:** an empty authority is shown only for `unix:` and `file:`; a path starting with `//` is not shown. |
+| High — libpq takes its server from the query: a `DATABASE_URL` showing `…@expected.invalid` connected, with the fake `PGPASSWORD`, to the server in `?hostaddr=…&port=…` (reproduced end to end) | **Fixed:** a URL whose query has `host`, `hostaddr`, `port`, `service`, `servicefile`, a socket or server parameter, or a parameter name with `%`, is not shown, and the warning names it. `?sslmode=require` and the like stay shown. |
+| Medium — `UV_INDEX` was in the list of list variables but not recognised as a destination, so it never reached the dialog (uv queried the index it named first) | **Fixed:** `UV_INDEX` and `UV_DEFAULT_INDEX` are endpoints, their `name=URL` items keep the name. |
+| Low — when a later `SSL_CERT_DIR` named the system store, the warning still showed the earlier, replaced value | **Fixed:** the environment is consolidated (last value wins) before anything is classified. |
+| Low — numeric IPv4 forms (`0x7f.1`, `127.1`, `2130706433`, `0177.0.0.1`) were shown literally, though parsers read them as `127.0.0.1` | **Fixed:** a host whose last label is a number must be a canonical `a.b.c.d`; otherwise it is not shown. A lone word (`0`, `1`, `direct`) is still shown: switches such as `GIT_SSL_NO_VERIFY=1` hold words. |
+| Noise — `PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"` and a certificate path with a space were `(not shown)` | **Fixed:** `PIP_TRUSTED_HOST` and `UV_INSECURE_HOST` are trust settings (a warning) split at spaces; certificate paths may contain spaces. |
+| Documentation — "the dialog never names a host the program will not use", "credentials are left out", and the description of list separators said more than the code | **Fixed:** the docs list the forms shown and not shown, and say that the rules cover the known readings of common parsers and libpq, not every program. |
 
 Each fix was reverted in a copy of the tree to see a test fail.

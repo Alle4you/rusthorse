@@ -125,7 +125,7 @@ variables that route its connections or change which servers it trusts
 replaces an earlier one, as in the command's environment. Destination values
 are shortened for the dialog and the audit record (`shown_destination`:
 scheme, host and port of a URL, item by item in a list variable such as
-`GOPROXY`); a value without an
+`GOPROXY`, split as its program splits it); a value without an
 unambiguous form is replaced by `(not shown)` and named in a warning. The
 command gets the values unchanged.
 

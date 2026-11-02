@@ -265,29 +265,42 @@ Requires approval; the dialog shows:
 The requester sets these variables, and with them it can make an approved,
 well-known program send your secret to a server of its own: check the host
 of every one. They are settings found in the environment, not the
-connections the program will make. Only unambiguous values are shown. The
-values of list variables — `GOPROXY` (`,` or `|`), `PIP_EXTRA_INDEX_URL`,
-`UV_EXTRA_INDEX_URL`, `UV_INDEX` (spaces) — are judged item by item; any
-other value is one item, so that a comma inside a URL's path cannot pass
-part of the path off as an item of its own:
+connections the program will make. Only unambiguous values are shown. A
+list variable is judged item by item, split as the program that reads it
+splits it — `GOPROXY` at `,` and `|`; `PIP_EXTRA_INDEX_URL`,
+`PIP_TRUSTED_HOST`, `UV_EXTRA_INDEX_URL`, `UV_INDEX` and `UV_INSECURE_HOST`
+at spaces — and uv's `name=URL` items keep their name. Any other value is
+one item, so that a comma or a space inside a URL, in a password or a path,
+never splits it. Shown:
 
 - a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
   names, passwords, paths, queries and fragments — where credentials and
   webhook tokens travel — are left out;
-- `user:password@host` without a scheme as `…@host`; a host name, an IP
-  address or a word (`direct`, `0`) as it is;
-- the paths of certificate variables, and absolute paths, as they are.
+- `user:password@host` without a scheme as `…@host`; a host name, a
+  canonical IPv4 address (`10.0.0.1`), a bracketed IPv6 address, or a word
+  (`direct`, `0`, `1`) as it is;
+- a local socket or file (`unix:///run/docker.sock`), the paths of
+  certificate variables, and absolute paths, as they are.
 
-Anything else — a backslash or a control character anywhere, two `@`, a
-host with characters other than letters, digits, `.`, `-` and `_`,
-`https:/host` — appears as `(not shown)`, and a warning names the variable:
-programs read such values differently (a parser that takes `\` for `/`
-connects to the host before the `@`, while the text after it names
-another), so no host drawn from them can be trusted, and copying them could
-disclose a credential. The audit log gets the same shortened text. The
-variables reach the command unchanged. The lists are not complete; a
-program can also read an address from a file or its arguments, and a name
-outside them (`MY_SERVICE=https://…`) is not listed.
+Anything else appears as `(not shown)`, and a warning names the variable:
+a backslash or a control character anywhere; two `@`; a host with
+characters other than letters, digits, `.`, `-` and `_`; a numeric host
+other than `a.b.c.d` (`127.1`, `0x7f.1`, `2130706433.`, which parsers turn
+into `127.0.0.1` each in its own way); an empty host outside `unix:` and
+`file:` (`https:///host/…`, `https:/host`); a path that starts with `//`;
+and a URL whose query names another destination (`host`, `hostaddr`,
+`port`, `service` — libpq connects to those, not to the URL's host — or a
+parameter name with `%`). Programs read such values differently (a parser
+that takes `\` for `/` connects to the host before the `@`, while the text
+after it names another), so a host drawn from them could be the wrong one,
+and copying them could disclose a credential. The audit log gets the same
+shortened text; the variables reach the command unchanged.
+
+These rules cover the readings of common URL parsers (WHATWG as in Node,
+Python's, curl's) and of libpq that are known to differ; they are not a
+proof about every program. The lists are not complete either: a program can
+read an address from a file or its arguments, and a name outside them
+(`MY_SERVICE=https://…`) is not listed.
 
 Requests whose command line, program path or directory is longer than 1000
 characters are refused (put the command in a script): the dialog never
