@@ -191,16 +191,26 @@ pub struct Dotenv {
 /// text: a byte-order mark, a lone carriage return, a control character,
 /// any other blank or line separator, a value over several lines, a
 /// backslash in quotes, a value in back quotes, a `#` without a blank before
-/// it in an unquoted value, and any line that is not one of the three above — nothing is
+/// it in an unquoted value, a `${…}` in a value (python-dotenv replaces it),
+/// a name set twice, the name `__proto__` (Node's dotenv drops it), and any
+/// line that is not one of the three above — nothing is
 /// skipped without a word, so a file is imported whole or not at all.
 pub fn parse_dotenv(text: &str) -> Result<Dotenv, String> {
     let mut parsed = Dotenv {
         pairs: Vec::new(),
         empty: Vec::new(),
     };
-    for (index, raw) in text.split('\n').enumerate() {
+    let segments: Vec<&str> = text.split('\n').collect();
+    // Where each name was first set: a name set twice refuses the file.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (index, raw) in segments.iter().enumerate() {
         let number = index + 1;
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        // A carriage return ends a line only before a line feed (CRLF).
+        let line = if index + 1 < segments.len() {
+            raw.strip_suffix('\r').unwrap_or(raw)
+        } else {
+            raw
+        };
         if let Some(c) = line.chars().find(|&c| {
             c == '\u{FEFF}'
                 || (c.is_control() && c != '\t')
@@ -236,6 +246,18 @@ pub fn parse_dotenv(text: &str) -> Result<Dotenv, String> {
         else {
             return Err(unsupported());
         };
+        // Node's dotenv drops this name (it is an object's prototype).
+        if name == "__proto__" {
+            return Err(format!(
+                "line {number}: the name __proto__, which Node's dotenv drops"
+            ));
+        }
+        if let Some(first) = seen.insert(name.to_string(), number) {
+            return Err(format!(
+                "line {number}: {name} is set again (also on line {first}); which one counts \
+                 differs between programs"
+            ));
+        }
         let value = value.trim_matches([' ', '\t']);
         let value = match value.chars().next() {
             Some('`') => {
@@ -278,6 +300,13 @@ pub fn parse_dotenv(text: &str) -> Result<Dotenv, String> {
                 }
             },
         };
+        // python-dotenv replaces `${NAME}` by default; Node's dotenv does not.
+        if value.contains("${") {
+            return Err(format!(
+                "line {number}: a ${{…}} in a value, which python-dotenv replaces and Node's \
+                 dotenv does not"
+            ));
+        }
         if value.is_empty() {
             parsed.empty.push(name.to_string());
         } else {
@@ -485,6 +514,18 @@ mod tests {
             ("K=FAKE\u{2028}X=y\n", "line 1: a character"),
             ("K=FAKE\u{85}\n", "line 1: a character"),
             ("K=FAKE\u{1}\n", "line 1: a character"),
+            // A carriage return at the very end, without a line feed.
+            ("K=FAKE\r", "line 1: a character"),
+            // Interpolation, in every form python-dotenv expands.
+            ("PART=x\nKEY=${PART}-FAKE\n", "line 2: a ${…} in a value"),
+            ("KEY='${PART}FAKE'\n", "line 1: a ${…} in a value"),
+            ("KEY=\"${PART:-FAKE}\"\n", "line 1: a ${…} in a value"),
+            // A name set twice, also once empty.
+            (
+                "DUP=\nDUP=FAKE\n",
+                "line 2: DUP is set again (also on line 1)",
+            ),
+            ("__proto__=FAKE\n", "line 1: the name __proto__"),
         ] {
             let Err(refused) = parse_dotenv(text) else {
                 panic!("accepted: {text:?}");

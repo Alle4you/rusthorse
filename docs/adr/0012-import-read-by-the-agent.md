@@ -66,10 +66,12 @@ not be another place that holds secrets.
    files are read in a small dialect — LF or CRLF line ends, spaces and
    tabs as the only blanks, blank, comment and `NAME=value` lines, one-line
    values in single or double quotes without a backslash or their own quote
-   inside, or unquoted with a `#` only after a blank — chosen so that
-   python-dotenv and Node's dotenv read every accepted file as Rusthorse
-   does (checked on some 5,000 generated files against python-dotenv 1.2.2
-   and dotenv 17.4.2). Any other file is refused as a whole, naming the
+   inside, or unquoted with a `#` only after a blank; no `${…}`, no name
+   set twice, no `__proto__` — chosen so that python-dotenv (as it reads
+   files by default, replacing `${…}`) and Node's dotenv read every
+   accepted file as Rusthorse does (checked on some 5,000 accepted files,
+   out of 31,000 generated, against python-dotenv 1.2.2 and dotenv
+   17.4.2). Any other file is refused as a whole, naming the
    line, with nothing skipped: the libraries disagree on the rest, and
    reading on could take part of a value for more names, or import a file
    in part. Values over

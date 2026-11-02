@@ -478,9 +478,11 @@ tabs; a line is blank, a `#` comment, or `NAME=value` with an optional
 `export` and blanks around `=`, `NAME` made of ASCII letters, digits, `_`,
 `.` and `-`; a value is on one line, either in single or double quotes with
 neither that quote nor a backslash inside, or unquoted — not starting with a
-back quote — where a `#` after a blank starts a comment. Any other file is
-refused as a whole, naming the line only: nothing in it is skipped, so a
-file is imported whole or not at all. Add values the dialect cannot hold
+back quote — where a `#` after a blank starts a comment; no value holds
+`${…}` (python-dotenv replaces it by another variable's value, Node's
+dotenv does not), no name is set twice, and none is `__proto__` (Node's
+dotenv drops it). Any other file is refused as a whole, naming the line
+only: nothing in it is skipped, so a file is imported whole or not at all. Add values the dialect cannot hold
 (over several lines, with backslashes) with `rusthorse add`. Variables with
 an empty value cannot be imported; the command names them.
 The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):

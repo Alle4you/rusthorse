@@ -174,9 +174,9 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
   — the requester learns the labels and attributes — and refuses a keyring
   of more than 10 000 items.
 - `dotenv_names` answers `{"type": "names", "names": [...], "empty": [...]}`:
-  the names of the file's variables with a value, in its order (a name can
-  appear twice), and, when there are any, those with an empty value, which
-  cannot be imported. The agent asks the human first, then reads the file
+  the names of the file's variables with a value, in its order, and, when
+  there are any, those with an empty value, which cannot be imported (a
+  file that sets a name twice is refused). The agent asks the human first, then reads the file
   and drops the values.
 - `import_from` imports at most 100 entries, after one approval. Keyring
   items can be imported only from the last `keyring_items` listing that

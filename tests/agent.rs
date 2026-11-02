@@ -2672,16 +2672,20 @@ fn duplicate_names_are_refused_before_anything_is_imported() {
     let env_file = h.dir.path().join("dup.env");
     std::fs::write(&env_file, "DUP=first\nOTHER=x1234\nDUP=second\n").expect("write");
     let file = env_file.to_str().expect("utf8");
-    // Each run asks only to show the names.
+    // The file is refused as soon as the agent reads it for the names:
+    // nothing is listed, nothing imported.
     h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
     let preview = h.run(&["import", "dotenv", file, "--dry-run"]);
+    assert!(!preview.status.success());
     assert!(
-        text(&preview.stdout)
-            .contains("dup      DUP  (appears more than once: the import will be refused)")
+        text(&preview.stderr).contains("line 3: DUP is set again (also on line 1)"),
+        "{}",
+        text(&preview.stderr)
     );
+    assert!(text(&preview.stdout).is_empty());
     let out = h.run(&["import", "dotenv", file, "--replace"]);
     assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("appear more than once"));
+    assert!(text(&out.stderr).contains("DUP is set again"));
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
     assert!(!text(&h.run(&["list"]).stdout).contains("OTHER"));
     // The agent refuses such a batch too.
@@ -4572,7 +4576,9 @@ mod import_from {
         let fifo = h.dir.path().join("fifo.env");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
         let file = h.dir.path().join("app.env");
-        std::fs::write(&file, "FAKE_ONE=fake\nFAKE_ONE=again\n").unwrap();
+        std::fs::write(&file, "FAKE_ONE=fake\n").unwrap();
+        let twice = h.dir.path().join("twice.env");
+        std::fs::write(&twice, "FAKE_ONE=fake\nFAKE_ONE=again\n").unwrap();
         let dotenv = |path: &Path, names: &[&str]| Request::ImportFrom {
             source: ImportSource::Dotenv {
                 path: path.display().to_string(),
@@ -4600,7 +4606,7 @@ mod import_from {
         assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
         // Anything that depends on the file comes after the dialog: denied,
         // the requester does not learn whether a name is in the file.
-        for request in [dotenv(&file, &["FAKE_TWO"]), dotenv(&file, &["FAKE_ONE"])] {
+        for request in [dotenv(&file, &["FAKE_TWO"]), dotenv(&twice, &["FAKE_ONE"])] {
             h.decide(&[Decision::Deny]);
             match h.call(&request) {
                 Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
@@ -4612,7 +4618,7 @@ mod import_from {
         h.decide(&[Decision::AllowOnce; 3]);
         refused(dotenv(&fifo, &["FAKE_ONE"]), "not a regular file");
         refused(dotenv(&file, &["FAKE_TWO"]), "is not in");
-        refused(dotenv(&file, &["FAKE_ONE"]), "more than once in");
+        refused(dotenv(&twice, &["FAKE_ONE"]), "FAKE_ONE is set again");
     }
 
     #[cfg(all(feature = "fake-keyring", feature = "session-lock"))]

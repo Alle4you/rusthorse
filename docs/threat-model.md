@@ -1293,3 +1293,23 @@ compare every value, back up, reopen the backup — passed. Findings:
 Each fix was reverted in a copy of the tree to see a test fail (8 of 9;
 the survivor, refusing a lone carriage return as a control character, is
 redundant: Rust counts it as a blank too, which the next check refuses).
+
+Seventh review (Codex, AI-assisted, 2026-11-02; verdict: not ready). No
+value came back as a name; the earlier fixes held; the keyring flow —
+create, import 34 fake items, compare every value, back up, reopen the
+backup and compare again — passed. Findings, all in `.env` files:
+
+| Finding | Disposition |
+|---|---|
+| Medium — `KEY=${PART}-suffix` was imported as written, while python-dotenv, by default, replaces `${PART}` (also in single quotes) | **Fixed:** a value holding `${` refuses the file; Rusthorse does not expand variables, from the file or from its own environment. |
+| Medium — names were checked for repetition only among those with a value: with `DUP=` and `DUP=x`, batches were saved before the second one was refused | **Fixed:** a name set twice refuses the file when it is read — before any listing or import — so a file is imported whole or not at all. |
+| Low — the name `__proto__`, which Node's dotenv drops, was accepted | **Fixed:** refused. |
+| Low — a carriage return at the very end of a file, without a line feed, was taken for a line end | **Fixed:** only a carriage return before a line feed ends a line. |
+
+The differential check, run again with python-dotenv as programs use it by
+default (replacing `${…}`) and new cases (`${…}`, `$NAME`, `__proto__`,
+`constructor`, a final carriage return): of 31,290 generated fake files,
+5,029 are accepted, none with a repeated name, and both libraries read them
+with Rusthorse's names and values.
+
+Each fix was reverted in a copy of the tree to see a test fail (4 of 4).

@@ -123,9 +123,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 - `.env` files are read in a small dialect that python-dotenv and Node's
   dotenv read alike (one-line values, in single or double quotes without
-  backslashes, or unquoted with a ` #` comment), and any other file is
-  refused as a whole, naming the line; variables with an empty value are
-  named, not skipped. Before, each line was read on its own and quotes were
+  backslashes, or unquoted with a ` #` comment; no `${…}`, no name set
+  twice), and any other file is refused as a whole, naming the line;
+  variables with an empty value are named, not skipped. Before, each line was read on its own and quotes were
   only stripped, so a value over several lines could be taken for more
   variables.
 
