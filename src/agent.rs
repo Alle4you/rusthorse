@@ -66,10 +66,7 @@ const MAX_CONNECTIONS: usize = 64;
 /// Requests that may wait for the human at the same time; more are refused.
 const MAX_WAITING_FOR_DIALOG: usize = 8;
 
-/// Longest text an approval or prompt dialog may contain. Requests whose
-/// dialog would be longer are refused: the human must be able to read all of
-/// it.
-const MAX_DIALOG_CHARS: usize = 4000;
+use crate::ui::MAX_DIALOG_CHARS;
 
 /// Longest text the approval dialog shows for one detail. Longer requests are
 /// refused instead of truncated: the human must see everything they approve.
@@ -169,15 +166,31 @@ struct State {
     /// only acted on if the generation did not change while the human was
     /// deciding, and remembered approvals are tied to one generation.
     generation: u64,
+    /// The last keyring listing the human allowed, and to whom: keyring
+    /// imports may only use items of it (ADR 0012). A lock forgets it.
+    keyring_listing: Option<KeyringListing>,
 }
 
 impl State {
     fn lock(&mut self) {
         self.vault = None;
         self.remembered.clear();
+        self.keyring_listing = None;
         self.generation += 1;
     }
 }
+
+/// A keyring listing that the human allowed a program to see.
+struct KeyringListing {
+    /// The program it was shown to: process id and start time.
+    requester: (i32, Option<u64>),
+    at: Instant,
+    /// The items, by object path, as they were shown.
+    items: std::collections::HashMap<String, crate::protocol::KeyringItem>,
+}
+
+/// How long a keyring listing may be imported from.
+const KEYRING_LISTING_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// Decrements a counter when dropped.
 struct CountGuard<'a>(&'a AtomicUsize);
@@ -247,6 +260,7 @@ impl Agent {
                 last_used: Instant::now(),
                 remembered: Vec::new(),
                 generation: 0,
+                keyring_listing: None,
             }),
             dialog: Mutex::new(()),
             waiting_for_dialog: AtomicUsize::new(0),
@@ -976,6 +990,15 @@ impl Agent {
         self.approve(request, None, AuditEvent::new("keyring_items", peer))?;
         let items = crate::keyring::items(&self.config.keyring)
             .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
+        // What this program may now import from, and what its dialogs show.
+        self.state().keyring_listing = Some(KeyringListing {
+            requester: (peer.pid, crate::peer::start_time(peer.pid)),
+            at: Instant::now(),
+            items: items
+                .iter()
+                .map(|item| (item.id.clone(), item.clone()))
+                .collect(),
+        });
         let response = Response::KeyringItems { items };
         let size = serde_json::to_vec(&response).map_or(usize::MAX, |b| b.len());
         if size > protocol::MAX_FRAME_LEN - 1024 {
@@ -1042,46 +1065,51 @@ impl Agent {
         match source {
             ImportSource::Keyring { items } => {
                 check_import_names(items.iter().map(|p| p.name.as_str()), items.len())?;
-                // Read for the dialog only: whatever it says goes to the
-                // human, not to the requester.
-                let ids = items.iter().map(|p| p.id.clone()).collect();
-                let found = crate::keyring::describe(&self.config.keyring, ids)
-                    .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
-                let sources: Vec<String> = found
+                // Only items of a listing this program was allowed to see:
+                // then nothing the dialog shows — and nothing that depends on
+                // it, such as its size — is news to the requester.
+                let shown: Vec<crate::protocol::KeyringItem> = {
+                    let state = self.state();
+                    let listing = state.keyring_listing.as_ref().filter(|l| {
+                        l.requester == (peer.pid, crate::peer::start_time(peer.pid))
+                            && l.at.elapsed() < KEYRING_LISTING_LIFETIME
+                    });
+                    let Some(listing) = listing else {
+                        return Err(Failure::invalid(
+                            "list the keyring first (keyring_items): items can be imported only \
+                             from a listing this program was shown, in the last 10 minutes and \
+                             since the vault was last locked",
+                        ));
+                    };
+                    items
+                        .iter()
+                        .map(|pick| listing.items.get(&pick.id).cloned())
+                        .collect::<Option<_>>()
+                        .ok_or_else(|| {
+                            Failure::invalid(
+                                "an item is not in the keyring listing this program was shown; \
+                                 list the keyring again",
+                            )
+                        })?
+                };
+                let rows = items
                     .iter()
-                    .map(|item| match item {
-                        Some(item) if item.locked => format!(
-                            "{} (locked: cannot be read)",
-                            crate::keyring::describe_item(item)
-                        ),
-                        Some(item) => crate::keyring::describe_item(item),
-                        None => "(no such keyring item)".to_string(),
+                    .zip(&shown)
+                    .map(|(pick, item)| {
+                        let mut source = crate::keyring::describe_item(item);
+                        if item.locked {
+                            source.push_str(" (locked: cannot be read)");
+                        }
+                        (pick.name.clone(), source)
                     })
                     .collect();
-                let (names, entries): (Vec<String>, Vec<NewEntry>) = items
-                    .into_iter()
-                    .map(|pick| (pick.name.clone(), entry(pick.name)))
-                    .unzip();
+                let entries = items.into_iter().map(|pick| entry(pick.name)).collect();
                 let settings = self.config.keyring.clone();
-                self.import_entries(
-                    peer,
-                    entries,
-                    replace,
-                    Origin::Keyring(names.into_iter().zip(sources).collect()),
-                    move || {
-                        // After approval: only items that are still what was
-                        // shown.
-                        let shown = found.into_iter().collect::<Option<Vec<_>>>().ok_or_else(
-                            || {
-                                Failure::invalid(
-                                    "an item of the import does not exist; nothing was imported",
-                                )
-                            },
-                        )?;
-                        crate::keyring::read(&settings, shown)
-                            .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))
-                    },
-                )
+                self.import_entries(peer, entries, replace, Origin::Keyring(rows), move || {
+                    // After approval: only items that are still what was shown.
+                    crate::keyring::read(&settings, shown)
+                        .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))
+                })
             }
             ImportSource::Dotenv {
                 path,
@@ -1145,67 +1173,16 @@ impl Agent {
             }
             Ok((new, existing))
         })?;
-        let existing_label = if replace {
-            "Will be replaced"
-        } else {
-            "Already exist (skipped)"
+        let source = match &origin {
+            Origin::Requester => crate::import::Source::Requester,
+            Origin::Keyring(rows) => crate::import::Source::Keyring(rows),
+            Origin::Dotenv(path) => crate::import::Source::Dotenv(path),
         };
-        let n = entries.len();
-        let mut details: Vec<(String, String)> = Vec::new();
-        let (summary, explanation, event) = match &origin {
-            Origin::Requester => (
-                format!("Import {n} secrets?"),
-                "The program that asked supplied these names and values. Check the names \
-                 before you allow it."
-                    .to_string(),
-                AuditEvent::new("import", peer),
-            ),
-            Origin::Keyring(_) => (
-                format!("Import {n} secrets from GNOME Keyring?"),
-                "The agent reads each value itself, from the keyring item shown next to the \
-                 entry's name; the program that asked chose the items and the names. Check \
-                 that each item is the one you mean before you allow it."
-                    .to_string(),
-                AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
-            ),
-            Origin::Dotenv(path) => (
-                format!("Import {n} secrets from a .env file?"),
-                "The agent reads the values itself, from the file below; the program that \
-                 asked chose the variables and their names. Check the names before you allow \
-                 it."
-                .to_string(),
-                AuditEvent::new("import_from", peer).detail(*path),
-            ),
-        };
-        match &origin {
-            Origin::Requester => {
-                details.push(("New entries".into(), list_names(&new)));
-            }
-            Origin::Dotenv(path) => {
-                details.push(("Read from".into(), path.to_string()));
-                details.push(("New entries".into(), list_names(&new)));
-            }
-            Origin::Keyring(mapping) => {
-                details.push(("Read from".into(), "GNOME Keyring".into()));
-                // One row per entry: the item its value comes from.
-                for (name, source) in mapping {
-                    details.push((name.clone(), format!("← {source}")));
-                }
-            }
-        }
-        if !existing.is_empty() {
-            details.push((existing_label.into(), list_names(&existing)));
-        }
-        details.push(("Requested by (unverified)".into(), peer.describe()));
-        let request = ApprovalRequest {
-            title: "Rusthorse — import secrets".into(),
-            summary,
-            explanation,
-            command: None,
-            details,
-            facts: Vec::new(),
-            warnings: Vec::new(),
-            can_remember: false,
+        let request = crate::import::approval(&source, &new, &existing, replace, &peer.describe());
+        let event = match &origin {
+            Origin::Requester => AuditEvent::new("import", peer),
+            Origin::Keyring(_) => AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
+            Origin::Dotenv(path) => AuditEvent::new("import_from", peer).detail(*path),
         };
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         self.approve(request, None, event.entries(names))?;
@@ -2301,13 +2278,6 @@ fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<Vec<(String, SecretSt
         .into_iter()
         .map(|(name, value)| (format!("{prefix}{name}"), value))
         .collect())
-}
-
-fn list_names(names: &[&str]) -> String {
-    if names.is_empty() {
-        return "(none)".into();
-    }
-    names.join(", ")
 }
 
 fn describe_fields(entry: &NewEntry) -> String {

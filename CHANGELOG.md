@@ -121,6 +121,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- `.env` files are read as python-dotenv (and Node's dotenv) read them:
+  quoted values may span lines, python-dotenv's escapes are decoded, an
+  unquoted value ends at ` #`. A file that could hide a value from that
+  reading is refused. Before, each line was read on its own and quotes were
+  only stripped.
 - The manager keeps showing what a change reported (for example a warning
   of `passwd`) after the status check that follows it; before, that check
   erased the message at once.

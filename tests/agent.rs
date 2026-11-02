@@ -2782,11 +2782,28 @@ fn fake_import_agent(
     })
 }
 
-/// Import 30 names (two batches: 24 lines of names fit in one dialog)
-/// through the fake agent on `socket`.
+/// Import names that make exactly two batches (as many as fit in one
+/// dialog, and five more) through the fake agent on `socket`.
 fn import_two_batches(dir: &Path, socket: &Path) -> std::process::Output {
     let env_file = dir.join("many.env");
-    let lines: String = (0..30).map(|i| format!("NAME_{i:03}=value{i}\n")).collect();
+    let path = env_file.display().to_string();
+    let planned = |n: usize| -> Vec<rusthorse::import::Planned> {
+        (0..n)
+            .map(|i| rusthorse::import::Planned {
+                name: format!("NAME_{i:03}"),
+                item: None,
+            })
+            .collect()
+    };
+    let first = rusthorse::import::batch_sizes(&planned(500), Some(&path))[0];
+    let count = first + 5;
+    assert_eq!(
+        rusthorse::import::batch_sizes(&planned(count), Some(&path)),
+        [first, 5]
+    );
+    let lines: String = (0..count)
+        .map(|i| format!("NAME_{i:03}=value{i}\n"))
+        .collect();
     std::fs::write(&env_file, lines).expect("write");
     Command::new(env!("CARGO_BIN_EXE_rusthorse"))
         .args(["import", "dotenv", env_file.to_str().expect("utf8")])
@@ -4611,6 +4628,16 @@ mod import_from {
             assert!(!h.audit_text().contains("fake-a-value"));
         }
 
+        /// List the keyring from this test's process (approved), as a
+        /// program must before it imports from it.
+        fn list(h: &Harness) -> Vec<rusthorse::protocol::KeyringItem> {
+            h.decide(&[Decision::AllowOnce]);
+            match h.call(&Request::KeyringItems) {
+                Response::KeyringItems { items } => items,
+                other => panic!("unexpected {}", other.kind()),
+            }
+        }
+
         fn pick(id: &str, name: &str) -> Request {
             Request::ImportFrom {
                 source: ImportSource::Keyring {
@@ -4637,6 +4664,7 @@ mod import_from {
             };
             let h = Harness::with_keyring(&bus.address);
             h.add_secret("OPENAI_API_KEY", "fake-original", &[]);
+            list(&h);
             h.decide(&[Decision::Deny]);
             let answer = h.call(&pick(FIRST, "OPENAI_API_KEY"));
             assert!(matches!(
@@ -4647,9 +4675,10 @@ mod import_from {
                 }
             ));
             let dialog = last_approval(&h);
+            // The entry's name is content, as written, after a fixed title.
             assert!(
-                dialog.contains("OPENAI_API_KEY")
-                    && dialog.contains("← UNRELATED_FAKE_STAGING [nome=OTHER_KEY]"),
+                dialog.contains("Entry 1")
+                    && dialog.contains("OPENAI_API_KEY ← UNRELATED_FAKE_STAGING [nome=OTHER_KEY]"),
                 "{dialog}"
             );
             assert!(dialog.contains("Will be replaced"), "{dialog}");
@@ -4663,6 +4692,7 @@ mod import_from {
             };
             let h = Harness::with_keyring(&bus.address);
             assert!(h.run(&["unlock"]).status.success());
+            list(&h);
             // (A clone: the service lives as long as `service`.)
             let relabel = service.clone();
             *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
@@ -4679,21 +4709,80 @@ mod import_from {
         }
 
         #[test]
-        fn an_unknown_item_is_said_only_in_the_dialog() {
+        fn only_items_of_a_listing_this_program_was_shown_can_be_imported() {
             let Some((bus, _service)) = keyring(vec![segredo("FAKE_A", "fake-a-value")]) else {
                 return;
             };
             let h = Harness::with_keyring(&bus.address);
-            h.decide(&[Decision::Deny]);
-            let answer = h.call(&pick("/org/freedesktop/secrets/collection/login/99", "X"));
-            assert!(matches!(
-                answer,
-                Response::Error {
-                    code: ErrorCode::Denied,
-                    ..
+            let refused = |request: &Request, expected: &str| match h.call(request) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                    assert!(message.contains(expected), "{message}");
+                    message
                 }
-            ));
-            assert!(last_approval(&h).contains("(no such keyring item)"));
+                other => panic!("unexpected {}", other.kind()),
+            };
+            // No listing: refused alike whatever the item, so that nothing —
+            // not even the dialog's size — tells what the keyring holds.
+            let long: Vec<_> = (0..40)
+                .map(|i| rusthorse::protocol::KeyringPick {
+                    id: FIRST.into(),
+                    name: format!("{}{i:03}", "N".repeat(97)),
+                })
+                .collect();
+            let many = |items| Request::ImportFrom {
+                source: ImportSource::Keyring { items },
+                tags: Vec::new(),
+                replace: false,
+            };
+            let gone: Vec<_> = long
+                .iter()
+                .map(|p| rusthorse::protocol::KeyringPick {
+                    id: "/org/freedesktop/secrets/collection/login/99".into(),
+                    name: p.name.clone(),
+                })
+                .collect();
+            assert_eq!(
+                refused(&many(long), "list the keyring first"),
+                refused(&many(gone), "list the keyring first")
+            );
+            // Listed by another program (the CLI): still refused here.
+            h.decide(&[Decision::AllowOnce]);
+            let out = h.run(&["import", "secret-service", "-a", "nome=FAKE_A", "--dry-run"]);
+            assert!(out.status.success(), "{}", text(&out.stderr));
+            refused(&pick(FIRST, "FAKE_A"), "list the keyring first");
+            // Listed here, but an item that was not in the listing.
+            list(&h);
+            refused(
+                &pick("/org/freedesktop/secrets/collection/login/99", "X"),
+                "not in the keyring listing",
+            );
+            // A lock forgets the listing.
+            assert!(h.run(&["lock"]).status.success());
+            refused(&pick(FIRST, "FAKE_A"), "list the keyring first");
+            assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn many_short_items_are_imported_in_batches_whose_dialogs_fit() {
+            let items: Vec<Item> = (0..20)
+                .map(|i| Item::new(&format!("FAKE_{i}"), &[("a", "b")], "fake-value"))
+                .collect();
+            let Some((bus, _service)) = keyring(items) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            assert!(h.run(&["unlock"]).status.success());
+            h.decide(&[Decision::AllowOnce; 10]);
+            let out = h.run(&["import", "secret-service", "-a", "a=b"]);
+            assert!(out.status.success(), "{}", text(&out.stderr));
+            let list = text(&h.run(&["list"]).stdout);
+            assert_eq!(
+                list.lines().filter(|l| l.contains("FAKE_")).count(),
+                20,
+                "{list}"
+            );
+            assert!(h.ui.approvals_asked.load(Ordering::SeqCst) >= 3);
         }
 
         #[test]

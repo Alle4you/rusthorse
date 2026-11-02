@@ -6,7 +6,9 @@
   would read the sources itself and send the values).
 - Amended: 2026-11-02, after review — nothing of the source before the
   approval, the dialog's item-to-entry rows, items checked unchanged, a
-  deadline for the whole keyring operation, multi-line `.env` values.
+  deadline for the whole keyring operation, multi-line `.env` values; then
+  keyring imports bound to an approved listing, the dotenv dialects, and
+  batches sized by the dialog itself.
 
 ## Context
 
@@ -37,10 +39,15 @@ not be another place that holds secrets.
    itself is checked first (names, a count, an absolute path); everything
    that depends on the source comes after the human allows the import — a
    variable missing from the file, a locked item, a value — so that a
-   request does not tell its sender what the keyring or a file holds. Item
-   metadata is read before the dialog only to show it to the human. After
-   the approval, an item is read only if it is still what the dialog showed
-   (same label and attributes), so that the approval covers what is read.
+   request does not tell its sender what the keyring or a file holds.
+   Keyring items can be imported only from a listing (`keyring_items`) the
+   human allowed the same program to see, within 10 minutes and since the
+   last lock; the dialog shows the items as that listing showed them, so
+   that nothing in it — not even its size, which decides whether it can be
+   shown at all — is news to the requester. After the approval, an item is
+   read only if it is still what the dialog showed (same label and
+   attributes), so that the approval covers what is read. Entry names are
+   shown as content, after fixed titles ("Entry 1", …), never as titles.
 3. **Requests** (protocol 6, not yet released):
    - `keyring_items` → the metadata of the Secret Service's items: object
      path, label, attributes, whether locked. No secret is read.
@@ -54,10 +61,13 @@ not be another place that holds secrets.
    keyring prompt would hold the agent's request for as long as nobody
    answers it), an item whose secret is not UTF-8 text, a `.env` path that
    is not absolute, not a regular file or larger than 1 MiB, a name that is
-   not in the source, and the usual: invalid or duplicate names. A `.env`
-   value in quotes may span several lines; a quote that is never closed
-   refuses the whole file, rather than reading the rest of the value as more
-   variables. Every call to the Secret Service is bounded (10 seconds), and
+   not in the source, and the usual: invalid or duplicate names. `.env`
+   files are read as python-dotenv and Node's dotenv read them (quoted
+   values over several lines, a backslash before a quote keeps it open); a
+   file that could hide a value from that reading is refused as a whole,
+   rather than reading the rest of a value as more variables. Clients size
+   their batches with the agent's own dialog builder, for the longest dialog
+   a batch could have. Every call to the Secret Service is bounded (10 seconds), and
    so is the whole operation, connecting and authenticating included (30
    seconds): past it, the agent shuts the connection's socket down, which
    ends it.

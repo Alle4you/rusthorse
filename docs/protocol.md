@@ -176,27 +176,36 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
 - `dotenv_names` answers `{"type": "names", "names": [...]}`: the variable
   names of the file, in its order (a name can appear twice). The agent asks
   the human first, then reads the file and drops the values.
-- `import_from` imports at most 100 entries, after one approval. Only what
-  the request says by itself is checked before the dialog (names, count, an
-  absolute path); nothing that depends on the source is answered before the
-  human allows it. The dialog shows, for keyring items, one row per entry
-  with the item found at its `id` (label and attributes, "locked", or "no
-  such keyring item"). After the approval, keyring items are read by `id`
-  and imported under `name`; an item that is locked, gone, or no longer what
-  the dialog showed (label, attributes), or a secret that is not UTF-8 text,
-  refuses the whole request. For a `.env` file, `prefix` (upper-cased) is
-  put before every variable name, and each of `names` must appear exactly
-  once in the file, as it is after the approval. Tags apply to every new
-  entry; existing entries are skipped unless `replace`.
+- `import_from` imports at most 100 entries, after one approval. Keyring
+  items can be imported only from the last `keyring_items` listing that
+  the human allowed **this program** (the same process) to see, in the last
+  10 minutes and since the vault was last locked; other items, or no such
+  listing, are refused before any dialog, alike whatever the keyring holds.
+  The dialog shows one row per entry — "Entry 1", "Entry 2", … — with the
+  entry's name and the item it comes from as that listing showed it (label
+  and attributes, or "locked"), so nothing in it, not even its size, is
+  news to the requester. For a `.env` file only what the request says (the
+  path, the names) is shown and checked before the dialog. After the
+  approval, keyring items are read by `id` and imported under `name`; an
+  item that is locked, gone, or no longer what the listing showed (label,
+  attributes), or a secret that is not UTF-8 text, refuses the whole
+  request. For a `.env` file, `prefix` (upper-cased) is put before every
+  variable name, and each of `names` must appear exactly once in the file,
+  as it is after the approval. Tags apply to every new entry; existing
+  entries are skipped unless `replace`.
 - A `.env` path must be absolute and name a regular file of at most 1 MiB,
   in UTF-8. The agent opens it without waiting (a FIFO is refused, not
-  waited on) and reads it as the user it runs as. A quoted value may span
-  lines; a quote never closed refuses the file (`invalid_request`, naming
-  the line only).
-- Every call to the Secret Service is limited to 10 seconds, and a whole
-  request's use of it — connecting and authenticating included — to 30.
-  Without the `secret-service` build feature, the keyring requests fail
-  with `internal`.
+  waited on) and reads it as the user it runs as, as python-dotenv and
+  Node's dotenv read `.env` files (see [cli.md](cli.md#rusthorse-import-dotenv));
+  a file that could hide a value from that reading — a quote never closed,
+  text after a closing quote, a quote on a line that is not `NAME=value` —
+  is refused (`invalid_request`, naming the line only).
+- A request uses the Secret Service once — the listing, or the reading
+  after the approval — and each call is limited to 10 seconds, the whole
+  use, connecting and authenticating included, to 30; past them the agent
+  shuts the connection down and answers within 5 more seconds. Without the
+  `secret-service` build feature, the keyring requests fail with
+  `internal`.
 
 ### Reveal
 

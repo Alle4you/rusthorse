@@ -85,6 +85,20 @@ pub fn process_chain(pid: i32) -> Vec<ProcessInfo> {
     chain
 }
 
+/// When process `pid` started, in clock ticks since boot (`/proc/<pid>/stat`,
+/// field 22): with the pid, it tells one process from a later one that
+/// reuses its pid.
+pub fn start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    std::str::from_utf8(stat.get(close + 1..)?)
+        .ok()?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 /// Parse the command name and parent pid out of `/proc/<pid>/stat`.
 fn read_stat(pid: i32) -> Option<(String, i32)> {
     let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
@@ -104,6 +118,14 @@ fn read_stat(pid: i32) -> Option<(String, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_has_a_start_time_and_keeps_it() {
+        let me = std::process::id() as i32;
+        let first = start_time(me).expect("start time");
+        assert_eq!(start_time(me), Some(first));
+        assert!(start_time(1).is_some_and(|init| init <= first));
+    }
 
     #[test]
     fn chain_starts_with_ourselves() {

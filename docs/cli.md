@@ -470,14 +470,21 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
-Imports `NAME=value` lines (optional `export`, `#` comments, quoted values,
-which may span lines; a quote never closed refuses the file).
+Imports `NAME=value` lines, read as python-dotenv and Node's dotenv read
+them: an optional `export`, `#` comment lines, values in single, double or
+back quotes that may span lines (a quote with a backslash before it does not
+close), python-dotenv's escapes in quotes (`\n`, `\"`, … in double quotes;
+`\\` and `\'` in single quotes), and an unquoted value that ends at ` #`.
+A file that could hide a value from that reading — a quote never closed,
+text after a closing quote, a quote on a line that is not `NAME=value` — is
+refused, naming the line only.
 The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):
 this command never holds a value. It first asks the agent for the names in
 the file — the agent asks you in a dialog before it shows them — then sends
 the names to import. `--prefix` is upper-cased and prepended to each name.
 Existing entries are skipped unless `--replace` is given. Entries are
-imported in batches of at most 24 lines of names, one approval each; the
+imported in batches, one approval each, each as large as fits in one dialog
+(estimated as the agent builds it, for the longest dialog it could be); the
 dialog says that the agent read the values from the file. A name that
 appears twice stops the import before anything is imported. If a batch
 fails, the summary says which batches were imported and whether the failed
@@ -499,7 +506,8 @@ Imports items from the freedesktop Secret Service (GNOME Keyring, KWallet)
 whose attributes match all `--attribute` filters. The agent lists the
 keyring's items — after asking you, since this command then sees their
 labels and attributes — and reads the chosen items' secrets itself: this
-command never holds a value. The entry name comes from the attribute named
+command never holds a value. The agent imports only items of that listing,
+for the same process, within 10 minutes. The entry name comes from the attribute named
 by `--name-from`, or from the item label. The import dialog shows each entry
 next to the item it comes from (label and attributes), and the agent reads
 an item only if it is still what the dialog showed. A locked item stops the

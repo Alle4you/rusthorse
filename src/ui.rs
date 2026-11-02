@@ -159,6 +159,11 @@ const DIALOG_ENV: [&str; 10] = [
 /// (see [`remember_note`]).
 pub const REMEMBER_NOTE_MAX: usize = 240;
 
+/// Longest text an approval or prompt dialog may contain. The agent refuses
+/// requests whose dialog would be longer: the human must be able to read all
+/// of it.
+pub const MAX_DIALOG_CHARS: usize = 4000;
+
 /// The note shown next to the "Allow for …" button.
 pub fn remember_note(label: &str, duration: Duration) -> String {
     format!(

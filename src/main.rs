@@ -595,39 +595,92 @@ fn init(client: &Client, vault: PathBuf) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// Whether `a` and `b` name the same vault file, comparing them as the
-/// system would resolve them: absolute, with the links of the directories
-/// that exist resolved, and `.` and `..` applied. `None` when that cannot be
-/// told (a directory that cannot be examined): the caller must not take it
-/// for "different".
+/// Whether `a` and `b` name the same vault file. Each is resolved as the
+/// system would follow it — links, including links to what does not exist
+/// yet, `.` and `..` — and then compared by the identity (device and inode)
+/// of its deepest existing directory and the names below it, so that bind
+/// mounts and other spellings of one directory compare equal. `None` when
+/// that cannot be told (a directory that cannot be examined, a loop of
+/// links): the caller must not take it for "different".
 fn same_vault(a: &Path, b: &Path) -> Option<bool> {
-    Some(resolved(a)? == resolved(b)?)
+    Some(identity(a)? == identity(b)?)
 }
 
-fn resolved(path: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    let absolute = std::path::absolute(path).ok()?;
-    let mut out = PathBuf::from("/");
-    // While every component so far exists, `out` is canonical and links are
-    // resolved; past the first one that does not, the rest is applied as
-    // written (nothing there can be a link yet).
-    let mut existing = true;
-    for component in absolute.components() {
-        match component {
-            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
-            Component::ParentDir => {
-                out.pop();
+/// The deepest existing directory of `path`, resolved, as (device, inode),
+/// and the rest of the path below it.
+fn identity(path: &Path) -> Option<(u64, u64, PathBuf)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut dir = resolved(path)?;
+    let mut below = Vec::new();
+    loop {
+        match std::fs::metadata(&dir) {
+            Ok(meta) => {
+                let rest: PathBuf = below.iter().rev().collect();
+                return Some((meta.dev(), meta.ino(), rest));
             }
-            Component::Normal(name) => {
-                out.push(name);
-                if existing {
-                    match out.canonicalize() {
-                        Ok(found) => out = found,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => existing = false,
-                        Err(_) => return None,
-                    }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                below.push(dir.file_name()?.to_owned());
+                dir = dir.parent()?.to_path_buf();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `path` made absolute, with every link followed — also one that points to
+/// something that does not exist yet — and `.` and `..` applied; below the
+/// first component that does not exist, the rest is taken as written (a
+/// later `..` that climbs back above it resolves links again).
+fn resolved(path: &Path) -> Option<PathBuf> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    let parts = |path: &Path| -> VecDeque<Option<std::ffi::OsString>> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(Some(name.to_owned())),
+                Component::ParentDir => Some(None),
+                _ => None,
+            })
+            .collect()
+    };
+    let absolute = std::path::absolute(path).ok()?;
+    let mut todo = parts(&absolute);
+    let mut out = PathBuf::from("/");
+    // How many of the last components of `out` do not exist.
+    let mut missing = 0usize;
+    let mut links = 0;
+    while let Some(part) = todo.pop_front() {
+        let Some(name) = part else {
+            out.pop();
+            missing = missing.saturating_sub(1);
+            continue;
+        };
+        let next = out.join(&name);
+        if missing > 0 {
+            out = next;
+            missing += 1;
+            continue;
+        }
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = std::fs::read_link(&next).ok()?;
+                if target.is_absolute() {
+                    out = PathBuf::from("/");
+                }
+                for part in parts(&target).into_iter().rev() {
+                    todo.push_front(part);
                 }
             }
+            Ok(_) => out = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                out = next;
+                missing = 1;
+            }
+            Err(_) => return None,
         }
     }
     Some(out)
@@ -1230,7 +1283,8 @@ struct Pick {
     // Read only for keyring imports, which need the `secret-service` feature.
     #[cfg_attr(not(feature = "secret-service"), allow(dead_code))]
     id: Option<String>,
-    line: String,
+    /// The keyring item, as the dialog shows it.
+    item: Option<String>,
 }
 
 /// Where `rusthorse import` asks the agent to read the values.
@@ -1276,9 +1330,9 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             let picks: Vec<Pick> = names
                 .into_iter()
                 .map(|name| Pick {
-                    line: name.clone(),
                     name,
                     id: None,
+                    item: None,
                 })
                 .collect();
             (picks, ImportFrom::Dotenv { path, prefix }, tags, replace)
@@ -1317,9 +1371,9 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                     None => item.label.clone(),
                 };
                 picks.push(Pick {
-                    // What the agent's dialog will show for it.
-                    line: format!("{name} ← {}", rusthorse::keyring::describe_item(&item)),
                     name,
+                    // What the agent's dialog will show for it.
+                    item: Some(rusthorse::keyring::describe_item(&item)),
                     id: Some(item.id),
                 });
             }
@@ -1348,7 +1402,19 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         );
     }
     // Split into batches small enough for one dialog each.
-    let sizes = rusthorse::import::batch_sizes(picks.iter().map(|pick| pick.line.as_str()));
+    let planned: Vec<rusthorse::import::Planned> = picks
+        .iter()
+        .map(|pick| rusthorse::import::Planned {
+            name: pick.name.clone(),
+            item: pick.item.clone(),
+        })
+        .collect();
+    let dotenv = match &source {
+        ImportFrom::Dotenv { path, .. } => Some(path.as_str()),
+        #[cfg(feature = "secret-service")]
+        ImportFrom::Keyring => None,
+    };
+    let sizes = rusthorse::import::batch_sizes(&planned, dotenv);
     let mut rest = picks.into_iter();
     let batches: Vec<Vec<Pick>> = sizes
         .into_iter()
@@ -1931,6 +1997,27 @@ mod tests {
                 &dir.path().join("link/new/sub/../vault.kdbx")
             ),
             Some(true)
+        );
+        // A `..` that climbs back above a missing directory resolves links
+        // again; a link to a directory that does not exist yet is followed.
+        assert_eq!(
+            same_vault(&vault, &dir.path().join("missing/../link/vault.kdbx")),
+            Some(true)
+        );
+        std::os::unix::fs::symlink(dir.path().join("future"), dir.path().join("later"))
+            .expect("dangling symlink");
+        assert_eq!(
+            same_vault(
+                &dir.path().join("future/vault.kdbx"),
+                &dir.path().join("later/vault.kdbx")
+            ),
+            Some(true)
+        );
+        // A loop of links cannot be resolved.
+        std::os::unix::fs::symlink(dir.path().join("loop"), dir.path().join("loop")).expect("loop");
+        assert_eq!(
+            same_vault(&vault, &dir.path().join("loop/vault.kdbx")),
+            None
         );
         assert_eq!(same_vault(&vault, &real.join("other.kdbx")), Some(false));
         assert_eq!(

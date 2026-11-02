@@ -2,9 +2,8 @@
 //! imports that the agent reads itself
 //! ([ADR 0012](https://github.com/Alle4you/rusthorse/blob/main/docs/adr/0012-import-read-by-the-agent.md)).
 //!
-//! [`items`] lists what the keyring holds and [`describe`] tells what some
-//! items are, without reading any secret; [`read`] reads the secrets of
-//! items that are still what was described. Nothing is unlocked: a locked
+//! [`items`] lists what the keyring holds without reading any secret;
+//! [`read`] reads the secrets of items that are still what was listed. Nothing is unlocked: a locked
 //! item is refused, because the keyring's unlock prompt has no time limit.
 //!
 //! Every operation is bounded: each call by [`CALL_TIMEOUT`], the whole
@@ -199,22 +198,6 @@ pub fn items(settings: &Settings) -> anyhow::Result<Vec<KeyringItem>> {
     })
 }
 
-/// What the items `ids` (object paths) are, in the same order: `None` for
-/// one that does not exist or cannot be examined. No secret is read.
-#[cfg(feature = "secret-service")]
-pub fn describe(settings: &Settings, ids: Vec<String>) -> anyhow::Result<Vec<Option<KeyringItem>>> {
-    with_service(settings, move |service| {
-        Ok(ids
-            .iter()
-            .map(|id| {
-                let path = OwnedObjectPath::try_from(id.clone()).ok()?;
-                let item = service.get_item_by_path(path).ok()?;
-                metadata(&item).ok()
-            })
-            .collect())
-    })
-}
-
 /// The secrets of the items `shown`, in the same order — each only if it is
 /// still exactly what was shown (label, attributes) and unlocked. Fails,
 /// returning nothing, otherwise or on a secret that is not UTF-8 text.
@@ -288,12 +271,6 @@ const NOT_BUILT: &str =
 /// Without the `secret-service` feature: always an error.
 #[cfg(not(feature = "secret-service"))]
 pub fn items(_: &Settings) -> anyhow::Result<Vec<KeyringItem>> {
-    anyhow::bail!(NOT_BUILT)
-}
-
-/// Without the `secret-service` feature: always an error.
-#[cfg(not(feature = "secret-service"))]
-pub fn describe(_: &Settings, _: Vec<String>) -> anyhow::Result<Vec<Option<KeyringItem>>> {
     anyhow::bail!(NOT_BUILT)
 }
 

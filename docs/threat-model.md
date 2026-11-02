@@ -1240,3 +1240,21 @@ findings:
 Each fix was reverted in a copy of the tree to see a test fail (11 of 11);
 for one of them, `init` stopping when it cannot tell, an end-to-end test was
 added first (a directory that cannot be examined).
+
+Fourth review (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Confirmed fixed: the keyring deadline (a mute bus, a full backlog, abstract
+addresses), the GTK cycle, the local outcome message; the others in part:
+
+| Finding | Disposition |
+|---|---|
+| High — a single quote with a backslash before it (`'start\'`) still closed the value, so the next line came back as a name; python-dotenv reads it as still open | **Fixed:** `.env` files are read as python-dotenv and Node's dotenv read them — single, double and back quotes, a quote with a backslash before it never closes, python-dotenv's escapes — and a file that could hide a value from that reading is refused (a quote never closed, text after a closing quote, a quote on a line that is not `NAME=value`, which also covers Node's `NAME: value`). Tested with each quote, two backslashes, a value whose name is not allowed. |
+| High — `init` still took equivalent paths for different ones when a link came after a missing directory (`missing/../link/…`) or pointed to a directory not created yet | **Fixed:** paths are resolved as the system would — every link followed, also one to something that does not exist yet, `..` climbing back resolves links again — and compared by the device and inode of their deepest existing directory and the names below it (also bind mounts); a loop of links or a directory that cannot be examined stops `init`. Unit-tested with each case. |
+| Medium — the dialog's size, refused or shown, depended on the item's metadata before any approval | **Fixed:** keyring imports take items only from a listing the human allowed the same program (process id and start time) to see, within 10 minutes and since the last lock; the dialog shows that listing's metadata. Without such a listing every request is refused alike. Tested: forty long names on an existing and on a missing item give the same refusal; a listing by another program, an item not in the listing, and a lock all refuse. |
+| Medium — entry names were the titles of dialog rows: zenity's markup changed their case, and a long name made the grid wider than the screen | **Fixed:** fixed titles ("Entry 1", …) and the name as content, which wraps. |
+| Medium — batches counted lines of names, not the dialog: twenty short keyring items made a dialog too tall for zenity | **Fixed:** the dialog is built by one function, `import::approval`, which the agent shows and the clients use to size batches (`import::fits`, for the longest dialog a batch could have: every entry existing, a long requester chain). Tested: every batch fits and one more entry would not; twenty short items import in batches. |
+| Low — the documentation claimed more than the code (nothing before the approval; 30 s for a whole request; text after a closing quote) | **Fixed** with the changes above: a request uses the keyring once, within 30 s plus 5 to end it; the `.env` rules are written out. |
+
+Each fix was reverted in a copy of the tree to see a test fail (12 of 13).
+The survivor: comparing `init`'s paths by device and inode instead of by
+resolved path differs only for bind mounts, which the tests cannot create
+without privileges; it is kept for them, checked by review only.

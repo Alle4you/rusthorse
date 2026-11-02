@@ -422,24 +422,22 @@ impl Manager {
                 .filter(|t| !t.is_empty())
                 .into_iter()
                 .collect();
-            // Batches that fit the agent's dialog: for keyring items, one
-            // row per entry naming the item.
-            let lines: Vec<String> = chosen
+            // Batches whose dialogs fit, estimated as the agent builds them.
+            let planned: Vec<rusthorse::import::Planned> = chosen
                 .iter()
-                .map(|(c, n)| match &c.id {
-                    Some(id) => format!(
-                        "{n} ← {}",
+                .map(|(c, n)| rusthorse::import::Planned {
+                    name: n.clone(),
+                    item: c.id.as_ref().map(|id| {
                         rusthorse::keyring::describe_item(&KeyringItem {
                             id: id.clone(),
                             label: c.title.clone(),
                             attributes: c.attributes.clone(),
                             locked: c.locked,
                         })
-                    ),
-                    None => n.clone(),
+                    }),
                 })
                 .collect();
-            let sizes = rusthorse::import::batch_sizes(lines.iter().map(String::as_str));
+            let sizes = rusthorse::import::batch_sizes(&planned, path.as_deref());
             let mut rest = chosen.into_iter();
             let requests: VecDeque<Request> = sizes
                 .into_iter()
