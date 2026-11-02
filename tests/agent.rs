@@ -156,6 +156,7 @@ impl Harness {
             rusthorse::keyring::Settings {
                 address: Some(address.into()),
                 plain: true,
+                ..Default::default()
             },
         )
     }
@@ -279,6 +280,7 @@ fn no_keyring() -> rusthorse::keyring::Settings {
     rusthorse::keyring::Settings {
         address: Some("unix:path=/nonexistent/rusthorse-test-bus".into()),
         plain: true,
+        ..Default::default()
     }
 }
 
@@ -962,7 +964,12 @@ fn an_unwritable_audit_log_creates_no_vault() {
 #[test]
 fn init_with_another_spelling_of_the_agents_vault_still_uses_the_agent() {
     // The commands run in the harness's directory, where the vault would be.
-    for spelling in ["vault.kdbx", "./sub/../vault.kdbx"] {
+    // ("new" does not exist: the path still names the same file.)
+    for spelling in [
+        "vault.kdbx",
+        "./sub/../vault.kdbx",
+        "new/sub/../../vault.kdbx",
+    ] {
         let h = without_vault();
         std::fs::create_dir(h.dir.path().join("sub")).expect("mkdir");
         let out = h.run(&["init", "--vault", spelling]);
@@ -1021,6 +1028,27 @@ fn the_agent_reports_its_vault_as_an_absolute_path() {
         status["vault"],
         dir.path().join("relative.kdbx").display().to_string()
     );
+}
+
+#[test]
+fn init_stops_when_it_cannot_tell_whether_the_agent_serves_that_file() {
+    if nix::unistd::geteuid().is_root() {
+        return; // root can examine any directory
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let h = without_vault();
+    let closed = h.dir.path().join("closed");
+    std::fs::create_dir(&closed).expect("mkdir");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let out = h.run(&["init", "--vault", "closed/inner/vault.kdbx"]);
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("chmod back");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot tell whether the agent's vault"),
+        "{stderr}"
+    );
+    assert!(h.ui.password_prompts.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2721,6 +2749,7 @@ fn fake_import_agent(
                 Request::DotenvNames { path } => {
                     let text = std::fs::read_to_string(&path).expect("the .env file");
                     let names = rusthorse::import::parse_dotenv(&text)
+                        .expect("parse")
                         .into_iter()
                         .map(|(name, _)| name)
                         .collect();
@@ -4404,6 +4433,45 @@ mod import_from {
     }
 
     #[test]
+    fn the_names_of_a_file_never_include_pieces_of_a_value() {
+        let h = Harness::new();
+        let file = h.dir.path().join("key.env");
+        std::fs::write(
+            &file,
+            "PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\n\
+             FAKE_PRIVATE_KEY_MATERIAL==\n\
+             -----END PRIVATE KEY-----\"\nNORMAL=x\n",
+        )
+        .unwrap();
+        let names = |h: &Harness| {
+            h.decide(&[Decision::AllowOnce]);
+            h.call(&Request::DotenvNames {
+                path: file.display().to_string(),
+            })
+        };
+        let Response::Names { names: found } = names(&h) else {
+            panic!("no names");
+        };
+        assert_eq!(found, ["PRIVATE_KEY", "NORMAL"]);
+        // A quote never closed: the file is refused, and nothing of it shown.
+        std::fs::write(
+            &file,
+            "OK=1\nKEY=\"FAKE_SECRET_START\nFAKE_LOOKS_LIKE=a name\n",
+        )
+        .unwrap();
+        match names(&h) {
+            Response::Error { message, .. } => {
+                assert!(
+                    message.contains("line 2: a quoted value is not closed"),
+                    "{message}"
+                );
+                assert!(!message.contains("FAKE_"), "{message}");
+            }
+            other => panic!("unexpected {}", other.kind()),
+        }
+    }
+
+    #[test]
     fn a_dry_run_shows_the_names_and_imports_nothing() {
         let h = Harness::new();
         std::fs::write(h.dir.path().join("app.env"), "FAKE_ONE=fake\n").unwrap();
@@ -4454,11 +4522,8 @@ mod import_from {
             }
             other => panic!("unexpected {}", other.kind()),
         };
-        // A FIFO is refused without waiting for a writer.
-        refused(dotenv(&fifo, &["FAKE_ONE"]), "not a regular file");
+        // Refused before any dialog: what the request itself says.
         refused(dotenv(Path::new("app.env"), &["FAKE_ONE"]), "absolute");
-        refused(dotenv(&file, &["FAKE_TWO"]), "is not in");
-        refused(dotenv(&file, &["FAKE_ONE"]), "more than once in");
         refused(
             Request::DotenvNames {
                 path: "relative.env".into(),
@@ -4466,6 +4531,21 @@ mod import_from {
             "absolute",
         );
         assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+        // Anything that depends on the file comes after the dialog: denied,
+        // the requester does not learn whether a name is in the file.
+        for request in [dotenv(&file, &["FAKE_TWO"]), dotenv(&file, &["FAKE_ONE"])] {
+            h.decide(&[Decision::Deny]);
+            match h.call(&request) {
+                Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+                other => panic!("unexpected {}", other.kind()),
+            }
+        }
+        // Allowed: a FIFO is refused without waiting for a writer, and the
+        // names are checked.
+        h.decide(&[Decision::AllowOnce; 3]);
+        refused(dotenv(&fifo, &["FAKE_ONE"]), "not a regular file");
+        refused(dotenv(&file, &["FAKE_TWO"]), "is not in");
+        refused(dotenv(&file, &["FAKE_ONE"]), "more than once in");
     }
 
     #[cfg(all(feature = "fake-keyring", feature = "session-lock"))]
@@ -4519,12 +4599,101 @@ mod import_from {
                 dialog.contains("Import 2 secrets from GNOME Keyring?"),
                 "{dialog}"
             );
-            assert!(dialog.contains("FAKE_A, FAKE_B"), "{dialog}");
+            // Each entry next to the item its value comes from.
+            assert!(
+                dialog.contains("← segredo: FAKE_A [aplicacao=segredo, nome=FAKE_A]"),
+                "{dialog}"
+            );
             assert_eq!(value_in_file(&h, "FAKE_A"), "fake-a-value");
             assert_eq!(value_in_file(&h, "FAKE_B"), "fake-b-value");
             let list = text(&h.run(&["list"]).stdout);
             assert!(!list.contains("another program"), "{list}");
             assert!(!h.audit_text().contains("fake-a-value"));
+        }
+
+        fn pick(id: &str, name: &str) -> Request {
+            Request::ImportFrom {
+                source: ImportSource::Keyring {
+                    items: vec![rusthorse::protocol::KeyringPick {
+                        id: id.into(),
+                        name: name.into(),
+                    }],
+                },
+                tags: Vec::new(),
+                replace: true,
+            }
+        }
+
+        const FIRST: &str = "/org/freedesktop/secrets/collection/login/1";
+
+        #[test]
+        fn the_dialog_shows_which_item_feeds_which_entry() {
+            let Some((bus, _service)) = keyring(vec![Item::new(
+                "UNRELATED_FAKE_STAGING",
+                &[("nome", "OTHER_KEY")],
+                "fake-staging",
+            )]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            h.add_secret("OPENAI_API_KEY", "fake-original", &[]);
+            h.decide(&[Decision::Deny]);
+            let answer = h.call(&pick(FIRST, "OPENAI_API_KEY"));
+            assert!(matches!(
+                answer,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ));
+            let dialog = last_approval(&h);
+            assert!(
+                dialog.contains("OPENAI_API_KEY")
+                    && dialog.contains("← UNRELATED_FAKE_STAGING [nome=OTHER_KEY]"),
+                "{dialog}"
+            );
+            assert!(dialog.contains("Will be replaced"), "{dialog}");
+            assert_eq!(value_in_file(&h, "OPENAI_API_KEY"), "fake-original");
+        }
+
+        #[test]
+        fn an_item_that_changes_while_the_human_decides_is_not_read() {
+            let Some((bus, service)) = keyring(vec![segredo("FAKE_A", "fake-a-value")]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            assert!(h.run(&["unlock"]).status.success());
+            // (A clone: the service lives as long as `service`.)
+            let relabel = service.clone();
+            *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+                fake::relabel(&relabel, 0, "segredo: SOMETHING_ELSE").expect("relabel");
+            }));
+            h.decide(&[Decision::AllowOnce]);
+            match h.call(&pick(FIRST, "FAKE_A")) {
+                Response::Error { message, .. } => {
+                    assert!(message.contains("changed while you decided"), "{message}")
+                }
+                other => panic!("unexpected {}", other.kind()),
+            }
+            assert!(!text(&h.run(&["list"]).stdout).contains("FAKE_A"));
+        }
+
+        #[test]
+        fn an_unknown_item_is_said_only_in_the_dialog() {
+            let Some((bus, _service)) = keyring(vec![segredo("FAKE_A", "fake-a-value")]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            h.decide(&[Decision::Deny]);
+            let answer = h.call(&pick("/org/freedesktop/secrets/collection/login/99", "X"));
+            assert!(matches!(
+                answer,
+                Response::Error {
+                    code: ErrorCode::Denied,
+                    ..
+                }
+            ));
+            assert!(last_approval(&h).contains("(no such keyring item)"));
         }
 
         #[test]
@@ -4559,6 +4728,20 @@ mod import_from {
                 tags: Vec::new(),
                 replace: false,
             };
+            // The dialog says that an item is locked; denied, the requester
+            // learns nothing of it.
+            h.decide(&[Decision::Deny]);
+            match h.call(&request) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::Denied);
+                    assert!(!message.contains("FAKE_LOCKED"), "{message}");
+                }
+                other => panic!("unexpected {}", other.kind()),
+            }
+            let dialog = last_approval(&h);
+            assert!(dialog.contains("locked: cannot be read"), "{dialog}");
+            // Allowed, the locked item stops the import.
+            h.decide(&[Decision::AllowOnce]);
             match h.call(&request) {
                 Response::Error { message, .. } => {
                     assert!(
@@ -4568,8 +4751,7 @@ mod import_from {
                 }
                 other => panic!("unexpected {}", other.kind()),
             }
-            // Nothing asked, nothing imported.
-            assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+            assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 3);
             assert!(!text(&h.run(&["list"]).stdout).contains("FAKE_A"));
         }
     }

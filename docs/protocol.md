@@ -176,18 +176,27 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
 - `dotenv_names` answers `{"type": "names", "names": [...]}`: the variable
   names of the file, in its order (a name can appear twice). The agent asks
   the human first, then reads the file and drops the values.
-- `import_from` imports at most 100 entries, after one approval. Keyring
-  items are read by `id` and imported under `name`; a locked or unknown item,
-  or a secret that is not UTF-8 text, refuses the whole request. For a
-  `.env` file, `prefix` (upper-cased) is put before every variable name, and
-  each of `names` must appear exactly once in the file with the prefix.
-  Tags apply to every new entry; existing entries are skipped unless
-  `replace`.
+- `import_from` imports at most 100 entries, after one approval. Only what
+  the request says by itself is checked before the dialog (names, count, an
+  absolute path); nothing that depends on the source is answered before the
+  human allows it. The dialog shows, for keyring items, one row per entry
+  with the item found at its `id` (label and attributes, "locked", or "no
+  such keyring item"). After the approval, keyring items are read by `id`
+  and imported under `name`; an item that is locked, gone, or no longer what
+  the dialog showed (label, attributes), or a secret that is not UTF-8 text,
+  refuses the whole request. For a `.env` file, `prefix` (upper-cased) is
+  put before every variable name, and each of `names` must appear exactly
+  once in the file, as it is after the approval. Tags apply to every new
+  entry; existing entries are skipped unless `replace`.
 - A `.env` path must be absolute and name a regular file of at most 1 MiB,
   in UTF-8. The agent opens it without waiting (a FIFO is refused, not
-  waited on) and reads it as the user it runs as.
-- Every call to the Secret Service is limited to 10 seconds. Without the
-  `secret-service` build feature, the keyring requests fail with `internal`.
+  waited on) and reads it as the user it runs as. A quoted value may span
+  lines; a quote never closed refuses the file (`invalid_request`, naming
+  the line only).
+- Every call to the Secret Service is limited to 10 seconds, and a whole
+  request's use of it — connecting and authenticating included — to 30.
+  Without the `secret-service` build feature, the keyring requests fail
+  with `internal`.
 
 ### Reveal
 

@@ -1178,10 +1178,12 @@ dialog names the source, which the older `import` request could not: there
 the requester supplies the values. Listing the keyring or a file's names
 asks for approval, so that a requester that reaches only the agent — a
 future isolated AI (§8) — cannot use it to learn what the keyring or a file
-holds. A `.env` path must be absolute and a regular file (opened without
-waiting: a FIFO is refused at once); a locked keyring item is refused rather
-than unlocked, because the keyring's prompt has no time limit; every call to
-the Secret Service is bounded (10 s). Tested end to end with a fake Secret
+holds; for the same reason `import_from` answers nothing that depends on the
+source before the human allows it. A `.env` path must be absolute and a
+regular file (opened without waiting: a FIFO is refused at once); a locked
+keyring item is refused rather than unlocked, because the keyring's prompt
+has no time limit; every call to the Secret Service is bounded (10 s), and
+so is a whole request's use of it (30 s, then the socket is shut down). Tested end to end with a fake Secret
 Service on a private bus (`fake-keyring` feature, never in a release): the
 CLI's keyring import, metadata only in the listing, a locked item refused
 before any dialog; `.env` imports with a prefix, a dry run, denied
@@ -1217,3 +1219,24 @@ finished after 30 seconds (tested with a stand-in that hangs). Not adopted
 yet: a test of the built package's contents. Each fix was reverted in a copy
 of the tree to see a test fail (8 of 8, two of them only once the two tests
 above were added).
+
+Review of the agent-read imports (Codex, AI-assisted, 2026-11-02; verdict:
+not ready). Confirmed fixed: `create_vault` beside an open vault, the exit
+statuses of `init` without an agent, the copyright notices, the deadline of
+Start agent; the path comparison of `init`, but for one case below. New
+findings:
+
+| Finding | Disposition |
+|---|---|
+| High — the `.env` parser read each line on its own, also inside an open quote: in a file with a multi-line PEM key, `dotenv_names` — approved to show names only — returned a line of the key as a name | **Fixed:** a quoted value may span lines up to its closing quote, after which only a comment may follow; a quote never closed refuses the whole file, with an error that names the line and nothing of it. Tested: unit cases, and `dotenv_names` on such files returns only the real names. |
+| High — `init --vault new/sub/../vault.kdbx` with no `new` directory yet: the comparison gave up, which counted as "another file", and the CLI asked for the password itself | **Fixed:** paths are resolved component by component — links of what exists, `.` and `..` applied, the rest as written — and a comparison that cannot be made (a directory that cannot be examined) stops `init`. Tested: unit cases and an end-to-end `new/sub/../../vault.kdbx`. |
+| Medium — `import_from` answered before the approval with what the source held: a locked item's label, whether a name was in a `.env` file | **Fixed:** only what the request says by itself is checked before the dialog; everything that depends on the source comes after the human allows it. Tested: a locked item, an unknown item and missing or repeated names are denied without a word about them, and refused with their reason only once allowed. |
+| Medium — connecting to the bus was not bounded: `method_timeout` does not cover authentication, and a socket that accepted and said nothing held the request past 12 s | **Fixed:** the agent connects the socket itself (without waiting), and every keyring operation runs within a deadline (30 s); past it the socket is shut down, which makes the connection's pending reads fail, so the thread ends. Tested with a socket that never answers (a 0.5 s deadline). |
+| Medium — the dialog did not show which keyring item would feed which entry: a requester could present another item under the expected name | **Fixed:** one row per entry with the item the agent found at that path (label and attributes); after the approval an item is read only if it is still what was shown. Tested: an unrelated item under `OPENAI_API_KEY` is shown as such; an item relabelled while the human decides is not read. |
+| Medium — the import windows kept themselves alive: rows' handlers held the refresh, which held the state and the Import button, whose handler held the state | **Fixed:** the refresh holds weak references only. Tested on Xvfb: a box of a closed window is freed. |
+| Low — a local `init` whose directory could not be synced said "no usable answer from the agent" | **Fixed:** its own message (the file is in place but may not survive a crash), still exit 124. |
+| Low — the documentation said "after approval" and "no secret is read for a preview" where the code read before, and "the same values" for a repeated import | **Fixed** with the order above; a preview reads a `.env` file in the agent and sends only names; a repeated import takes what the source holds then. |
+
+Each fix was reverted in a copy of the tree to see a test fail (11 of 11);
+for one of them, `init` stopping when it cannot tell, an end-to-end test was
+added first (a directory that cannot be examined).

@@ -271,10 +271,22 @@ impl Manager {
 
         let state = Rc::new((candidates, naming, existing));
         // Recompute every row's name and status, and what Import would do.
+        // The rows' and the options' handlers keep this closure; it keeps
+        // only weak references — to the state that holds those widgets, and
+        // to the widgets whose handlers hold the state — or they would keep
+        // each other alive after the window is gone.
         let refresh = {
-            let state = Rc::clone(&state);
-            let (summary, go, replace) = (summary.clone(), go.clone(), replace.clone());
+            let state = Rc::downgrade(&state);
+            let (summary, go, replace) = (summary.downgrade(), go.downgrade(), replace.downgrade());
             move || {
+                let (Some(state), Some(summary), Some(go), Some(replace)) = (
+                    state.upgrade(),
+                    summary.upgrade(),
+                    go.upgrade(),
+                    replace.upgrade(),
+                ) else {
+                    return;
+                };
                 let (candidates, naming, existing) = &*state;
                 let names: Vec<Option<String>> =
                     candidates.iter().map(|c| naming.name(c)).collect();
@@ -410,7 +422,24 @@ impl Manager {
                 .filter(|t| !t.is_empty())
                 .into_iter()
                 .collect();
-            let sizes = rusthorse::import::batch_sizes(chosen.iter().map(|(_, n)| n.as_str()));
+            // Batches that fit the agent's dialog: for keyring items, one
+            // row per entry naming the item.
+            let lines: Vec<String> = chosen
+                .iter()
+                .map(|(c, n)| match &c.id {
+                    Some(id) => format!(
+                        "{n} ← {}",
+                        rusthorse::keyring::describe_item(&KeyringItem {
+                            id: id.clone(),
+                            label: c.title.clone(),
+                            attributes: c.attributes.clone(),
+                            locked: c.locked,
+                        })
+                    ),
+                    None => n.clone(),
+                })
+                .collect();
+            let sizes = rusthorse::import::batch_sizes(lines.iter().map(String::as_str));
             let mut rest = chosen.into_iter();
             let requests: VecDeque<Request> = sizes
                 .into_iter()

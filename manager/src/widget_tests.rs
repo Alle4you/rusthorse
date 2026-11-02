@@ -1040,6 +1040,7 @@ fn import_windows() {
             keyring: rusthorse::keyring::Settings {
                 address: None,
                 plain: true,
+                ..Default::default()
             },
         },
         Box::new(Scripted(
@@ -1161,6 +1162,11 @@ fn import_windows() {
         s.message.text()
     );
     assert_eq!(approvals.load(Ordering::SeqCst), 2);
+    // The closed window's widgets are freed: no handler keeps them alive.
+    let weak = locked_check.downgrade();
+    drop((locked_check, from, search, picker));
+    s.editor.borrow_mut().take();
+    spin_until(|| weak.upgrade().is_none());
 
     // A .env file: the agent asks before showing the names; a prefix.
     let env = dir.path().join("app.env");

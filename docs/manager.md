@@ -257,7 +257,7 @@ names; the window then lists them, with what each would become:
 
 **Import N** sends the names in batches, one dialog each: the agent reads
 the values itself — from the keyring or the file — and its dialog says
-where. The window never holds a value. When a batch fails, the message says
+where; for keyring items, each entry next to the item it comes from. The window never holds a value. When a batch fails, the message says
 which batches were imported and whether that one was not imported or may
 have been (look at the entries before importing again). Follow the
 [migration steps](installation.md#migrating-existing-secrets): one item

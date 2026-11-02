@@ -33,12 +33,19 @@ pub fn batch_sizes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
     sizes
 }
 
-/// Parse a `.env` file: `NAME=value` lines, optional `export ` prefix,
-/// `#` comments, and matching single or double quotes around the value.
-/// Lines with invalid names or empty values are skipped.
-pub fn parse_dotenv(text: &str) -> Vec<(String, SecretString)> {
+/// Parse a `.env` file: `NAME=value` lines, optional `export ` prefix, `#`
+/// comments, and single or double quotes around the value. A quoted value
+/// may go on over several lines (a PEM key, say), up to its closing quote;
+/// after a closing quote, only a `#` comment may follow. Lines with invalid
+/// names or empty values are skipped.
+///
+/// A quote that is never closed refuses the whole file: going on line by
+/// line would read the rest of the value as more `NAME=value` lines, and
+/// return pieces of it as names. The error names the line, never its text.
+pub fn parse_dotenv(text: &str) -> Result<Vec<(String, SecretString)>, String> {
     let mut pairs = Vec::new();
-    for line in text.lines() {
+    let mut lines = text.lines().enumerate();
+    while let Some((index, line)) = lines.next() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -48,19 +55,71 @@ pub fn parse_dotenv(text: &str) -> Vec<(String, SecretString)> {
             continue;
         };
         let name = name.trim();
-        let mut value = value.trim();
-        if value.len() >= 2 {
-            let bytes = value.as_bytes();
-            let (first, last) = (bytes[0], bytes[value.len() - 1]);
-            if first == last && (first == b'"' || first == b'\'') {
-                value = &value[1..value.len() - 1];
+        let value = value.trim();
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let value = match quote {
+            None => value.to_string(),
+            Some(quote) => {
+                let inner = &value[1..];
+                match closing(inner, quote) {
+                    Some(end) if after_value(&inner[end + 1..]) => inner[..end].to_string(),
+                    // Something other than a comment after the closing quote:
+                    // the value is the text as written.
+                    Some(_) => value.to_string(),
+                    None => {
+                        let mut joined = inner.to_string();
+                        loop {
+                            let Some((_, next)) = lines.next() else {
+                                return Err(format!(
+                                    "line {}: a quoted value is not closed",
+                                    index + 1
+                                ));
+                            };
+                            joined.push('\n');
+                            match closing(next, quote) {
+                                Some(end) if after_value(&next[end + 1..]) => {
+                                    joined.push_str(&next[..end]);
+                                    break;
+                                }
+                                Some(_) => {
+                                    return Err(format!(
+                                        "line {}: text after the end of a quoted value",
+                                        index + 1
+                                    ));
+                                }
+                                None => joined.push_str(next),
+                            }
+                        }
+                        joined
+                    }
+                }
             }
-        }
+        };
         if is_valid_env_name(name) && !value.is_empty() {
-            pairs.push((name.to_string(), SecretString::new(value.to_string())));
+            pairs.push((name.to_string(), SecretString::new(value)));
         }
     }
-    pairs
+    Ok(pairs)
+}
+
+/// The position of the first `quote` in `text` that is not escaped with a
+/// backslash (only `"` can be escaped).
+fn closing(text: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        match c {
+            '\\' if quote == '"' && !escaped => escaped = true,
+            c if c == quote && !escaped => return Some(at),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+/// What may follow a closing quote: nothing, or a comment.
+fn after_value(rest: &str) -> bool {
+    let rest = rest.trim();
+    rest.is_empty() || rest.starts_with('#')
 }
 
 #[cfg(test)]
@@ -82,6 +141,36 @@ mod tests {
     }
 
     #[test]
+    fn a_value_over_several_lines_is_one_value_and_never_names() {
+        let text = "PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\n\
+                    FAKE_PRIVATE_KEY_MATERIAL==\n\
+                    OTHER=looks-like-a-line\n\
+                    -----END PRIVATE KEY-----\" # a comment\n\
+                    NORMAL=x\n";
+        let pairs = parse_dotenv(text).expect("parse");
+        let names: Vec<&str> = pairs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["PRIVATE_KEY", "NORMAL"]);
+        assert_eq!(
+            pairs[0].1.as_str(),
+            "-----BEGIN PRIVATE KEY-----\nFAKE_PRIVATE_KEY_MATERIAL==\n\
+             OTHER=looks-like-a-line\n-----END PRIVATE KEY-----"
+        );
+        // Single-line forms, comments after the value, escaped quotes.
+        let pairs = parse_dotenv("A=\"x\" # c\nB='y z'\nC=\"say \\\"hi\\\"\"\n").expect("parse");
+        let values: Vec<String> = pairs.iter().map(|(_, v)| v.to_string()).collect();
+        assert_eq!(values, ["x", "y z", "say \\\"hi\\\""]);
+    }
+
+    #[test]
+    fn an_unclosed_quote_refuses_the_file_without_showing_it() {
+        let text = "OK=1\nKEY=\"FAKE_SECRET_START\nFAKE_NAME_LOOKING=part\n";
+        let error = parse_dotenv(text).expect_err("refused");
+        assert_eq!(error, "line 2: a quoted value is not closed");
+        let error = parse_dotenv("K=\"FAKE_A\nFAKE_B\" trailing\n").expect_err("refused");
+        assert_eq!(error, "line 1: text after the end of a quoted value");
+    }
+
+    #[test]
     fn dotenv_parsing() {
         let text = "\
 # comment
@@ -94,6 +183,7 @@ bad-name=1
 NOEQUALS
 ";
         let pairs: Vec<(String, String)> = parse_dotenv(text)
+            .expect("parse")
             .into_iter()
             .map(|(k, v)| (k, v.to_string()))
             .collect();

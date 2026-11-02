@@ -429,6 +429,9 @@ fn main() -> ExitCode {
             {
                 eprintln!("rusthorse: {e:#}; it may or may not have taken effect");
                 ExitCode::from(EXIT_UNKNOWN)
+            } else if e.downcast_ref::<LocalOutcomeUnknown>().is_some() {
+                eprintln!("rusthorse: {e:#}");
+                ExitCode::from(EXIT_UNKNOWN)
             } else {
                 eprintln!("rusthorse: {e:#}");
                 ExitCode::FAILURE
@@ -548,8 +551,21 @@ fn init(client: &Client, vault: PathBuf) -> anyhow::Result<u8> {
     // password in its own dialogs: the password then never enters this
     // process, which an AI agent may have started and could inspect. Only
     // when no agent runs, or one serves another file, does this process ask.
-    match client.call(&Request::Status) {
-        Ok(Response::Status(info)) if same_vault(Path::new(&info.vault), &vault) => {
+    let answer = client.call(&Request::Status);
+    let serves = match &answer {
+        Ok(Response::Status(info)) => match same_vault(Path::new(&info.vault), &vault) {
+            Some(same) => same,
+            None => bail!(
+                "cannot tell whether the agent's vault ({}) is {}, so the vault is not created \
+                 here (this command would read the master password itself)",
+                info.vault,
+                vault.display()
+            ),
+        },
+        _ => false,
+    };
+    match answer {
+        Ok(Response::Status(_)) if serves => {
             client.check_compatible()?;
             eprintln!("The agent asks for the new master password in a dialog.");
             let status = simple(client, &Request::CreateVault)?;
@@ -579,34 +595,42 @@ fn init(client: &Client, vault: PathBuf) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-/// Whether `a` and `b` name the same vault file: compared after making them
-/// absolute and resolving the links of their nearest existing directory
-/// (the file itself does not exist yet).
-fn same_vault(a: &Path, b: &Path) -> bool {
-    match (resolved(a), resolved(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+/// Whether `a` and `b` name the same vault file, comparing them as the
+/// system would resolve them: absolute, with the links of the directories
+/// that exist resolved, and `.` and `..` applied. `None` when that cannot be
+/// told (a directory that cannot be examined): the caller must not take it
+/// for "different".
+fn same_vault(a: &Path, b: &Path) -> Option<bool> {
+    Some(resolved(a)? == resolved(b)?)
 }
 
 fn resolved(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
     let absolute = std::path::absolute(path).ok()?;
-    let name = absolute.file_name()?.to_owned();
-    let mut dir = absolute.parent()?.to_path_buf();
-    let mut missing = Vec::new();
-    loop {
-        match dir.canonicalize() {
-            Ok(mut found) => {
-                found.extend(missing.iter().rev());
-                found.push(name);
-                return Some(found);
+    let mut out = PathBuf::from("/");
+    // While every component so far exists, `out` is canonical and links are
+    // resolved; past the first one that does not, the rest is applied as
+    // written (nothing there can be a link yet).
+    let mut existing = true;
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                out.pop();
             }
-            Err(_) => {
-                missing.push(dir.file_name()?.to_owned());
-                dir = dir.parent()?.to_path_buf();
+            Component::Normal(name) => {
+                out.push(name);
+                if existing {
+                    match out.canonicalize() {
+                        Ok(found) => out = found,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => existing = false,
+                        Err(_) => return None,
+                    }
+                }
             }
         }
     }
+    Some(out)
 }
 
 /// Whether `e` says that nothing listens on the agent's socket.
@@ -621,13 +645,26 @@ fn agent_not_running(e: &anyhow::Error) -> bool {
         })
 }
 
+/// A change this process made itself (no agent involved) whose outcome is
+/// unknown: exit 124, as for a request to the agent.
+#[derive(Debug)]
+struct LocalOutcomeUnknown(String);
+
+impl std::fmt::Display for LocalOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LocalOutcomeUnknown {}
+
 /// The error of a vault this process created: one that is in place but may
-/// not survive a crash is an unknown outcome (exit 124), as for the agent.
+/// not survive a crash is an unknown outcome (exit 124).
 fn created_locally(e: rusthorse::vault::VaultError) -> anyhow::Error {
     match e {
-        rusthorse::vault::VaultError::NotDurable(_) => {
-            anyhow::Error::new(rusthorse::client::OutcomeUnknown(e.to_string()))
-        }
+        rusthorse::vault::VaultError::NotDurable(_) => anyhow::Error::new(LocalOutcomeUnknown(
+            format!("{e}; the vault file is in place, but may not survive a crash"),
+        )),
         other => other.into(),
     }
 }
@@ -1186,6 +1223,16 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     }
 }
 
+/// One entry of `rusthorse import`: its name, the keyring item it comes
+/// from, and what the dialog shows for it (to fit the batches to dialogs).
+struct Pick {
+    name: String,
+    // Read only for keyring imports, which need the `secret-service` feature.
+    #[cfg_attr(not(feature = "secret-service"), allow(dead_code))]
+    id: Option<String>,
+    line: String,
+}
+
 /// Where `rusthorse import` asks the agent to read the values.
 enum ImportFrom {
     Dotenv {
@@ -1226,8 +1273,14 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             if dry_run {
                 return import_preview(client, names, replace);
             }
-            let picks: Vec<(String, Option<String>)> =
-                names.into_iter().map(|name| (name, None)).collect();
+            let picks: Vec<Pick> = names
+                .into_iter()
+                .map(|name| Pick {
+                    line: name.clone(),
+                    name,
+                    id: None,
+                })
+                .collect();
             (picks, ImportFrom::Dotenv { path, prefix }, tags, replace)
         }
         #[cfg(feature = "secret-service")]
@@ -1263,11 +1316,16 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                     })?,
                     None => item.label.clone(),
                 };
-                picks.push((name, Some(item.id)));
+                picks.push(Pick {
+                    // What the agent's dialog will show for it.
+                    line: format!("{name} ← {}", rusthorse::keyring::describe_item(&item)),
+                    name,
+                    id: Some(item.id),
+                });
             }
-            picks.sort_by(|a, b| a.0.cmp(&b.0));
+            picks.sort_by(|a, b| a.name.cmp(&b.name));
             if dry_run {
-                let names = picks.into_iter().map(|(name, _)| name).collect();
+                let names = picks.into_iter().map(|pick| pick.name).collect();
                 return import_preview(client, names, replace);
             }
             (picks, ImportFrom::Keyring, tags, replace)
@@ -1279,8 +1337,8 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
     let mut seen = std::collections::HashSet::new();
     let duplicates: std::collections::BTreeSet<&str> = picks
         .iter()
-        .filter(|(name, _)| !seen.insert(name.as_str()))
-        .map(|(name, _)| name.as_str())
+        .filter(|pick| !seen.insert(pick.name.as_str()))
+        .map(|pick| pick.name.as_str())
         .collect();
     if !duplicates.is_empty() {
         bail!(
@@ -1290,9 +1348,9 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         );
     }
     // Split into batches small enough for one dialog each.
-    let sizes = rusthorse::import::batch_sizes(picks.iter().map(|(name, _)| name.as_str()));
+    let sizes = rusthorse::import::batch_sizes(picks.iter().map(|pick| pick.line.as_str()));
     let mut rest = picks.into_iter();
-    let batches: Vec<Vec<(String, Option<String>)>> = sizes
+    let batches: Vec<Vec<Pick>> = sizes
         .into_iter()
         .map(|size| rest.by_ref().take(size).collect())
         .collect();
@@ -1305,15 +1363,15 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             ImportFrom::Dotenv { path, prefix } => ImportSource::Dotenv {
                 path: path.clone(),
                 prefix: prefix.clone(),
-                names: batch.into_iter().map(|(name, _)| name).collect(),
+                names: batch.into_iter().map(|pick| pick.name).collect(),
             },
             #[cfg(feature = "secret-service")]
             ImportFrom::Keyring => ImportSource::Keyring {
                 items: batch
                     .into_iter()
-                    .map(|(name, id)| rusthorse::protocol::KeyringPick {
-                        id: id.unwrap_or_default(),
-                        name,
+                    .map(|pick| rusthorse::protocol::KeyringPick {
+                        id: pick.id.unwrap_or_default(),
+                        name: pick.name,
                     })
                     .collect(),
             },
@@ -1330,7 +1388,7 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
         };
         let rerun = if replace {
             "running the same import again re-imports everything (with --replace, \
-             already imported entries are overwritten with the same values)"
+             already imported entries are overwritten with what the source holds then)"
         } else {
             "running the same import again skips the names already imported"
         };
@@ -1853,19 +1911,45 @@ mod tests {
             dir.path().join("real/./vault.kdbx"),
             dir.path().join("link/../real/vault.kdbx"),
         ] {
-            assert!(same_vault(&vault, &same), "{}", same.display());
+            assert_eq!(same_vault(&vault, &same), Some(true), "{}", same.display());
         }
         // Relative to the working directory.
         let cwd = std::env::current_dir().expect("cwd");
         let relative = Path::new("relative-vault.kdbx");
-        assert!(same_vault(&cwd.join(relative), relative));
-        // Directories that do not exist yet are compared as written.
-        assert!(same_vault(
-            &dir.path().join("link/new/sub/vault.kdbx"),
-            &real.join("new/sub/vault.kdbx")
-        ));
-        assert!(!same_vault(&vault, &real.join("other.kdbx")));
-        assert!(!same_vault(&vault, &dir.path().join("vault.kdbx")));
+        assert_eq!(same_vault(&cwd.join(relative), relative), Some(true));
+        // Directories that do not exist yet, with `..` among them.
+        assert_eq!(
+            same_vault(
+                &dir.path().join("link/new/sub/vault.kdbx"),
+                &real.join("new/sub/vault.kdbx")
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_vault(
+                &real.join("new/vault.kdbx"),
+                &dir.path().join("link/new/sub/../vault.kdbx")
+            ),
+            Some(true)
+        );
+        assert_eq!(same_vault(&vault, &real.join("other.kdbx")), Some(false));
+        assert_eq!(
+            same_vault(&vault, &dir.path().join("vault.kdbx")),
+            Some(false)
+        );
+        // A directory that cannot be examined: cannot tell (not as root,
+        // who can examine anything).
+        if !nix::unistd::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let closed = dir.path().join("closed");
+            std::fs::create_dir(&closed).expect("mkdir");
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            let unknown = same_vault(&vault, &closed.join("inner/vault.kdbx"));
+            std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod back");
+            assert_eq!(unknown, None);
+        }
     }
 
     #[test]
@@ -1873,15 +1957,11 @@ mod tests {
         let e = created_locally(rusthorse::vault::VaultError::NotDurable(
             std::io::Error::other("injected"),
         ));
-        assert!(
-            e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
-                .is_some()
-        );
+        assert!(e.downcast_ref::<LocalOutcomeUnknown>().is_some());
+        // No agent was involved: the message does not speak of one.
+        assert!(!format!("{e:#}").contains("agent"), "{e:#}");
         let e = created_locally(rusthorse::vault::VaultError::Exists("/x".into()));
-        assert!(
-            e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
-                .is_none()
-        );
+        assert!(e.downcast_ref::<LocalOutcomeUnknown>().is_none());
     }
 
     #[test]

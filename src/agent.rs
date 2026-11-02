@@ -953,7 +953,9 @@ impl Agent {
         entries: Vec<ImportedEntry>,
         replace: bool,
     ) -> Result<Response, Failure> {
-        self.import_entries(peer, entries, replace, Origin::Requester)
+        let (entries, values): (Vec<NewEntry>, Vec<SecretString>) =
+            entries.into_iter().map(|e| (e.entry, e.value)).unzip();
+        self.import_entries(peer, entries, replace, Origin::Requester, || Ok(values))
     }
 
     /// Show the items of GNOME Keyring to the requester, after approval:
@@ -1017,6 +1019,11 @@ impl Agent {
 
     /// Import secrets that the agent reads itself (ADR 0012): the requester
     /// names the items or variables and the entry names, never the values.
+    /// Nothing read from the source reaches the requester before the human
+    /// allows the import: not a value, not whether an item or a variable
+    /// exists. The dialog shows, for keyring items, what the agent found at
+    /// each one; the values are read after approval, from items that are
+    /// still what the dialog showed.
     fn import_from(
         &self,
         peer: &Peer,
@@ -1034,20 +1041,47 @@ impl Agent {
         };
         match source {
             ImportSource::Keyring { items } => {
-                // Refuse what would be refused anyway before reading a secret.
                 check_import_names(items.iter().map(|p| p.name.as_str()), items.len())?;
-                let ids: Vec<&str> = items.iter().map(|p| p.id.as_str()).collect();
-                let values = crate::keyring::read(&self.config.keyring, &ids)
+                // Read for the dialog only: whatever it says goes to the
+                // human, not to the requester.
+                let ids = items.iter().map(|p| p.id.clone()).collect();
+                let found = crate::keyring::describe(&self.config.keyring, ids)
                     .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
-                let entries = items
-                    .into_iter()
-                    .zip(values)
-                    .map(|(pick, value)| ImportedEntry {
-                        entry: entry(pick.name),
-                        value,
+                let sources: Vec<String> = found
+                    .iter()
+                    .map(|item| match item {
+                        Some(item) if item.locked => format!(
+                            "{} (locked: cannot be read)",
+                            crate::keyring::describe_item(item)
+                        ),
+                        Some(item) => crate::keyring::describe_item(item),
+                        None => "(no such keyring item)".to_string(),
                     })
                     .collect();
-                self.import_entries(peer, entries, replace, Origin::Keyring)
+                let (names, entries): (Vec<String>, Vec<NewEntry>) = items
+                    .into_iter()
+                    .map(|pick| (pick.name.clone(), entry(pick.name)))
+                    .unzip();
+                let settings = self.config.keyring.clone();
+                self.import_entries(
+                    peer,
+                    entries,
+                    replace,
+                    Origin::Keyring(names.into_iter().zip(sources).collect()),
+                    move || {
+                        // After approval: only items that are still what was
+                        // shown.
+                        let shown = found.into_iter().collect::<Option<Vec<_>>>().ok_or_else(
+                            || {
+                                Failure::invalid(
+                                    "an item of the import does not exist; nothing was imported",
+                                )
+                            },
+                        )?;
+                        crate::keyring::read(&settings, shown)
+                            .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))
+                    },
+                )
             }
             ImportSource::Dotenv {
                 path,
@@ -1056,86 +1090,69 @@ impl Agent {
             } => {
                 check_import_names(names.iter().map(String::as_str), names.len())?;
                 check_dotenv_path(&path)?;
-                let mut found = read_dotenv(&path, prefix.as_deref())?;
-                let mut entries = Vec::with_capacity(names.len());
-                for name in names {
-                    let mut matching = found.iter().filter(|(n, _)| *n == name);
-                    if matching.next().is_none() {
-                        return Err(Failure::invalid(format!(
-                            "{name} is not in {path}; nothing was imported"
-                        )));
+                let entries = names.iter().cloned().map(entry).collect();
+                let file = path.clone();
+                self.import_entries(peer, entries, replace, Origin::Dotenv(&path), move || {
+                    // After approval: the file as it is now.
+                    let mut found = read_dotenv(&file, prefix.as_deref())?;
+                    let mut values = Vec::with_capacity(names.len());
+                    for name in &names {
+                        let mut matching = found.iter().filter(|(n, _)| n == name);
+                        if matching.next().is_none() {
+                            return Err(Failure::invalid(format!(
+                                "{name} is not in {file}; nothing was imported"
+                            )));
+                        }
+                        if matching.next().is_some() {
+                            return Err(Failure::invalid(format!(
+                                "{name} appears more than once in {file}; nothing was imported"
+                            )));
+                        }
+                        let at = found
+                            .iter()
+                            .position(|(n, _)| n == name)
+                            .unwrap_or_default();
+                        values.push(found.swap_remove(at).1);
                     }
-                    if matching.next().is_some() {
-                        return Err(Failure::invalid(format!(
-                            "{name} appears more than once in {path}; nothing was imported"
-                        )));
-                    }
-                    let at = found
-                        .iter()
-                        .position(|(n, _)| *n == name)
-                        .unwrap_or_default();
-                    let (_, value) = found.swap_remove(at);
-                    entries.push(ImportedEntry {
-                        entry: entry(name),
-                        value,
-                    });
-                }
-                self.import_entries(peer, entries, replace, Origin::Dotenv(&path))
+                    Ok(values)
+                })
             }
         }
     }
 
+    /// Ask the human to import `entries`, then — only if allowed — get their
+    /// values from `values` and save them. Errors before the dialog say
+    /// nothing about the source.
     fn import_entries(
         &self,
         peer: &Peer,
-        entries: Vec<ImportedEntry>,
+        entries: Vec<NewEntry>,
         replace: bool,
         origin: Origin<'_>,
+        values: impl FnOnce() -> Result<Vec<SecretString>, Failure>,
     ) -> Result<Response, Failure> {
-        if entries.is_empty() {
-            return Err(Failure::invalid("nothing to import"));
-        }
-        if entries.len() > MAX_IMPORT {
-            return Err(Failure::invalid(format!(
-                "at most {MAX_IMPORT} entries can be imported at once (got {}); split the import",
-                entries.len()
-            )));
-        }
-        let mut names = std::collections::HashSet::new();
-        for item in &entries {
-            crate::vault::validate_name(&item.entry.name)?;
-            if !names.insert(item.entry.name.as_str()) {
-                return Err(Failure::invalid(format!(
-                    "{} appears more than once in the import; nothing was imported",
-                    item.entry.name
-                )));
-            }
-        }
+        check_import_names(entries.iter().map(|e| e.name.as_str()), entries.len())?;
         let generation = self.generation(peer)?;
         let (new, existing): (Vec<&str>, Vec<&str>) = self.with_vault(peer, |v| {
             let mut new = Vec::new();
             let mut existing = Vec::new();
-            for item in &entries {
-                if v.contains(&item.entry.name) {
-                    existing.push(item.entry.name.as_str());
+            for entry in &entries {
+                if v.contains(&entry.name) {
+                    existing.push(entry.name.as_str());
                 } else {
-                    new.push(item.entry.name.as_str());
+                    new.push(entry.name.as_str());
                 }
             }
             Ok((new, existing))
         })?;
-        let mut details = vec![("New entries".into(), list_names(&new))];
-        if !existing.is_empty() {
-            let label = if replace {
-                "Will be replaced"
-            } else {
-                "Already exist (skipped)"
-            };
-            details.push((label.into(), list_names(&existing)));
-        }
-        details.push(("Requested by (unverified)".into(), peer.describe()));
+        let existing_label = if replace {
+            "Will be replaced"
+        } else {
+            "Already exist (skipped)"
+        };
         let n = entries.len();
-        let (summary, explanation, event) = match origin {
+        let mut details: Vec<(String, String)> = Vec::new();
+        let (summary, explanation, event) = match &origin {
             Origin::Requester => (
                 format!("Import {n} secrets?"),
                 "The program that asked supplied these names and values. Check the names \
@@ -1143,29 +1160,43 @@ impl Agent {
                     .to_string(),
                 AuditEvent::new("import", peer),
             ),
-            Origin::Keyring => {
-                details.insert(0, ("Read from".into(), "GNOME Keyring".into()));
-                (
-                    format!("Import {n} secrets from GNOME Keyring?"),
-                    "The agent read the values itself, from GNOME Keyring; the program that \
-                     asked chose the items and their names. Check the names before you allow \
-                     it."
+            Origin::Keyring(_) => (
+                format!("Import {n} secrets from GNOME Keyring?"),
+                "The agent reads each value itself, from the keyring item shown next to the \
+                 entry's name; the program that asked chose the items and the names. Check \
+                 that each item is the one you mean before you allow it."
                     .to_string(),
-                    AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
-                )
+                AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
+            ),
+            Origin::Dotenv(path) => (
+                format!("Import {n} secrets from a .env file?"),
+                "The agent reads the values itself, from the file below; the program that \
+                 asked chose the variables and their names. Check the names before you allow \
+                 it."
+                .to_string(),
+                AuditEvent::new("import_from", peer).detail(*path),
+            ),
+        };
+        match &origin {
+            Origin::Requester => {
+                details.push(("New entries".into(), list_names(&new)));
             }
             Origin::Dotenv(path) => {
-                details.insert(0, ("Read from".into(), path.to_string()));
-                (
-                    format!("Import {n} secrets from a .env file?"),
-                    "The agent read the values itself, from the file below; the program that \
-                     asked chose the variables and their names. Check the names before you \
-                     allow it."
-                        .to_string(),
-                    AuditEvent::new("import_from", peer).detail(path),
-                )
+                details.push(("Read from".into(), path.to_string()));
+                details.push(("New entries".into(), list_names(&new)));
             }
-        };
+            Origin::Keyring(mapping) => {
+                details.push(("Read from".into(), "GNOME Keyring".into()));
+                // One row per entry: the item its value comes from.
+                for (name, source) in mapping {
+                    details.push((name.clone(), format!("← {source}")));
+                }
+            }
+        }
+        if !existing.is_empty() {
+            details.push((existing_label.into(), list_names(&existing)));
+        }
+        details.push(("Requested by (unverified)".into(), peer.describe()));
         let request = ApprovalRequest {
             title: "Rusthorse — import secrets".into(),
             summary,
@@ -1176,12 +1207,19 @@ impl Agent {
             warnings: Vec::new(),
             can_remember: false,
         };
-        let names: Vec<String> = entries.iter().map(|e| e.entry.name.clone()).collect();
+        let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         self.approve(request, None, event.entries(names))?;
+        let values = values()?;
+        if values.len() != entries.len() {
+            return Err(Failure::new(
+                ErrorCode::Internal,
+                "the source gave a different number of values; nothing was imported",
+            ));
+        }
         self.commit(generation, |v| {
             let (mut added, mut replaced, mut skipped) = (0, 0, 0);
-            for item in &entries {
-                match v.add(&item.entry, &item.value, replace) {
+            for (entry, value) in entries.iter().zip(&values) {
+                match v.add(entry, value, replace) {
                     Ok(true) => replaced += 1,
                     Ok(false) => added += 1,
                     Err(VaultError::AlreadyExists(_)) => skipped += 1,
@@ -2182,9 +2220,10 @@ fn run_event(peer: &Peer, run: &RunRequest, entries: &[String]) -> AuditEvent {
 enum Origin<'a> {
     /// The requester sent them (`import`).
     Requester,
-    /// The agent read them from GNOME Keyring (`import_from`).
-    Keyring,
-    /// The agent read them from this `.env` file (`import_from`).
+    /// The agent reads them from GNOME Keyring (`import_from`): each entry's
+    /// name, and the item its value comes from as the agent found it.
+    Keyring(Vec<(String, String)>),
+    /// The agent reads them from this `.env` file (`import_from`).
     Dotenv(&'a str),
 }
 
@@ -2258,6 +2297,7 @@ fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<Vec<(String, SecretSt
         .map_err(|_| Failure::invalid(format!("{path} is not text (UTF-8)")))?;
     let prefix = prefix.unwrap_or_default().to_uppercase();
     Ok(crate::import::parse_dotenv(text)
+        .map_err(|e| Failure::invalid(format!("{path}, {e}; nothing was read from it")))?
         .into_iter()
         .map(|(name, value)| (format!("{prefix}{name}"), value))
         .collect())

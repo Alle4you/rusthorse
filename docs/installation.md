@@ -270,7 +270,9 @@ the agent read them.
    rusthorse import secret-service -a service=myapp --name-from key --dry-run
    ```
 
-   No secret is read for a preview. Keyring items are chosen by attribute:
+   No value reaches the window or the command for a preview (a `.env`
+   file is read by the agent, which keeps only the names; keyring secrets
+   are not read at all). Keyring items are chosen by attribute:
    items stored with `secret-tool store --label=... service myapp key token`
    are matched by `-a service=myapp` (in the manager: type `myapp` in the
    filter), and `--name-from key` (**Names from: Attribute key**) names each
@@ -289,7 +291,9 @@ the agent read them.
    ```
 
    Names go to the agent in batches small enough for one approval dialog
-   each; a locked keyring item stops the import (unlock the keyring first).
+   each. For keyring items the dialog shows each entry next to the item its
+   value comes from: check that each is the one you mean. A locked keyring
+   item stops the import (unlock the keyring first).
 4. **Verify each entry by using it**, not just by listing it: run a real,
    harmless command with it — an API call that only reads, a login check —
    for example:

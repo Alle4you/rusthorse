@@ -470,7 +470,8 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
-Imports `NAME=value` lines (optional `export`, `#` comments, quoted values).
+Imports `NAME=value` lines (optional `export`, `#` comments, quoted values,
+which may span lines; a quote never closed refuses the file).
 The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):
 this command never holds a value. It first asks the agent for the names in
 the file — the agent asks you in a dialog before it shows them — then sends
@@ -499,8 +500,10 @@ whose attributes match all `--attribute` filters. The agent lists the
 keyring's items — after asking you, since this command then sees their
 labels and attributes — and reads the chosen items' secrets itself: this
 command never holds a value. The entry name comes from the attribute named
-by `--name-from`, or from the item label. A locked item stops the import:
-unlock the keyring first. Batches and `--dry-run` work as for `import
+by `--name-from`, or from the item label. The import dialog shows each entry
+next to the item it comes from (label and attributes), and the agent reads
+an item only if it is still what the dialog showed. A locked item stops the
+import: unlock the keyring first. Batches and `--dry-run` work as for `import
 dotenv`; a dry run reads no secret. See
 [installation.md](installation.md#migrating-existing-secrets) for a safe
 migration procedure; the manager's **Import & backup** page does the same

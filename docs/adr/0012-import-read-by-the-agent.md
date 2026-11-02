@@ -4,6 +4,9 @@
 - Date: 2026-11-02
 - Amends: [ADR 0007](0007-visual-manager.md), section 5 (M3: the manager
   would read the sources itself and send the values).
+- Amended: 2026-11-02, after review — nothing of the source before the
+  approval, the dialog's item-to-entry rows, items checked unchanged, a
+  deadline for the whole keyring operation, multi-line `.env` values.
 
 ## Context
 
@@ -26,9 +29,19 @@ not be another place that holds secrets.
    Service items by their D-Bus object path, or a `.env` file by its
    absolute path — and the entry name for each; the agent reads the values
    itself, after approval. No client holds the values. The dialog says where
-   they come from, because the agent read them there: "from GNOME Keyring",
-   "from the file /home/…/.env".
-2. **Requests** (protocol 6, not yet released):
+   they come from, because the agent reads them there: for keyring items,
+   one row per entry with the item the agent found at that path (label and
+   attributes, or "no such keyring item", or "locked"); for a file, its
+   path.
+2. **Nothing of the source before the approval.** What the request says by
+   itself is checked first (names, a count, an absolute path); everything
+   that depends on the source comes after the human allows the import — a
+   variable missing from the file, a locked item, a value — so that a
+   request does not tell its sender what the keyring or a file holds. Item
+   metadata is read before the dialog only to show it to the human. After
+   the approval, an item is read only if it is still what the dialog showed
+   (same label and attributes), so that the approval covers what is read.
+3. **Requests** (protocol 6, not yet released):
    - `keyring_items` → the metadata of the Secret Service's items: object
      path, label, attributes, whether locked. No secret is read.
    - `dotenv_names` (`path`, `prefix`) → the names in the file. The agent
@@ -37,17 +50,22 @@ not be another place that holds secrets.
      `keyring` with a list of `{id, name}`, or `dotenv` with `path`,
      `prefix` and the `names` to import. At most 100 entries, one dialog per
      request; clients split larger imports into batches, as the CLI does.
-3. **What the agent refuses.** A locked item (unlock the keyring first: a
+4. **What the agent refuses.** A locked item (unlock the keyring first: a
    keyring prompt would hold the agent's request for as long as nobody
    answers it), an item whose secret is not UTF-8 text, a `.env` path that
    is not absolute, not a regular file or larger than 1 MiB, a name that is
-   not in the source, and the usual: invalid or duplicate names. Every call
-   to the Secret Service is bounded in time.
-4. **The CLI uses the same requests**, so that `rusthorse import` no longer
+   not in the source, and the usual: invalid or duplicate names. A `.env`
+   value in quotes may span several lines; a quote that is never closed
+   refuses the whole file, rather than reading the rest of the value as more
+   variables. Every call to the Secret Service is bounded (10 seconds), and
+   so is the whole operation, connecting and authenticating included (30
+   seconds): past it, the agent shuts the connection's socket down, which
+   ends it.
+5. **The CLI uses the same requests**, so that `rusthorse import` no longer
    holds values either. The `import` request (values from the client) stays
    for other clients; its dialog keeps saying that the requester supplied
    the values.
-5. **The manager.** *Import & backup* gets **Import from GNOME Keyring…**
+6. **The manager.** *Import & backup* gets **Import from GNOME Keyring…**
    (the items, which can be filtered and ticked; names from the label or an
    attribute; each name marked new, existing, invalid or repeated) and
    **Import from a .env file…** (a file chooser, an optional prefix, the
