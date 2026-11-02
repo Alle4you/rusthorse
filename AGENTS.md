@@ -155,7 +155,7 @@ Breaking one of these is a security bug, whatever the tests say.
 | When you change… | Also update |
 |---|---|
 | anything a user notices | `CHANGELOG.md` (*Unreleased*) |
-| a command, option or exit status | `docs/cli.md` (and `README.md` if shown there) |
+| a command, option or exit status | `docs/cli.md` (and `README.md` if shown there); `src/guide/ai.md`, the guide for AI agents, when they use it |
 | a request, response or error code | `docs/protocol.md` |
 | components, flows, dialogs, storage | `docs/architecture.md` |
 | what is protected or how | `docs/threat-model.md` |
@@ -207,6 +207,7 @@ present and capture only its window, in a dark and a light theme
 | `manager/src/import_window.rs` | The manager's import windows |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
+| `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; a test checks the commands and options it names |
 | `tests/agent.rs` | End-to-end tests |
 | `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): service file, maintainer scripts, `build-deb.sh`, the generated copyright file and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |

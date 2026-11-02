@@ -39,7 +39,8 @@ const EXIT_DENIED: u8 = 4;
     long_about = "Rusthorse keeps secrets in a KeePass (KDBX4) file. A background agent holds \
 the unlocked vault; every use of a secret is approved by you in a dialog, and `rusthorse run` \
 lets a program (or an AI agent) use a secret without the value being shown to the caller.\n\n\
-Documentation: https://github.com/Alle4you/rusthorse/tree/main/docs"
+Documentation: https://github.com/Alle4you/rusthorse/tree/main/docs",
+    after_help = "AI agents: read `rusthorse guide ai` before using Rusthorse."
 )]
 struct Cli {
     /// Agent socket.
@@ -149,6 +150,30 @@ enum Command {
         /// The shell.
         shell: clap_complete::Shell,
     },
+    /// Print a guide (`ai`: the guide for AI agents). Needs no agent.
+    Guide {
+        /// The guide.
+        #[arg(value_enum)]
+        topic: GuideTopic,
+    },
+}
+
+/// The guides of `rusthorse guide`.
+#[derive(Clone, Copy, ValueEnum)]
+enum GuideTopic {
+    /// How an AI agent uses Rusthorse: rules, commands, exit statuses.
+    Ai,
+}
+
+/// The guide for AI agents, written for the `rusthorse` it is built into.
+const AI_GUIDE: &str = include_str!("guide/ai.md");
+
+impl GuideTopic {
+    fn text(self) -> String {
+        match self {
+            GuideTopic::Ai => AI_GUIDE.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -462,6 +487,7 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             | Command::Doctor
             | Command::Generate(_)
             | Command::Completions { .. }
+            | Command::Guide { .. }
             // `run` checks inside its own error handling, so that a missing
             // or incompatible agent is reported as "did not run" (125).
             | Command::Run(_)
@@ -486,6 +512,7 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             );
             Ok(0)
         }
+        Command::Guide { topic } => guide(topic),
         Command::Unlock => simple(client, &Request::Unlock),
         Command::Lock => simple(client, &Request::Lock),
         Command::List {
@@ -510,6 +537,22 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
         Command::Run(args) => run(client, args),
         Command::Import(cmd) => import_cmd(client, cmd),
         Command::Audit { lines, json } => show_audit(lines, json),
+    }
+}
+
+/// Print a guide. A reader that stops early (`rusthorse guide ai | head`)
+/// is not an error.
+fn guide(topic: GuideTopic) -> anyhow::Result<u8> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(topic.text().as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(anyhow::Error::new(e).context("cannot print the guide"))
+        }
+        _ => Ok(0),
     }
 }
 
@@ -2163,5 +2206,183 @@ mod tests {
             agent_executable_check("", None, None),
             Check::Warn(_)
         ));
+    }
+
+    /// The `rusthorse …` command lines of the AI guide, each cut at the end
+    /// of its code span or line: inline code in the prose (whose lines are
+    /// joined first, as Markdown does), and the lines of code blocks.
+    fn guide_command_lines(guide: &str) -> Vec<String> {
+        fn collect(text: &str, ends: &[char], into: &mut Vec<String>) {
+            for (at, _) in text.match_indices("rusthorse ") {
+                let before = text[..at].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || "-_/".contains(c)) {
+                    continue;
+                }
+                let rest = &text[at + "rusthorse ".len()..];
+                let end = rest.find(ends).unwrap_or(rest.len());
+                into.push(rest[..end].to_string());
+            }
+        }
+        let mut lines = Vec::new();
+        let mut prose = String::new();
+        let mut fenced = false;
+        for line in guide.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                prose.push('\n');
+            } else if fenced {
+                collect(line, &['\n'], &mut lines);
+            } else {
+                prose.push_str(line);
+                prose.push(' ');
+            }
+        }
+        assert!(!fenced, "a code block of the guide is not closed");
+        collect(&prose, &['`', '\n'], &mut lines);
+        lines
+    }
+
+    /// Every subcommand and option the AI guide names exists: the guide is
+    /// built into the binary, and an AI agent follows it to the letter.
+    #[test]
+    fn the_ai_guide_names_only_real_commands_and_options() {
+        let mut cli = Cli::command();
+        cli.build();
+        let guide = GuideTopic::Ai.text();
+        let lines = guide_command_lines(&guide);
+        let mut options = 0;
+        for line in &lines {
+            // The command's own words start after `--`; a shell's `|`, `#`,
+            // `;` and `&&` end the `rusthorse` part.
+            let mut words = line
+                .split_whitespace()
+                .take_while(|w| !matches!(*w, "--" | "|" | "#" | ";" | "&&"));
+            let name = words.next().unwrap_or_else(|| panic!("`rusthorse {line}`"));
+            let mut command = cli
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`rusthorse {line}`: no command {name:?}"));
+            if command.has_subcommands() {
+                let sub = words.next().unwrap_or_else(|| panic!("`rusthorse {line}`"));
+                command = command
+                    .find_subcommand(sub)
+                    .unwrap_or_else(|| panic!("`rusthorse {line}`: no command {sub:?}"));
+            }
+            for word in words {
+                let word = word.trim_matches(['[', ']']);
+                let known = if let Some(long) = word.strip_prefix("--") {
+                    let long = long.split(['=', '|', ']']).next().expect("split");
+                    command.get_arguments().any(|a| a.get_long() == Some(long))
+                } else if let Some(short) = word.strip_prefix('-') {
+                    let mut chars = short.chars();
+                    let (Some(short), None) = (chars.next(), chars.next()) else {
+                        panic!("`rusthorse {line}`: {word:?}");
+                    };
+                    command
+                        .get_arguments()
+                        .any(|a| a.get_short() == Some(short))
+                } else {
+                    continue;
+                };
+                assert!(
+                    known,
+                    "`rusthorse {line}`: {word} is not an option of {name}"
+                );
+                options += 1;
+            }
+        }
+        // An option named alone (`--no-redact`) belongs to some command.
+        fn longs(command: &clap::Command, into: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                into.extend(arg.get_long().map(str::to_string));
+            }
+            for sub in command.get_subcommands() {
+                longs(sub, into);
+            }
+        }
+        let mut all = Vec::new();
+        longs(&cli, &mut all);
+        let alone: Vec<_> = guide
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| span.strip_prefix("--"))
+            .map(|span| span.split([' ', '=']).next().expect("split"))
+            .collect();
+        assert!(alone.len() > 5, "{alone:?}");
+        for long in alone {
+            assert!(all.iter().any(|a| a == long), "--{long} is no option");
+        }
+        // The scan found the commands: a broken scan checks nothing.
+        assert!(
+            lines.len() > 30 && options > 25,
+            "{} lines, {options} options",
+            lines.len()
+        );
+        // It reads inline code across a line break, and stops a code-block
+        // line at its comment.
+        let found =
+            guide_command_lines("a `rusthorse list\n  --json` b\n```\nrusthorse ls # x\n```");
+        assert_eq!(found, ["ls # x", "list   --json"]);
+    }
+
+    /// The facts of the AI guide that tests cannot draw from its commands:
+    /// the kinds, the exit statuses and the JSON fields it names.
+    #[test]
+    fn the_ai_guide_lists_the_real_kinds_statuses_and_fields() {
+        let guide = GuideTopic::Ai.text();
+        assert!(guide.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!guide.contains('@'), "a placeholder is left in the guide");
+        // Every kind, and nothing else.
+        let kinds = guide
+            .lines()
+            .find_map(|l| l.split_once("# kinds: ").map(|(_, k)| k))
+            .expect("the guide lists the kinds");
+        let real: Vec<_> = KindArg::value_variants()
+            .iter()
+            .map(|k| k.to_possible_value().expect("value").get_name().to_string())
+            .collect();
+        assert_eq!(kinds.split(", ").collect::<Vec<_>>(), real);
+        // The exit statuses, each a row of its table.
+        for status in [0, 1, 2, EXIT_DENIED, EXIT_UNKNOWN, EXIT_RUN_FAILURE]
+            .into_iter()
+            .filter(|s| *s != 0)
+        {
+            assert!(guide.contains(&format!("\n| `{status}` |")), "{status}");
+        }
+        // The JSON fields it names are fields of `list --json`.
+        let info = EntryInfo {
+            id: "id".into(),
+            name: "n".into(),
+            group: Some("g".into()),
+            fields: EntryFields {
+                kind: Some(EntryKind::Device),
+                username: Some("u".into()),
+                url: Some("https://x/".into()),
+                host: Some("h".into()),
+                port: Some(1),
+                tags: vec!["t".into()],
+            },
+            protected_fields: vec!["UserName".into()],
+            has_password: true,
+            has_notes: true,
+            other_fields: vec!["f".into()],
+            modified: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let json = serde_json::to_value(&info).expect("json");
+        let sentence = guide
+            .split("The JSON objects have ")
+            .nth(1)
+            .and_then(|s| s.split('.').next())
+            .expect("the guide names the JSON fields");
+        let mut named: Vec<_> = sentence.split('`').skip(1).step_by(2).collect();
+        assert!(named.len() >= 10, "{named:?}");
+        assert!(guide.contains("`protected_fields`"));
+        named.push("protected_fields");
+        for field in named {
+            assert!(
+                json.get(field).is_some(),
+                "`{field}` is not a field of list --json"
+            );
+        }
     }
 }

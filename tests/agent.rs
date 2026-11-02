@@ -2297,6 +2297,49 @@ fn generate_completions_and_doctor_work_offline() {
 }
 
 #[test]
+fn the_ai_guide_needs_no_agent_and_the_help_points_to_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rusthorse = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rusthorse"));
+        cmd.env("RUSTHORSE_SOCKET", dir.path().join("nobody.sock"))
+            .stdin(Stdio::null());
+        cmd
+    };
+    let out = rusthorse().args(["guide", "ai"]).finish();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    let guide = text(&out.stdout);
+    assert!(guide.starts_with(&format!(
+        "# Rusthorse {}: guide for AI agents\n",
+        env!("CARGO_PKG_VERSION")
+    )));
+    for rule in [
+        "Never ask the human for a secret value",
+        "Never use `rusthorse reveal`",
+        "stop and ask the human",
+        "rusthorse run VAR=NAME -- COMMAND",
+    ] {
+        assert!(guide.contains(rule), "{rule}");
+    }
+    // A reader that stops early is no error.
+    let mut child = rusthorse()
+        .args(["guide", "ai"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    // An unknown guide is a command-line error.
+    let out = rusthorse().args(["guide", "nope"]).finish();
+    assert_eq!(out.status.code(), Some(2));
+    let out = rusthorse().arg("--help").finish();
+    assert!(text(&out.stdout).contains("`rusthorse guide ai`"));
+}
+
+#[test]
 fn a_client_that_never_reads_acknowledgements_can_still_cancel() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);

@@ -118,6 +118,16 @@ The boundary that matters is between **requesters** and the **agent**.
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
 
+### The guide for AI agents is advice
+
+`rusthorse guide ai` tells a cooperative agent (A1) how to work with
+Rusthorse: never ask for or print a value, no `reveal`, stop after a denial,
+read the metadata before asking. It is not a mechanism. Its rules bind
+nothing, an agent that follows planted instructions may ignore them, and
+every property above holds whether or not the agent has read it. It makes
+the common mistakes of a cooperative agent less likely; the dialog stays
+the control.
+
 ### Who starts the agent
 
 A process can read the memory of the processes it starts (with the default

@@ -117,7 +117,8 @@ Once each entry works, delete the originals: while they stay in the keyring
 or the file, any program of your session can still read them there. Then
 tell your AI agent how to use them — paste the snippet from
 [ai-agents.md](ai-agents.md#setting-up-an-agent) into its `CLAUDE.md` or
-`AGENTS.md`.
+`AGENTS.md`. The snippet points the agent to `rusthorse guide ai`, which
+explains the rest.
 
 ## 6. Know the limits
 

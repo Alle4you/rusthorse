@@ -43,33 +43,24 @@ from the vault straight into the approved program.
 
    ```markdown
    ## Secrets
-   - Secrets are managed by Rusthorse. `rusthorse list --json` shows what
-     exists (names, kinds, usernames, URLs, hosts, ports, tags — never
-     values); `rusthorse list --kind api-key` lists the API keys.
-   - To use a secret, run the command through Rusthorse:
-     `rusthorse run NAME -- command args` or `rusthorse run VAR=NAME -- …`.
-     The human approves each use in a dialog. For an API key with an
-     endpoint, add `--url VAR=NAME` to pass the endpoint too, e.g.
-     `rusthorse run OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- …`.
-   - Never ask the human for a secret value, never print or echo secrets,
-     never write them to files, and never use `rusthorse reveal`.
-   - Exit status 125 with a `rusthorse:` message means Rusthorse refused or
-     failed before the command started — including when the agent is not
-     running or is out of date — so the command did not run; if it was
-     denied — or nobody answered the dialog in time — stop and ask the human
-     instead of retrying a variation. Exit status 124 means the
-     outcome is unknown (the connection was lost after the request was sent,
-     or the agent could not confirm the result): the command may or may not
-     have run, so check before repeating anything that is not idempotent.
-     (A command can also exit with 124 or 125 itself; the `rusthorse:` message
-     tells them apart.)
-   - To store a new secret, run
-     `rusthorse add NAME [--kind …] [--url …] [--username …]`;
-     the human types the value in a dialog. Do not pipe values into
-     `rusthorse add --stdin`.
-   - Commands run by `rusthorse run` read no input unless you add `--stdin`,
-     and background processes they start are stopped when they exit.
+   - Secrets live in Rusthorse. Before you use one, run `rusthorse guide ai`
+     and follow it.
+   - Never ask for, print or write secret values, and never use
+     `rusthorse reveal`. If a request is denied, or nobody answers the
+     dialog in time, stop and ask the human.
    ```
+
+   `rusthorse guide ai` prints the guide built into the installed
+   `rusthorse`: the rules above and why, how to find entries
+   (`list --kind`, `show NAME --json` for the host and username), how to
+   use `run` (`VAR=NAME`, `--url`, quoting, input, redaction), what each exit
+   status means and what to do about it, and how to store secrets without
+   seeing them (`add`, `--generate`, `import dotenv`). A test checks that
+   every command and option it names exists, so it changes with the CLI and
+   the instructions file does not have to. Its source is
+   [src/guide/ai.md](../src/guide/ai.md). The snippet repeats the most
+   important rules, so that they apply even before the agent has read the
+   guide.
 
 3. Keep `rusthorse agent` running under systemd (see
    [installation.md](installation.md)). Never let the AI start the agent.

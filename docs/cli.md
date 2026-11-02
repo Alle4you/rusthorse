@@ -4,9 +4,11 @@
 rusthorse [--socket PATH] <COMMAND> [OPTIONS]
 ```
 
-Every command except `init`, `agent` and `audit` talks to the agent over its
-Unix socket. Run `rusthorse <command> --help` for the same information in the
-terminal.
+Most commands talk to the agent over its Unix socket. `agent`, `audit`,
+`generate`, `completions` and `guide` never do, and `init` does when an agent
+runs. Run `rusthorse <command> --help` for the same information in the
+terminal; `rusthorse --help` ends by pointing AI agents to
+[`rusthorse guide ai`](#rusthorse-guide).
 
 ## Global options and environment
 
@@ -588,6 +590,22 @@ Prints a completion script. For bash:
 mkdir -p ~/.local/share/bash-completion/completions
 rusthorse completions bash > ~/.local/share/bash-completion/completions/rusthorse
 ```
+
+## `rusthorse guide`
+
+```
+rusthorse guide ai
+```
+
+Prints a guide in Markdown on standard output; it needs no agent. `ai` is
+written for AI agents: the rules they follow (never ask for, print or write
+a value; no `reveal`; stop after a denial), how to find entries and read
+their metadata, how to use `run`, the exit statuses and what to do about
+each, and how to store secrets without seeing them. It is built into the
+binary, so it describes the version that prints it; a test checks that every
+command and option it names exists. Point an agent to it from its
+instructions file ([ai-agents.md](ai-agents.md#setting-up-an-agent)). A
+reader that stops early (`rusthorse guide ai | head`) is not an error.
 
 ## Upgrades
 

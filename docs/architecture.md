@@ -421,6 +421,7 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | Module | Responsibility |
 |---|---|
 | [`src/main.rs`](../src/main.rs) | Command-line parsing and output formatting. |
+| [`src/guide/ai.md`](../src/guide/ai.md) | The guide for AI agents that `rusthorse guide ai` prints. |
 | [`src/agent.rs`](../src/agent.rs) | The agent: socket server, policy, unlock, approvals, `run`. |
 | [`src/vault.rs`](../src/vault.rs) | KDBX4 access, field mapping, atomic saves. |
 | [`src/session_lock.rs`](../src/session_lock.rs) | Locking on suspend and screen lock: the D-Bus watchers. |

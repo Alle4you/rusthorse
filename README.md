@@ -150,22 +150,24 @@ action, where a shown or copied value can end up, and what comes later.
 
 ## Using it with AI agents
 
-Tell the agent that secrets are available through `rusthorse` and that it must
-never try to read them. For example, in `CLAUDE.md` or `AGENTS.md`:
+Tell the agent that secrets are available through `rusthorse`, and point it
+to the guide. For example, in `CLAUDE.md` or `AGENTS.md`:
 
 ```markdown
 ## Secrets
-- Secrets live in Rusthorse. List what exists with `rusthorse list` (names and
-  metadata only).
-- Use a secret with `rusthorse run NAME -- command` (or `VAR=NAME`); the human
-  approves each use in a dialog. Never ask for or print secret values, never
-  use `rusthorse reveal`, never write secrets to files.
-- If a command is denied, or nobody answers the dialog in time, stop and ask the
-  human; do not retry variations.
+- Secrets live in Rusthorse. Before you use one, run `rusthorse guide ai` and
+  follow it.
+- Never ask for, print or write secret values, and never use
+  `rusthorse reveal`. If a request is denied, or nobody answers the dialog in
+  time, stop and ask the human.
 ```
 
-[docs/ai-agents.md](docs/ai-agents.md) covers patterns, approval hygiene and
-what Rusthorse can and cannot protect against when the requester is an AI.
+`rusthorse guide ai` prints the rules and the commands an AI agent needs —
+finding entries, `run`, the exit statuses, storing secrets — for the version
+of `rusthorse` that prints it, so the instructions file stays short and does
+not go out of date. [docs/ai-agents.md](docs/ai-agents.md) covers patterns,
+approval hygiene and what Rusthorse can and cannot protect against when the
+requester is an AI.
 
 ## Commands
 
@@ -192,6 +194,7 @@ what Rusthorse can and cannot protect against when the requester is an AI.
 | `audit` | Show recent audit records | — |
 | `doctor` | Check the installation and environment | — |
 | `completions SHELL` | Print a shell completion script | — |
+| `guide ai` | Print the guide for AI agents | — |
 
 See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
 

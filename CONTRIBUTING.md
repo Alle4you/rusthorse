@@ -59,8 +59,9 @@ And check the following by hand:
   in `tests/agent.rs` that shows both the allowed and the denied path.
 - **Documentation.** Update every document the change affects — the README,
   `docs/cli.md`, `docs/protocol.md`, `docs/architecture.md`,
-  `docs/threat-model.md` — in the same pull request, and add an entry to
-  `CHANGELOG.md` under *Unreleased*.
+  `docs/threat-model.md`, and `src/guide/ai.md` (the guide that
+  `rusthorse guide ai` prints) when AI agents use what changed — in the
+  same pull request, and add an entry to `CHANGELOG.md` under *Unreleased*.
 - **Decisions.** Significant design decisions get an ADR.
 
 ## Rules for security-sensitive code

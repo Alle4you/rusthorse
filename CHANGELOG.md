@@ -11,6 +11,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **`rusthorse guide ai`** prints a guide for AI agents, built into the
+  binary: the rules, how to find entries and use `run`, what each exit
+  status means and what to do, and how to store secrets without seeing
+  them. A test checks every command and option it names. The instructions
+  for `CLAUDE.md` or `AGENTS.md` in the README and
+  [ai-agents.md](docs/ai-agents.md) now point to it, and `rusthorse --help`
+  ends with a pointer for AI agents.
 - **Import from the manager** ([ADR 0012](docs/adr/0012-import-read-by-the-agent.md)):
   **Import & backup → From GNOME Keyring…** and **From a .env file…** list
   the items or names (after the agent asks you), mark each name new,
