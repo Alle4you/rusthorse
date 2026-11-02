@@ -200,8 +200,10 @@ authorities, switches that disable certificate checks, and name resolution
 ([cli.md](cli.md#rusthorse-run)); the audit record names them too. A value
 that programs could read differently — a backslash, two `@`, an unusual
 host, a numeric host other than `a.b.c.d`, a query naming another server
-(libpq's `hostaddr`) — is not shown but warned about, so that the dialog
-does not name a host that common parsers would not use. Limits: the lists go
+(libpq's `hostaddr`), a `#`, anything outside printable ASCII — is not
+shown but warned about. The aim is that the dialog never names a host other
+than the one the program uses; it is met for the readings of common URL
+parsers and libpq known to differ, which tests pin down. Limits: the lists go
 by name and cannot be complete (`MY_SERVICE=https://…`, a configuration file
 or an argument escape them); a URL is shown by scheme, host and port only,
 so a different path on the same host is not visible; the forms judged
@@ -948,13 +950,29 @@ what was done:
 
 | Finding | Disposition |
 |---|---|
-| High — list separators were the same for every list variable: pip reads `PIP_EXTRA_INDEX_URL` at spaces only, so `https://user:1234,5678@packages/…` is one URL whose password contains a comma, and the dialog and the audit log showed part of it | **Fixed:** each list variable has the separators its program uses (`GOPROXY`: `,` and `|`; pip and uv: spaces). |
+| High — list separators were the same for every list variable: pip reads `PIP_EXTRA_INDEX_URL` at spaces only, so `https://user:1234,5678@packages/…` is one URL whose password contains a comma, and the dialog and the audit log showed part of it | **Partly fixed:** each list variable has the separators its program uses (`GOPROXY`: `,` and `|`; pip and uv: spaces); Unicode spaces, which pip also splits at, were left (completed in the next round). |
 | High — an empty authority was taken for a local path: `https:///hooks.invalid/TOKEN` was shown whole (Node and curl connect to `hooks.invalid`), and so was `//TOKEN@host/path` | **Fixed:** an empty authority is shown only for `unix:` and `file:`; a path starting with `//` is not shown. |
-| High — libpq takes its server from the query: a `DATABASE_URL` showing `…@expected.invalid` connected, with the fake `PGPASSWORD`, to the server in `?hostaddr=…&port=…` (reproduced end to end) | **Fixed:** a URL whose query has `host`, `hostaddr`, `port`, `service`, `servicefile`, a socket or server parameter, or a parameter name with `%`, is not shown, and the warning names it. `?sslmode=require` and the like stay shown. |
+| High — libpq takes its server from the query: a `DATABASE_URL` showing `…@expected.invalid` connected, with the fake `PGPASSWORD`, to the server in `?hostaddr=…&port=…` (reproduced end to end) | **Partly fixed:** a URL whose query has `host`, `hostaddr`, `port`, `service`, `servicefile`, a socket or server parameter, or a parameter name with `%`, is not shown, and the warning names it; `?sslmode=require` and the like stay shown. Parameters after a `#`, which libpq still reads, were missed (completed in the next round). |
 | Medium — `UV_INDEX` was in the list of list variables but not recognised as a destination, so it never reached the dialog (uv queried the index it named first) | **Fixed:** `UV_INDEX` and `UV_DEFAULT_INDEX` are endpoints, their `name=URL` items keep the name. |
 | Low — when a later `SSL_CERT_DIR` named the system store, the warning still showed the earlier, replaced value | **Fixed:** the environment is consolidated (last value wins) before anything is classified. |
-| Low — numeric IPv4 forms (`0x7f.1`, `127.1`, `2130706433`, `0177.0.0.1`) were shown literally, though parsers read them as `127.0.0.1` | **Fixed:** a host whose last label is a number must be a canonical `a.b.c.d`; otherwise it is not shown. A lone word (`0`, `1`, `direct`) is still shown: switches such as `GIT_SSL_NO_VERIFY=1` hold words. |
+| Low — numeric IPv4 forms (`0x7f.1`, `127.1`, `2130706433`, `0177.0.0.1`) were shown literally, though parsers read them as `127.0.0.1` | **Partly fixed:** inside a URL, a host whose last label is a number must be a canonical `a.b.c.d`; but a lone word was still shown in any variable, so `PGHOST=2130706433` passed (completed in the next round). |
 | Noise — `PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"` and a certificate path with a space were `(not shown)` | **Fixed:** `PIP_TRUSTED_HOST` and `UV_INSECURE_HOST` are trust settings (a warning) split at spaces; certificate paths may contain spaces. |
 | Documentation — "the dialog never names a host the program will not use", "credentials are left out", and the description of list separators said more than the code | **Fixed:** the docs list the forms shown and not shown, and say that the rules cover the known readings of common parsers and libpq, not every program. |
+
+Each fix was reverted in a copy of the tree to see a test fail.
+
+Second verification (Codex, AI-assisted, 2026-11-01; verdict: not ready).
+Confirmed fixed: the empty authority, `UV_INDEX`, the consolidation of
+duplicates, both noise cases. The remaining findings were narrower readings
+of the same kind, so the rules were made more general rather than closer
+imitations of each program:
+
+| Finding | Disposition |
+|---|---|
+| High — libpq reads a `#` in the query as part of a value and goes on reading parameters: `…?application_name=x#y&hostaddr=127.0.0.1&port=…` showed the URL's host, without a warning, and the fake `PGPASSWORD` reached the local server | **Fixed:** an item with a `#` anywhere is not shown, and a query parameter name of other characters than letters, digits, `_`, `-` and `.` makes the URL not shown. |
+| Medium — pip splits `PIP_EXTRA_INDEX_URL` at Unicode spaces too (`str.split`): with U+00A0 between two URLs, the second index disappeared into the first one's hidden path, without a warning | **Fixed:** a value with anything outside printable ASCII is not shown at all; a space is accepted only where it separates items or pads them. |
+| Low — a bare number passed as a word in any variable: `PGHOST=2130706433` (libpq connected to 127.0.0.1), `HTTPS_PROXY=0x7f000001` | **Fixed:** words and numbers are shown as they are only for switches and ports (`GIT_SSL_NO_VERIFY`, `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`, `PGPORT`); elsewhere a bare number is a host and must be `a.b.c.d`. |
+| Low (noise) — `GOPROXY=https://proxy.golang.org, direct` warned, though Go trims each item | **Fixed:** `GOPROXY` items are trimmed of spaces. |
+| Documentation — "does not name a host that common parsers would not use" was false for the `#` case; "split as the program splits it" did not hold for Unicode spaces or `GOPROXY` padding; F1, F3 and F6 were recorded as fixed | **Fixed:** the docs state the aim and what it is checked against; the previous table records those three as partly fixed. |
 
 Each fix was reverted in a copy of the tree to see a test fail.

@@ -265,32 +265,37 @@ Requires approval; the dialog shows:
 The requester sets these variables, and with them it can make an approved,
 well-known program send your secret to a server of its own: check the host
 of every one. They are settings found in the environment, not the
-connections the program will make. Only unambiguous values are shown. A
-list variable is judged item by item, split as the program that reads it
-splits it — `GOPROXY` at `,` and `|`; `PIP_EXTRA_INDEX_URL`,
+connections the program will make. Only unambiguous values are shown, and
+only values of printable ASCII: anything else (U+00A0, which Python splits
+at like a space; a control character) is not shown at all. A list variable
+is judged item by item, at the separators its program uses — `GOPROXY` at
+`,` and `|`, each item trimmed of spaces as Go does; `PIP_EXTRA_INDEX_URL`,
 `PIP_TRUSTED_HOST`, `UV_EXTRA_INDEX_URL`, `UV_INDEX` and `UV_INSECURE_HOST`
 at spaces — and uv's `name=URL` items keep their name. Any other value is
-one item, so that a comma or a space inside a URL, in a password or a path,
-never splits it. Shown:
+one item, never split, and is not shown if it contains a space. Shown:
 
 - a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
   names, passwords, paths, queries and fragments — where credentials and
   webhook tokens travel — are left out;
-- `user:password@host` without a scheme as `…@host`; a host name, a
-  canonical IPv4 address (`10.0.0.1`), a bracketed IPv6 address, or a word
-  (`direct`, `0`, `1`) as it is;
+- `user:password@host` without a scheme as `…@host`; a host name
+  (`direct` and `off` read as such), a canonical IPv4 address (`10.0.0.1`)
+  or a bracketed IPv6 address as it is;
+- the value of a switch or a port — `GIT_SSL_NO_VERIFY`,
+  `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`, `PGPORT` — as it is
+  when it is one word or number;
 - a local socket or file (`unix:///run/docker.sock`), the paths of
   certificate variables, and absolute paths, as they are.
 
 Anything else appears as `(not shown)`, and a warning names the variable:
-a backslash or a control character anywhere; two `@`; a host with
-characters other than letters, digits, `.`, `-` and `_`; a numeric host
-other than `a.b.c.d` (`127.1`, `0x7f.1`, `2130706433.`, which parsers turn
-into `127.0.0.1` each in its own way); an empty host outside `unix:` and
-`file:` (`https:///host/…`, `https:/host`); a path that starts with `//`;
-and a URL whose query names another destination (`host`, `hostaddr`,
-`port`, `service` — libpq connects to those, not to the URL's host — or a
-parameter name with `%`). Programs read such values differently (a parser
+a backslash anywhere; two `@`; a `#` (libpq reads it as part of a value and
+goes on reading parameters); a host with characters other than letters,
+digits, `.`, `-` and `_`; a numeric host other than `a.b.c.d` (`127.1`,
+`0x7f.1`, `2130706433`, which resolvers turn into `127.0.0.1` each in its
+own way); an empty host outside `unix:` and `file:` (`https:///host/…`,
+`https:/host`); a path that starts with `//`; and a URL whose query names
+another destination (`host`, `hostaddr`, `port`, `service` — libpq connects
+to those, not to the URL's host) or has a parameter name with characters
+other than letters, digits, `_`, `-` and `.`. Programs read such values differently (a parser
 that takes `\` for `/` connects to the host before the `@`, while the text
 after it names another), so a host drawn from them could be the wrong one,
 and copying them could disclose a credential. The audit log gets the same

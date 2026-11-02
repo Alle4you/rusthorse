@@ -206,6 +206,21 @@ pub const LIST_VARS: &[(&str, &[char])] = &[
     ("UV_INSECURE_HOST", &[' ']),
 ];
 
+/// Destination variables whose value is a word or a number, not a host:
+/// certificate-check switches (`GIT_SSL_NO_VERIFY=1`) and `PGPORT`. Any
+/// other value that is a bare number is read as a host — `2130706433` is
+/// `127.0.0.1` to most resolvers — and is not shown.
+pub const WORD_VARS: &[&str] = &[
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "GIT_SSL_NO_VERIFY",
+    "PYTHONHTTPSVERIFY",
+    "PGPORT",
+];
+
+/// List variables whose items may have spaces around them, which their
+/// program removes (Go trims each item of `GOPROXY`).
+pub const TRIMMED_ITEM_VARS: &[&str] = &["GOPROXY"];
+
 /// Variables whose items may be named, `name=URL` (uv's indexes).
 pub const NAMED_ITEM_VARS: &[&str] = &["UV_INDEX", "UV_DEFAULT_INDEX"];
 
@@ -217,8 +232,9 @@ pub const LOCAL_SCHEMES: &[&str] = &["unix", "file"];
 /// Query parameters with which a connection library takes its destination
 /// from the query instead of the URL's host — libpq's `host`, `hostaddr`,
 /// `port`, `service`; sockets and servers in other drivers. A URL with one
-/// of them (or with an encoded parameter name) is not shown: its host is
-/// not where the program connects.
+/// of them (or with a parameter name of other characters than letters,
+/// digits, `_`, `-` and `.`) is not shown: its host is not where the
+/// program connects.
 pub const REDIRECTING_QUERY_KEYS: &[&str] = &[
     "host",
     "hostaddr",
@@ -244,32 +260,61 @@ pub const NOT_SHOWN: &str = "(not shown)";
 /// one item. Only unambiguous forms are shown: a URL keeps its scheme, host
 /// and port and loses its user name, password, path, query and fragment,
 /// where credentials and tokens travel (`https://…@proxy:3128/…`; a webhook
-/// URL is a secret); `user:password@host` loses its user part; a host name,
-/// a canonical IPv4 address, a word (`direct`, `0`), an absolute path
-/// (`unix:///run/docker.sock`) are shown as they are. Anything else — a
-/// backslash or a control character anywhere, several `@`, a host with
-/// characters other than letters, digits, `.`, `-` and `_`, a numeric host
-/// that is not `a.b.c.d` (`127.1`, `0x7f.1`), an empty authority outside
+/// URL is a secret); `user:password@host` loses its user part; a host name
+/// (`direct`), a canonical IPv4 address, an absolute path
+/// (`unix:///run/docker.sock`) are shown as they are, and so is the word or
+/// number of a switch or a port ([`WORD_VARS`]). Anything else — a character
+/// outside printable ASCII or a backslash anywhere, a space outside a list's
+/// separators, several `@`, a `#`, a host with characters other than
+/// letters, digits, `.`, `-` and `_`, a numeric host that is not `a.b.c.d`
+/// (`127.1`, `0x7f.1`, `2130706433`), an empty authority outside
 /// [`LOCAL_SCHEMES`], a query that names another destination
 /// ([`REDIRECTING_QUERY_KEYS`]) — is not shown: programs read such values
 /// differently (a URL parser that takes `\` for `/` connects to the host
 /// *before* the `@`), so a host drawn from them could be the wrong one, and
 /// copying them could disclose a credential.
 pub fn shown_destination(name: &str, value: &str) -> (String, bool) {
-    if value.chars().any(|c| c == '\\' || c.is_control()) {
-        return (NOT_SHOWN.to_string(), true);
+    let not_shown = || (NOT_SHOWN.to_string(), true);
+    // Outside printable ASCII, programs split and decode differently
+    // (Python's `str.split` also splits at U+00A0): nothing is shown.
+    if value
+        .bytes()
+        .any(|b| !(b' '..=b'~').contains(&b) || b == b'\\')
+    {
+        return not_shown();
     }
     let upper = name.to_ascii_uppercase();
+    if WORD_VARS.contains(&upper.as_str()) {
+        let word = !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+        return if word {
+            (value.to_string(), false)
+        } else {
+            not_shown()
+        };
+    }
     let separators: &[char] = LIST_VARS
         .iter()
         .find(|(list, _)| *list == upper)
         .map_or(&[], |(_, separators)| separators);
+    let trimmed = TRIMMED_ITEM_VARS.contains(&upper.as_str());
+    // A space is a separator, or an item's padding, or not shown at all.
+    if value.contains(' ') && !trimmed && !separators.contains(&' ') {
+        return not_shown();
+    }
     let named = NAMED_ITEM_VARS.contains(&upper.as_str());
     let mut shown = String::new();
     let mut unusual = false;
     let mut item = String::new();
     let mut flush = |item: &mut String, shown: &mut String| {
-        match shown_named_item(item, named) {
+        let text = if trimmed {
+            item.trim_matches(' ')
+        } else {
+            item.as_str()
+        };
+        match shown_named_item(text, named) {
             Some(text) => shown.push_str(&text),
             None => {
                 shown.push_str(NOT_SHOWN);
@@ -326,6 +371,11 @@ fn shown_item(item: &str) -> Option<String> {
     if item.is_empty() {
         return Some(String::new());
     }
+    // A fragment means different things to different programs (libpq reads
+    // `#` as part of a query value and goes on reading parameters).
+    if item.contains('#') {
+        return None;
+    }
     if let Some((scheme, rest)) = item.split_once("://") {
         let mut chars = scheme.chars();
         let scheme_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
@@ -349,14 +399,6 @@ fn shown_item(item: &str) -> Option<String> {
     if item.starts_with('/') {
         return absolute_paths(item).then(|| item.to_string());
     }
-    // A lone word — `direct`, `off`, `0`, `1` — is shown as it is: switches
-    // such as `GIT_SSL_NO_VERIFY=1` hold words, not hosts.
-    if item
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Some(item.to_string());
-    }
     let end = item.find('/').unwrap_or(item.len());
     let (authority, tail) = item.split_at(end);
     let (user, host) = split_user(authority)?;
@@ -370,14 +412,17 @@ fn redirecting_query(tail: &str) -> bool {
     let Some((_, query)) = tail.split_once('?') else {
         return false;
     };
-    let query = query.split('#').next().unwrap_or_default();
     query.split(['&', ';']).any(|pair| {
         let key = pair
             .split('=')
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        key.contains('%') || REDIRECTING_QUERY_KEYS.contains(&key.as_str())
+        // A name made of other characters (`%`, a second `?`) may be
+        // decoded or split into one of those.
+        !key.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            || REDIRECTING_QUERY_KEYS.contains(&key.as_str())
     })
 }
 
@@ -788,7 +833,6 @@ mod tests {
             ("u:FAKE@proxy.invalid:3128", "…@proxy.invalid:3128"),
             ("/home/me/ca@2.pem", "/home/me/ca@2.pem"),
             ("file:///etc/app.sock", "file:///etc/app.sock"),
-            ("1", "1"),
             ("direct", "direct"),
             (
                 "pg://h.invalid/db?sslmode=require&connect_timeout=2",
@@ -823,6 +867,23 @@ mod tests {
             ("127.1:5432", "(not shown)"),
             ("http://0177.0.0.1/", "(not shown)"),
             ("http://010.0.0.1/", "(not shown)"),
+            // A bare number is a host to most resolvers (127.0.0.1 here).
+            ("2130706433", "(not shown)"),
+            ("0x7f000001", "(not shown)"),
+            // libpq reads `#` as part of a value and goes on reading.
+            (
+                "pg://u@a.invalid/db?application_name=x#y&hostaddr=1.2.3.4",
+                "(not shown)",
+            ),
+            ("https://h.invalid/#frag", "(not shown)"),
+            ("pg://u@a.invalid/db?a?b=c", "(not shown)"),
+            // Outside printable ASCII nothing is shown (U+00A0 splits for
+            // Python), nor a space in a value that is not a list.
+            (
+                "https://a.invalid/simple\u{a0}https://b.invalid",
+                "(not shown)",
+            ),
+            ("https://a.invalid/x y", "(not shown)"),
             ("http://256.0.0.1/", "(not shown)"),
         ] {
             let (text, unusual) = shown_destination("SOME_URL", value);
@@ -852,6 +913,24 @@ mod tests {
                 "b@d=https://a.invalid name=https://a.invalid",
                 "(not shown) name=https://a.invalid",
             ),
+            // Go trims each item of GOPROXY.
+            (
+                "GOPROXY",
+                "https://proxy.golang.org, direct",
+                "https://proxy.golang.org,direct",
+            ),
+            (
+                "PIP_EXTRA_INDEX_URL",
+                "https://a.invalid\u{a0}https://b.invalid",
+                "(not shown)",
+            ),
+            // Switches and ports hold words and numbers, not hosts.
+            ("GIT_SSL_NO_VERIFY", "1", "1"),
+            ("NODE_TLS_REJECT_UNAUTHORIZED", "0", "0"),
+            ("PGPORT", "5432", "5432"),
+            ("PGPORT", "5432 x", "(not shown)"),
+            ("PGHOST", "2130706433", "(not shown)"),
+            ("HTTPS_PROXY", "0x7f000001", "(not shown)"),
         ] {
             let (text, _) = shown_destination(name, value);
             assert_eq!(text, shown, "{name}={value}");
