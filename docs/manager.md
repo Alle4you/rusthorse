@@ -45,7 +45,8 @@ cargo run --locked -p rusthorse-manager
 ## The window
 
 The window has three columns: a sidebar of fixed width, the entry list, and
-the details, which take any extra width.
+the details, which take any extra width. It fits a screen 1024 pixels wide
+(about 950 at its narrowest, measured with the default font).
 
 - **Sidebar.** The state of the vault (Locked, Unlocked, Unavailable), the
   pages, and one button that unlocks or locks. Under it, when the vault is
@@ -54,11 +55,13 @@ the details, which take any extra width.
   group filter. Search looks at names, UUIDs, groups, logins, URLs, hosts and
   tags — only metadata the manager already has.
 - **Details.** The selected entry: its actions (Edit, New random value,
-  Delete), the **Secret** rows (Value and Notes, with Show and Copy), the
+  Delete), the **Secret** rows (Value and Notes, each with **Show…** and
+  **Copy…**), the
   **Details** (login, URL, host, port, tags, the names of other fields, the
   UUID) and the command to use it. Each row has its name on the left and
-  its content on the right; the details can be selected and copied, since
-  none of them is secret.
+  its content on the right (screen readers name the row by it); the details
+  can be selected and copied, since none of them is secret. No hyphen is
+  added where a long value, URL or command wraps.
 - **Bottom line.** The result of the last action, and a spinner while the
   agent is waiting for you to answer one of its dialogs.
 
@@ -153,14 +156,14 @@ safe.
 
 ### Show a value
 
-**Show value…** (or **Show notes…**) asks the agent; its dialog says
+**Show…** in the Value row (or in the Notes row) asks the agent; its dialog says
 "Show the value of an entry on screen?". After you allow it, the value
 appears in a small window:
 
 - as plain text in the monospace font, which tells `0` from `O` and `l`
-  from `1`, wrapped where the line ends — never split into groups or
-  changed. Characters that the agent's dialogs would not draw appear as
-  `\u{…}` escapes;
+  from `1`, wrapped where the line ends, with no hyphen added at the break
+  and no grouping. Characters that the agent's dialogs would not draw appear
+  as `\u{…}` escapes;
 - not selectable, so that it never lands in the X11 primary selection;
 - for 30 seconds at most, and it closes as soon as the window loses focus,
   when you click **Hide now**, or when the vault is locked.
@@ -176,8 +179,8 @@ can see a shown value. Never ask an AI agent to use Show.
 ### Copy a value
 
 For a key you need to paste into a web console, a sign-in form or a
-program's password prompt, use **Copy value…** in the Secret rows (or
-**Copy** in the Show window).
+program's password prompt, use **Copy…** in the Value row (or **Copy** in
+the Show window).
 
 1. The agent asks "**Copy the value of an entry to the clipboard?**".
 2. After you allow it, the value is on the clipboard like any text you copy:

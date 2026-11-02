@@ -81,7 +81,7 @@ approval that is never remembered. The value appears in a window of its own:
 
 - plain text, not selectable, so it never reaches the primary selection;
 - as one piece of plain text in the monospace font, wrapped at the line's
-  end and never split into groups (an earlier version grouped it by four
+  end with no hyphen added, and never split into groups (an earlier version grouped it by four
   characters; with a Copy button next to it, reading it in chunks no longer
   pays for the clutter); characters outside the dialogs' allow-list appear
   as `\u{…}` escapes, as in the agent's dialogs;

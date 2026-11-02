@@ -830,3 +830,33 @@ Each fix was reverted in a copy of the tree to see a test fail (3 of 3;
 the documentation fixes have no test).
 
 Verification (Codex, 2026-11-01): **ready to keep trying with fake entries.** Two low points followed and were fixed: the tests of an older agent now pin protocol 3 (and the version may not go below 4, checked at compile time), and the remaining texts that called protocol 3 current were corrected.
+
+**Layout as in the prototype (2026-11-01).** The maintainer found the
+details squeezed and the grouped, bold value of the Show window pointless
+now that it can be copied. The sidebar took half of any spare width (a
+child's `hexpand` propagated to it); it now has a fixed width, the details
+take the rest, rows are key/value lines, and Show draws the value as one
+plain label.
+
+Review of that change (Codex, AI-assisted, 2026-11-01; verdict: not ready;
+no new way for a value to leave, no authorization change), and what was
+done:
+
+| Finding | Disposition |
+|---|---|
+| Medium — the window's minimum width grew from 985 to 1121 pixels: a 1024-pixel screen no longer held it (the key column, the bullets that could not shrink, and the long Show and Copy labels) | **Fixed:** a 120-pixel key column as in the prototype, bullets that shrink, buttons labelled **Show…** and **Copy…** (the row says Value or Notes; the full action is in the tooltip and the accessible name), and a list that narrows to 260. The narrowest layout is now 941 pixels, 951 with the window's frame; the widget test measures it. |
+| Medium — the key/value rows had lost their accessible names (AT-SPI showed them unnamed, without a labelled-by relation) | **Fixed:** each row is labelled by its key label; the Show and Copy buttons carry "Show the value", "Copy the value to the clipboard", …. The widget test checks the relation and the names. |
+| Low — Pango drew a hyphen where a long value wrapped in the Show window (`W-` with a value of `W`s), and the guide said the value is never changed | **Fixed:** no hyphens in the Show window, the command snippet or any metadata label; the guide says so. The widget test checks the attribute. |
+
+Each fix was reverted in a copy of the tree to see a test fail (5 of 5).
+Ideas from the same review, not adopted yet: fold the UUID and technical
+fields into "Advanced details", tags as separate chips, a list that can be
+collapsed, Show and Copy beside their field in a compact layout.
+
+**Entry kinds (2026-11-01).** At the maintainer's request:
+[ADR 0008](adr/0008-entry-kinds.md) (kinds, protocol 5, `run --url`).
+Writing it made one existing gap visible, now in L4: variables that redirect
+where an approved program sends a key (`OPENAI_BASE_URL`, `HTTPS_PROXY`)
+come from the requester and are not listed in the run dialog. Ten mutations
+of the new behaviour, and one of a fix made before review (a kind hid a row
+whose field the file withholds), each made a test fail. Awaiting review.

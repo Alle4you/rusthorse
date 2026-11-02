@@ -81,7 +81,16 @@ fn label(text: &str) -> gtk::Label {
         .xalign(0.0)
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)
+        .attributes(&no_hyphens())
         .build()
+}
+
+/// Text attributes that stop Pango from drawing a hyphen where it breaks a
+/// word: a value, a URL or a command must look exactly as it is.
+fn no_hyphens() -> pango::AttrList {
+    let list = pango::AttrList::new();
+    list.insert(pango::AttrInt::new_insert_hyphens(false));
+    list
 }
 
 fn styled(text: &str, classes: &[&str]) -> gtk::Label {
@@ -144,8 +153,9 @@ fn group(title: &str, description: Option<&str>) -> adw::PreferencesGroup {
 /// as in the approved prototype (`docs/design/manager/`).
 const SIDEBAR_WIDTH: i32 = 230;
 
-/// Width of the key column in key/value rows, so that values line up.
-const KEY_WIDTH: i32 = 150;
+/// Width of the key column in key/value rows, so that values line up (as in
+/// the prototype; longer keys wrap).
+const KEY_WIDTH: i32 = 120;
 
 /// A boxed row laid out as a key on the left and its content on the right.
 fn key_row(key: &str, content: &impl IsA<gtk::Widget>) -> adw::PreferencesRow {
@@ -156,11 +166,16 @@ fn key_row(key: &str, content: &impl IsA<gtk::Widget>) -> adw::PreferencesRow {
     k.set_valign(gtk::Align::Center);
     line.append(&k);
     line.append(content);
-    adw::PreferencesRow::builder()
+    let row = adw::PreferencesRow::builder()
         .title(key)
         .activatable(false)
         .child(&line)
-        .build()
+        .build();
+    // Screen readers name the row by its key, as they did the action rows
+    // these replaced; its content says what it holds.
+    row.upcast_ref::<gtk::Widget>()
+        .update_relation(&[gtk::accessible::Relation::LabelledBy(&[k.upcast_ref()])]);
+    row
 }
 
 /// A row showing requester-independent metadata as plain, selectable text.
@@ -240,7 +255,9 @@ impl Manager {
         entries_page.set_shrink_end_child(false);
         let left = column(10);
         margins(&left, 12, 12);
-        left.set_width_request(280);
+        // The narrowest the list gets when the window is narrow; it starts
+        // at 340.
+        left.set_width_request(260);
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search names, logins, hosts, tags")
             .build();
@@ -1138,13 +1155,22 @@ impl Manager {
                 })
                 .use_markup(false)
                 .xalign(0.0)
+                .ellipsize(pango::EllipsizeMode::End)
                 .css_classes(["dim-label"])
                 .build();
             state.set_hexpand(true);
             state.set_valign(gtk::Align::Center);
             line.append(&state);
+            // Short labels — the row says Value or Notes — keep the panel
+            // narrow; the full action is in the tooltip and the accessible
+            // name.
             let what = if notes { "notes" } else { "value" };
-            let show = button(&format!("Show {what}…"), Some("view-reveal-symbolic"));
+            let show = button("Show…", Some("view-reveal-symbolic"));
+            show.set_widget_name(&format!("show-{what}"));
+            show.set_tooltip_text(Some(&format!("Show the {what}…")));
+            show.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Show the {what}"
+            ))]);
             show.set_valign(gtk::Align::Center);
             show.set_sensitive(present);
             let e = entry.clone();
@@ -1162,7 +1188,12 @@ impl Manager {
                 )
             });
             line.append(&show);
-            let copy = button(&format!("Copy {what}…"), Some("edit-copy-symbolic"));
+            let copy = button("Copy…", Some("edit-copy-symbolic"));
+            copy.set_widget_name(&format!("copy-{what}"));
+            copy.set_tooltip_text(Some(&format!("Copy the {what} to the clipboard…")));
+            copy.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Copy the {what} to the clipboard"
+            ))]);
             copy.set_valign(gtk::Align::Center);
             copy.set_sensitive(present);
             let e = entry.clone();
@@ -1225,6 +1256,7 @@ impl Manager {
             .selectable(true)
             .wrap(true)
             .wrap_mode(pango::WrapMode::WordChar)
+            .attributes(&no_hyphens())
             .xalign(0.0)
             .css_classes(["monospace"])
             .build();
@@ -1326,6 +1358,7 @@ impl Manager {
             .selectable(false)
             .wrap(true)
             .wrap_mode(pango::WrapMode::Char)
+            .attributes(&no_hyphens())
             .xalign(0.0)
             .css_classes(["monospace"])
             .build();

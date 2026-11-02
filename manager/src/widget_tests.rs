@@ -80,6 +80,26 @@ fn button(root: &impl IsA<gtk::Widget>, text: &str) -> gtk::Button {
         .unwrap_or_else(|| panic!("button missing: {text}"))
 }
 
+/// The button with this widget name.
+fn named(root: &impl IsA<gtk::Widget>, name: &str) -> gtk::Button {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .find(|b| b.widget_name() == name)
+        .unwrap_or_else(|| panic!("button missing: {name}"))
+}
+
+/// Whether Pango may not draw hyphens where it breaks this label's words.
+fn hyphenless(l: &gtk::Label) -> bool {
+    l.attributes().is_some_and(|list| {
+        list.attributes().iter().any(|a| {
+            a.type_() == pango::AttrType::InsertHyphens
+                && a.downcast_ref::<pango::AttrInt>()
+                    .is_some_and(|i| i.value() == 0)
+        })
+    })
+}
+
 fn entry_rows(root: &impl IsA<gtk::Widget>) -> Vec<adw::EntryRow> {
     let mut rows: Vec<_> = descendants(root)
         .into_iter()
@@ -367,6 +387,36 @@ fn desktop_flow() {
     let settle_frame = Instant::now() + Duration::from_millis(200);
     spin_until(|| Instant::now() >= settle_frame);
     snapshot(&s, "manager-light.png");
+    // The window fits a 1024-pixel screen: its narrowest layout, with an
+    // entry selected, is measured as GTK lays it out.
+    let (narrowest, _, _, _) = s
+        .window
+        .content()
+        .expect("content")
+        .measure(gtk::Orientation::Horizontal, -1);
+    let (window_min, _, _, _) = s.window.measure(gtk::Orientation::Horizontal, -1);
+    assert!(
+        narrowest <= 960 && window_min <= 1000,
+        "minimum width {narrowest}, {window_min} with the window's frame"
+    );
+    // Every key/value row is named by its key for screen readers, and the
+    // short Show and Copy buttons carry the full action.
+    let rows: Vec<_> = descendants(&s.detail)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::PreferencesRow>().ok())
+        .filter(|r| r.type_() == adw::PreferencesRow::static_type())
+        .collect();
+    assert!(rows.len() >= 4);
+    assert!(rows.iter().all(|r| gtk::test_accessible_has_relation(
+        r.upcast_ref::<gtk::Widget>(),
+        gtk::AccessibleRelation::LabelledBy
+    )));
+    for name in ["show-value", "copy-value", "show-notes", "copy-notes"] {
+        assert!(gtk::test_accessible_has_property(
+            &named(&s.detail, name),
+            gtk::AccessibleProperty::Label
+        ));
+    }
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     let settle_frame = Instant::now() + Duration::from_millis(250);
     spin_until(|| Instant::now() >= settle_frame);
@@ -420,7 +470,7 @@ fn desktop_flow() {
     assert!(!copied.contains("FAKE-desktop-value"));
 
     allowed.store(false, Ordering::SeqCst);
-    button(&s.detail, "Show value…").emit_clicked();
+    named(&s.detail, "show-value").emit_clicked();
     settle(&s);
     assert!(s.revealed.borrow().is_none());
     assert!(s.message.text().contains("denied"));
@@ -431,13 +481,15 @@ fn desktop_flow() {
     settle(&s);
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     allowed.store(true, Ordering::SeqCst);
-    button(&s.detail, "Show value…").emit_clicked();
+    named(&s.detail, "show-value").emit_clicked();
     settle(&s);
     let reveal = s.revealed.borrow().as_ref().unwrap().clone();
     assert_eq!(shown_text(&reveal), "FAKE-desktop-value");
     let parts = value_labels(&reveal);
-    // Plain text: not selectable (no PRIMARY), not bold, not split up.
+    // Plain text: not selectable (no PRIMARY), not bold, not split up, and
+    // no hyphen drawn where a long value wraps.
     assert!(parts.iter().all(|l| !l.is_selectable()));
+    assert!(parts.iter().all(hyphenless));
     assert!(
         parts
             .iter()
@@ -469,7 +521,7 @@ fn desktop_flow() {
     s.refresh();
     settle(&s);
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
-    button(&s.detail, "Show notes…").emit_clicked();
+    named(&s.detail, "show-notes").emit_clicked();
     settle(&s);
     let notes = s.revealed.borrow().as_ref().unwrap().clone();
     assert_eq!(shown_text(&notes), "FAKE-notes");
@@ -503,11 +555,11 @@ fn desktop_flow() {
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     s.window.clipboard().set_text("before the copy");
     allowed.store(false, Ordering::SeqCst);
-    button(&s.detail, "Copy value…").emit_clicked();
+    named(&s.detail, "copy-value").emit_clicked();
     settle(&s);
     assert_eq!(paste().as_deref(), Some("before the copy"));
     allowed.store(true, Ordering::SeqCst);
-    button(&s.detail, "Copy value…").emit_clicked();
+    named(&s.detail, "copy-value").emit_clicked();
     settle(&s);
     assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
     assert_eq!(paste().as_deref(), Some("FAKE-desktop-value"));
@@ -520,7 +572,7 @@ fn desktop_flow() {
     // The Show window copies what it shows, exactly, without asking again.
     s.window.clipboard().set_text("before the copy");
     let before = approvals.load(Ordering::SeqCst);
-    button(&s.detail, "Show value…").emit_clicked();
+    named(&s.detail, "show-value").emit_clicked();
     settle(&s);
     assert_eq!(approvals.load(Ordering::SeqCst), before + 1);
     let reveal = s.revealed.borrow().as_ref().unwrap().clone();
@@ -591,7 +643,7 @@ fn desktop_flow() {
     // A value that arrives after such a lock was seen is not used.
     s.window.clipboard().set_text("before the copy");
     hold.store(true, Ordering::SeqCst);
-    button(&s.detail, "Copy value…").emit_clicked();
+    named(&s.detail, "copy-value").emit_clicked();
     spin_until(|| asking.load(Ordering::SeqCst));
     s.lock_seen.set(true);
     hold.store(false, Ordering::SeqCst);
