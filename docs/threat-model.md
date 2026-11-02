@@ -1107,3 +1107,11 @@ Each fix was reverted in a copy of the tree to see a test fail (3 of 3). A
 mutation script had counted syntax errors as failing tests; the one earlier
 mutation that might have been such a case was redone as valid code and
 still failed the test.
+
+Third verification (Codex, AI-assisted, 2026-11-02): **ready.** The finding
+is confirmed fixed — the reproduction (a lock held up, `PrepareForSleep`,
+logind's name changing hands) keeps the inhibitor until the lock completes,
+and restoring the previous code makes both it and the project's test fail.
+No new medium or high finding. The reviewer's opinion: sufficient for the
+documented use, accepting the dependence on the desktop's signals and buses
+and logind's maximum delay (L20).
