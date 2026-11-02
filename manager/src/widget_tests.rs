@@ -1051,10 +1051,14 @@ fn desktop_flow() {
             .map(|r| r.title().to_string())
     };
     entry_rows(&editor)[1].set_text("work / servers");
-    assert_eq!(
-        warned(&editor).as_deref(),
-        Some("There is already a group named Work/Servers; names are case-sensitive.")
-    );
+    let twin = Some("There is already a group named Work/Servers; names are case-sensitive.");
+    assert_eq!(warned(&editor).as_deref(), twin);
+    // Away from "New group…" and back: the text is still there, and so is
+    // the warning.
+    pick_group(&groups, "No group");
+    assert_eq!(warned(&editor), None);
+    pick_group(&groups, "New group…");
+    assert_eq!(warned(&editor).as_deref(), twin);
     entry_rows(&editor)[1].set_text("Work/Servers/New");
     assert_eq!(warned(&editor), None);
     // "New group…" with nothing typed sends nothing.

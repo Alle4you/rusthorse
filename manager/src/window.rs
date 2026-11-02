@@ -1878,6 +1878,7 @@ impl Manager {
             // Weak references: these closures are stored on the form's own
             // widgets.
             let (row, warning) = (fields[1].downgrade(), group_warning.downgrade());
+            let names = known.clone();
             group_list.connect_selected_notify(move |list| {
                 let (Some(row), Some(warning)) = (row.upgrade(), warning.upgrade()) else {
                     return;
@@ -1885,32 +1886,18 @@ impl Manager {
                 let new = list.selected() == new_group_index;
                 row.set_visible(new);
                 if new {
+                    // What was typed before is still there: warn again.
+                    warn_case_twin(&names, &row, &warning);
                     row.grab_focus();
                 } else {
                     warning.set_visible(false);
                 }
             });
-            // A new group that differs from an existing one only in case is
-            // most likely a typo: names are case-sensitive.
             let names = known.clone();
             let warning = group_warning.downgrade();
             fields[1].connect_changed(move |row| {
-                let Some(warning) = warning.upgrade() else {
-                    return;
-                };
-                let typed = model::group_path(&row.text());
-                match names
-                    .iter()
-                    .find(|g| **g != typed && g.to_lowercase() == typed.to_lowercase())
-                {
-                    Some(existing) => {
-                        warning.set_title(&format!(
-                            "There is already a group named {}; names are case-sensitive.",
-                            rusthorse::ui::dialog_text(existing)
-                        ));
-                        warning.set_visible(true);
-                    }
-                    None => warning.set_visible(false),
+                if let Some(warning) = warning.upgrade() {
+                    warn_case_twin(&names, row, &warning);
                 }
             });
         }
@@ -2136,6 +2123,25 @@ impl Manager {
 /// Port), show those the kind offers — all of them with `all` — and every
 /// one with text or withheld by the file (`withheld`, in the same order);
 /// name the URL row for the kind.
+/// Show `warning` when the new group typed in `row` differs from an existing
+/// one only in case — most likely a typo, since names are case-sensitive.
+fn warn_case_twin(names: &[String], row: &adw::EntryRow, warning: &adw::ActionRow) {
+    let typed = model::group_path(&row.text());
+    match names
+        .iter()
+        .find(|g| **g != typed && g.to_lowercase() == typed.to_lowercase())
+    {
+        Some(existing) => {
+            warning.set_title(&format!(
+                "There is already a group named {}; names are case-sensitive.",
+                rusthorse::ui::dialog_text(existing)
+            ));
+            warning.set_visible(true);
+        }
+        None => warning.set_visible(false),
+    }
+}
+
 fn shape_rows(rows: &[adw::EntryRow], kind: Option<EntryKind>, withheld: [bool; 4], all: bool) {
     let offered = if all { None } else { kind };
     for ((row, field), withheld) in rows[2..6]

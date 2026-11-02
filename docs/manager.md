@@ -189,7 +189,8 @@ do. Spaces around each name and empty names are left out, so
 entry's name (at most 128 characters, no control or invisible characters):
 the form says which rule a name breaks before it sends anything, and warns
 when a new path differs from an existing group only in case. A group that
-holds no entry is not in the list; type its path after **New group…**.
+holds no entry, and has none in the groups below it, is not in the list;
+type its path after **New group…**.
 
 A new entry starts in the group the entry list is filtered on, or in **No
 group**. To **move** an entry, choose another group in **Edit**; **No

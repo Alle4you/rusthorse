@@ -1479,3 +1479,23 @@ the start of their UUID, L9); and P7 promised a 1000-character limit for
 every field, which applies to a run's command line, program path and
 directory (other details count towards the dialog's total and, with zenity,
 its height; a destination is never truncated).
+
+**Choose the group from a list (2026-11-02).** At the maintainer's request:
+a typed group path invites typos, and names are case-sensitive. The
+manager's forms offer No group, the groups in use and the groups above
+them, and "New group…" for a path, with a warning for a new path that
+differs from an existing group only in case; the form tells the model
+whether the human chose another group, so a chosen group is sent and the
+agent still decides by the group itself.
+
+Review (Codex, AI-assisted, 2026-11-02): **ready.** Searching, refreshing
+the list, renaming without a new choice, choosing another group and back,
+escaped labels and groups of the same name behaved as they should; a group
+of another client named `Work/Servers` offers an inferred `Work`, which the
+agent's dialog then shows as "creates Work at the top level". Two low
+findings, fixed and checked against the mistake (2 of 2): the case warning
+did not come back when "New group…" was chosen again with the text still
+there; and a new entry's group was checked by the agent only, after the form
+had closed — the form now checks it as it does for an edit. The guide now
+says that a group is left out of the list only when neither it nor any
+group below it holds an entry.

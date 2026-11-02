@@ -67,6 +67,9 @@ impl Form {
             .collect();
         let Some(old) = old else {
             rusthorse::vault::validate_name(&self.name).map_err(|e| e.to_string())?;
+            for component in group_path(&self.group).split('/').filter(|c| !c.is_empty()) {
+                rusthorse::vault::validate_name(component).map_err(|e| format!("Group: {e}"))?;
+            }
             return Ok(Request::Add {
                 entry: NewEntry {
                     name: self.name.clone(),
@@ -506,6 +509,17 @@ pub(crate) mod tests {
         form.group = "Work".into();
         let sent = changes(&form, &entry).expect("edit");
         assert_eq!(sent.group.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn a_new_entry_with_an_invalid_group_is_refused_before_sending() {
+        let form = Form {
+            name: "FAKE".into(),
+            group: "Work/Bad\u{200b}Name".into(),
+            ..Default::default()
+        };
+        let error = form.request(None, ValueMode::Prompt).expect_err("refused");
+        assert!(error.starts_with("Group: "), "{error}");
     }
 
     #[test]
