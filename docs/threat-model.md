@@ -6,7 +6,7 @@ document and the code, that is a bug; please report it
 ([SECURITY.md](../SECURITY.md)).
 
 - Applies to: Rusthorse 0.1.x
-- Last reviewed: 2026-10-31 (see [review history](#11-review-history))
+- Last reviewed: 2026-11-02 (ADR 0013 design; see [review history](#11-review-history))
 
 ## 1. Scope and the exact guarantee
 
@@ -1513,4 +1513,130 @@ allows; a same-user process can steal a token while it is valid (A2 needs
 isolation); private devices need pinned TLS; administration APIs need
 narrow operations; SSH with a password cannot be brokered (the maintainer
 moves the routers to SSH keys). Three overstatements in the roadmap and in
-L4 were corrected. The review of the ADR itself is pending.
+L4 were corrected. The four reviews of the ADR itself are recorded below.
+
+**Credential broker ADR reviews (2026-11-02).** At the maintainer's
+request: four adversarial reviews of [ADR 0013](adr/0013-credential-broker.md)
+before it becomes the basis for phase 1, checked against the agent, vault,
+execution, redaction, audit, protocol and supervision code and the security
+invariants. This entry was written by Codex (AI-assisted), at the
+maintainer's request on 2026-11-02, to record the dispositions before
+implementation; there is no phase 1 broker code yet, and its implementation
+will be reviewed separately. **Fixed (design)** below means specified in
+the amended ADR, not implemented or proved by running broker tests. The
+tables give the final dispositions; later rounds record the cases where
+earlier amendments had not yet closed a finding.
+
+Review (Codex, AI-assisted, 2026-11-02; verdict: not ready). The proposed
+ADR at `aff56e1` left 25 findings (F01–F25), ten open questions and further
+questions needed to implement phase 1 without inventing security policy.
+
+| Finding | Disposition |
+|---|---|
+| High — F01: a separate process was said to contain a compromised HTTP/TLS stack to one credential | **Fixed (design):** decisions 1 and 4 distinguish credentials present in one broker's memory from arbitrary code execution with the user's powers; the broker hardens itself before reading secrets (Components and processes). |
+| High — F02: broker cardinality, supervision, control-channel failure and restart behavior were unspecified | **Fixed (design):** one broker per grant; a bounded startup transaction, control-channel EOF and process-group termination govern its lifetime; no grant is restored after restart (Components and processes; Admission, revocation and the agent's registry). |
+| High — F03: admission, audit and revocation could race without one authority | **Fixed (design):** the agent's registry reserves uses and slots, records durably, rechecks before admission, and serializes revocation; ACK or kill marks completed revocation, with the earlier-admitted-request window documented (Admission, revocation and the agent's registry). |
+| High — F04: a grant could remain usable after its command leader exited while output or descendants kept the run alive | **Fixed (design):** detecting leader exit or requester disconnection revokes before process-group termination and output draining; the test includes a descendant that called `setsid` (The end of the command; Tests before real credentials). |
+| Medium — F05: exhausting the use count could revoke the request that consumed the last use | **Fixed (design):** `exhausted` differs from `revoked`; admitted requests finish, and the N-th request must complete in the limit test (decision 8; Admission, revocation and the agent's registry). |
+| High — F06: remembered approval could mint fresh grants and budgets without another decision | **Fixed (design):** a run with broker bindings never offers `--remember`; each approval creates its grants once (`run`, `grants` and the protocol). |
+| High — F07: route prefixes could admit batches, files or administrative operations beyond inference | **Fixed (design):** built-in presets have exact routes; batches, uploads, files and administration are excluded from phase 1 (Presets). |
+| High — F08: path normalization could make the checked path differ from the forwarded path | **Fixed (design):** one restricted path grammar, exact matching and the same path upstream; escapes, empty and dot segments, semicolons and backslashes are refused (Requests and responses). |
+| High — F09: HTTP framing and hop-by-hop handling did not define a safe forwarding boundary | **Fixed (design):** the final policy accepts Hyper's identical-length normalization, rejects conflicting lengths and every request transfer coding, restricts `Connection`, rebuilds framing and drops trailers (Requests and responses; N11 below). |
+| High — F10: local token authentication and upstream credentials could be confused or forwarded together | **Fixed (design):** each preset defines token headers and upstream authentication; conflicting token headers fail, other credentials are discarded, and queries are allowlisted (Presets; Requests and responses). |
+| High — F11: compressed responses, framing changes and short or transformed credentials defeated the proposed redaction guarantee | **Fixed (design):** only uncompressed response content and the permitted transfer coding are accepted; credential-bearing header values are dropped, output is chunked, credentials have a supported length/alphabet and HTTP redaction uses a fixed marker. Transformed echoes remain a documented limit; Basic is deferred (decision 1; Requests and responses). |
+| Medium — F12: passing redirects to an SDK could bypass the fixed destination | **Fixed (design):** every upstream `3xx` becomes a local `502` without `Location`; neither broker nor client follows an upstream redirect through this response (Requests and responses). |
+| Medium — F13: SDK retries could repeat charged or non-idempotent operations without a clear use count | **Fixed (design):** every admitted attempt consumes a use, regardless of outcome; local errors control retry advice and the guide recommends disabling SDK retries (Requests and responses; Answers 1 and 9). |
+| Medium — F14: a client's environment proxy could receive the loopback token and traffic | **Fixed (design):** both `NO_PROXY` and `no_proxy` include `127.0.0.1`; the broker has an empty environment and fixed CA-file policy. Custom client transports remain outside this environment guarantee (Components and processes; `run`, `grants` and the protocol). |
+| High — F15: using exit 125 after the command started would break the no-start error contract | **Fixed (design):** 125 applies only before command start; afterward the command's status is returned and individual HTTP outcomes are audited (decision 6; Answer 6). |
+| Medium — F16: edits, replacement, failed saves and external reloads lacked complete grant invalidation rules | **Fixed (design):** entry changes end its grants, replacement removes the profile, failed saves end all grants, and the final unlock barrier compares encrypted-file content and revokes all survivors on change (Profiles; Admission, revocation and the agent's registry; N01 below). |
+| Medium — F17: profile storage, validation and preset evolution were not specified | **Fixed (design):** the unprotected `Rusthorse.Broker` field holds strict versioned JSON; invalid or protected profiles are unusable, preset revisions stay fixed, and the base-path grammar is canonical (Profiles). |
+| Medium — F18: broker bindings, URL routing, mixed execution and protocol compatibility lacked an enforceable wire contract | **Changed by the maintainer's decision:** mixed bindings are allowed for different entry UUIDs, never the same entry in both modes; `--no-redact` is allowed with a warning. Agent-side validation and protocol 8's distinct `broker_run` and `broker_edit` requests close silent downgrade paths (`run`, `grants` and the protocol). |
+| Medium — F19: recording raw paths or queries could put credentials or tokens in the audit log | **Fixed (design):** audit records contain the grant ID, method and route template, never raw paths, queries, header values or bodies (Audit records). |
+| Medium — F20: one audit event could not distinguish permission to forward from the request's eventual outcome | **Fixed (design):** durable admission and completion are separate records; failed completion recording revokes the grant, while revocation never waits for audit I/O (Audit records; Admission, revocation and the agent's registry). |
+| Medium — F21: missing resource budgets and deadlines left streaming and concurrent requests unbounded | **Fixed (design):** phase 1 specifies grant, connection, request, body-memory, DNS and time limits; body capacity is reserved before admission and reading (Requests and responses; Limits). |
+| Medium — F22: a reused loopback port, DNS rebinding or browser access could undermine the local endpoint | **Fixed (design):** the agent retains the listener, publishes a literal loopback address and validates `Host`; `Origin` is refused. The absence of server authentication on the plaintext local hop is **documented** (Components and processes; Requests and responses; Consequences). |
+| Medium — F23: DNS and TLS policy could allow credentials to reach private or unverified destinations | **Fixed (design):** only checked public addresses are connected to, without resolving again; Host/SNI come from the profile, TLS verification uses the fixed trust policy, and redirects are not followed (Requests and responses). |
+| Medium — F24: guarantees exceeded the design and conflicted with the existing agent-only secret invariant | **Fixed (design):** guarantees apply to brokered bindings, state same-user and transformed-echo limits, and distinguish memory separation from code-execution containment; Consequences requires updating invariant 1 with implementation. Later wording residuals are recorded below. |
+| Medium — F25: approval did not expose the grant's effective authority and limits | **Fixed (design):** decision 7 requires destination, every route, termination policy, duration, request limit or its absence, concurrency, real-value bindings, cost and opaque-body warnings; existing dialog escaping and refusal-on-size invariants still apply. |
+| Medium — further questions: states, token format, IPC contents, quota authority, completed revocation, clocks and idle, cookies/cache, Basic, preset evolution, invalid/protected profiles, manual revocation, traffic assets, body handling and audit-independent revocation | **Answered (design):** Phase 1 specification assigns these contracts to the registry, token, control-channel, profile, HTTP, audit and manager sections; Consequences adds the assets. Basic is explicitly deferred to phase 2 rather than left implicit in phase 1. |
+
+On 2026-11-02 the maintainer accepted the ten recommended answers (the
+ADR's Answers section) and chose the following policy changes: profiles
+select `automatic_locks: end` or `continue`; AI presets default to
+`continue` and 12 hours, while device profiles in phase 2 default to `end`
+and 15 minutes. Command end, explicit lock, manual revocation, relevant
+entry changes, failed saves, broker failure, agent stop and expiry still
+end grants. `--broker` with `--no-redact` is allowed with an approval
+warning for interactive clients; mixed runs are allowed for different
+entries. Basic and generic profiles move to phase 2; the manager's grants
+panel belongs to phase 1, with profile editing in the CLI. These are
+maintainer decisions, not unresolved findings demanding the earlier policy.
+
+Second review (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Rechecked F01–F25 and the further questions against the rewritten ADR;
+identified 11 concrete cases (N01–N11) and eight inconsistencies
+(C01–C08), including residuals of the first review.
+
+| Finding | Disposition |
+|---|---|
+| High — N01: `continue` grants could survive loading an externally changed entry | **Fixed (design), after the third review:** the final unlock barrier keeps a keyed fingerprint of the encrypted file across locks and ends all surviving grants on a difference or absent reference, with reason `vault_changed`; an unchanged file preserves them (Admission, revocation and the agent's registry; Audit records). |
+| Medium — N02: reading bodies before admission allowed up to 32 GiB across the stated connection and grant limits | **Fixed (design):** each body is at most 16 MiB, its declared length is reserved against 64 MiB per broker before admission, and only admitted bodies are read (Requests and responses). |
+| Medium — N03: checking only `Content-Encoding` missed compressed `Transfer-Encoding` responses | **Fixed (design):** unsupported content encodings and any transfer coding other than exactly `chunked` produce a local 502 before response forwarding (Requests and responses). |
+| Medium — N04: the existing redactor skips short credentials that the profile still allowed | **Fixed (design):** credentials must contain 8 to 4096 visible ASCII characters without spaces, checked before approval; HTTP redaction uses `[REDACTED:credential]` rather than an entry-derived label (Requests and responses; `run`, `grants` and the protocol). |
+| Medium — N05: preparation lacked atomic publication, a startup deadline and rollback of all grants if spawn failed | **Fixed (design):** `starting` grants are registered with the generation check and credential read, installation has a ten-second deadline, and any failure stops all prepared brokers and releases their ports before returning 125 (Preparing a run's grants). |
+| Medium — N06: concurrent IPC requests and completions had no specified correlation or duplicate handling | **Fixed (design):** increasing request numbers correlate both directions; reused or invalid transitions end the grant and kill the broker without applying the offending message to counters (Request numbers; The control channel). |
+| Medium — N07: DNS and initial headers lacked deadlines, and blocking resolution could prevent shutdown on EOF | **Fixed (design):** the whole header block has a 30-second deadline, resolution plus connection has ten seconds and at most four resolutions run concurrently; process exit must not wait for pending resolution (Requests and responses; Leaving). |
+| Medium — N08: profile validation accepted dot-segment base paths that request validation refused | **Fixed (design):** the profile and request grammars exclude empty, `.` and `..` segments and a trailing slash (Profiles; Tests before real credentials). |
+| Medium — N09: an agent 7 encountered after the version check could ignore optional broker bindings in a mixed `run` | **Fixed (design):** `broker_run` is a new request discriminator, refused whole by agent 7; plain `run` cannot carry broker bindings (`run`, `grants` and the protocol). |
+| Medium — N10: registry revocation and effective cancellation were conflated, particularly for automatic locks | **Fixed (design):** every revocation awaits ACK or kill before reporting completion, documents the previously admitted request window, and retains L20's limits on when a suspend lock can begin (Revocation; R02 below). |
+| Medium — N11: Hyper removes CL when TE is present and merges identical CL headers before the handler can inspect them | **Changed (design):** the policy accepts identical CL normalization, rejects conflicting lengths and refuses every request TE; it no longer requires detecting headers the parser has discarded. This was a feasibility finding, not demonstrated request smuggling (Requests and responses). |
+| Low — C01: the containment claim still covered arbitrary code execution despite its caveat | **Fixed (design):** decisions 1 and 4 explicitly separate a leak of one process's memory from execution with the user's powers. |
+| Low — C02: token-only delivery and output redaction were stated without the mixed-run and `--no-redact` qualifications | **Fixed (design):** decisions 1 and 2 scope the promises to brokered bindings and enabled output filtering. |
+| Medium — C03: an opaque client body could contain the token despite the test's universal claim that the destination never receives it | **Fixed (design), through later reviews:** decision 1 acknowledges client-controlled body contents; the header guarantee is enforced by dropping allowed headers whose name or value contains the token (Requests and responses; R03 below). |
+| Medium — C04: saying a run's grants always end together contradicted per-entry and per-profile termination | **Fixed (design):** decision 8 and Answer 10 distinguish shared events from individual termination; the unlock barrier separately specifies conservative revocation of all survivors after an external vault change. |
+| Low — C05: `audit_failed` was used but missing from the audit reason list | **Fixed (design):** the Audit records table includes it. |
+| Low — C06: the ADR pointed to dispositions in this history before they had been recorded | **Recorded:** the history was written after the fourth verdict, as planned; this entry records all four rounds and replaces the earlier pending-review sentence. |
+| Low — C07: environment proxy behavior was presented as universal across SDK runtimes | **Fixed (design):** What the clients do distinguishes Python's transport behavior from Node configured to use environment proxies. |
+| Low — C08: approval could omit the absence of a request limit, concurrency or the raw-value part of a mixed run | **Fixed (design):** decision 7 requires all three explicitly. |
+
+Third review (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Most amendments were confirmed; N01 and C03 remained partial, and two new
+findings, R01 and R02, exposed a downgrade path for editing and an
+overstatement of suspend timing. R02 also explains the remaining N10
+qualification; these follow-ups are not additional first-round findings.
+
+| Finding | Disposition |
+|---|---|
+| High — N01, still partial: UUID, last-modification time and profile do not identify entry content; an external move can change only `location_changed`, and value edits can preserve timestamps | **Fixed (design):** the unlock barrier now compares the encrypted file's keyed content fingerprint, not entry timestamps, and conservatively ends every surviving grant on change. Its test includes a move and a value change with modification time preserved. |
+| Medium — R01: adding a profile to the existing `edit` let an agent 7 apply known fields, such as username, and silently ignore a more restrictive profile after a restart between connections | **Fixed (design):** every edit that sets or clears a profile uses `broker_edit`, including combined edits; plain `edit` refuses profile operations. The protocol test meets an agent 7 after checking version 8 (`run`, `grants` and the protocol; Tests before real credentials). |
+| Medium — R02, residual N10: a one-second broker cancellation budget did not guarantee that the whole lock fits logind's delay, since a save can hold the agent's state first | **Documented:** Revocation measures the approximate second after revocation starts and explicitly preserves L20's delayed-start and logind limits; no new guarantee of completing before suspend is made. |
+| Low — C03, still partial: an allowed `User-Agent` value could contain the token despite the header guarantee | **Fixed (design):** forwarded headers containing the token are dropped; the test includes `User-Agent`. The fourth review checked the remaining header-name case (Requests and responses; Tests before real credentials). |
+
+The third review also requested consistent wording for the 16-grant
+limit, `Connection` handling and observing leader exit. The ADR now says
+"no more than 16", refuses a request whose `Connection` names anything
+except `close` or `keep-alive`, and ties command-end detection to the
+agent observing the leader exit, before output draining.
+
+Fourth review (Codex, AI-assisted, 2026-11-02; verdict: ready).
+Confirmed N01, N10, R01, R02, F16 and F18 resolved in the design and the
+three wording suggestions incorporated. No critical, high or medium
+blocker remained. C03 and F24 retained one low case, R03, which did not
+expose the source credential or expand the grant's authority; the client
+already holds its token and can deliberately put it in an opaque body.
+
+| Finding | Disposition |
+|---|---|
+| Low — R03, residual C03/F24: filtering only header values still let `x-stainless-` followed by the token carry it in an allowed header name | **Fixed (design), after the fourth verdict:** Requests and responses now drops an allowed header when its name or value contains the token; the test includes both a token-bearing `User-Agent` and an `x-stainless-` header named after the token. C03 and F24 are closed at the design level. |
+
+The fourth review's additional checks are now in the test matrix: a failed
+unlock preserves the previous fingerprint, and the agent's successful
+save of another entry updates the fingerprint without ending unaffected
+grants. The fingerprint must describe the bytes actually read or written;
+comparison precedes replacing its reference. These are implementation
+checks, not claims that broker tests have already run.
+
+Final disposition: **READY as the design basis for phase 1**, with R03
+corrected in the ADR after the fourth review. Implementation, its tests
+and the corresponding changes to the security invariants and protection
+claims still require their own review.

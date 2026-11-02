@@ -5,7 +5,16 @@
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).
 - Preceded by: an independent design analysis (Codex, AI-assisted,
   2026-11-02), summarized under [Context](#the-analysis-before-this-adr).
-  A full review of this ADR is still to come, before any code.
+- Amended: 2026-11-02, after four reviews of this ADR (Codex,
+  AI-assisted: not ready with 25 findings, then 11 more and 8
+  inconsistencies, then 3 more; the fourth: ready, its one low finding
+  fixed) and the maintainer's answers to its open questions.
+  The amendment specifies phase 1 in full
+  ([Phase 1 specification](#phase-1-specification)), makes the end of a
+  grant a per-profile policy, and answers the open questions
+  ([Answers](#answers-to-the-open-questions)). The findings and what was
+  done about each are recorded in the
+  [threat model's review history](../threat-model.md#11-review-history).
 
 ## Context
 
@@ -71,11 +80,10 @@ threat model and the maintainer's real uses concluded:
   same-user process can read a token from another process's environment
   and use it within its scope. Isolation (another user, §8) is the
   complement for A2.
-- **HTTP first, AI APIs first.** Anthropic (`x-api-key`) and the
-  OpenAI-compatible APIs (OpenAI, DeepSeek, Experiential Labs: Bearer)
-  accept another base URL; Claude Code documents LLM gateways. Streaming
-  (server-sent events) is needed from the start. WebSocket (Deepgram's
-  streaming) comes later.
+- **HTTP first, AI APIs first.** Anthropic and the OpenAI-compatible APIs
+  (OpenAI, DeepSeek, Experiential Labs) accept another base URL; Claude
+  Code documents LLM gateways. Streaming (server-sent events) is needed from
+  the start. WebSocket (Deepgram's streaming) comes later.
 - **Private devices need pinned TLS.** The FortiGate's REST API on the LAN
   has a self-signed certificate: the broker must trust that certificate (or
   its public key) explicitly, per profile, never skip verification.
@@ -90,101 +98,163 @@ threat model and the maintainer's real uses concluded:
   `ssh` process (`SSH_ASKPASS`) is giving it to the approved command. The
   maintainer's routers will use SSH keys instead (see decision 11).
 - **Three statements were stronger than the design** — "approval per use"
-  (a 10-minute grant is an approval per grant), a token "worthless outside
+  (a grant is an approval per grant), a token "worthless outside
   Rusthorse" (a stolen token still works through the broker while it is
   valid), and that the broker would "remove the problem" of L4 (it removes
   the direct delivery of the key and fixes its destination, not the trust
-  in the operations allowed). They are corrected with this ADR.
+  in the operations allowed). They were corrected with this ADR.
+
+### What the clients do
+
+A survey of the clients' sources and documentation (2026-11-02; Anthropic
+Python SDK 2.4.0 and TypeScript SDK 1.4.0, OpenAI Python SDK 3.42.1 and
+Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
+
+- Every client takes another base URL from its environment
+  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`), as `http://` too. None can
+  reach a Unix socket through its environment.
+- Anthropic base URLs have no `/v1` (the clients append `/v1/messages`);
+  OpenAI base URLs end in `/v1`.
+- Since API version 2026-10-21 the Anthropic SDKs send the key as
+  `Authorization: Bearer`; Claude Code sends `ANTHROPIC_API_KEY` as
+  `x-api-key` and `ANTHROPIC_AUTH_TOKEN` as `Authorization: Bearer`.
+- The SDKs retry (2 times by default, Claude Code 10 times) on 408, 409,
+  429, 5xx and dropped connections, POSTs included, unless the response
+  carries `x-should-retry: false`; they follow redirects. They can send
+  requests for `http://127.0.0.1` through a proxy named in the environment
+  unless `NO_PROXY` names that address (the Python SDKs' HTTP library does;
+  Node does when it is configured to use the environment's proxy).
+- Claude Code also calls `api.anthropic.com` directly for a few
+  non-essential features (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns
+  them off), and an `env` block in its settings files overrides the
+  variables `run` sets.
+- `messages.batches.results()` fetches an absolute URL returned by the API,
+  around any base URL.
 
 ## Decision
 
-1. **What the broker guarantees.** The approved program receives a
-   **grant**, never the source credential: the broker uses the credential
-   only towards the grant's destination, authenticated and within its
-   scope. Not guaranteed: what the program does with the operations it is
-   allowed (it can spend credit, read data, change what the API lets it
-   change); that a same-user process cannot steal the token and use it
-   while it is valid; that a response from the destination does not echo a
-   credential (responses are still redacted, as a second line, not as
-   proof).
+1. **What the broker guarantees.** In phase 1, for each entry a run binds
+   with `--broker`, the approved command receives a **token**, never the
+   source credential (entries bound by value in the same run are delivered
+   as `run` always did). The credential leaves the broker only in the
+   authentication header the broker builds, in requests to the profile's
+   destination, over TLS verified against the system's certificate
+   authorities, and only for the profile's routes. Every request is
+   recorded before it is forwarded. A grant ends as decision 8 says.
+
+   Not guaranteed: what the program does with the operations it is allowed
+   (it can spend credit, read data, change what the API lets it change, and
+   put anything it holds, the token included, in a request body, which the
+   broker does not inspect); that a same-user process cannot read the token
+   and use it while the grant lasts; that the destination does not return
+   the credential in another form (literal copies in responses are
+   redacted, as a second line, not as proof); the confidentiality of the
+   requests and responses (prompts, data) against processes of the same
+   user. Running each grant in its own process limits which credential is
+   in that process's memory; it does not contain code execution there — the
+   broker runs as the user, with the user's other powers.
 
 2. **A grant** is created by an approval and has a public **grant ID**
-   (audit, revocation, the manager's grants panel) and a secret **token**
-   (`rh_` and 256 random bits, given to the command). It is bound to: one
-   entry; that entry's **profile** (decision 3); the operations allowed; a
-   lifetime (minutes); a maximum number of requests and of concurrent
-   requests; and the approved command — it ends when the command ends. The
-   token is a secret like a value: never logged, never in an error, and
-   redacted from the command's output.
+   (audit, revocation, the grants panel) and a secret **token**, given to
+   the command. It is bound to one entry, a snapshot of that entry's
+   profile taken when the grant is created, the approved command, and the
+   profile's limits. The token is a secret like a value: never logged,
+   audited, put in an error or in a `Debug` output, and redacted from the
+   command's output when output redaction is on (the default; decision 6
+   says when it is off).
 
 3. **Profiles fix the destination.** A profile belongs to an entry and is
-   set by the human (CLI or manager, with approval): scheme, host and port;
-   how the credential is presented (`Authorization: Bearer`, `x-api-key`,
-   another header, Basic); TLS trust (the system's roots, or a pinned
-   certificate or public key for a private device); and the routes allowed
-   (methods and path prefixes). Built-in presets cover common providers
-   (Anthropic, OpenAI-compatible inference). The client never chooses the
-   destination: the broker builds the request line, `Host` and SNI itself,
-   ignores the requester's proxy and CA variables, and does not follow
-   redirects. Changing an entry's profile or URL revokes its grants.
+   set only by the human, through an approved edit: a preset (the routes,
+   how the client presents the token, how the credential is presented to
+   the destination) with its revision, the destination's origin and base
+   path, and the grant policy (decision 8). Presets are built into the
+   program. The client never chooses the destination: the broker builds the
+   request line, `Host` and SNI itself, connects only to addresses it
+   resolved and checked, ignores the requester's proxy and certificate
+   variables, follows no redirect and passes none on. Any change to an
+   entry ends its grants.
 
-4. **The broker is its own process.** `rusthorse-broker` is started and
-   supervised by the agent, as `rusthorse-dialog` is
-   ([ADR 0006](0006-own-dialog-program.md)), and receives over a socket
-   pair only what an active grant needs — the one credential and its
-   profile — never the vault. A bug in the network code (HTTP parsing, TLS)
-   then exposes at most the credentials of active grants, not every entry.
-   New dependencies for HTTP and TLS (a mature HTTP library and `rustls`)
-   live in that process only.
+4. **The broker is its own process, one per grant.** The agent starts
+   `rusthorse-broker` for each grant and supervises it, as it does
+   `rusthorse-dialog` ([ADR 0006](0006-own-dialog-program.md)), and gives it
+   over a socket pair only what that grant needs — its credential, token,
+   profile snapshot, limits and listening socket — never the vault. A bug
+   in the network code (HTTP parsing, TLS) that leaks memory then leaks at
+   most the credential of that one grant; a bug that lets an attacker run
+   code there gives the attacker the user's powers, which the separation
+   does not contain. The new dependencies for HTTP and TLS live in that
+   program's package only.
 
-5. **The HTTP connector (first phase)** is a reverse proxy with a fixed
-   origin per profile. The client points its base URL at the broker — a
-   private Unix socket where the client supports one, otherwise a loopback
-   TCP port that still requires the token — and sends the token as its API
-   key. The broker checks the token, the route and the limits; removes any
-   credential the client sent; adds the real one; connects to the
-   destination over TLS only; and relays the response, server-sent events
-   included, with limits on size, time and concurrency. No `CONNECT`, no
-   generic forward proxy, no automatic retries (a lost answer is an unknown
-   outcome, as elsewhere in Rusthorse), no TLS interception.
+5. **The HTTP connector (phase 1)** is a reverse proxy with a fixed origin
+   per profile, listening on a loopback TCP port (`127.0.0.1`) that still
+   requires the token. It checks the token, the route, the framing and the
+   limits; builds the request to the destination from the parts it
+   accepted, with the credential added; connects over TLS only; and relays
+   the response, server-sent events included, unbuffered. No `CONNECT`, no
+   generic forward proxy, no upgrades, no automatic retries (a lost answer
+   is an unknown outcome, as elsewhere in Rusthorse), no TLS interception,
+   no cookies or cache. A Unix socket listener is left for later: no
+   supported client can use one from its environment.
 
 6. **`run` asks for it explicitly.** `rusthorse run --broker VAR=ENTRY
-   [--url URLVAR=ENTRY] -- command` puts the token in `VAR` and, with
-   `--url`, the broker's address for that entry in `URLVAR` (instead of the
-   entry's own URL). The exact option names are settled in the
-   implementation. **There is no fallback**: if the broker cannot serve the
-   grant, the run fails (125, nothing ran) — it never silently gives the
-   real key instead. `run` without `--broker` stays as it is, with its
-   documented limits.
+   [--url URLVAR=ENTRY] -- command` puts the token in `VAR` and, when
+   `--url` names the same entry, the broker's address in `URLVAR` (instead
+   of the entry's own URL). `--broker` combines with ordinary `VAR=ENTRY`
+   bindings for other entries in the same run; one entry cannot be both.
+   **There is no fallback**: if a grant cannot be served before the
+   command starts, the run fails (125, nothing ran) — it never gives the
+   real key instead. After the command has started, `run` reports its exit
+   status as today; the outcome of each HTTP request is in the audit log.
+   `run` without `--broker` stays as it is, with its documented limits.
 
 7. **The dialog says what the grant allows**, from the profile and the
-   request: "This command may call **api.anthropic.com** (`POST
-   /v1/messages`) for **10 minutes**, at most **200** requests. It receives
-   a temporary token, not the key." — with the command, the program, the
-   directory and the requester as today.
+   request: the entry, the destination, every route, how and when the grant
+   ends, the request limit (or that there is none) and the number of
+   requests at a time, that the command receives a temporary token and not
+   the key, which other variables receive real values in a mixed run, that
+   the command can spend credit, that a request count is not a spending
+   limit and that request bodies are not inspected — with the command, the
+   program, the directory and the requester as today.
 
-8. **Revocation** happens on `rusthorse lock` (and on every lock: screen
-   lock, suspend, idle), when the command ends, at expiry, when the request
-   limit is reached, when the entry's profile changes, and by hand in the
-   manager. It refuses new requests **and closes open ones** (a stream in
-   progress ends). A request already sent upstream may still take effect:
-   its outcome is reported as unknown.
+8. **A grant ends** on any of these, whatever the profile says: the
+   command ends (its leader exits, or the requester disconnects); `rusthorse
+   lock` (the explicit lock, which stays the way to stop everything at
+   once); revocation by hand (`rusthorse grants revoke`, the manager's
+   grants panel); any change to its entry; any change to the vault file
+   made by another program while the vault was locked, found when it is
+   unlocked again;
+   a failed save; its broker process failing; the agent stopping; its
+   maximum lifetime passing. Each profile also says whether the
+   **automatic locks** — screen lock, suspend, idle timeout — end its
+   grants (`end`) or not (`continue`). The built-in AI presets default to
+   `continue` and 12 hours: a long session of an AI agent survives the
+   screen locking. Device profiles (phase 2) will default to `end` and 15
+   minutes. Reaching the request limit stops new requests and lets those
+   already admitted finish. Ending a grant refuses new requests at once
+   **and closes the open ones** (a stream in progress ends); a request
+   already sent to the destination may still take effect, and its outcome
+   is recorded as unknown. The command's end, the explicit lock and the
+   agent stopping end all of a run's grants together; the other events end
+   the grants they concern (an entry's, one revoked by hand, those whose
+   profile says `end`).
 
-9. **Audit.** The grant's creation is recorded with the approval, as other
-   approvals are; every request is recorded under the grant ID — method,
-   host, path without the query, status, size, outcome — before it is
-   forwarded (fail closed: no record, no request) and when it ends. Never
-   the token, a credential, a header value or a body.
+9. **Audit.** The grant's creation is recorded before the command starts;
+   every request is recorded under the grant ID — method and route, never
+   the raw path — before it is forwarded (fail closed: no record, no
+   request), and again when it ends, with its status, size and outcome; the
+   grant's end is recorded with its reason. Never the token, a credential,
+   a header value, a query or a body. The agent writes every record: the
+   broker asks it, and waits for the answer.
 
 10. **Phases.** Each phase gets its own review and tests:
 
     | Phase | What | Notes |
     |---|---|---|
-    | 1 | HTTP: Bearer, `x-api-key`, Basic; server-sent events; Anthropic and OpenAI-compatible presets | The minimum: the AI APIs used every day. |
-    | 2 | HTTP with pinned TLS for private devices (FortiGate); Gemini and Hugging Face presets; narrow operations for administration APIs (Palo Alto, Panorama) | Operations, not "the whole `/api`". |
+    | 1 | HTTP: Anthropic, OpenAI and OpenAI-compatible presets; server-sent events; per-profile grant policy; `run --broker`; `rusthorse grants`; the manager's grants panel | The minimum: the AI APIs used every day. Specified below. |
+    | 2 | HTTP with pinned TLS for private devices (FortiGate); Basic authentication; profiles with their own routes; Gemini and Hugging Face presets; narrow operations for administration APIs (Palo Alto, Panorama); profile editing in the manager | Operations, not "the whole `/api`". |
     | 3 | `ssh-agent`: keys stay in the vault, each signature or session approved, with OpenSSH's destination constraints | Replaces password SSH for the routers. |
     | 4 | PostgreSQL, then MySQL: the broker answers the authentication handshake (SCRAM for PostgreSQL) and relays, with the database pinned | As Secretless does. |
-    | Later | WebSocket (Deepgram streaming); AWS SigV4 or short-lived STS credentials | Only on concrete demand. |
+    | Later | WebSocket (Deepgram streaming); AWS SigV4 or short-lived STS credentials; a Unix socket listener; grants for clients that run in their own sandbox | Only on concrete demand. |
     | Not planned | Connector plugins; credential providers other than the vault | Fixed connectors keep the code reviewable; the vault is the provider (imports cover keyrings and `.env` files). |
 
     With phases 1 to 4, Rusthorse covers what Secretless offers — HTTP,
@@ -198,12 +268,429 @@ threat model and the maintainer's real uses concluded:
     then, `run` with `SSH_ASKPASS` remains possible, with the limits of
     `run` (L3–L5). The maintainer's routers move to SSH keys.
 
-12. **Before real credentials**, tests must show: a malicious client never
-    receives the key; a changed destination (URL, `Host`, proxy variables,
-    redirects) is refused; concurrent requests cannot exceed a grant's
-    limits; a lock ends open streams; a failed audit write stops
-    forwarding; responses and errors do not expose authentication; a
-    stolen token stops working when its command ends.
+12. **Before real credentials**, end-to-end tests with a fake destination
+    and fake keys must show everything listed under
+    [Tests](#tests-before-real-credentials).
+
+## Phase 1 specification
+
+This section is normative for phase 1. Where a number is given, it is the
+phase 1 value; changing it changes this ADR.
+
+### Components and processes
+
+- **`rusthorse-broker`**, a new member of the workspace (`broker/`), built
+  for Rust 1.89 like the main package. It depends on the `rusthorse`
+  library (without default features) for the agent–broker protocol, the
+  profile types and the redactor, and on `hyper` 1 (HTTP/1.1 server and
+  client), `tokio` (current-thread runtime), `rustls` 0.23 with the `ring`
+  provider, `tokio-rustls` and `rustls-native-certs` (to read one fixed
+  file). Their default features are off where those would add another
+  cryptography library, proxy support or connection pools.
+- **Where it is found.** Next to the agent's executable, with the checks
+  `rusthorse-dialog` gets (a regular executable owned by the user or root,
+  not writable by group or others, refused when the agent's own executable
+  was replaced since it started). There is no fallback: when the program is
+  absent or unusable, `run --broker` fails before the dialog is shown.
+- **How it is started.** One process per grant, started after the approval
+  and before the command: an empty environment, `/` as working directory,
+  its own process group, standard input and output one end of a socket
+  pair (the control channel), standard error `/dev/null`. Before it reads
+  anything it makes itself non-dumpable and disables core files (`execve`
+  undid the agent's protection, threat model P10). It exits as soon as the
+  control channel ends, so a dead agent leaves no broker behind; under
+  systemd, stopping the agent's service kills it too.
+- **The listening socket** is created by the agent (`127.0.0.1`, a port
+  chosen by the kernel) and passed to the broker over the control channel.
+  The agent keeps its own copy until the command ends, so the port cannot
+  be taken by another program while the command may still use it, even if
+  the broker fails. The command gets `http://127.0.0.1:PORT` plus the
+  profile's base path — never `localhost`, which can resolve to an IPv6
+  address another program listens on.
+- **Trust.** The broker reads its certificate authorities from the first
+  existing file of a fixed list (`/etc/ssl/certs/ca-certificates.crt`,
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`), which must
+  be owned by root and not writable by group or others. No environment
+  variable changes it: the broker has an empty environment and does not
+  read one. Without such a file no grant can be served, and `rusthorse
+  doctor` says so.
+- **Tests only:** a feature of the broker package that is never enabled in
+  a release (like `fake-keyring`) lets end-to-end tests add a test
+  certificate authority and reach a loopback destination. The release
+  build, `packaging/build-deb.sh`, enables no feature.
+
+### The token and the grant ID
+
+- The **token** is `rh_` followed by 64 lowercase hexadecimal digits (32
+  bytes from the operating system's random generator). The agent creates
+  it, puts it in the command's environment and in the redactor, and gives
+  it to the broker. The broker compares it in constant time; anything not
+  of that exact form is refused before comparison.
+- The **grant ID** is `g` followed by 16 lowercase hexadecimal digits,
+  random. It is public: the audit log, `rusthorse grants` and the manager
+  show it.
+
+### Profiles
+
+A profile is stored in the entry's custom string field
+`Rusthorse.Broker`, unprotected, as one line of JSON:
+
+```json
+{"version":1,"preset":"anthropic","revision":1,"origin":"https://api.anthropic.com","base_path":"","automatic_locks":"continue","max_lifetime_minutes":720}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | The format: `1`. |
+| `preset`, `revision` | The preset and the revision of it the human approved. A newer Rusthorse keeps old revisions as they were: it never widens a stored profile. |
+| `origin` | `https://` and a host name, with an optional port. No IP address, user information, path, query or fragment in phase 1. |
+| `base_path` | What the client's base URL adds after the origin: empty, or one or more segments, each `/` followed by letters, digits, `.`, `_`, `~` and `-`, never `.` or `..`, with no trailing `/` — the same rules as a request's path. |
+| `automatic_locks` | `end` or `continue`: whether screen lock, suspend and the idle timeout end the entry's grants (decision 8). |
+| `max_lifetime_minutes` | 1 to 1440. |
+| `max_requests` | Optional, 1 to 1,000,000: the most requests one grant admits. |
+
+Rules:
+
+- The agent stores the profile with every field written out, so a later
+  default never changes it. It reads it strictly: an unknown `version`,
+  preset, revision or field, a value out of range, or more than 1000
+  characters makes the profile **unusable** — `show` reports it, and
+  `run --broker` refuses the entry; nothing guesses. A protected field is
+  withheld like any protected field and is unusable for the broker.
+- A profile is set or cleared only by `rusthorse edit` (`--broker PRESET`
+  with `--broker-origin`, `--broker-base-path`, `--broker-locks`,
+  `--broker-lifetime`, `--broker-requests`; `--clear broker`), approved in
+  a dialog that shows the whole new profile and how many grants it ends.
+  `add` and `import` cannot set one, and replacing an entry (`add
+  --replace`, `import --replace`) removes it.
+- A profile is metadata (threat model L6): it holds no credential, token or
+  other secret. `show`, `list --json` and the manager display it.
+- It is read only from the agent's copy of the vault. A profile or entry
+  edited by another program while the agent is unlocked is not seen: the
+  agent's next save fails (L15), and a failed save ends every grant. A
+  vault file changed while the vault is locked is noticed at the next
+  unlock, which then ends the grants that survived the lock (below).
+
+### Presets
+
+| Preset (revision 1) | Default origin, base path | Client presents the token as | Credential sent to the destination as | Routes (after the base path) |
+|---|---|---|---|---|
+| `anthropic` | `https://api.anthropic.com`, empty | `x-api-key: TOKEN` or `Authorization: Bearer TOKEN` | `x-api-key: KEY` | `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /v1/models/{id}` |
+| `openai` | `https://api.openai.com`, `/v1` | `Authorization: Bearer TOKEN` | `Authorization: Bearer KEY` | `POST /chat/completions`, `POST /responses`, `POST /responses/input_tokens`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
+| `openai-compatible` | none (the profile names it), `/v1` | `Authorization: Bearer TOKEN` | `Authorization: Bearer KEY` | `POST /chat/completions`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
+
+- Routes are exact. `{id}` is one segment of letters, digits, `.`, `_`,
+  `:`, `~` and `-`. Message batches, files, administration, key and
+  organisation management, fine-tuning, uploads and everything else are
+  not routes of any phase 1 preset; they answer `404` from the broker and
+  are never forwarded.
+- Query parameters: `beta` (value `true`) on the Anthropic routes, and
+  `limit`, `before_id`, `after_id` on `GET /v1/models`; none elsewhere.
+- Request headers forwarded (all others are dropped): `content-type`,
+  `accept`, `user-agent`, and those starting with `anthropic-`,
+  `x-stainless-` or `x-claude-code-` (Anthropic), or `openai-beta` and
+  those starting with `x-stainless-` (OpenAI and compatible).
+  `OpenAI-Organization` and `OpenAI-Project` are dropped: the key decides
+  the account.
+- Response headers relayed (all others are dropped): `content-type`,
+  `date`, `cache-control`, `retry-after`, `x-should-retry`, `request-id`,
+  `x-request-id`, `openai-processing-ms`, `openai-version`, and those
+  starting with `anthropic-ratelimit-` or `x-ratelimit-`.
+- When both token headers arrive (Anthropic), both must carry the token;
+  any other credential the client sends is dropped, never forwarded.
+
+### Requests and responses
+
+The broker serves HTTP/1.1 and speaks HTTP/1.1 to the destination. For each
+request, in order:
+
+1. **Framing**: the HTTP library refuses malformed messages, conflicting
+   `Content-Length` values and lines folded over several lines; identical
+   duplicate `Content-Length` headers are merged by it, which leaves no
+   ambiguity. The broker then refuses (`400`) any request with a
+   `Transfer-Encoding` header (a request body must be sent with
+   `Content-Length`, as the supported clients do), an `Upgrade` header, a
+   `Connection` header naming anything but `close` or `keep-alive`, a
+   request target that is not in origin form, a `Host` other than
+   `127.0.0.1:PORT`, an `Origin` header (browsers have no business here), a
+   method `CONNECT`, `TRACE` or `OPTIONS`, or a body on a route without one;
+   headers larger than 32 KiB get `431`. The whole header block must
+   arrive within 30 seconds of the connection being opened or of the
+   previous response on it.
+2. **Token**: missing or wrong → `401`.
+3. **Route**: the path must be in the exact form above, without `%`
+   escapes, empty, `.` or `..` segments, `;` or `\`, and match a route of
+   the preset after the base path, with only the allowed query parameters
+   (each at most once); otherwise `404`. The path the broker checks is the
+   path it sends.
+4. **Room for the body**: a body may be at most 16 MiB (`413`). A broker
+   holds at most 64 MiB of request bodies at once: it reserves the
+   declared length before it asks for admission, and a request that does
+   not fit gets `503` with `retry-after: 1` — nothing was admitted or sent.
+5. **Admission** (below): the grant's state, the request limit, the number
+   of requests in flight and the audit record. Only an admitted request is
+   read further; a grant that has ended or is exhausted is refused before
+   its body is received.
+6. **Body**: read whole into memory before anything is sent, within 60
+   seconds; a body that does not arrive in full is not forwarded (outcome
+   `not_forwarded`; the use is spent).
+7. **Forwarding**: the broker resolves the origin's host, keeps only
+   public addresses (no loopback, private, link-local, unique-local,
+   shared, multicast, unspecified or IPv4-mapped forms of them) and
+   connects to one of those it checked, never resolving again. Resolving
+   and connecting must end within 10 seconds, and a broker resolves at most
+   4 names at a time. TLS 1.2 or 1.3 with the host as SNI, ALPN `http/1.1`
+   only, no early data, no key log. The request line, `Host`,
+   `Content-Length` and the credential header are its own;
+   `Accept-Encoding: identity` replaces the client's. Only the headers
+   listed for the preset pass, so hop-by-hop headers (`Connection`,
+   `Keep-Alive`, `TE`, `Trailer`, `Upgrade`, `Proxy-*`) never do; a listed
+   header whose name or value contains the token is dropped too, so the
+   broker never sends the token in a header; trailers are dropped in both
+   directions. One connection per request; nothing is shared between
+   grants.
+8. **Response**: refused with a local `502`, before anything is passed to
+   the client, when it is a `3xx` (no `Location` reaches the client), has a
+   `Content-Encoding` other than `identity` (in any of its occurrences), or
+   a `Transfer-Encoding` other than exactly `chunked` (a compressed
+   transfer coding would hide the credential from the redactor). Otherwise
+   the status and the relayed headers are passed on and the body is
+   streamed chunked, without buffering, through a redactor that replaces
+   literal copies of the credential with `[REDACTED:credential]`, a fixed
+   text that is safe inside JSON. A header whose value contains the
+   credential is dropped. At most 64 MiB of body per response.
+
+A credential must be at least 8 and at most 4096 characters, all visible
+ASCII without spaces, or the entry cannot be used with the broker: shorter
+ones would escape the redactor, and the credential travels in a header.
+
+Local answers carry a short JSON error and, except `429` and `503`,
+`x-should-retry: false`, so that the clients' own retries do not repeat
+what cannot succeed. A failure to resolve, connect or complete TLS,
+before anything was sent, is a `502` without that header: nothing reached
+the destination, so the client may retry (as a new request, which counts).
+
+### Admission, revocation and the agent's registry
+
+- The **agent** keeps a registry of grants and is the one authority for
+  their state and limits. Every request the broker accepts goes through it
+  over the control channel: `admit` (request number, method and route) →
+  the agent checks that the grant is active and within its limits,
+  reserves a use and a slot, writes the admission record (durably), checks
+  again that the grant is still active, and answers `admitted` or
+  `refused` with the same request number. The broker reads the body and
+  forwards only after `admitted`, and only if it has not been told to
+  revoke meanwhile; it reports `finished` with the number and the outcome,
+  which frees the slot and is recorded. A `refused` admission releases its
+  reservation; an admitted request spends its use whatever its outcome.
+- **Request numbers** are chosen by the broker, increasing from 1 within a
+  grant. The agent accepts each number once in `admit` and once in
+  `finished`, after `admitted`; anything else — a number reused, a
+  `finished` for a number not admitted or already finished, an unknown
+  message — is a broken broker: the agent ends the grant (`broker_failed`)
+  and kills the broker, and changes no counter for the offending message.
+- **States**: `starting` (the broker is being prepared; no request
+  admitted), `active`, `exhausted` (no new admission; admitted requests
+  finish), `revoked` (nothing new; open requests closed) and `ended` (the
+  broker has exited). A grant never becomes active again.
+- **Preparing a run's grants** is one transaction. The grants are entered
+  in the registry as `starting` under the same lock that checks the vault
+  generation and reads the credentials, so a lock is either before (the
+  run fails, nothing was read) or after (it ends the `starting` grants).
+  Then, for each grant, the agent binds the port, starts the broker, sends
+  `install` and waits for `ready`, at most 10 seconds. Last, under the
+  registry's lock, it checks that every grant of the run is still
+  `starting` and makes them all `active`; only then does it start the
+  command. If anything fails — a broker that does not start or answer, a
+  grant ended meanwhile, the command that cannot be started — every grant
+  of the run is ended, its broker stopped and its port released, and only
+  then does `run` fail (125, nothing ran).
+- **Revocation** is decided in the registry, so no request is admitted
+  after that moment. The agent then tells the broker to revoke: it closes
+  every open request and stream, drops the credential, confirms, and from
+  then on answers `403` until the command ends. A broker that does not
+  confirm within one second is killed. Every revocation waits for that
+  confirmation or kill — at most about a second once it has started, the
+  brokers of a lock being told at once — before the lock, the edit or the
+  revocation is reported done. A lock before suspend keeps the limits of
+  L20: it can start late (a save in progress holds the agent's state), and
+  logind waits only so long. Between the decision and the confirmation, a
+  request admitted just before the decision may still be sent; after it,
+  nothing more is. Revocation never waits for the audit log.
+- **The unlock barrier**: a grant can outlive a lock (`continue`), and
+  another program may change the vault file while it is locked — move an
+  entry, change its value — without touching the times KeePass records.
+  The agent therefore keeps, in memory only, a fingerprint of the vault
+  file's encrypted content as it last read or wrote it (a hash keyed with a
+  random key the agent chooses at start), and keeps it across a lock. When
+  the vault is unlocked again, before the unlock completes, it compares the
+  fingerprint of the file it just read: if they differ, or the agent has
+  none, every grant that survived the lock ends (`vault_changed`). An
+  unchanged file leaves them running; a changed file ends them even if the
+  change concerned other entries.
+- **The end of the command** is noticed when its leader exits (or the
+  requester disconnects): the run's grants are revoked then — before the
+  command's other processes are terminated and before its output is
+  drained — and their brokers are stopped and the port released once the
+  command is over. A process that escaped the command's process group
+  (L17) keeps only a token that no longer works.
+- **Limits** in phase 1: at most 16 grants at once per agent; per grant, 16
+  requests in flight (more get `429` with `retry-after: 1`) and 64 open
+  connections; idle connections are closed after 60 seconds; the
+  destination must be resolved and connected within 10 seconds, complete
+  TLS within 10 seconds and answer with its headers within 10 minutes, and
+  the response body may not pause for more than 5 minutes. The maximum
+  lifetime is measured on the boot-time clock, so time spent suspended
+  counts.
+- **Leaving**: a broker exits at once when its control channel ends,
+  without waiting for work in progress (a name resolution that hangs
+  included); the agent kills its process group if it is still there a
+  second later.
+- **The idle timer**: requests through the broker are not approvals and do
+  not postpone the idle lock (P9 unchanged). Whether that lock ends a
+  grant is the profile's `automatic_locks`.
+
+### The control channel
+
+Framed like the dialog protocol (a 4-byte big-endian length, then JSON,
+unknown fields refused), with its own version number, frames of at most
+64 KiB and the listening socket passed as file-descriptor data. Agent to
+broker: `install` (version, grant ID, token, credential, profile snapshot,
+limits), `admitted` and `refused` (request number), `revoke`. Broker to
+agent: `ready`, `admit` (request number, method, route), `finished`
+(request number, outcome, status, sizes), `revoked`, with a count of the
+requests it refused before admission. The credential and the token are
+kept in zeroizing buffers and never printed. Nothing else crosses: no
+vault, no master password, no requester environment.
+
+### Audit records
+
+| Action | When | Fields beyond the usual ones |
+|---|---|---|
+| `run` | the approval, as today | the grants it creates, by ID, entry and destination |
+| `grant` | created (before the command starts; fail closed), ended (best effort) | grant ID; at the end: the reason (`command_ended`, `locked`, `screen_locked`, `suspend`, `idle_timeout`, `revoked`, `entry_changed`, `vault_changed`, `expired`, `broker_failed`, `save_failed`, `agent_stopped`, `audit_failed`), requests admitted, finished and unknown, requests refused before admission |
+| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, method, route (`POST /v1/messages`) |
+| `broker_request` | finished (best effort) | grant ID, request number, outcome (`completed`, `not_forwarded`, `client_closed`, `revoked`, `unknown`), status, bytes each way |
+
+Refused requests are counted, not recorded one by one, so a client cannot
+flood the log. If a `finished` record cannot be written, the grant admits
+nothing more (it is revoked with reason `audit_failed`).
+
+### `run`, `grants` and the protocol
+
+- `rusthorse run --broker VAR=ENTRY` (repeatable) and `--url URLVAR=ENTRY`
+  as in decision 6. The agent checks that the variables are valid and
+  distinct, that no entry is both brokered and given by value (by UUID),
+  that each brokered entry has a usable profile and a value the broker can
+  carry (8 to 4096 visible ASCII characters), that no more than 16 grants
+  would then be active, and that the broker program is usable — all before
+  the dialog — and adds `127.0.0.1` to `NO_PROXY` and `no_proxy` in the
+  command's environment. The token and URL variables the requester sent
+  are dropped.
+- `--remember` is not offered for a run with `--broker`: each approval
+  creates its grants once.
+- `--no-redact` is allowed with `--broker`, with a warning in the dialog:
+  the output is not filtered, so the token can reach whoever reads it, who
+  can use the grant until it ends. It is what an interactive program such
+  as Claude Code needs, since `run` gives it the terminal only without
+  redaction.
+- `rusthorse grants [--json]` lists active grants (ID, entry, destination,
+  command, requester, start, end, requests used and allowed, policy) —
+  never a token — and `rusthorse grants revoke ID|--all` ends them.
+  Neither needs an approval, like `lock`.
+- `rusthorse status` reports the broker program and the number of active
+  grants; `rusthorse doctor` checks the broker program and the certificate
+  file.
+- **Protocol 8.** A run with broker bindings is a new request,
+  `broker_run`: the run request's fields plus the list of broker bindings
+  (variable, entry, URL variable). An agent of protocol 7 does not know
+  that request and refuses it whole, so a client that checked the version
+  on one connection and meets an older agent on the next one (after a
+  restart) still runs nothing; a plain `run` carrying broker bindings is
+  refused by the agent. In the same way, an edit that sets or clears a
+  profile is a new request, `broker_edit` (the fields of `edit`, profile
+  included), and a plain `edit` that carries a profile, or names `broker`
+  among the fields to clear, is refused — an older agent would apply the
+  other changes and drop the profile; entries report their profile; `grants` and `revoke_grant` are new
+  requests; `status` gains optional fields. No error code is added: a grant
+  that cannot be served before the command starts is `internal` or
+  `invalid_request`, which `run` reports as 125. A client of protocol 8
+  refuses an agent of protocol 7 before it sends anything else.
+
+### The manager
+
+The manager's grants page lists the active grants with their entry,
+destination, command, start, end and requests, and revokes one or all —
+also while the vault is locked, which the page says, since grants can
+outlive a lock. It shows an entry's profile, read-only. Editing a profile
+stays in the CLI until phase 2.
+
+### Tests before real credentials
+
+End-to-end, with a fake HTTPS destination in the test process and fake
+keys, showing the allowed and the refused path of each:
+
+| Area | Must show |
+|---|---|
+| The key | Never in the command's environment, output, files it can write from what it receives, error bodies, response headers, the audit log, `grants` or `status`; the destination receives exactly one credential header, built by the broker, and the broker never sends the token in a header it builds or passes on (a `User-Agent` carrying it, or an `x-stainless-` header named after it, is dropped). |
+| Tokens | Missing, malformed, wrong, another grant's, or conflicting token headers → `401`, nothing forwarded. |
+| Routes and framing | `/v1/messages/batches`, unknown methods, `%2e%2e`, `//`, `;`, `\`, absolute-form targets, a foreign `Host`, `Origin`, `CONNECT`, `TRACE`, upgrades, any `Transfer-Encoding` on a request (alone and with `Content-Length`), conflicting lengths, `Connection` naming a forwarded header, a query parameter twice, oversized headers and bodies, headers that trickle in → refused, nothing forwarded. |
+| Destination | `Host` and SNI from the profile; the requester's proxy and certificate variables, and the agent's, have no effect on the broker; private addresses refused; a `3xx` with `Location` reaches the client as `502` without it; a response with a compressed `Content-Encoding` or `Transfer-Encoding` refused before anything reaches the client; a name resolution that hangs ends within its deadline. |
+| Redaction | The credential echoed in a response body, split across chunks, and in headers, is removed; `Content-Length` is not passed on; a credential shorter than 8 characters is refused before the dialog. |
+| Limits | With a request limit of N, at most N requests reach the destination however many arrive at once; the N-th finishes; the limit of requests in flight and the 64 MiB of bodies hold under load; refused admissions free their slots; requests finishing in another order than they started are counted right. |
+| Revocation | `rusthorse lock`, `grants revoke`, the automatic locks with `end` (and not with `continue`), an entry edit, expiry: open streams end; once the revocation is reported done nothing new is forwarded; an admission waiting for its audit record is refused if the grant was revoked meanwhile; a vault file changed by another program while locked — an entry moved, a value changed, its modification time kept — ends the grants that survived the lock at the next unlock, and an unchanged file keeps them; a failed unlock keeps the previous fingerprint, so the change is still found at the next attempt; the agent's own successful save of another entry updates the fingerprint and ends no grant. |
+| The command's end | A stolen token stops working once the agent sees the command's leader exit — before its output is drained, and for a descendant that called `setsid`. |
+| Failures | Broker program missing or unusable → `run` exits 125 before the dialog and the key is nowhere; one broker of a run failing to start → none of the run's grants remains and nothing ran; the broker dying mid-request → the outcome recorded as unknown, the run's status still the command's; a broker that ignores `revoke`, or breaks the request numbering, is killed; a broker whose control channel ends exits even with a name resolution in progress. |
+| Audit | A failed admission record stops forwarding (the destination counts no request); a failed `finished` record ends the grant; revocation still works when the audit log cannot be written. |
+| Protocol | A protocol 7 agent and client refuse each other, a protocol 7 agent refuses `broker_run` and `broker_edit` whole (a version checked on one connection, an older agent met on the next), and a plain `run` with broker bindings or a plain `edit` with a profile is refused; `--remember` is not offered; mixed runs; the same entry both ways refused; `--no-redact` warns. |
+| Profiles | Unknown version, preset, revision or field, a `base_path` with `.` or `..`, protected or too long → unusable; replace removes the profile; a profile survives a round trip through a KeePassXC-compatible file; an edit ends the entry's grants. |
+
+## Answers to the open questions
+
+Closed with the maintainer on 2026-11-02, after the first review (the
+second review's corrections are folded in):
+
+1. **What is a "use"?** One HTTP request the broker admits for forwarding.
+   A server-sent event stream is one request and holds a concurrency slot
+   until it ends; each retry by the client's SDK is another request;
+   requests refused before admission do not count. An admitted request is
+   never given back, whatever its outcome.
+2. **Who edits profiles, and which changes end grants?** The human, through
+   an approved `edit` (the CLI in phase 1, the manager in phase 2). Any
+   change to the entry — value, user name, URL, profile, group, replacement,
+   removal — ends its grants.
+3. **How does the dialog express cost and power?** By stating facts the
+   broker enforces (destination, every route, the end of the grant, the
+   request limit) and those it does not: the command can spend credit, a
+   request count is not a spending limit, the bodies are not inspected.
+4. **Where does the client run?** The command is still started by the
+   agent, outside the requester's sandbox (L16 unchanged in phase 1).
+   Grants for a client that stays in its own sandbox come later.
+5. **How does a client find the broker after a restart?** It does not: a
+   grant dies with its broker and with the agent, and a new run asks again.
+   The address is `127.0.0.1` with a port the agent holds while the command
+   runs.
+6. **How is a revoked request that the destination accepted shown?** In the
+   audit log, as outcome `unknown`; the client sees an error or a stream
+   cut short; `run`'s exit status stays the command's (125 only before the
+   command starts).
+7. **Certificates of private devices?** Not in phase 1. Phase 2: enrolled by
+   fingerprint, approved by the human after checking it through another
+   channel; a changed certificate fails closed until a new approval.
+8. **Which endpoints are refused for every grant?** Everything that is not
+   an exact route of the profile's preset; `CONNECT`, `TRACE`, `OPTIONS`
+   and upgrades always.
+9. **Which SDKs are supported?** Phase 1 is tested with requests in the
+   form the Anthropic and OpenAI SDKs and Claude Code send; Claude Code
+   2.1.316 and the Python SDKs are tried by hand with the maintainer before
+   any version is called supported. The guide recommends turning the SDKs'
+   retries off.
+10. **Can one grant cover several entries?** No: one grant, token, broker
+    and port per entry; one run may hold several, approved in one dialog
+    and prepared together before the command starts. They end together
+    when the command ends, on the explicit lock and when the agent stops;
+    each also ends on its own (its entry changed, revoked by hand, its
+    profile's policy, its lifetime).
 
 ## Alternatives considered
 
@@ -228,46 +715,53 @@ threat model and the maintainer's real uses concluded:
 - **Running the AI agent as another user.** The answer to a hostile agent
   (A2), already planned (§8); it complements the broker, which mainly
   protects against a fallible one (A1).
+- **One long-lived broker for every grant**, or one per run. Fewer
+  processes, but a bug in the network code would expose every active
+  credential, and revocation and accounting would be shared between
+  grants. One process per grant costs a process start per grant.
+- **Every lock ends every grant**, as this ADR first said. Simpler, but a
+  long session of an AI agent would stop whenever the screen locks, which
+  would push users back to `run` without the broker. The profile decides
+  instead, and the explicit lock still ends everything.
+- **The broker as the authority for limits**, with the agent only told the
+  results. It would save a round trip per request, but the agent must
+  record each request before it is forwarded anyway, and two counters
+  would have to agree.
+- **Refusing `--broker` with `--no-redact`.** It would keep the token out
+  of unfiltered output, but interactive programs, Claude Code first, could
+  not use the broker at all.
 
 ## Consequences
 
-- **The threat model changes**: L3, L4 and L5 get a "with the broker"
-  paragraph (the key is not in the client; the destination is fixed; the
-  operations allowed remain trusted), a new limit records that a token can
-  be stolen and used by a same-user process while it is valid, and L16 is
-  revisited — a client that no longer receives the secret could stay in the
-  requester's sandbox.
-- **New process, new dependencies**: `rusthorse-broker`, with an HTTP
-  library and `rustls`, each justified in its commit; the trusted computing
-  base grows, which decision 4 contains.
-- **Protocol**: new requests for grants and their revocation; a protocol
-  version bump.
-- **Manager**: the grants panel planned in M2 (inspect and revoke grants);
-  profile settings on an entry.
-- **Documentation**: the CLI reference, `rusthorse guide ai` (AI agents
-  should prefer `run --broker` where a profile exists), the supported SDKs
-  and how to point each at the broker.
+- **Invariant 1 changes**: a broker process handles the credential of its
+  one grant, as the agent hands it over; the CLI and the manager still
+  never hold a value they did not ask for. AGENTS.md is updated with the
+  implementation.
+- **The threat model changes**: new assets (tokens, profiles, the traffic
+  through the broker), the broker and its libraries and the certificate
+  file in the trusted computing base, new properties (the command gets a
+  token; the destination is fixed; revocation; per-request audit), "with
+  the broker" paragraphs in L3, L4 and L5, L8 and L17 revisited, and new
+  limits: a token can be stolen and used by a same-user process while the
+  grant lasts; the loopback hop authenticates the client, not the server,
+  and carries the traffic in clear text to same-user processes that can
+  reach it; a grant set to survive automatic locks keeps working while the
+  screen is locked.
+- **New program, new dependencies**: `rusthorse-broker`, with an HTTP
+  library, an async runtime, rustls and ring, each justified in its commit;
+  the trusted computing base grows, which decision 4 contains. The checks
+  in AGENTS.md and the CI gain the new package; the Debian package installs
+  a fourth program.
+- **Protocol 8**, and a new protocol between the agent and the broker.
+- **The manager**: the grants page (until now planned for remembered
+  approvals, which keep their own name) and the profile in an entry's
+  details.
+- **Documentation**: the CLI reference, the protocol, the architecture, the
+  AI-agent guide (`rusthorse guide ai`: prefer `run --broker` where a
+  profile exists; Claude Code with `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, and
+  its settings files checked), `docs/ai-agents.md`, installation and the
+  roadmap.
 - **What it does not change**: an approval still trusts the program it
   approves for the operations it allows; a careless approval of a broad
   grant is still a careless approval.
-
-## Open questions (for the review of this ADR)
-
-1. What is a "use": a request, a stream, a retry by the client's SDK?
-2. Who edits profiles, and which changes to an entry revoke its grants?
-3. How does the dialog express cost and administrative power, not just a
-   host and a time?
-4. Where does the client run — can it stay in the requester's sandbox now
-   that it does not receive the secret, and later as another user?
-5. How does a client find the broker after a restart; what if a loopback
-   port is reused by another program?
-6. How is a revoked request that the destination already accepted shown in
-   the CLI and the audit log?
-7. Certificates of private devices: how are they enrolled, checked through
-   another channel, renewed, and what happens when one changes?
-8. Which endpoints are refused for every grant (creating keys, exporting
-   credentials, changing permissions)?
-9. Which SDKs and versions are supported, given their own retries, proxy
-   variables and secondary endpoints?
-10. Can one grant cover several entries (a script that needs an API key and
-    a database)?
