@@ -1817,7 +1817,8 @@ impl Manager {
             let title = if withheld {
                 format!("{name} (protected; unchanged)")
             } else if name == "Group" && old.is_some() {
-                "Group (moving entries comes later)".to_string()
+                // Emptying the row moves the entry to the top level.
+                "Group (empty for none)".to_string()
             } else {
                 name.to_string()
             };
@@ -1826,7 +1827,7 @@ impl Manager {
                 .use_markup(false)
                 .build();
             row.set_text(value);
-            row.set_sensitive(!withheld && !(name == "Group" && old.is_some()));
+            row.set_sensitive(!withheld);
             fields_group.add(&row);
             fields.push(row);
         }
@@ -1907,7 +1908,7 @@ impl Manager {
         body.append(&value_group);
         if old.is_some() {
             body.append(&styled(
-                "Moving an entry to another group and editing notes come in a later version.",
+                "Editing notes comes in a later version.",
                 &["caption", "dim-label"],
             ));
         }

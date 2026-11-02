@@ -220,7 +220,9 @@ example a database password it will only ever use through `rusthorse run`.
 
 `--replace` overwrites an existing entry with the same name (the old version
 stays in the entry's history). `--group` places a new entry in a group,
-creating it if needed (`Work/Servers`).
+creating it if needed (`Work/Servers`). A path into the recycle bin that
+another KeePass client keeps is refused, before the value is asked for: an
+entry there would be hidden from every listing, as if deleted.
 
 Examples — an API key with its endpoint, and a router with its access
 details:
@@ -235,8 +237,8 @@ rusthorse add core-router --kind device --username admin --url https://10.0.0.1/
 
 ```
 rusthorse edit NAME [--kind KIND] [--username USER] [--url URL] [--host HOST]
-                    [--port PORT] [--notes TEXT] [--rename NEW] [--clear FIELD]...
-                    [--add-tag TAG]... [--remove-tag TAG]...
+                    [--port PORT] [--notes TEXT] [--rename NEW] [--group PATH]
+                    [--clear FIELD]... [--add-tag TAG]... [--remove-tag TAG]...
                     [--value | --stdin | --generate [--length N] [--alphabet KIND]]
 ```
 
@@ -246,6 +248,18 @@ standard input; `--generate` replaces it with a new random value (to rotate a
 credential: generate, then update it at the provider with `rusthorse run`). `--clear` removes a field: `username`, `url`, `host`, `port`,
 `notes` or `kind`; `--kind other` also removes the kind. The previous state is
 kept in the entry's KeePass history.
+
+`--group` moves the entry to the group at `PATH` (`Work/Servers`), creating
+the group if needed; `/` (or an empty path) moves it to the top level. Spaces
+around each part of the path and empty parts are dropped, and each part
+follows the rules for names. The dialog shows the destination as a path from
+the top, `/Work/Servers`, or `/` for the top level. The agent checks the path
+before it asks for approval: an invalid path, or one into the recycle bin, is
+refused without an approval dialog. A move to the group the entry is already
+in is left out of the request (the dialog does not show it); alone, it is
+refused with "nothing to change". The entry records its previous group and when it moved (the KDBX
+fields `PreviousParentGroup` and `LocationChanged`), and its previous version
+goes to its history, as with every edit.
 
 ## `rusthorse remove`
 

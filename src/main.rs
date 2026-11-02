@@ -362,6 +362,10 @@ struct EditArgs {
     /// New name.
     #[arg(long, value_name = "NAME")]
     rename: Option<String>,
+    /// Move the entry to this group, e.g. Work/Servers, creating it if
+    /// needed; `/` moves it to the top level.
+    #[arg(long, value_name = "PATH")]
+    group: Option<String>,
     /// Remove a field (repeatable).
     #[arg(long, value_enum, value_name = "FIELD")]
     clear: Vec<ClearField>,
@@ -1157,6 +1161,7 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
     let changes = EntryChanges {
         rename: args.rename,
         kind: args.fields.kind.and_then(KindArg::kind),
+        group: args.group,
         username: args.fields.username,
         url: args.fields.url,
         host: args.fields.host,

@@ -34,7 +34,10 @@ use zeroize::Zeroizing;
 ///
 /// 6: `create_vault`, and `already_exists` also for the vault file;
 /// `keyring_items`, `dotenv_names` and `import_from`.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7: `edit.group` moves an entry to another group. A version-6 agent would
+/// drop it without a word and report the edit done.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
@@ -437,6 +440,10 @@ pub struct EntryChanges {
     /// New kind (to remove it, put [`Field::Kind`] in `clear`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<EntryKind>,
+    /// Group to move the entry to, as a path (`Work/Servers`), created if
+    /// missing; an empty path (or `/`) is the top level. Since protocol 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// New notes.
     #[serde(default)]
     pub notes: Option<String>,
@@ -463,6 +470,7 @@ impl EntryChanges {
             || self.host.is_some()
             || self.port.is_some()
             || self.kind.is_some()
+            || self.group.is_some()
             || self.notes.is_some()
             || !self.clear.is_empty()
             || !self.add_tags.is_empty()

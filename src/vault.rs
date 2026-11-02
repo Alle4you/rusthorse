@@ -746,6 +746,11 @@ impl Vault {
 
     /// Apply `changes` to an entry, recording the previous state in the
     /// entry's KeePass history. `new_value` replaces the password.
+    ///
+    /// [`EntryChanges::group`] moves the entry to the group at that path
+    /// (created if missing; empty or `/` is the top level) unless it is
+    /// already in a group with that path. Everything is checked before
+    /// anything changes.
     pub fn edit(
         &mut self,
         id: EntryId,
@@ -768,12 +773,36 @@ impl Vault {
             username: changes.username.clone(),
             ..EntryFields::default()
         })?;
-
+        // A group is identified by its path: an entry already in a group
+        // with that path stays where it is. `ensure_group` checks the path,
+        // the recycle bin included, before it creates anything — the first
+        // change this edit makes; nothing after it can fail.
+        let target = match &changes.group {
+            Some(path) => {
+                let components = group_components(path)?;
+                let current = self
+                    .db
+                    .entry(id)
+                    .expect("entry id comes from this database")
+                    .parent()
+                    .id();
+                if self.group_path(current) == components {
+                    None
+                } else {
+                    Some(self.ensure_group(Some(path))?)
+                }
+            }
+            None => None,
+        };
         let mut entry = self
             .db
             .entry_mut(id)
             .expect("entry id comes from this database");
         let mut e = entry.track_changes();
+        if let Some(group) = target {
+            e.move_to(group)
+                .expect("ensure_group returns a group of this database");
+        }
         if let Some(name) = &changes.rename {
             e.set_unprotected(fields::TITLE, name.as_str());
         }
@@ -842,20 +871,56 @@ impl Vault {
         }
     }
 
-    /// The group at `path` (`A/B/C`), created if missing. `None` is the root.
+    /// The normalized form of a group path: its components (see
+    /// [`group_components`]) joined by `/`, empty for the top level. Refuses
+    /// an invalid component and a path into the recycle bin, as
+    /// [`Vault::edit`] and [`Vault::add`] would; nothing is created.
+    pub fn check_group(&self, path: &str) -> Result<String, VaultError> {
+        let components = group_components(path)?;
+        self.refuse_recycle_bin(&components)?;
+        Ok(components.join("/"))
+    }
+
+    /// The first child of `parent` named `name`: the one a path leads to.
+    fn child_group(&self, parent: GroupId, name: &str) -> Option<GroupId> {
+        self.db
+            .group(parent)?
+            .groups()
+            .find(|child| child.name == name)
+            .map(|child| child.id())
+    }
+
+    /// Refuse a group path that leads into the recycle bin. The path is
+    /// followed through the existing groups from the root, as
+    /// [`Vault::ensure_group`] follows it: an entry put there would vanish
+    /// from every listing, as if deleted, without being deleted.
+    fn refuse_recycle_bin(&self, components: &[String]) -> Result<(), VaultError> {
+        let mut current = Some(self.db.root().id());
+        let mut remaining = components.iter();
+        while let Some(group) = current {
+            if self.in_recycle_bin(group) {
+                return Err(VaultError::Invalid(
+                    "entries cannot be put in the recycle bin; delete them with `rusthorse \
+                     remove`"
+                        .into(),
+                ));
+            }
+            current = remaining
+                .next()
+                .and_then(|name| self.child_group(group, name));
+        }
+        Ok(())
+    }
+
+    /// The group at `path` (`A/B/C`), created if missing. `None`, an empty
+    /// path and `/` are the root. A path into the recycle bin is refused
+    /// before anything is created.
     fn ensure_group(&mut self, path: Option<&str>) -> Result<GroupId, VaultError> {
+        let components = group_components(path.unwrap_or_default())?;
+        self.refuse_recycle_bin(&components)?;
         let mut current = self.db.root().id();
-        let Some(path) = path else {
-            return Ok(current);
-        };
-        for component in path.split('/').map(str::trim).filter(|c| !c.is_empty()) {
-            validate_name(component)?;
-            let existing = self.db.group(current).and_then(|g| {
-                g.groups()
-                    .find(|child| child.name == component)
-                    .map(|c| c.id())
-            });
-            current = match existing {
+        for component in components {
+            current = match self.child_group(current, &component) {
                 Some(id) => id,
                 None => {
                     let mut parent = self
@@ -863,13 +928,28 @@ impl Vault {
                         .group_mut(current)
                         .expect("group id comes from this database");
                     let mut child = parent.add_group();
-                    child.name = component.to_string();
+                    child.name = component;
                     child.id()
                 }
             };
         }
         Ok(current)
     }
+}
+
+/// The components of a group path such as `Work/Servers`: split at `/`,
+/// each trimmed, empty ones dropped; each must be a valid name
+/// ([`validate_name`]). No components (an empty path, `/`) is the top level.
+pub fn group_components(path: &str) -> Result<Vec<String>, VaultError> {
+    path.split('/')
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            validate_name(component)
+                .map(|()| component.to_string())
+                .map_err(|e| VaultError::Invalid(format!("group {component:?}: {e}")))
+        })
+        .collect()
 }
 
 fn display_path(group: &[String], title: &str) -> String {
@@ -1085,6 +1165,251 @@ mod tests {
             Some("Work/Servers")
         );
         assert!(vault.find("Work/Servers/db").is_ok());
+    }
+
+    fn move_to(group: &str) -> EntryChanges {
+        EntryChanges {
+            group: Some(group.into()),
+            ..EntryChanges::default()
+        }
+    }
+
+    /// Add `name` in `group`, with its location-change time cleared so that
+    /// a test can see whether a move set it.
+    fn add_in(vault: &mut Vault, name: &str, group: &str) -> EntryId {
+        let mut new = entry(name);
+        new.group = Some(group.into());
+        vault.add(&new, &secret("abcd"), false).expect("add");
+        let id = vault.find(name).expect("find");
+        vault
+            .db
+            .entry_mut(id)
+            .expect("entry")
+            .times
+            .location_changed = None;
+        id
+    }
+
+    fn history_len(vault: &Vault, id: EntryId) -> usize {
+        let entry = vault.db.entry(id).expect("entry");
+        entry.history.as_ref().map_or(0, |h| h.get_entries().len())
+    }
+
+    /// A recycle bin, as another KeePass client makes it, with a group
+    /// `Old` inside.
+    fn add_recycle_bin(vault: &mut Vault) {
+        let bin = {
+            let mut root = vault.db.root_mut();
+            let mut bin = root.add_group();
+            bin.name = "Recycle Bin".into();
+            bin.id()
+        };
+        vault.db.group_mut(bin).expect("bin").add_group().name = "Old".into();
+        vault.db.meta.recyclebin_enabled = Some(true);
+        vault.db.meta.recyclebin_uuid = Some(bin.uuid());
+    }
+
+    #[test]
+    fn group_paths_are_normalized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (vault, _) = new_vault(&dir);
+        for (path, normalized) in [
+            ("Work/Servers", "Work/Servers"),
+            (" Work / Servers/ ", "Work/Servers"),
+            ("/Work//Servers/", "Work/Servers"),
+            ("", ""),
+            ("/", ""),
+            (" // ", ""),
+        ] {
+            assert_eq!(vault.check_group(path).expect(path), normalized, "{path:?}");
+        }
+        assert_eq!(group_components("/A / B").expect("components"), ["A", "B"]);
+        assert!(group_components("/").expect("top level").is_empty());
+    }
+
+    #[test]
+    fn edit_moves_an_entry_to_another_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        let id = add_in(&mut vault, "router", "Home");
+        let home = vault.db.entry(id).expect("entry").parent().id();
+
+        // Into a group that does not exist yet, nested: it is created.
+        vault
+            .edit(id, &move_to(" Work / Servers/Core/"), None)
+            .expect("move");
+        assert_eq!(vault.info(id).group.as_deref(), Some("Work/Servers/Core"));
+        assert_eq!(
+            vault.find("Work/Servers/Core/router").expect("new path"),
+            id
+        );
+        assert!(matches!(
+            vault.find("Home/router"),
+            Err(VaultError::NotFound(_))
+        ));
+        let stored = vault.db.entry(id).expect("entry");
+        assert!(stored.times.location_changed.is_some());
+        assert_eq!(stored.previous_parent().map(|g| g.id()), Some(home));
+        // The previous state is in the entry's history; nothing else changed.
+        assert_eq!(history_len(&vault, id), 1);
+        assert_eq!(
+            vault.secret(id).as_deref().map(String::as_str),
+            Some("abcd")
+        );
+        assert_eq!(vault.info(id).fields, entry("router").fields);
+        vault.save().expect("save");
+        let reopened = Vault::open(&path, secret("correct horse")).expect("reopen");
+        let found = reopened.find("Work/Servers/Core/router").expect("saved");
+        assert_eq!(found, id);
+        assert_eq!(
+            reopened
+                .db
+                .entry(id)
+                .and_then(|e| e.previous_parent().map(|g| g.id())),
+            Some(home)
+        );
+
+        // To the top level, written as an empty path or as `/`; back into
+        // the existing group, which is not created again.
+        let groups = vault.db.num_groups();
+        for top in ["", "/"] {
+            vault.edit(id, &move_to("Home"), None).expect("back home");
+            assert_eq!(vault.info(id).group.as_deref(), Some("Home"));
+            vault.edit(id, &move_to(top), None).expect("top level");
+            assert_eq!(vault.info(id).group, None, "{top:?}");
+            assert_eq!(
+                vault.db.entry(id).expect("entry").parent().id(),
+                vault.db.root().id()
+            );
+            assert_eq!(vault.find("router").expect("find"), id);
+        }
+        assert_eq!(vault.db.num_groups(), groups);
+        assert_eq!(history_len(&vault, id), 5);
+    }
+
+    #[test]
+    fn moving_an_entry_to_its_own_group_moves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let id = add_in(&mut vault, "db", "Work/Servers");
+        let groups = vault.db.num_groups();
+        vault
+            .edit(id, &move_to("/Work/Servers/"), None)
+            .expect("edit");
+        let stored = vault.db.entry(id).expect("entry");
+        assert_eq!(stored.times.location_changed, None);
+        assert!(stored.previous_parent().is_none());
+        assert_eq!(vault.info(id).group.as_deref(), Some("Work/Servers"));
+        assert_eq!(vault.db.num_groups(), groups);
+        // The same at the top level.
+        let top = add_in(&mut vault, "top", "");
+        vault.edit(top, &move_to("/"), None).expect("edit");
+        let stored = vault.db.entry(top).expect("entry");
+        assert_eq!(stored.times.location_changed, None);
+        assert!(stored.previous_parent().is_none());
+    }
+
+    #[test]
+    fn nothing_is_put_in_the_recycle_bin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let id = add_in(&mut vault, "router", "Home");
+        add_recycle_bin(&mut vault);
+        let groups = vault.db.num_groups();
+        for path in [
+            "Recycle Bin",
+            "/Recycle Bin/",
+            "Recycle Bin/Old",
+            "Recycle Bin/New/Deeper",
+        ] {
+            let refused = |result: Result<_, VaultError>| match result {
+                Err(VaultError::Invalid(message)) => {
+                    assert!(message.contains("recycle bin"), "{message}")
+                }
+                other => panic!("{path:?}: {:?}", other.map(|_| ())),
+            };
+            refused(vault.check_group(path).map(|_| ()));
+            let changes = EntryChanges {
+                rename: Some("renamed".into()),
+                host: Some("10.0.0.9".into()),
+                ..move_to(path)
+            };
+            refused(vault.edit(id, &changes, Some(&secret("new-value"))));
+            let mut new = entry("other");
+            new.group = Some(path.into());
+            refused(vault.add(&new, &secret("efgh"), false).map(|_| ()));
+        }
+        // Nothing changed: no group was created, the entry is as it was.
+        assert_eq!(vault.db.num_groups(), groups);
+        assert_eq!(vault.info(id).group.as_deref(), Some("Home"));
+        assert_eq!(vault.info(id).name, "router");
+        assert_eq!(vault.info(id).fields, entry("router").fields);
+        assert_eq!(
+            vault.secret(id).as_deref().map(String::as_str),
+            Some("abcd")
+        );
+        assert_eq!(history_len(&vault, id), 0);
+        assert!(matches!(vault.find("other"), Err(VaultError::NotFound(_))));
+        // A group that only has the same name, elsewhere, is not the bin.
+        assert_eq!(
+            vault.check_group("Home/Recycle Bin").expect("not the bin"),
+            "Home/Recycle Bin"
+        );
+        vault
+            .edit(id, &move_to("Home/Recycle Bin"), None)
+            .expect("move");
+        assert_eq!(vault.find("Home/Recycle Bin/router").expect("find"), id);
+    }
+
+    #[test]
+    fn an_invalid_group_is_refused_before_anything_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        let id = add_in(&mut vault, "router", "Home");
+        let groups = vault.db.num_groups();
+        let long = "x".repeat(129);
+        for path in [
+            "New/evil\u{202E}txt".to_string(),
+            "New/a\tb".to_string(),
+            format!("New/{long}"),
+        ] {
+            let refused = |result: Result<(), VaultError>| match result {
+                Err(VaultError::Invalid(message)) => {
+                    assert!(message.starts_with("group "), "{message}")
+                }
+                other => panic!("{path:?}: {other:?}"),
+            };
+            refused(vault.check_group(&path).map(|_| ()));
+            let changes = EntryChanges {
+                rename: Some("renamed".into()),
+                ..move_to(&path)
+            };
+            refused(vault.edit(id, &changes, None));
+            let mut new = entry("other");
+            new.group = Some(path.clone());
+            refused(vault.add(&new, &secret("efgh"), false).map(|_| ()));
+        }
+        // Not even the valid first component was created.
+        assert_eq!(vault.db.num_groups(), groups);
+        // A valid new group is not created either when another change of
+        // the same edit is refused.
+        add_in(&mut vault, "taken", "");
+        for changes in [
+            EntryChanges {
+                rename: Some("taken".into()),
+                ..move_to("Brand/New")
+            },
+            EntryChanges {
+                url: Some("https://x\nAllow".into()),
+                ..move_to("Brand/New")
+            },
+        ] {
+            assert!(vault.edit(id, &changes, None).is_err());
+        }
+        assert_eq!(vault.db.num_groups(), groups);
+        assert_eq!(vault.info(id).group.as_deref(), Some("Home"));
+        assert_eq!(vault.info(id).name, "router");
+        assert_eq!(history_len(&vault, id), 0);
     }
 
     #[test]

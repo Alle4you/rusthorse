@@ -33,7 +33,9 @@ values, approved Show and Copy of password/notes, a safely
 quoted UUID-based command snippet, password change and verified backup
 through existing requests.
 Existing groups cannot be changed by `edit`; M1 says so instead of emulating
-a move with delete/add (which would lose identity/history). Notes can be
+a move with delete/add (which would lose identity/history). (Since protocol
+7, `edit.group` moves an entry for real — same UUID, history kept — and the
+manager's Edit form uses it.) Notes can be
 shown but not edited in M1. Protected metadata is displayed as withheld and
 left untouched by forms. Only fields the user changes are sent.
 

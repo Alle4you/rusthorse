@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **6** (`PROTOCOL_VERSION` in
+Protocol version: **7** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -15,6 +15,7 @@ Protocol version: **6** (`PROTOCOL_VERSION` in
 | 4 | `reveal.purpose` (`show`, `copy`): what the client says it will do with a revealed value, named in the approval dialog and the audit log. Unreleased builds that reported protocol 3 had this field with another meaning for `copy` (one paste, then cleared); clients of protocol 4 refuse those agents. |
 | 5 | The entry `kind` (see [Entry kinds](#entry-kinds)): in `NewEntry.fields`, `EntryInfo`, `EntryChanges.kind`, and `"kind"` in `EntryChanges.clear`. An agent of version 4 would silently drop it, so the version changed. |
 | 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. Imports read by the agent: `keyring_items`, `dotenv_names`, `import_from` (see [Imports read by the agent](#imports-read-by-the-agent)). |
+| 7 | `EntryChanges.group` moves an entry to another group (see [EntryChanges](#entrychanges)). An agent of version 6 would silently drop it and report the edit done, so the version changed. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -128,6 +129,7 @@ Any request can also be answered with an [`error`](#errors).
 {"type": "show", "name": "core-router"}
 {"type": "add", "entry": {"name": "GITHUB_TOKEN", "fields": {"url": "https://github.com", "tags": ["dev"]}}, "value": null, "replace": false}
 {"type": "edit", "name": "core-router", "changes": {"host": "10.0.0.2", "clear": ["url"], "value": "prompt"}}
+{"type": "edit", "name": "core-router", "changes": {"group": "Network/Core"}}
 ```
 
 With `"value": null`, `add` makes the agent ask the human for the value. A
@@ -248,7 +250,10 @@ another. Clients leave the field out when they have no purpose to state.
 }
 ```
 
-Every field except `name` is optional.
+Every field except `name` is optional. `group` places a new entry; it is a
+path as in [`EntryChanges.group`](#entrychanges), created if missing, and
+refused if it leads into the recycle bin — for a new entry, before any
+dialog. An entry overwritten with `replace` stays in its group.
 
 ### Entry kinds
 
@@ -281,9 +286,26 @@ All fields are optional; omitted fields are left unchanged.
 | `username`, `url`, `host`, `notes` | string | New value (an empty string removes the field). |
 | `port` | integer 0–65535 | New port. |
 | `kind` | `"api-key"`, `"login"`, `"server"` or `"device"` | New kind (protocol 5). To remove the kind, put `"kind"` in `clear`. |
+| `group` | string | Move the entry to the group at this path (protocol 7), e.g. `"Work/Servers"`, created if missing; `""` or `"/"` is the top level. See below. |
 | `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"`, `"kind"` | Fields to remove. |
 | `add_tags`, `remove_tags` | array of strings | Tag changes. |
 | `value` | `"prompt"`, `{"provided": "…"}` or `{"generate": {"length": N, "alphabet": "…"}}` | New secret value: ask the human, use the given one, or generate one. |
+
+`group` is split at `/`; spaces around each part and empty parts are
+dropped, and each part must be a valid entry name (no control or invisible
+formatting characters, at most 128 characters). The path is followed from
+the top through the existing groups (the first child with each name),
+creating what is missing. The agent checks it before the approval dialog:
+an invalid path, or one that leads into the recycle bin (where an entry
+would be hidden from every listing), is refused with `invalid_request`
+without an approval dialog. The dialog shows the destination normalized and
+from the top (`/Work/Servers`; `/` for the top level). A path naming the
+group the entry is already in is dropped from the request before the dialog;
+if nothing else changes, the request fails with `invalid_request` ("nothing
+to change"). A move records the previous group and the
+time of the move in the entry (KDBX `PreviousParentGroup`,
+`LocationChanged`), and the entry's previous version goes to its history, as
+with every edit.
 
 ### Run
 
@@ -333,7 +355,7 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -445,7 +467,7 @@ treat the outcome as unknown.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-6 requests above, with the same
+`rusthorse-manager` uses the version-7 requests above, with the same
 approvals as the CLI. It targets entries by UUID, sends `reveal` with purpose
 `show` or `copy` for its Show and Copy actions, sends `create_vault` when
 there is no vault yet, imports with `keyring_items`, `dotenv_names` and

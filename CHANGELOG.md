@@ -11,6 +11,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **Move an entry to another group**: `rusthorse edit NAME --group PATH`
+  (`/` for the top level) and the **Group** field of the manager's **Edit**
+  form, which used to be locked. The group is created if needed, and the
+  agent's approval dialog shows the destination as a path from the top
+  (`/Work/Servers`, or `/`). The UUID stays the same, and the entry
+  records the group it came from.
 - **Change the value from the manager**: the **Secret** section has a row
   **Change the value…**, which opens the agent's dialog for the new value
   at once, and **Replace with a random value…** (before, **New random
@@ -165,12 +171,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   that is not in a command or a path could mislead), and the keys of detail
   rows no longer break inside words ("Dire-ctory").
 
-- **Protocol 6** (versions 2 to 5 existed only during development): data
+- **Protocol 7** (versions 2 to 6 existed only during development): data
   frames and credits, new requests (among them `create_vault`), definite
-  errors, `reveal.purpose` and the entry `kind` (see Added);
+  errors, `reveal.purpose`, the entry `kind` and `edit.group` (see Added);
   `already_exists` also means that the vault file exists. Upgrade the agent
   together with its clients and restart it: clients refuse an agent that
   speaks another version.
+- `add --group` refuses a path into the recycle bin: an entry there is
+  hidden from every listing, as if deleted.
 - `passwd` reports when the old-password backup could not be deleted.
 - `doctor` checks the files the agent actually uses, and notices an agent
   still running a build that an upgrade replaced; `status` shows the agent's

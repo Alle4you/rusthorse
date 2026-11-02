@@ -685,6 +685,200 @@ fn import_dotenv_edit_and_remove() {
     assert!(listing.contains("A_KEY") && !listing.contains("B_KEY"));
 }
 
+/// The group of entry `name` as `list --json` shows it (`None`: the top
+/// level).
+fn listed_group(h: &Harness, name: &str) -> Option<String> {
+    let out = h.run(&["list", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).expect("json");
+    let entry = entries
+        .iter()
+        .find(|e| e["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is not listed"));
+    entry["group"].as_str().map(str::to_string)
+}
+
+/// The value of the detail `label` in the last approval dialog.
+fn approval_detail(h: &Harness, label: &str) -> Option<String> {
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    request
+        .details
+        .iter()
+        .find(|(k, _)| k == label)
+        .map(|(_, v)| v.clone())
+}
+
+#[test]
+fn edit_moves_an_entry_to_another_group_only_when_allowed() {
+    let h = Harness::new();
+    h.add_secret(
+        "DB_PASSWORD",
+        "db-value-1234",
+        &["--group", "Home", "--host", "db.lan"],
+    );
+    let on_disk = std::fs::read(h.vault_path()).expect("read");
+
+    // Denied: the entry stays where it was, and no group is created.
+    h.decide(&[Decision::Deny]);
+    let out = h.run(&["edit", "DB_PASSWORD", "--group", "Work/Servers"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    assert_eq!(
+        approval_detail(&h, "Move to group").as_deref(),
+        Some("/Work/Servers")
+    );
+    assert!(
+        approval_detail(&h, "Entry")
+            .expect("entry")
+            .starts_with("Home/DB_PASSWORD (")
+    );
+    assert_eq!(listed_group(&h, "DB_PASSWORD").as_deref(), Some("Home"));
+    assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
+
+    // Allowed: moved into a new nested group. The dialog shows the path as
+    // it will be, from the top.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "DB_PASSWORD", "--group", " Work / Servers/"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        approval_detail(&h, "Move to group").as_deref(),
+        Some("/Work/Servers")
+    );
+    assert_eq!(
+        listed_group(&h, "DB_PASSWORD").as_deref(),
+        Some("Work/Servers")
+    );
+    let out = h.run(&["show", "Work/Servers/DB_PASSWORD"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("db.lan"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(!h.run(&["show", "Home/DB_PASSWORD"]).status.success());
+    let vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+    let id = vault
+        .find("Work/Servers/DB_PASSWORD")
+        .expect("moved on disk");
+    assert_eq!(
+        vault.secret(id).as_deref().map(String::as_str),
+        Some("db-value-1234")
+    );
+
+    // Back to the top level with `/`, shown as `/`.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "DB_PASSWORD", "--group", "/"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(approval_detail(&h, "Move to group").as_deref(), Some("/"));
+    assert_eq!(listed_group(&h, "DB_PASSWORD"), None);
+    assert!(h.run(&["show", "DB_PASSWORD"]).status.success());
+
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        audit_outcomes(&h, "edit"),
+        ["denied", "allowed_once", "allowed_once"]
+    );
+}
+
+#[test]
+fn a_bad_destination_group_is_refused_before_any_dialog() {
+    use keepass::{Database, DatabaseKey};
+    let h = Harness::new();
+    // A recycle bin with a group inside, as another KeePass client makes
+    // them; written before the agent opens the vault.
+    let raw = |path: &Path| {
+        Database::open(
+            &mut std::fs::File::open(path).expect("open"),
+            DatabaseKey::new().with_password(PASSWORD),
+        )
+        .expect("decrypt")
+    };
+    let mut db = raw(&h.vault_path());
+    let bin = {
+        let mut root = db.root_mut();
+        let mut bin = root.add_group();
+        bin.name = "Recycle Bin".into();
+        bin.add_group().name = "Old".into();
+        bin.id()
+    };
+    db.meta.recyclebin_enabled = Some(true);
+    db.meta.recyclebin_uuid = Some(bin.uuid());
+    db.save(
+        &mut std::fs::File::create(h.vault_path()).expect("create"),
+        DatabaseKey::new().with_password(PASSWORD),
+    )
+    .expect("save");
+
+    h.add_secret("API_KEY", "key-value-1234", &["--group", "Work"]);
+    let on_disk = std::fs::read(h.vault_path()).expect("read");
+    for (path, expected) in [
+        ("Recycle Bin", "recycle bin"),
+        ("/Recycle Bin/Old", "recycle bin"),
+        ("Recycle Bin/New", "recycle bin"),
+        ("Work/evil\u{202E}name", "group "),
+        ("Work/a\tb", "group "),
+    ] {
+        let out = h.run(&["edit", "API_KEY", "--group", path, "--host", "h.lan"]);
+        assert_eq!(out.status.code(), Some(1), "{path:?}");
+        assert!(
+            text(&out.stderr).contains(expected),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(audit_outcomes(&h, "edit").is_empty());
+    assert_eq!(listed_group(&h, "API_KEY").as_deref(), Some("Work"));
+    assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
+
+    // `add --group` refuses the recycle bin too, where the entry would be
+    // hidden from every listing.
+    h.ui.values
+        .lock()
+        .unwrap()
+        .push_back(Some("other-value-1234".into()));
+    let out = h.run(&["add", "OTHER", "--group", "Recycle Bin/Old"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("recycle bin"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Before the value is asked for: nobody types a value for nothing.
+    assert_eq!(
+        h.ui.values.lock().unwrap().len(),
+        1,
+        "the value was asked for"
+    );
+    h.ui.values.lock().unwrap().clear();
+    let db = raw(&h.vault_path());
+    assert!(
+        db.iter_all_entries()
+            .all(|e| e.get(keepass::db::fields::TITLE) != Some("OTHER")),
+        "the entry was put in the recycle bin"
+    );
+
+    // A move to the group the entry is in moves nothing: refused before any
+    // dialog, alone; with other changes, the dialog does not offer it.
+    for same in ["Work", " Work /", "/Work"] {
+        let out = h.run(&["edit", "API_KEY", "--group", same]);
+        assert_eq!(out.status.code(), Some(1), "{same:?}");
+        assert!(
+            text(&out.stderr).contains("already in that group"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "API_KEY", "--group", "Work", "--host", "h.lan"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        approval_detail(&h, "Move to group").is_none(),
+        "the dialog offered a move to the group the entry is in"
+    );
+    assert_eq!(listed_group(&h, "API_KEY").as_deref(), Some("Work"));
+}
+
 #[test]
 fn client_disconnect_kills_the_command() {
     let h = Harness::new();

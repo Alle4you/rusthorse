@@ -17,8 +17,8 @@ awaiting an independent review: try it with fake entries first.
 |---|---|
 | First start: start the agent, create the vault | |
 | Status of the agent, including what else locks it; unlock and lock | |
-| Browse, search and filter entries by group | Moving an entry to another group; editing notes |
-| Create, edit, rename and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
+| Browse, search and filter entries by group | Editing notes |
+| Create, edit, rename, move and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
 | The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
@@ -162,7 +162,7 @@ The **Secret** section has a row for each way to change the value:
 Either way the previous value stays in the entry's KeePass history, and a
 shown value is hidden.
 
-### Edit, rename, delete
+### Edit, rename, move, delete
 
 **Edit** sends only the fields you changed, after the agent's approval.
 Emptying a field removes it. Renaming keeps the entry's UUID and its KeePass
@@ -173,6 +173,21 @@ other changes, the agent asks for your approval of all of them first, then,
 for a typed value, for the value; **Type a new value** alone opens the
 agent's dialog for the value at once, like **Change the value…**. **Delete** removes the entry and its
 history from the vault — it does not revoke the credential at its provider.
+
+To **move** an entry, write another group in the form's **Group** row: a
+path such as `Work/Servers`, with `/` between the groups. A group that does
+not exist yet is created. Spaces around each group's name and empty names
+are left out, so ` Work / Servers ` is `Work/Servers`, and the same group
+written differently moves nothing. **Emptying the row moves the entry to the
+top level**, outside any group. A group's name follows the rules for an
+entry's name (for example at most 128 characters, no control or invisible
+characters): the form says which rule a name breaks before it sends
+anything. The agent's approval dialog shows the destination as a path from
+the top, `/Work/Servers`, or `/` for the top level. A move keeps the entry's
+UUID, so the command of **Use it from a command**, which names the entry by
+UUID, still works; a command that names it by its old `Group/Name` path no
+longer finds it. The agent refuses to move an entry into the recycle bin;
+use **Delete** to remove it.
 
 ### Give a secret to a program
 

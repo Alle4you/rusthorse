@@ -873,7 +873,17 @@ impl Agent {
             ));
         }
         let generation = self.generation(peer)?;
-        let exists = self.with_vault(peer, |v| Ok(v.contains(&entry.name)))?;
+        let exists = self.with_vault(peer, |v| {
+            let exists = v.contains(&entry.name);
+            // A new entry's group is checked before anyone types a value:
+            // the save would refuse the recycle bin or an invalid name after
+            // the dialogs. (With `replace`, an existing entry stays where it
+            // is and the group is not used.)
+            if !exists && let Some(group) = &entry.group {
+                v.check_group(group)?;
+            }
+            Ok(exists)
+        })?;
         if exists && !replace {
             return Err(VaultError::AlreadyExists(entry.name.clone()).into());
         }
@@ -1240,7 +1250,24 @@ impl Agent {
             return Err(Failure::invalid("nothing to change"));
         }
         let generation = self.generation(peer)?;
-        let current = self.with_vault(peer, |v| Ok(v.info(v.find(name)?)))?;
+        let current = self.with_vault(peer, |v| {
+            let current = v.info(v.find(name)?);
+            // Checked before anyone is asked: an invalid path, or one into
+            // the recycle bin, fails here. The dialog shows the destination
+            // as it will be: normalized, from the top. A move to the group
+            // the entry is in moves nothing, so the dialog does not offer it.
+            if let Some(path) = &changes.group {
+                let path = v.check_group(path)?;
+                let here = current.group.as_deref().unwrap_or_default();
+                changes.group = (path != here).then_some(path);
+            }
+            Ok(current)
+        })?;
+        if changes.is_empty() {
+            return Err(Failure::invalid(
+                "nothing to change: the entry is already in that group",
+            ));
+        }
         let event = AuditEvent::new("edit", peer).entries(vec![current.identity()]);
 
         let prompt_for_value = matches!(changes.value, Some(ValueChange::Prompt));
@@ -2343,6 +2370,11 @@ fn describe_fields(entry: &NewEntry) -> String {
 
 fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
+    // Always from the top, `/` alone for the top level: no group name
+    // (which cannot contain `/`) can pass for another destination.
+    if let Some(group) = &changes.group {
+        out.push(("Move to group".into(), format!("/{group}")));
+    }
     let mut set = |label: &str, value: &Option<String>| {
         if let Some(v) = value {
             out.push((format!("New {label}"), v.clone()));

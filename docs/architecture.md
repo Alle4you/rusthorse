@@ -264,8 +264,11 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 | group | entry's group path | — | yes |
 | other fields | custom fields | as stored | names only |
 
-Entries in the recycle bin are ignored. Edits record the previous state in
-the entry's KeePass history, so KeePassXC can show and restore old versions.
+Entries in the recycle bin are ignored, and none is put there: `add` and
+`edit` refuse a group path that leads into it. Edits record the previous
+state in the entry's KeePass history, so KeePassXC can show and restore old
+versions; a move to another group (`edit --group`) also records the previous
+group and the time of the move (`PreviousParentGroup`, `LocationChanged`).
 
 A `Kind` field that holds anything other than the four kinds (written by
 another client) is reported as one of the other fields, by name only, and

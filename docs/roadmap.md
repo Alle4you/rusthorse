@@ -10,13 +10,15 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 
 ## Visual manager
 
-**M1 implemented, awaiting review** ([ADR 0007](adr/0007-visual-manager.md),
-[guide](manager.md)). M1: metadata browsing, search and groups, agent-approved
-edits, generated values, Show and Copy, command snippets,
-status, locking and verified backup.
-M2: persistent agent configuration, grant revocation, bounded history and
-screen/suspend locking. M3: import UI, safe restoration and exclusive
-KeePassXC handoff. The [reference prototype](design/manager/index.html) uses
+**M1 done, M2 and M3 in progress** ([ADR 0007](adr/0007-visual-manager.md),
+[guide](manager.md)). M1 (done, reviewed): metadata browsing, search and
+groups, agent-approved edits, generated values, Show and Copy, command
+snippets, status, locking and verified backup; since then, first start,
+changing the value and moving entries between groups.
+M2: persistent agent configuration, grant revocation, bounded history, and
+screen/suspend locking (done in the agent, [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)).
+M3: import UI (done, [ADR 0012](adr/0012-import-read-by-the-agent.md)), safe
+restoration and exclusive KeePassXC handoff. The [reference prototype](design/manager/index.html) uses
 fake data and simulates features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
@@ -143,8 +145,10 @@ approved command.
 | **Lock on screen lock and suspend** | Done — [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md) | The agent watches logind (with a delay inhibitor before a suspend) and the Cinnamon, GNOME, MATE and freedesktop screensavers over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Entry kinds** | Done — [ADR 0008](adr/0008-entry-kinds.md) | `api-key`, `login`, `server`, `device`: labels and form fields, never policy. `run --url` passes an API key's endpoint. More kinds (database, SSH key) can follow. |
+| **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
+| **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Designed with the credential broker, whose tokens would point to a field. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 implemented, awaiting review | ADR 0007 and milestones above; manager stays an agent client. |
+| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |

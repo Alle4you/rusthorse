@@ -181,7 +181,7 @@ requester is an AI.
 | `add NAME` | New entry; you type the value in a dialog | the dialog itself |
 | `add NAME --stdin` | New entry with a value from standard input | yes |
 | `add NAME --generate` | New entry with a random value nobody sees | yes |
-| `edit NAME …` | Change fields, tags, name or value | yes |
+| `edit NAME …` | Change fields, tags, name, group or value | yes |
 | `remove NAME` | Delete an entry | yes |
 | `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
 | `reveal NAME [--notes]` | Print a value or the notes (for humans; avoid in automation) | yes (never remembered) |

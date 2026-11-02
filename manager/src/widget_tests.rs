@@ -837,7 +837,10 @@ fn desktop_flow() {
     spin_until(|| Instant::now() >= settle_frame);
     let inputs = entry_rows(&editor);
     assert_eq!(inputs[0].title(), "Name");
-    assert!(!inputs[1].is_sensitive());
+    // The group can be changed, which moves the entry (see below).
+    assert_eq!(inputs[1].title(), "Group (empty for none)");
+    assert!(inputs[1].is_sensitive());
+    assert_eq!(inputs[1].text(), "AI");
     inputs[0].set_text("RENAMED_FAKE");
     // The value: kept unless another choice is made, one choice at a time.
     let choices = value_choices(&editor);
@@ -894,6 +897,89 @@ fn desktop_flow() {
     ActionRowExt::activate(&named_row(&s.detail, "random-value"));
     settle(&s);
     assert!(s.revealed.borrow().as_ref().is_none_or(|w| !w.is_visible()));
+
+    // Moving: the Edit form's Group row takes a path, created if missing,
+    // with spaces around a `/` left out; emptying it moves the entry to the
+    // top level. Each move asks for approval and keeps the UUID.
+    let move_to = |typed: &str| {
+        s.rows.select_row(s.rows.row_at_index(0).as_ref());
+        s.edit(s.current());
+        let editor = s.editor.borrow().as_ref().unwrap().clone();
+        let group = entry_rows(&editor).remove(1);
+        assert_eq!(group.title(), "Group (empty for none)");
+        assert!(group.is_sensitive());
+        group.set_text(typed);
+        let asked = approvals.load(Ordering::SeqCst);
+        button(&editor, "Send to agent…").emit_clicked();
+        settle(&s);
+        let error = descendants(&editor)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.has_css_class("error"))
+            .map(|l| l.text().to_string());
+        assert!(!editor.is_visible(), "the form stayed open: {error:?}");
+        assert_eq!(approvals.load(Ordering::SeqCst), asked + 1);
+        assert_eq!(s.entries.borrow().len(), 1);
+        assert_eq!(s.entries.borrow()[0].id, id);
+        assert_eq!(s.entries.borrow()[0].name, "RENAMED_FAKE");
+    };
+    // The heading the list shows above the entry, and the groups the filter
+    // offers after "All groups".
+    let heading = |s: &Manager| {
+        s.rows
+            .row_at_index(0)
+            .and_then(|r| r.header())
+            .and_downcast::<gtk::Label>()
+            .map(|l| l.text().to_string())
+    };
+    let offered = |s: &Manager| {
+        let list = s.groups.model().and_downcast::<gtk::StringList>().unwrap();
+        (0..list.n_items())
+            .filter_map(|i| list.string(i))
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(heading(&s).as_deref(), Some("AI"));
+    move_to(" Work / Servers ");
+    assert_eq!(s.entries.borrow()[0].group.as_deref(), Some("Work/Servers"));
+    assert_eq!(heading(&s).as_deref(), Some("Work/Servers"));
+    assert!(descendants(&s.detail).iter().any(|w| {
+        w.clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|l| l.text().starts_with("Work/Servers · "))
+    }));
+    // The filter offers the new group (the old one has no entry left), and
+    // choosing it shows the entry.
+    assert_eq!(offered(&s), ["All groups", "Work/Servers"]);
+    s.groups.set_selected(1);
+    assert_eq!(
+        s.rows.row_at_index(0).map(|r| r.widget_name().to_string()),
+        Some(id.clone())
+    );
+    s.groups.set_selected(0);
+    // A group name the agent would refuse is refused by the form: nothing
+    // is sent and the form stays open with the reason.
+    s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    s.edit(s.current());
+    let editor = s.editor.borrow().as_ref().unwrap().clone();
+    entry_rows(&editor)[1].set_text("Work/Bad\u{200b}Name");
+    let asked = approvals.load(Ordering::SeqCst);
+    button(&editor, "Send to agent…").emit_clicked();
+    assert!(s.job.borrow().is_none() && editor.is_visible());
+    assert!(descendants(&editor).iter().any(|w| {
+        w.clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|l| l.has_css_class("error") && l.text().starts_with("Group: "))
+    }));
+    button(&editor, "Cancel").emit_clicked();
+    spin_until(|| !editor.is_visible());
+    drop(editor);
+    assert_eq!(approvals.load(Ordering::SeqCst), asked);
+    // Back to the top level.
+    move_to("");
+    assert_eq!(s.entries.borrow()[0].group, None);
+    assert_eq!(heading(&s).as_deref(), Some("No group"));
+    assert_eq!(offered(&s), ["All groups", "No group"]);
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     button(&s.detail, "Delete…").emit_clicked();
     settle(&s);

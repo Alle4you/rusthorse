@@ -83,14 +83,20 @@ impl Form {
             });
         };
         let before = Self::from_entry(old);
-        if self.group != before.group {
-            return Err("Moving an existing entry to another group is not supported yet.".into());
-        }
         let mut changes = EntryChanges::default();
         if self.name != before.name {
             editable(old, "Title")?;
             rusthorse::vault::validate_name(&self.name).map_err(|e| e.to_string())?;
             changes.rename = Some(self.name.clone());
+        }
+        // Compared as the agent reads a path, so that spaces around a `/`
+        // or a doubled `/` are no move. The empty path is the top level.
+        let group = group_path(&self.group);
+        if group != group_path(&before.group) {
+            for component in group.split('/').filter(|c| !c.is_empty()) {
+                rusthorse::vault::validate_name(component).map_err(|e| format!("Group: {e}"))?;
+            }
+            changes.group = Some(group);
         }
         for (current, previous, protected, field, dest) in [
             (
@@ -192,6 +198,16 @@ pub(crate) const KIND_CHOICES: [Option<EntryKind>; 5] = [
 /// How a kind is named in the form and the details.
 pub(crate) fn kind_label(kind: Option<EntryKind>) -> &'static str {
     kind.map_or("Other", EntryKind::label)
+}
+
+/// A group path as the agent reads it: each component trimmed, empty ones
+/// dropped, joined with `/`. The top level is the empty path.
+fn group_path(text: &str) -> String {
+    text.split('/')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn nonempty(text: &str) -> Option<String> {
@@ -369,6 +385,7 @@ pub(crate) mod tests {
         assert_eq!(name, entry.id);
         assert_eq!(changes.rename.as_deref(), Some("RENAMED"));
         assert_eq!(changes.clear, [Field::Username]);
+        assert!(changes.group.is_none(), "the entry stays in its group");
         assert!(changes.url.is_none() && changes.notes.is_none() && changes.value.is_none());
         assert!(changes.add_tags.is_empty() && changes.remove_tags.is_empty());
         form.url = "https://example.invalid".into();
@@ -376,15 +393,131 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn invalid_ports_no_changes_and_group_moves_do_not_send() {
+    fn invalid_ports_and_no_changes_do_not_send() {
         let entry = entry();
         let mut form = Form::from_entry(&entry);
         assert!(form.request(Some(&entry), ValueMode::Keep).is_err());
         form.port = "65536".into();
         assert!(form.request(Some(&entry), ValueMode::Generate).is_err());
-        form.port.clear();
-        form.group = "Other".into();
-        assert!(form.request(Some(&entry), ValueMode::Prompt).is_err());
+    }
+
+    /// The change an edit form sends, or its error.
+    fn changes(form: &Form, entry: &EntryInfo) -> Result<EntryChanges, String> {
+        match form.request(Some(entry), ValueMode::Keep)? {
+            Request::Edit { name, changes } => {
+                assert_eq!(name, entry.id);
+                Ok(changes)
+            }
+            _ => panic!("not edit"),
+        }
+    }
+
+    #[test]
+    fn group_moves_send_the_path_as_the_agent_reads_it() {
+        let entry = entry();
+        let mut form = Form::from_entry(&entry);
+        for (typed, sent) in [
+            ("Work/Servers", "Work/Servers"),
+            (" Work / Servers/ ", "Work/Servers"),
+            ("//Work//Servers", "Work/Servers"),
+            ("Prod", "Prod"),
+        ] {
+            form.group = typed.into();
+            let changes = changes(&form, &entry).expect(typed);
+            assert_eq!(changes.group.as_deref(), Some(sent), "{typed:?}");
+            // Only the group moves: no rename, nothing cleared or set.
+            assert!(
+                changes.rename.is_none() && changes.clear.is_empty(),
+                "{typed:?}"
+            );
+            assert!(changes.username.is_none() && changes.value.is_none());
+            assert!(changes.add_tags.is_empty() && changes.remove_tags.is_empty());
+        }
+    }
+
+    #[test]
+    fn emptying_the_group_moves_to_the_top_level() {
+        let entry = entry();
+        let mut form = Form::from_entry(&entry);
+        for typed in ["", "  ", "/", " / "] {
+            form.group = typed.into();
+            let changes = changes(&form, &entry).expect(typed);
+            assert_eq!(changes.group.as_deref(), Some(""), "{typed:?}");
+        }
+        // An entry at the top level moves into a group, and stays where it
+        // is when the row is left empty.
+        let mut top = entry.clone();
+        top.group = None;
+        let mut form = Form::from_entry(&top);
+        assert_eq!(form.group, "");
+        assert_eq!(
+            changes(&form, &top).expect_err("no move"),
+            "Nothing changed."
+        );
+        form.group = " / ".into();
+        assert_eq!(
+            changes(&form, &top).expect_err("no move"),
+            "Nothing changed."
+        );
+        form.group = "AI".into();
+        assert_eq!(
+            changes(&form, &top).expect("move").group.as_deref(),
+            Some("AI")
+        );
+    }
+
+    #[test]
+    fn the_same_group_written_differently_is_no_move() {
+        let mut entry = entry();
+        entry.group = Some("Work/Servers".into());
+        let mut form = Form::from_entry(&entry);
+        for typed in [" Work / Servers ", "Work//Servers/", "/Work/Servers"] {
+            form.group = typed.into();
+            let error = changes(&form, &entry).expect_err(typed);
+            assert_eq!(error, "Nothing changed.", "{typed:?}");
+        }
+        // Another change is sent without a move.
+        form.port = "22".into();
+        let changes = changes(&form, &entry).expect("edit");
+        assert_eq!(changes.port, Some(22));
+        assert!(changes.group.is_none());
+    }
+
+    #[test]
+    fn invalid_group_names_are_refused_before_sending() {
+        let entry = entry();
+        let mut form = Form::from_entry(&entry);
+        let long = "g".repeat(129);
+        for typed in [
+            "Work/Bad\u{200b}Name".to_string(),
+            "Work/Tab\there".to_string(),
+            format!("Work/{long}"),
+        ] {
+            form.group = typed.clone();
+            let error = changes(&form, &entry).expect_err(&typed);
+            assert!(error.starts_with("Group: the name must"), "{error}");
+        }
+        // 128 characters is a valid group name.
+        form.group = format!("Work/{}", "g".repeat(128));
+        assert!(changes(&form, &entry).is_ok());
+    }
+
+    #[test]
+    fn a_rename_and_a_move_go_together() {
+        let entry = entry();
+        let mut form = Form::from_entry(&entry);
+        form.name = "RENAMED".into();
+        form.group = " Prod / Keys ".into();
+        let changes = changes(&form, &entry).expect("edit");
+        assert_eq!(changes.rename.as_deref(), Some("RENAMED"));
+        assert_eq!(changes.group.as_deref(), Some("Prod/Keys"));
+        // An invalid name stops the whole edit, the move with it.
+        form.name = "Bad/Name".into();
+        assert!(form.request(Some(&entry), ValueMode::Keep).is_err());
+        // And an invalid group stops the rename.
+        form.name = "RENAMED".into();
+        form.group = "Prod/\u{202e}Keys".into();
+        assert!(form.request(Some(&entry), ValueMode::Keep).is_err());
     }
 
     #[test]
