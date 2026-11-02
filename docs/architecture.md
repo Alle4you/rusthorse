@@ -220,15 +220,18 @@ for sessions of the agent's user, and the screensavers' `ActiveChanged` on
 the session bus. Each reads signals on one connection and asks its
 questions (the owner of logind's name, a session's user, the inhibitor —
 the last on a helper thread) on a second one with a 2-second limit, so that
-a reply never waits behind queued signals and a slow one never delays a
-lock. logind's signals count only as broadcasts from the current owner of
-its name; malformed ones are ignored. A lock from them is the same as
+a reply never waits behind queued signals; the inhibitor never delays a
+lock, the other questions by at most that limit. logind's signals count only
+from the current owner of its name; malformed ones are ignored. A lock from them is the same as
 `rusthorse lock` and changes the generation even when the vault is already
 locked, so an unlock under way does nothing. Signals only lock; no signal
 unlocks. A watcher whose bus goes away reports itself inactive in `status`
-and connects again every five seconds; on connecting it locks if a session
-is locked or a screensaver on already. The agent's handle on the watchers
-closes their connections and joins their threads when the agent is dropped.
+and connects again every five seconds; on connecting — and when a
+screensaver appears — it locks if a session is locked or a screensaver on
+already, or if it gets no answer in time. The inhibitor is let go only once
+the lock is done. The agent's handle on the watchers closes their
+connections and waits up to 3 seconds for their threads when the agent is
+dropped.
 The watchers exist only with the `session-lock` Cargo feature (on by
 default).
 

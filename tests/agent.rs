@@ -3036,6 +3036,9 @@ mod session_lock {
     const SESSION: &str = "org.freedesktop.login1.Session";
     const OURS: &str = "/org/freedesktop/login1/session/_31";
     const OTHERS: &str = "/org/freedesktop/login1/session/_32";
+    /// Another user's session, asked about only in the burst below, so that
+    /// its first question is still pending while signals pile up.
+    const THIRD: &str = "/org/freedesktop/login1/session/_33";
 
     /// A `dbus-daemon` with a configuration of its own: anyone may own any
     /// name, nothing is activated, it listens in a private directory. (Its
@@ -3152,8 +3155,8 @@ mod session_lock {
         }
     }
 
-    /// A logind session of user `uid`; `slow` delays the answer to who
-    /// its user is, in milliseconds.
+    /// A logind session of user `uid`; `slow` delays its answers (who its
+    /// user is, whether it is locked), in milliseconds.
     struct FakeSession {
         uid: u32,
         locked: bool,
@@ -3173,19 +3176,31 @@ mod session_lock {
 
         #[zbus(property)]
         fn locked_hint(&self) -> bool {
+            std::thread::sleep(Duration::from_millis(self.slow));
             self.locked
         }
     }
 
-    /// Cinnamon's screensaver, as far as the agent asks it.
+    /// Cinnamon's screensaver, as far as the agent asks it: `slow` delays
+    /// the answer to `GetActive` (milliseconds); `refuse` answers that it
+    /// cannot tell, as `csd-screensaver` does.
+    #[derive(Default)]
     struct FakeScreenSaver {
         active: bool,
+        slow: u64,
+        refuse: bool,
     }
 
     #[zbus::interface(name = "org.cinnamon.ScreenSaver")]
     impl FakeScreenSaver {
-        fn get_active(&self) -> bool {
-            self.active
+        fn get_active(&self) -> zbus::fdo::Result<bool> {
+            std::thread::sleep(Duration::from_millis(self.slow));
+            if self.refuse {
+                return Err(zbus::fdo::Error::NotSupported(
+                    "This method is not implemented".into(),
+                ));
+            }
+            Ok(self.active)
         }
     }
 
@@ -3218,11 +3233,20 @@ mod session_lock {
                 },
             )
             .unwrap()
-            // Slow to say whose it is, so that signals pile up meanwhile.
             .serve_at(
                 OTHERS,
                 FakeSession {
                     uid: uid + 1,
+                    locked: false,
+                    slow: 0,
+                },
+            )
+            .unwrap()
+            // Slow to say whose it is, so that signals pile up meanwhile.
+            .serve_at(
+                THIRD,
+                FakeSession {
+                    uid: uid + 2,
                     locked: false,
                     slow: 500,
                 },
@@ -3233,11 +3257,21 @@ mod session_lock {
     }
 
     fn screensaver(bus: &Bus, active: bool) -> Connection {
+        screensaver_like(
+            bus,
+            FakeScreenSaver {
+                active,
+                ..FakeScreenSaver::default()
+            },
+        )
+    }
+
+    fn screensaver_like(bus: &Bus, fake: FakeScreenSaver) -> Connection {
         connection::Builder::address(bus.address.as_str())
             .unwrap()
             .name("org.cinnamon.ScreenSaver")
             .unwrap()
-            .serve_at("/org/cinnamon/ScreenSaver", FakeScreenSaver { active })
+            .serve_at("/org/cinnamon/ScreenSaver", fake)
             .unwrap()
             .build()
             .unwrap()
@@ -3322,6 +3356,7 @@ mod session_lock {
             on_screen_lock: true,
             system_bus: Some(system.address.clone()),
             session_bus: Some(session.address.clone()),
+            refresh_every: Some(Duration::from_millis(300)),
         }
     }
 
@@ -3475,7 +3510,7 @@ mod session_lock {
         wait_for_records(&h, "screen_locked", 1);
         unlock(&h);
         for _ in 0..200 {
-            emit(&logind, OTHERS, SESSION, "Lock", &());
+            emit(&logind, THIRD, SESSION, "Lock", &());
         }
         std::thread::sleep(Duration::from_millis(500));
         assert!(!locked(&h), "another user's session lock locked this vault");
@@ -3544,13 +3579,10 @@ mod session_lock {
         );
     }
 
-    #[test]
-    fn a_screensaver_already_on_when_the_bus_comes_back_locks() {
-        if !Bus::available() {
-            return;
-        }
-        // The session bus is not there when the agent starts; the vault is
-        // unlocked meanwhile; the bus comes with the screensaver already on.
+    /// The session bus is not there when the agent starts; the vault is
+    /// unlocked meanwhile; then the bus comes, with `fake` on it. Whether
+    /// the vault ends up locked.
+    fn after_the_session_bus_comes(fake: FakeScreenSaver) -> bool {
         let system = Bus::started();
         let mut session = Bus::new();
         let h = Harness::with_session_lock(Settings {
@@ -3567,16 +3599,119 @@ mod session_lock {
         });
         unlock(&h);
         session.start();
+        let _screensaver = screensaver_like(&session, fake);
+        wait_for("the screensaver to be seen", || {
+            trigger(&h, "screen_lock", "org.cinnamon.ScreenSaver").is_some()
+        });
+        // Its `GetActive` is asked right after; give a slow one its time.
+        std::thread::sleep(Duration::from_millis(2500));
+        let locked = locked(&h);
+        if locked {
+            wait_for_records(&h, "screen_locked", 1);
+        }
+        locked
+    }
+
+    #[test]
+    fn a_screensaver_already_on_when_the_bus_comes_back_locks() {
+        if !Bus::available() {
+            return;
+        }
+        assert!(after_the_session_bus_comes(FakeScreenSaver {
+            active: true,
+            ..FakeScreenSaver::default()
+        }));
+    }
+
+    #[test]
+    fn a_screensaver_that_does_not_answer_in_time_counts_as_on() {
+        if !Bus::available() {
+            return;
+        }
+        // It would say "on" after 3 s, past the 2-second limit.
+        assert!(after_the_session_bus_comes(FakeScreenSaver {
+            active: true,
+            slow: 3000,
+            refuse: false,
+        }));
+    }
+
+    #[test]
+    fn a_screensaver_that_cannot_tell_does_not_lock() {
+        if !Bus::available() {
+            return;
+        }
+        assert!(!after_the_session_bus_comes(FakeScreenSaver {
+            refuse: true,
+            ..FakeScreenSaver::default()
+        }));
+        assert!(!after_the_session_bus_comes(FakeScreenSaver::default()));
+    }
+
+    #[test]
+    fn a_screensaver_that_comes_later_already_on_locks() {
+        if !Bus::available() {
+            return;
+        }
+        let (system, session) = (Bus::started(), Bus::started());
+        let h = Harness::with_session_lock(Settings {
+            on_suspend: false,
+            ..settings(&system, &session)
+        });
+        wait_for("no screensaver to show", || {
+            trigger(&h, "screen_lock", "screensaver").is_some_and(|t| t["active"] == false)
+        });
+        unlock(&h);
+        // It comes on the bus already on, and sends no signal.
         let _screensaver = screensaver(&session, true);
-        wait_for("the lock on reconnecting", || locked(&h));
+        wait_for("the lock when it is seen", || locked(&h));
         wait_for_records(&h, "screen_locked", 1);
     }
 
     #[test]
-    fn a_session_already_locked_when_logind_comes_back_locks() {
+    fn logind_leaving_or_restarting_is_noticed() {
         if !Bus::available() {
             return;
         }
+        let (system, session) = (Bus::started(), Bus::started());
+        let inhibitors = Arc::new(Mutex::new(Vec::new()));
+        let delay = Arc::new(AtomicU64::new(0));
+        let first = logind(&system, &inhibitors, &delay);
+        let h = Harness::with_session_lock(Settings {
+            on_screen_lock: false,
+            ..settings(&system, &session)
+        });
+        wait_for("the suspend watcher", || {
+            trigger(&h, "suspend", "logind").is_some_and(|t| t["active"] == true)
+        });
+        // logind goes: the suspend lock is no longer promised, and the
+        // inhibitor it gave, which means nothing now, is let go.
+        first.close().unwrap();
+        wait_for("logind's absence to show", || {
+            trigger(&h, "suspend", "logind").is_some_and(|t| {
+                t["active"] == false
+                    && t["note"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("not on the system bus")
+            })
+        });
+        wait_for("the stale inhibitor's release", || {
+            released(&inhibitors.lock().unwrap()[0])
+        });
+        // It comes back (a new unique name): a new inhibitor, watched again.
+        let _second = logind(&system, &inhibitors, &delay);
+        wait_for("a new inhibitor", || inhibitors.lock().unwrap().len() == 2);
+        wait_for("the suspend lock watched again", || {
+            trigger(&h, "suspend", "logind").is_some_and(|t| t["active"] == true)
+        });
+        assert!(!released(&inhibitors.lock().unwrap()[1]));
+    }
+
+    /// The system bus is not there when the agent starts; the vault is
+    /// unlocked meanwhile; then the bus comes, with logind and its session of
+    /// this user `ours` — or without logind. Whether the vault ends up locked.
+    fn after_logind_comes(ours: Option<FakeSession>) -> bool {
         let mut system = Bus::new();
         let session = Bus::started();
         let h = Harness::with_session_lock(Settings {
@@ -3594,32 +3729,71 @@ mod session_lock {
         unlock(&h);
         system.start();
         let uid = nix::unistd::getuid().as_raw();
-        let _logind = connection::Builder::address(system.address.as_str())
-            .unwrap()
-            .name(LOGIND)
-            .unwrap()
-            .serve_at(
-                MANAGER_PATH,
-                FakeManager {
-                    inhibitors: Arc::default(),
-                    delay: Arc::default(),
-                    uid,
-                },
-            )
-            .unwrap()
-            .serve_at(
-                OURS,
-                FakeSession {
-                    uid,
-                    locked: true,
-                    slow: 0,
-                },
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-        wait_for("the lock on reconnecting", || locked(&h));
-        wait_for_records(&h, "screen_locked", 1);
+        let present = ours.is_some();
+        let _logind = ours.map(|ours| {
+            connection::Builder::address(system.address.as_str())
+                .unwrap()
+                .name(LOGIND)
+                .unwrap()
+                .serve_at(
+                    MANAGER_PATH,
+                    FakeManager {
+                        inhibitors: Arc::default(),
+                        delay: Arc::default(),
+                        uid,
+                    },
+                )
+                .unwrap()
+                .serve_at(OURS, ours)
+                .unwrap()
+                .build()
+                .unwrap()
+        });
+        wait_for("the bus to be seen", || {
+            trigger(&h, "screen_lock", "logind").is_some_and(|t| {
+                if present {
+                    t["active"] == true
+                } else {
+                    t["note"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("not on the system bus")
+                }
+            })
+        });
+        // `LockedHint` is asked right after; give a slow answer its time.
+        std::thread::sleep(Duration::from_millis(2500));
+        let locked = locked(&h);
+        if locked {
+            wait_for_records(&h, "screen_locked", 1);
+        }
+        locked
+    }
+
+    #[test]
+    fn a_session_already_locked_when_logind_comes_back_locks() {
+        if !Bus::available() {
+            return;
+        }
+        let uid = nix::unistd::getuid().as_raw();
+        assert!(after_logind_comes(Some(FakeSession {
+            uid,
+            locked: true,
+            slow: 0
+        })));
+        // Not answering in time counts as locked: the safe side.
+        assert!(after_logind_comes(Some(FakeSession {
+            uid,
+            locked: false,
+            slow: 3000
+        })));
+        assert!(!after_logind_comes(Some(FakeSession {
+            uid,
+            locked: false,
+            slow: 0
+        })));
+        // No logind at all: nothing to recover, nothing locked.
+        assert!(!after_logind_comes(None));
     }
 
     #[test]
@@ -3687,6 +3861,116 @@ mod session_lock {
         );
         wait_for("its release", || released(&inhibitors.lock().unwrap()[0]));
         drop(counter);
+    }
+
+    /// Holds every lock until opened, like a vault save holding the
+    /// agent's state lock.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+        locks: AtomicUsize,
+    }
+
+    impl Gate {
+        fn set(&self, open: bool) {
+            *self.open.lock().unwrap() = open;
+            self.opened.notify_all();
+        }
+    }
+
+    impl Locker for Gate {
+        fn lock_for(&self, _: &str, _: &str) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            self.locks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn an_inhibitor_that_arrives_while_locking_is_kept_until_locked() {
+        if !Bus::available() {
+            return;
+        }
+        let (system, session) = (Bus::started(), Bus::started());
+        let inhibitors = Arc::new(Mutex::new(Vec::new()));
+        let delay = Arc::new(AtomicU64::new(0));
+        let logind = logind(&system, &inhibitors, &delay);
+        let gate = Arc::new(Gate::default());
+        gate.set(true);
+        let _watchers = rusthorse::session_lock::start(
+            Arc::downgrade(&gate),
+            Settings {
+                on_screen_lock: false,
+                ..settings(&system, &session)
+            },
+            Arc::new(Triggers::default()),
+        );
+        wait_for("the inhibitor", || inhibitors.lock().unwrap().len() == 1);
+        // One full suspend and resume; the next inhibitor comes slowly.
+        emit(&logind, MANAGER_PATH, MANAGER, "PrepareForSleep", &(true,));
+        wait_for("the first lock", || gate.locks.load(Ordering::SeqCst) == 1);
+        delay.store(1200, Ordering::SeqCst);
+        emit(&logind, MANAGER_PATH, MANAGER, "PrepareForSleep", &(false,));
+        // The next suspend's lock is held up; the inhibitor arrives
+        // meanwhile and must be kept until the lock is done.
+        gate.set(false);
+        emit(&logind, MANAGER_PATH, MANAGER, "PrepareForSleep", &(true,));
+        wait_for("the slow inhibitor", || {
+            inhibitors.lock().unwrap().len() == 2
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !released(&inhibitors.lock().unwrap()[1]),
+            "let go before the vault was locked"
+        );
+        gate.set(true);
+        wait_for("its release once locked", || {
+            released(&inhibitors.lock().unwrap()[1])
+        });
+        assert_eq!(gate.locks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_a_bus_that_never_answers() {
+        // A socket that accepts connections and never says a word: the
+        // watchers hang in authentication.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mute");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        {
+            let accepted = Arc::clone(&accepted);
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    accepted.lock().unwrap().push(stream);
+                }
+            });
+        }
+        let address = format!("unix:path={}", path.display());
+        let counter = Arc::new(Counter::default());
+        let watchers = rusthorse::session_lock::start(
+            Arc::downgrade(&counter),
+            Settings {
+                on_suspend: true,
+                on_screen_lock: true,
+                system_bus: Some(address.clone()),
+                session_bus: Some(address),
+                refresh_every: None,
+            },
+            Arc::new(Triggers::default()),
+        );
+        wait_for("the connections", || accepted.lock().unwrap().len() >= 3);
+        let started = Instant::now();
+        drop(watchers);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stopping waited for a mute bus"
+        );
+        // Let the threads left behind fail and end.
+        accepted.lock().unwrap().clear();
     }
 
     #[test]

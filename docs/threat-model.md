@@ -418,8 +418,8 @@ logind's signal only, accepted as a broadcast from the owner of logind's
 name. A dialog already on the screen when the vault
 locks stays until it is answered or times out; whatever it would approve then
 finds the vault locked and does nothing. Hibernation writes RAM to disk: the
-vault is locked first, but memory that held it is not guaranteed to have been
-overwritten (L7). Forged signals — any program of the session can emit a
+agent locks the vault on logind's signal, within the limits above, and memory
+that held it is not guaranteed to have been overwritten (L7). Forged signals — any program of the session can emit a
 screensaver's — can only lock: nothing unlocks but the master password.
 *Mitigation:* keep both behaviours on; check `rusthorse doctor`; with a
 locker that emits no signal, run `rusthorse lock` from its hook, and keep
@@ -1075,3 +1075,20 @@ the fake answered whose a session is so fast that signals never piled up —
 it now takes 500 ms for the other user's session, which made the shared-
 connection deadlock show. A check of the real buses, read only, found the
 same signals and properties as the design assumed.
+
+Verification of those fixes (Codex, AI-assisted, 2026-11-02; verdict: not
+ready). Confirmed fixed: the forged and malformed signals, the original
+blocking cases, missing services at start, a refused inhibitor, the audit
+race. New findings, and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Medium — the inhibitor could be let go before the lock was done: the watcher marked "going to sleep" before locking, and an inhibitor that arrived while the lock waited for the agent's state lock (a vault save) was closed at once | **Fixed:** three phases — awake, locking, locked. An inhibitor that arrives while locking is kept and let go once the lock is done; one that arrives after it is let go at once. Tested with a locker that holds the lock until released. |
+| Medium — stopping the watchers had no limit while a bus accepted the connection but never answered its authentication: `method_timeout` does not cover it, and the connection was not yet known, so it could not be closed | **Fixed:** each connection is kept for closing as soon as it exists, and stopping waits at most 3 seconds for the threads; one still connecting is left to end on its own, holding nothing. Tested with a socket that never answers. |
+| Medium — recovery took "no answer in time" for "not locked": a screensaver that said "on" after 3 s left the vault open, and only presence was refreshed | **Fixed:** without an answer in time, a watcher locks; a definite "cannot tell" (no logind, a screensaver that does not implement `GetActive`, as Cinnamon's `csd-screensaver` does not) locks nothing; a screensaver that appears later is asked too. Tested: a slow `GetActive` and a slow `LockedHint` lock; a refusal, no logind, and a screensaver off do not; one that appears already on locks. |
+| Medium — after logind left, the suspend lock still showed as watched (the refresh asked only when no inhibitor was held) | **Fixed:** the refresh checks the owner of logind's name and lets go of an inhibitor given by a logind that left or restarted, then asks again — which reports logind's absence. Tested: logind leaving and coming back. |
+| Low — the saturated-queue test asked about the other user's session before the burst, so the answer was cached and the queue never filled while waiting | **Fixed:** the burst is about a session not asked about before, whose answer takes 500 ms. Reverting the separate connection now makes the test fail. |
+| Documentation — "a slow one never delays a lock" (questions about logind's owner and a session's user are asked in the watcher's thread, within the limit), "a signal sent to the agent alone is ignored" (one from logind itself is not), "the vault is locked first" | **Fixed** in architecture.md, ADR 0009 and L20. |
+
+Each fix was reverted in a copy of the tree to see a test fail (10 of 10;
+an eleventh mutation found a redundant status update, removed).

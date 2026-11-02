@@ -63,6 +63,9 @@ pub struct Settings {
     pub system_bus: Option<String>,
     /// Address of the session bus; `None` for the usual one.
     pub session_bus: Option<String>,
+    /// How often a watcher checks that its services are still there;
+    /// `None` for every 30 seconds. (Tests use a shorter one.)
+    pub refresh_every: Option<std::time::Duration>,
 }
 
 /// The state of one trigger, as `status` reports it.
@@ -219,6 +222,10 @@ mod watch {
     const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
     /// How often a sleeping thread looks whether it should stop.
     const STEP: Duration = Duration::from_millis(50);
+    /// The longest stopping the watchers waits for their threads; a thread
+    /// still connecting then (the bus not answering its authentication) is
+    /// left to finish on its own — it holds nothing yet.
+    const SHUTDOWN: Duration = Duration::from_secs(3);
 
     const BUS_NAME: &str = "org.freedesktop.DBus";
     const BUS_PATH: &str = "/org/freedesktop/DBus";
@@ -302,11 +309,21 @@ mod watch {
             self.shared.stopped.store(true, Ordering::SeqCst);
             self.shared.close_all();
             // The last reference to the agent may go away in one of these
-            // threads (it holds one while locking): never join oneself.
+            // threads (it holds one while locking): never wait for oneself.
             let me = thread::current().id();
-            let helpers: Vec<_> = lock_of(&self.shared.helpers).drain(..).collect();
-            for handle in self.threads.drain(..).chain(helpers) {
-                if handle.thread().id() != me {
+            let mut handles: Vec<_> = self
+                .threads
+                .drain(..)
+                .chain(lock_of(&self.shared.helpers).drain(..))
+                .filter(|h| h.thread().id() != me)
+                .collect();
+            let until = Instant::now() + SHUTDOWN;
+            while handles.iter().any(|h| !h.is_finished()) && Instant::now() < until {
+                // A connection made after `close_all` is closed by `keep`.
+                thread::sleep(STEP);
+            }
+            for handle in handles.drain(..) {
+                if handle.is_finished() {
                     let _ = handle.join();
                 }
             }
@@ -320,6 +337,7 @@ mod watch {
         shared: Arc<Shared>,
         bus: Option<String>,
         system: bool,
+        refresh_every: Duration,
     }
 
     impl<L: Locker> Ctx<L> {
@@ -368,27 +386,36 @@ mod watch {
             locker: &Weak<L>,
             triggers: &Arc<Triggers>,
             shared: &Arc<Shared>,
-            bus: Option<String>,
+            settings: &Settings,
         ) -> Option<JoinHandle<()>> {
             let ctx = Ctx {
                 locker: locker.clone(),
                 triggers: Arc::clone(triggers),
                 shared: Arc::clone(shared),
-                bus,
+                bus: if self.system {
+                    settings.system_bus.clone()
+                } else {
+                    settings.session_bus.clone()
+                },
                 system: self.system,
+                refresh_every: settings.refresh_every.unwrap_or(REFRESH),
             };
             thread::Builder::new()
                 .name(self.name.into())
                 .spawn(move || {
                     while ctx.going() {
                         let result = (|| {
+                            // Each kept as soon as it exists, so that stopping
+                            // can close it.
                             let signals = ctx.connect(None)?;
-                            let queries = ctx.connect(Some(QUERY_TIMEOUT))?;
-                            let ids = [ctx.shared.keep(&signals), ctx.shared.keep(&queries)];
-                            let result = (self.once)(&ctx, &signals, &queries);
-                            for id in ids {
-                                ctx.shared.forget(id);
-                            }
+                            let signals_id = ctx.shared.keep(&signals);
+                            let result = ctx.connect(Some(QUERY_TIMEOUT)).and_then(|queries| {
+                                let queries_id = ctx.shared.keep(&queries);
+                                let result = (self.once)(&ctx, &signals, &queries);
+                                ctx.shared.forget(queries_id);
+                                result
+                            });
+                            ctx.shared.forget(signals_id);
                             result
                         })();
                         if !ctx.going() {
@@ -425,7 +452,7 @@ mod watch {
                 once: watch_suspend::<L>,
                 lost: |t: &Triggers, note| t.set(SUSPEND, LOGIND, State::Inactive, Some(note)),
             };
-            threads.extend(watcher.spawn(&locker, &triggers, &shared, settings.system_bus.clone()));
+            threads.extend(watcher.spawn(&locker, &triggers, &shared, &settings));
         } else {
             triggers.set(SUSPEND, LOGIND, State::Inactive, Some("turned off".into()));
         }
@@ -438,12 +465,7 @@ mod watch {
                 once: watch_sessions::<L>,
                 lost: |t: &Triggers, note| t.set(SCREEN_LOCK, LOGIND, State::Inactive, Some(note)),
             };
-            threads.extend(sessions.spawn(
-                &locker,
-                &triggers,
-                &shared,
-                settings.system_bus.clone(),
-            ));
+            threads.extend(sessions.spawn(&locker, &triggers, &shared, &settings));
             let screensavers = Watcher {
                 name: "rusthorse-screensaver",
                 system: false,
@@ -455,7 +477,7 @@ mod watch {
                     t.set(SCREEN_LOCK, ANY_SCREENSAVER, State::Inactive, Some(note));
                 },
             };
-            threads.extend(screensavers.spawn(&locker, &triggers, &shared, settings.session_bus));
+            threads.extend(screensavers.spawn(&locker, &triggers, &shared, &settings));
         } else {
             for source in [LOGIND, ANY_SCREENSAVER] {
                 triggers.set(
@@ -523,13 +545,35 @@ mod watch {
         }
     }
 
+    /// Where the computer is, as far as the inhibitor is concerned.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum Phase {
+        /// Awake: an inhibitor is held, or asked for.
+        #[default]
+        Awake,
+        /// Going to sleep, the vault being locked: an inhibitor that arrives
+        /// now is kept until the lock is done.
+        Locking,
+        /// Going to sleep, the vault locked: an inhibitor that arrives now is
+        /// let go at once.
+        Asleep,
+    }
+
+    #[derive(Default)]
+    struct Held {
+        fd: Option<OwnedFd>,
+        /// The unique name of the logind that gave it: one from a logind
+        /// gone or restarted means nothing.
+        from: Option<String>,
+        phase: Phase,
+    }
+
     /// The delay inhibitor. It is asked for on a thread of its own, so that
-    /// a slow answer never holds up a lock; one that arrives while the
-    /// computer goes to sleep is let go at once.
+    /// a slow answer never holds up a lock, and let go only once the vault
+    /// is locked.
     #[derive(Default)]
     struct Inhibitor {
-        fd: Mutex<Option<OwnedFd>>,
-        sleeping: AtomicBool,
+        held: Mutex<Held>,
         asking: AtomicBool,
     }
 
@@ -540,10 +584,13 @@ mod watch {
             shared: &Shared,
             queries: &Connection,
         ) {
-            if self.sleeping.load(Ordering::SeqCst)
-                || lock_of(&self.fd).is_some()
-                || self.asking.swap(true, Ordering::SeqCst)
             {
+                let held = lock_of(&self.held);
+                if held.phase != Phase::Awake || held.fd.is_some() {
+                    return;
+                }
+            }
+            if self.asking.swap(true, Ordering::SeqCst) {
                 return;
             }
             let (me, queries, triggers) = (Arc::clone(self), queries.clone(), Arc::clone(triggers));
@@ -562,11 +609,19 @@ mod watch {
                         ),
                     )
                     .and_then(|reply| reply.body().deserialize::<OwnedFd>());
+                let from = owner_of(&queries, LOGIND_NAME);
                 me.asking.store(false, Ordering::SeqCst);
                 match answer {
                     Ok(fd) => {
-                        if !me.sleeping.load(Ordering::SeqCst) {
-                            lock_of(&me.fd).get_or_insert(fd);
+                        {
+                            let mut held = lock_of(&me.held);
+                            // Asleep: the vault is locked, the computer must
+                            // not wait for us. Otherwise keep it (while
+                            // locking, `locked` lets it go afterwards).
+                            if held.phase != Phase::Asleep && held.fd.is_none() {
+                                held.fd = Some(fd);
+                                held.from = from;
+                            }
                         }
                         triggers.set(
                             SUSPEND,
@@ -593,8 +648,31 @@ mod watch {
             });
         }
 
-        fn release(&self) {
-            lock_of(&self.fd).take();
+        fn going_to_sleep(&self) {
+            lock_of(&self.held).phase = Phase::Locking;
+        }
+
+        /// The vault is locked: let the computer sleep.
+        fn locked(&self) {
+            let mut held = lock_of(&self.held);
+            held.phase = Phase::Asleep;
+            held.fd = None;
+            held.from = None;
+        }
+
+        fn woke(&self) {
+            lock_of(&self.held).phase = Phase::Awake;
+        }
+
+        /// Let go of an inhibitor given by a logind that is no longer the
+        /// owner of its name (`current`); whether one is still held.
+        fn still_held(&self, current: Option<&str>) -> bool {
+            let mut held = lock_of(&self.held);
+            if held.fd.is_some() && held.from.as_deref() != current {
+                held.fd = None;
+                held.from = None;
+            }
+            held.fd.is_some()
         }
     }
 
@@ -614,20 +692,17 @@ mod watch {
         let mut owner = Owner::new(queries);
         let inhibitor = Arc::new(Inhibitor::default());
         inhibitor.acquire(&ctx.triggers, &ctx.shared, queries);
-        // Ask again from time to time while there is none (logind may come
-        // later, or have refused).
+        // From time to time: is logind still there, is the inhibitor still
+        // its own? Ask again when there is none (logind may come later,
+        // restart, or have refused).
         let alive = Arc::new(());
         {
-            let (inhibitor, triggers, shared, queries) = (
-                Arc::clone(&inhibitor),
-                Arc::clone(&ctx.triggers),
-                Arc::clone(&ctx.shared),
-                queries.clone(),
-            );
-            let alive = Arc::downgrade(&alive);
-            ctx.shared.helper("rusthorse-refresh", move || {
-                while shared.pause(REFRESH) && alive.strong_count() > 0 {
-                    inhibitor.acquire(&triggers, &shared, &queries);
+            let (inhibitor, shared) = (Arc::clone(&inhibitor), Arc::clone(&ctx.shared));
+            refresh(ctx, queries, &alive, move |queries, triggers| {
+                let current = owner_of(queries, LOGIND_NAME);
+                // Without one (logind gone: the request says so in status).
+                if !inhibitor.still_held(current.as_deref()) {
+                    inhibitor.acquire(triggers, &shared, queries);
                 }
             });
         }
@@ -643,12 +718,12 @@ mod watch {
                 continue;
             };
             if sleeping {
-                inhibitor.sleeping.store(true, Ordering::SeqCst);
+                inhibitor.going_to_sleep();
                 ctx.lock(SUSPEND, LOGIND);
                 // Letting it go lets the computer sleep now.
-                inhibitor.release();
+                inhibitor.locked();
             } else {
-                inhibitor.sleeping.store(false, Ordering::SeqCst);
+                inhibitor.woke();
                 inhibitor.acquire(&ctx.triggers, &ctx.shared, queries);
             }
         }
@@ -671,8 +746,9 @@ mod watch {
         let iter = signals(signals_conn, rule)?;
         let mut owner = Owner::new(queries);
         report_logind(&ctx.triggers, owner.unique.is_some());
-        // A lock that happened while the agent was not listening.
-        if any_session_locked(queries) {
+        // A lock that happened while the agent was not listening. When
+        // logind cannot tell, lock: the safe side.
+        if any_session_locked(queries) != Some(false) {
             ctx.lock(SCREEN_LOCK, LOGIND);
         }
         let alive = Arc::new(());
@@ -732,16 +808,17 @@ mod watch {
         ctx: &Ctx<L>,
         queries: &Connection,
         alive: &Arc<()>,
-        check: fn(&Connection, &Triggers),
+        mut check: impl FnMut(&Connection, &Arc<Triggers>) + Send + 'static,
     ) {
-        let (queries, triggers, shared) = (
+        let (queries, triggers, shared, every) = (
             queries.clone(),
             Arc::clone(&ctx.triggers),
             Arc::clone(&ctx.shared),
+            ctx.refresh_every,
         );
         let alive = Arc::downgrade(alive);
         ctx.shared.helper("rusthorse-refresh", move || {
-            while shared.pause(REFRESH) && alive.strong_count() > 0 {
+            while shared.pause(every) && alive.strong_count() > 0 {
                 check(&queries, &triggers);
             }
         });
@@ -794,32 +871,42 @@ mod watch {
         Some(uid == nix::unistd::getuid().as_raw())
     }
 
-    /// Whether a session of the agent's user is locked already.
-    fn any_session_locked(queries: &Connection) -> bool {
-        let Ok(reply) = queries.call_method(
-            Some(LOGIND_NAME),
-            LOGIND_PATH,
-            Some(MANAGER),
-            "ListSessions",
-            &(),
-        ) else {
-            return false;
-        };
-        let Ok(sessions) = reply
-            .body()
-            .deserialize::<Vec<(String, u32, String, String, OwnedObjectPath)>>()
-        else {
-            return false;
+    /// Whether a session of the agent's user is locked already; `None` when
+    /// logind does not tell (in time). No logind on the bus is a definite
+    /// answer: no session to be locked.
+    fn any_session_locked(queries: &Connection) -> Option<bool> {
+        let sessions = match queries
+            .call_method(
+                Some(LOGIND_NAME),
+                LOGIND_PATH,
+                Some(MANAGER),
+                "ListSessions",
+                &(),
+            )
+            .and_then(|reply| {
+                reply
+                    .body()
+                    .deserialize::<Vec<(String, u32, String, String, OwnedObjectPath)>>()
+            }) {
+            Ok(sessions) => sessions,
+            Err(e) if absent(&e) => return Some(false),
+            Err(_) => return None,
         };
         let uid = nix::unistd::getuid().as_raw();
-        sessions
-            .iter()
-            .filter(|(_, owner, _, _, _)| *owner == uid)
-            .any(|(_, _, _, _, path)| {
-                property(queries, path.as_str(), "LockedHint")
-                    .and_then(|v| bool::try_from(v).ok())
-                    .unwrap_or(false)
-            })
+        let mut unknown = false;
+        for (_, owner, _, _, path) in &sessions {
+            if *owner != uid {
+                continue;
+            }
+            match property(queries, path.as_str(), "LockedHint")
+                .and_then(|v| bool::try_from(v).ok())
+            {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        (!unknown).then_some(false)
     }
 
     fn watch_screensavers<L: Locker>(
@@ -833,16 +920,31 @@ mod watch {
             .member("ActiveChanged")?
             .build();
         let iter = signals(signals_conn, rule)?;
-        // A screensaver that started while the agent was not listening.
-        for name in report_screensavers(queries, &ctx.triggers) {
-            if screensaver_active(queries, name) {
+        // A screensaver that started while the agent was not listening; when
+        // it does not tell (in time) whether it is on, lock: the safe side.
+        let present = report_screensavers(queries, &ctx.triggers);
+        for name in &present {
+            if screensaver_active(queries, name) != Some(false) {
                 ctx.lock(SCREEN_LOCK, name);
             }
         }
+        // From time to time: which are there, and is one that came since on?
         let alive = Arc::new(());
-        refresh(ctx, queries, &alive, |queries, triggers| {
-            report_screensavers(queries, triggers);
-        });
+        {
+            let locker = ctx.locker.clone();
+            let mut known = present;
+            refresh(ctx, queries, &alive, move |queries, triggers| {
+                let now = report_screensavers(queries, triggers);
+                for name in now.iter().filter(|n| !known.contains(n)) {
+                    if screensaver_active(queries, name) != Some(false)
+                        && let Some(locker) = locker.upgrade()
+                    {
+                        locker.lock_for(SCREEN_LOCK, name);
+                    }
+                }
+                known = now;
+            });
+        }
         for message in iter {
             let message = message?;
             if !ctx.going() {
@@ -864,12 +966,31 @@ mod watch {
         Err(zbus::Error::Failure("the bus closed the connection".into()))
     }
 
-    fn screensaver_active(queries: &Connection, name: &str) -> bool {
+    /// Whether screensaver `name` is on; `None` when it does not answer (in
+    /// time). One that says it cannot tell — `csd-screensaver`'s
+    /// `org.freedesktop.ScreenSaver` does not implement `GetActive` — counts
+    /// as off: its signal is still watched.
+    fn screensaver_active(queries: &Connection, name: &str) -> Option<bool> {
         let path = format!("/{}", name.replace('.', "/"));
-        queries
+        match queries
             .call_method(Some(name), path.as_str(), Some(name), "GetActive", &())
             .and_then(|reply| reply.body().deserialize::<bool>())
-            .unwrap_or(false)
+        {
+            Ok(active) => Some(active),
+            Err(zbus::Error::MethodError(error, _, _))
+                if [
+                    "org.freedesktop.DBus.Error.NotSupported",
+                    "org.freedesktop.DBus.Error.UnknownMethod",
+                    "org.freedesktop.DBus.Error.UnknownObject",
+                    "org.freedesktop.DBus.Error.UnknownInterface",
+                    "org.freedesktop.DBus.Error.ServiceUnknown",
+                ]
+                .contains(&error.as_str()) =>
+            {
+                Some(false)
+            }
+            Err(_) => None,
+        }
     }
 
     /// One entry per screensaver present on the bus, or one saying that

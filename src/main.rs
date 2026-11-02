@@ -629,6 +629,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
             on_screen_lock: !args.no_lock_on_screen_lock,
             system_bus: None,
             session_bus: None,
+            refresh_every: None,
         },
     };
     let ui = DesktopUi {

@@ -61,8 +61,11 @@ were given. The audit log records a `lock` with outcome `suspend` or
 
 The delay inhibitor is taken at start and again after each resume
 (`PrepareForSleep(false)`), on a thread of its own so that a slow answer
-never holds up a lock; one that arrives while the computer goes to sleep is
-let go at once. While it is held, logind waits for the agent to lock — but
+never holds up a lock. It is let go only once the vault is locked: one that
+arrives while the lock is under way is kept until the lock is done, one
+that arrives after it is let go at once. One given by a logind that has
+since left or restarted means nothing and is let go; a new one is asked
+for. While it is held, logind waits for the agent to lock — but
 only up to its `InhibitDelayMaxSec` (5 seconds by default), not forever.
 Locking drops the decrypted vault from memory; it waits for the agent's
 state lock, so a vault save in progress, or a slow disk under the audit
@@ -72,10 +75,16 @@ logind waits.
 Each watcher reads signals on one connection and asks its questions — who
 owns logind's name, whose a session is, the inhibitor — on a second one,
 each question limited to 2 seconds, so that an answer never waits behind
-queued signals. When a watcher connects, or connects again, it also asks
+queued signals. Questions about logind's name and a session's user are
+still asked in the watcher's own thread: a slow answer delays the lock by
+up to that limit. When a watcher connects, or connects again — and the
+screensaver watcher also when a screensaver appears on the bus — it asks
 whether a session of the agent's user is locked already (`LockedHint`) or a
 screensaver is on (`GetActive`), and locks if so: a lock that happened while
-it was not listening is not missed.
+it was not listening is not missed. Without an answer in time it locks too
+(the safe side); a definite "cannot tell" — no logind on the bus, a
+screensaver that does not implement `GetActive`, as `csd-screensaver`'s
+`org.freedesktop.ScreenSaver` does not — locks nothing.
 
 ### 2. Signals only ever lock
 
@@ -86,9 +95,10 @@ another user could make a logind session lock; the worst a forged signal
 can do is lock the vault, which the human unlocks again with the master
 password. logind's signals count only as broadcasts from the current owner
 of `org.freedesktop.login1` (its unique name, asked again when a sender
-differs, since logind may restart): a signal sent to the agent alone, or by
-anyone else, is ignored, and so is a malformed one — none of them can make
-the agent let go of the inhibitor or stop watching. Session signals count
+differs, since logind may restart): a signal from anyone else is ignored,
+even one sent to the agent alone (which the bus's matching does not
+filter), and so is a malformed one — none of them can make the agent let go
+of the inhibitor or stop watching. Session signals count
 only for sessions whose user is the agent's, asked of logind, so that
 another user locking their screen does not lock this vault; when logind does
 not answer within the limit, the session counts as the agent's — locking is
@@ -118,7 +128,11 @@ suspend lock is degraded. A watcher whose bus goes away reports itself
 inactive and reconnects every few seconds.
 
 The agent holds a handle on its watchers: dropping it closes their
-connections — letting go of the inhibitor — and joins their threads.
+connections — letting go of the inhibitor — and waits up to 3 seconds for
+their threads; one still connecting then (a bus that never answers its
+authentication) is left to end on its own, holding nothing. Changes in what
+is there (logind leaving, a screensaver coming) show in `status` within 30
+seconds.
 
 The field is optional within protocol 5: older agents leave it out, and
 clients say "not reported".
@@ -157,6 +171,6 @@ has no watchers and its status says so.
 - A dialog already on screen when the vault locks stays until it is
   answered or times out, but whatever it would approve finds the vault
   locked and does nothing.
-- Hibernation writes RAM to disk: the vault is locked first, as for a
-  suspend, but freed memory is not guaranteed to have been overwritten
-  (threat model L7).
+- Hibernation writes RAM to disk: the agent locks the vault on logind's
+  signal, as for a suspend and within the same limits, and freed memory is
+  not guaranteed to have been overwritten (threat model L7).
