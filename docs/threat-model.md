@@ -1394,3 +1394,14 @@ earlier examples. Findings:
 
 Each fix was checked against the mistake it must catch, made in a copy of
 the tree (5 of 5); the 141 wording is documentation, checked by review.
+
+Fourth review of the guide (Codex, AI-assisted, 2026-11-02): **ready.** The
+four findings are confirmed fixed: the reviewer's command acted after
+`rusthorse run` had returned 141 and died by `SIGKILL` about 3 seconds
+later, as the guide now says; with `--no-redact` its own status came back;
+a run without an agent and with standard error on `/dev/full` exits with
+125. Two low findings, both fixed: the test took a quoted number before a
+redirection (`'2'>/dev/null`) for a descriptor, which the shell passes as an
+argument — a quoted word now stays an argument (checked against the mistake,
+2 of 2); and the guide said that 125 and 124 come with a message, which
+holds only when standard error can be written — it now says so.

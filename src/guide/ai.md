@@ -118,10 +118,11 @@ not a secret and is not redacted.
 Once the command has started, `rusthorse run` exits with the command's own
 status, whatever it is: `0` for success, `128 + N` if signal `N` killed it,
 and any other number the command chooses, `1`, `2`, `4`, `124` and `125`
-included. Rusthorse's own statuses are the four below. `125` and `124` come
-with a message on standard error that starts with `rusthorse:`, `2` with
-`error:` and the usage, and `141` with no message. (A crash of `rusthorse`
-itself, status `101` with a `panicked` message, tells as little as `124`.)
+included. Rusthorse's own statuses are the four below. When standard error
+can be written, `125` and `124` come with a message that starts with
+`rusthorse:`, and `2` with `error:` and the usage; `141` comes with no
+message. (A crash of `rusthorse` itself, status `101` with a `panicked`
+message, tells as little as `124`.)
 
 | Status | Meaning | What to do |
 |---|---|---|

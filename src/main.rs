@@ -2294,6 +2294,8 @@ mod tests {
         let mut words = Vec::new();
         let mut word = String::new();
         let mut in_word = false;
+        // Whether a part of the word was quoted: `'2'>x` is an argument.
+        let mut quoted = false;
         let mut target = false;
         let mut quote = None;
         let mut chars = line.chars().peekable();
@@ -2304,19 +2306,22 @@ mod tests {
                 (None, '\'' | '"') => {
                     quote = Some(c);
                     in_word = true;
+                    quoted = true;
                 }
                 (None, c) if c.is_whitespace() => {
                     end(&mut words, &mut word, &mut in_word, &mut target);
+                    quoted = false;
                 }
                 (None, '#') if !in_word => break,
                 (None, '<' | '>') => {
                     // The descriptor number before it (`2>`) is no argument.
-                    if in_word && !target && word.chars().all(|c| c.is_ascii_digit()) {
+                    if in_word && !quoted && !target && word.chars().all(|c| c.is_ascii_digit()) {
                         word.clear();
                         in_word = false;
                     } else {
                         end(&mut words, &mut word, &mut in_word, &mut target);
                     }
+                    quoted = false;
                     while let Some('<' | '>' | '&') = chars.peek() {
                         chars.next();
                     }
@@ -2424,6 +2429,7 @@ mod tests {
             ("add --kind server --host db.lan --generate", Shown::Block),
             ("show ';' --kind api-key", Shown::Inline),
             ("list >/dev/null --kind invented", Shown::Block),
+            ("list '2'>/dev/null", Shown::Block),
             ("list --help --kind invented", Shown::Inline),
             ("list -h --kind invented", Shown::Inline),
             ("guide nope", Shown::Inline),
