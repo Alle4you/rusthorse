@@ -1363,3 +1363,20 @@ Each test fix was checked against the mistakes it must catch, made in a copy
 of the tree (12 of 12: the reviewer's examples, a dropped or made-up status
 row, an unknown command, option or guide, a closed pipe taken for an error
 and the opposite); the wording fixes are documentation, checked by review.
+
+Second review of the guide (Codex, AI-assisted, 2026-11-02; verdict: not
+ready). Confirmed fixed: scripts, the process group, the closed-pipe test,
+remembered approvals and input; the reviewer ran commands that exited with
+1, 2, 4, 124 and 125 after doing their work, and each status was passed on
+without a message. Findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — "Rusthorse's own statuses are the three below" left out `141`, which `rusthorse run` returns without a message when it cannot write the command's output; the reviewer sent the output to `/dev/full`: 141, no message, the command's work done and audited as `exited (exit code 0)` | **Fixed:** the guide lists `141` among Rusthorse's own statuses, says the command may have done some or all of its work, that a command killed by `SIGPIPE` exits with 141 too, and to let `run` write its whole output. `docs/cli.md` and the invariants in `AGENTS.md` say the same. |
+| Medium — the tests still let wrong examples through: a code-block example without its required name, and `rusthorse show ';' --kind api-key`, whose quoted `;` the test took for a separator | **Fixed:** an example in a code block must be complete; only a mention in inline code may leave out a required argument. The shell split ends a command only at an unquoted `|`, `;`, `&`, `<` or `>`. A `--help` line is checked without its `--help`, since clap stops reading there (`list --help --kind invented` is refused). |
+| Low — the exact comparison of the status rows skipped rows without backquotes (`\| 77 \| …`) | **Fixed:** every data row is read, and its first cell must be a status in backquotes. |
+| Low — the audit log was said to show how a command ended "when the agent knows", but the agent goes on when it cannot write the record of the end | **Fixed:** the guide says that an approval in the audit log does not prove that the command ran, and that a missing record of its end does not prove that it did not. |
+
+Each test fix was checked against the mistakes it must catch, made in a copy
+of the tree (7 of 7: the reviewer's examples, a row without backquotes, the
+`141` row changed, options after `--help`, a mention in a code block).

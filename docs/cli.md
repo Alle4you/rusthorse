@@ -30,7 +30,7 @@ terminal; `rusthorse --help` ends by pointing AI agents to
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
 | `124` | The outcome is unknown: the request was sent but no usable answer came back, or the agent could not confirm that it took effect (it could not determine the result of a command it had started, or could not sync a change to disk). For `run`, the command may or may not have run; for a change (`add`, `edit`, `remove`, `import`, `passwd`, `backup`), check with `rusthorse list` or `show` before repeating it. Read-only commands exit with 1 instead. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
-| other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141 when the output of `rusthorse run` itself was closed). |
+| other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141, without a message, when `rusthorse run` could not write the command's output — see [`run`](#rusthorse-run)). |
 
 Messages go to standard error; data (listings, JSON, revealed values) goes to
 standard output.
@@ -381,9 +381,11 @@ of a secret value (4 characters or longer) in them is replaced with
 therefore see pipes rather than a terminal. With `--no-redact`, the command
 gets the caller's descriptors directly (including stdin).
 
-If the output of `rusthorse run` is closed early (for example
-`rusthorse run … | head`), it stops the command and exits with status 141,
-like a program killed by `SIGPIPE`. With `--stdin`, input is read only once
+If `rusthorse run` cannot write the command's output — it was closed early
+(for example `rusthorse run … | head`) or the disk is full — it stops the
+command and exits with status 141, like a program killed by `SIGPIPE`, and
+prints no message. The command may already have done some or all of its
+work, so 141 does not tell what it did. With `--stdin`, input is read only once
 the command has started, so a denied request never consumes it.
 
 When the command exits, anything it left running in its process group (for
@@ -602,8 +604,9 @@ written for AI agents: the rules they follow (never ask for, print or write
 a value; no `reveal`; stop after a denial), how to find entries and read
 their metadata, how to use `run`, the exit statuses and what to do about
 each, and how to store secrets without seeing them. It is built into the
-binary, so it describes the version that prints it; a test checks that every
-command and option it names exists. Point an agent to it from its
+binary, so it describes the version that prints it. A test parses every
+command line it shows with the CLI's own parser (an example in a code block
+must be complete) and checks the exit status tables row by row. Point an agent to it from its
 instructions file ([ai-agents.md](ai-agents.md#setting-up-an-agent)). A
 reader that stops early (`rusthorse guide ai | head`) is not an error.
 

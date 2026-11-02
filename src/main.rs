@@ -2208,12 +2208,22 @@ mod tests {
         ));
     }
 
+    /// Where a command line of the AI guide is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Shown {
+        /// In inline code in the prose: it may be a mention of a command
+        /// (`rusthorse reveal`), without the arguments it needs.
+        Inline,
+        /// In a code block: an example to run, which must be complete.
+        Block,
+    }
+
     /// The `rusthorse …` command lines of the AI guide, each cut at the end
     /// of its code span or line: inline code in the prose (whose lines are
     /// joined first, as Markdown does), and the lines of code blocks (a line
     /// that ends with `\` continued by the next, as the shell does).
-    fn guide_command_lines(guide: &str) -> Vec<String> {
-        fn collect(text: &str, ends: &[char], into: &mut Vec<String>) {
+    fn guide_command_lines(guide: &str) -> Vec<(String, Shown)> {
+        fn collect(text: &str, ends: &[char], shown: Shown, into: &mut Vec<(String, Shown)>) {
             for (at, _) in text.match_indices("rusthorse ") {
                 let before = text[..at].chars().next_back();
                 if before.is_some_and(|c| c.is_alphanumeric() || "-_/".contains(c)) {
@@ -2221,7 +2231,7 @@ mod tests {
                 }
                 let rest = &text[at + "rusthorse ".len()..];
                 let end = rest.find(ends).unwrap_or(rest.len());
-                into.push(rest[..end].to_string());
+                into.push((rest[..end].to_string(), shown));
             }
         }
         let mut lines = Vec::new();
@@ -2238,7 +2248,7 @@ mod tests {
                     Some(start) => continued.push_str(start),
                     None => {
                         continued.push_str(line);
-                        collect(&continued, &['\n'], &mut lines);
+                        collect(&continued, &['\n'], Shown::Block, &mut lines);
                         continued.clear();
                     }
                 }
@@ -2248,13 +2258,14 @@ mod tests {
             }
         }
         assert!(!fenced, "a code block of the guide is not closed");
-        collect(&prose, &['`', '\n'], &mut lines);
+        collect(&prose, &['`', '\n'], Shown::Inline, &mut lines);
         lines
     }
 
     /// The words of a command line as `sh` splits them: quotes removed, a
-    /// `#` at the start of a word starting a comment, and the line ending at
-    /// a `|`, `||`, `&&` or `;` word.
+    /// `#` at the start of a word starting a comment, and the command ending
+    /// at an unquoted `|`, `;`, `&`, `<` or `>` (a pipe, a list, a
+    /// redirection).
     fn shell_words(line: &str) -> Vec<String> {
         let mut words = Vec::new();
         let mut word = String::new();
@@ -2275,6 +2286,7 @@ mod tests {
                     }
                 }
                 (None, '#') if !in_word => break,
+                (None, '|' | ';' | '&' | '<' | '>') => break,
                 (None, c) => {
                     word.push(c);
                     in_word = true;
@@ -2286,40 +2298,54 @@ mod tests {
             words.push(word);
         }
         words
-            .into_iter()
-            .take_while(|w| !matches!(w.as_str(), "|" | "||" | "&&" | ";"))
-            .collect()
+    }
+
+    /// Whether the CLI accepts a command line of the AI guide. An example in
+    /// a code block must be complete. A mention in inline code may leave out
+    /// the arguments a command needs, and so may a `--help` line, which is
+    /// checked without its `--help` (clap stops reading at it).
+    fn guide_line_accepted(line: &str, shown: Shown) -> Result<(), String> {
+        use clap::error::ErrorKind;
+        let mut words = shell_words(line);
+        let end = words.iter().position(|w| w == "--").unwrap_or(words.len());
+        let before = words.len();
+        words = words
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| *i >= end || w.as_str() != "--help")
+            .map(|(_, w)| w.clone())
+            .collect();
+        let help = words.len() < before;
+        let argv = std::iter::once("rusthorse".to_string()).chain(words);
+        match Cli::try_parse_from(argv) {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.kind() == ErrorKind::MissingRequiredArgument
+                    && (shown == Shown::Inline || help) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Every command line the AI guide shows is one the CLI accepts, with
     /// its options and their values: the guide is built into the binary, and
-    /// an AI agent follows it to the letter. A mention of a command without
-    /// its arguments (`rusthorse reveal`) may leave a required argument out,
-    /// and nothing else.
+    /// an AI agent follows it to the letter.
     #[test]
     fn the_ai_guide_shows_only_command_lines_the_cli_accepts() {
-        use clap::error::ErrorKind;
-        let mention = |kind: ErrorKind| {
-            matches!(
-                kind,
-                ErrorKind::MissingRequiredArgument | ErrorKind::DisplayHelp
-            )
-        };
         let guide = GuideTopic::Ai.text();
         let lines = guide_command_lines(&guide);
-        let mut complete = 0;
-        for line in &lines {
-            let argv = std::iter::once("rusthorse".to_string()).chain(shell_words(line));
-            match Cli::try_parse_from(argv) {
-                Ok(_) => complete += 1,
-                Err(e) if mention(e.kind()) => {}
-                Err(e) => panic!("`rusthorse {line}`:\n{e}"),
+        for (line, shown) in &lines {
+            if let Err(e) = guide_line_accepted(line, *shown) {
+                panic!("`rusthorse {line}` ({shown:?}):\n{e}");
             }
         }
         // The scan found the commands: a broken scan checks nothing.
+        let blocks = lines.iter().filter(|(_, s)| *s == Shown::Block).count();
         assert!(
-            lines.len() > 30 && complete > 20,
-            "{} lines, {complete} complete",
+            lines.len() > 30 && blocks > 15,
+            "{} lines, {blocks} in code blocks",
             lines.len()
         );
         // It reads inline code across a line break and a code-block line
@@ -2327,33 +2353,44 @@ mod tests {
         let found = guide_command_lines(
             "a `rusthorse list\n  --json` b\n```\nrusthorse ls # x\nrusthorse list \\\n  --tag t\n```",
         );
-        let found: Vec<_> = found.iter().map(|l| shell_words(l)).collect();
+        let found: Vec<_> = found.iter().map(|(l, s)| (shell_words(l), *s)).collect();
         assert_eq!(
             found,
             [
-                vec!["ls"],
-                vec!["list", "--tag", "t"],
-                vec!["list", "--json"]
+                (vec!["ls".to_string()], Shown::Block),
+                (
+                    vec!["list".into(), "--tag".into(), "t".into()],
+                    Shown::Block
+                ),
+                (vec!["list".into(), "--json".into()], Shown::Inline),
             ]
         );
         assert_eq!(
-            shell_words(r#"run T=x -- sh -c 'a "$T" b' # c"#),
-            ["run", "T=x", "--", "sh", "-c", r#"a "$T" b"#]
+            shell_words(r#"run T=x -- sh -c 'a "$T" | b' # c"#),
+            ["run", "T=x", "--", "sh", "-c", r#"a "$T" | b"#]
         );
-        // A mention leaves an argument out; a wrong word is another error.
-        let e = Cli::try_parse_from(["rusthorse", "guide"]).err();
-        assert!(mention(e.expect("error").kind()));
-        for wrong in [
-            &["guide", "nope"][..],
-            &["list", "--definitely-not-an-option"],
-            &["add", "N", "--generate", "--length", "nope"],
-            &["add", "N", "--generate", "--alphabet", "invented"],
-            &["add", "--stdin", "--bogus"],
-            &["import", "nope"],
+        assert_eq!(shell_words("show ';' --json | jq"), ["show", ";", "--json"]);
+        // A mention may leave arguments out; an example may not; nothing may
+        // be wrong.
+        assert!(guide_line_accepted("reveal", Shown::Inline).is_ok());
+        assert!(guide_line_accepted("run --help", Shown::Inline).is_ok());
+        assert!(guide_line_accepted("--socket /tmp/x.sock list", Shown::Block).is_ok());
+        for (wrong, shown) in [
+            ("reveal", Shown::Block),
+            ("add --kind server --host db.lan --generate", Shown::Block),
+            ("show ';' --kind api-key", Shown::Inline),
+            ("list --help --kind invented", Shown::Inline),
+            ("guide nope", Shown::Inline),
+            ("list --definitely-not-an-option", Shown::Inline),
+            ("add N --generate --length nope", Shown::Block),
+            ("add N --generate --alphabet invented", Shown::Block),
+            ("add --stdin --bogus", Shown::Inline),
+            ("import nope", Shown::Inline),
         ] {
-            let argv = std::iter::once(&"rusthorse").chain(wrong);
-            let e = Cli::try_parse_from(argv).err().expect("error");
-            assert!(!mention(e.kind()), "{wrong:?}: {:?}", e.kind());
+            assert!(
+                guide_line_accepted(wrong, shown).is_err(),
+                "{wrong:?} ({shown:?})"
+            );
         }
     }
 
@@ -2406,12 +2443,20 @@ mod tests {
         assert_eq!(kinds.split(", ").collect::<Vec<_>>(), real);
         // The exit statuses: exactly the rows of each table. An invalid
         // command line is clap's usage error.
+        // Every data row of the table in `section`: its first cell must be
+        // a status in backquotes.
         fn statuses(section: &str) -> Vec<u8> {
-            section
-                .lines()
-                .filter_map(|l| l.strip_prefix("| `"))
-                .map(|l| l.split('`').next().and_then(|n| n.parse().ok()))
-                .map(|n| n.expect("a status"))
+            let rows: Vec<_> = section.lines().filter(|l| l.starts_with('|')).collect();
+            assert!(rows.len() > 2 && rows[1].starts_with("|---"), "{section}");
+            rows[2..]
+                .iter()
+                .map(|row| {
+                    let cell = row.split('|').nth(1).expect("a cell").trim();
+                    cell.strip_prefix('`')
+                        .and_then(|c| c.strip_suffix('`'))
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or_else(|| panic!("not a status: {row}"))
+                })
                 .collect()
         }
         let section = |from: &str, to: &str| {
@@ -2421,7 +2466,7 @@ mod tests {
         };
         let run = section("### `rusthorse run`", "### Other commands");
         let other = section("### Other commands", "\n## ");
-        assert_eq!(statuses(&run), [EXIT_RUN_FAILURE, EXIT_UNKNOWN, 2]);
+        assert_eq!(statuses(&run), [EXIT_RUN_FAILURE, EXIT_UNKNOWN, 2, 141]);
         assert_eq!(statuses(&other), [0, 1, 2, EXIT_DENIED, EXIT_UNKNOWN]);
         let usage = Cli::try_parse_from(["rusthorse", "run", "--bogus"]).err();
         assert_eq!(usage.expect("error").exit_code(), 2);
