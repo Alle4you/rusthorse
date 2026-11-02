@@ -23,7 +23,11 @@ fake data and simulates features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
 
-**Status: Planned.** The most important direction after the first release.
+**Status: Planned — [ADR 0013](adr/0013-credential-broker.md) proposed
+(2026-11-02).** The most important direction; the maintainer moved it before
+the first publication. The ADR refines the sketch below — phases, a
+separate `rusthorse-broker` process, profiles that fix the destination, no
+fallback to the real key — and is the reference where the two differ.
 
 ### Why
 
@@ -35,8 +39,10 @@ only catches the literal value in the output, and approval only helps if the
 human reads the command.
 
 A broker removes the secret from the client entirely: the client receives a
-**temporary token** that is worthless outside Rusthorse, and the agent uses
-the real credential on the client's behalf.
+**temporary token** that no provider accepts — it works only through the
+Rusthorse broker, within its scope and while it is valid (a stolen token
+still works there until then) — and the agent uses the real credential on
+the client's behalf.
 
 ### Design
 
@@ -96,8 +102,8 @@ reach its listener gets an authenticated session, so access to the listener
 must be isolated (in its deployments, a sidecar sharing a pod's network
 namespace). On a desktop, where every program of the user can reach a local
 port, that is not enough. Rusthorse adds what is missing there: a human
-approval per use and tokens that are scoped, short-lived and revoked with the
-approved command.
+approval per grant and tokens that are scoped, short-lived and revoked with
+the approved command.
 
 ### Limits
 
@@ -111,6 +117,10 @@ approved command.
 - **Secrets used locally** — decrypting a file, a password typed into a
   program, a signing key used offline — still need `run`, which stays as the
   general fallback.
+- **SSH with a password cannot be brokered**: the password is what `ssh`
+  sends, so whoever runs `ssh` must have it. Devices reached by SSH should
+  use keys, which the `ssh-agent` connector keeps in the vault; until then,
+  password SSH goes through `run` with its limits (L3–L5).
 
 ### Questions the ADR must answer
 

@@ -229,8 +229,11 @@ takes the address from the entry's metadata, looks the same as a variable
 the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
 *Mitigation:* read the dialog — check the host of every destination; prefer
 well-known binaries with explicit arguments; review recent changes to scripts
-before approving them. The planned credential broker would remove the
-problem for HTTP APIs: the real key would only travel to its own provider.
+before approving them. The planned credential broker
+([ADR 0013](adr/0013-credential-broker.md)) would, for HTTP APIs, remove the
+direct delivery of the key and fix its destination: the real key would only
+travel to its own provider. The operations a grant allows would still be
+trusted.
 
 ### L5 — Redaction only catches exact copies in the command's output
 
@@ -1499,3 +1502,15 @@ there; and a new entry's group was checked by the agent only, after the form
 had closed — the form now checks it as it does for an edit. The guide now
 says that a group is left out of the list only when neither it nor any
 group below it holds an entry.
+
+**Credential broker design (2026-11-02).** At the maintainer's request,
+before writing [ADR 0013](adr/0013-credential-broker.md): an independent
+analysis (Codex, AI-assisted) of the roadmap's broker sketch against
+CyberArk's Secretless Broker and the maintainer's real uses. Its
+conclusions are in the ADR's context: worth doing, HTTP and the AI APIs
+first; a grant limits but does not remove the trust in the operations it
+allows; a same-user process can steal a token while it is valid (A2 needs
+isolation); private devices need pinned TLS; administration APIs need
+narrow operations; SSH with a password cannot be brokered (the maintainer
+moves the routers to SSH keys). Three overstatements in the roadmap and in
+L4 were corrected. The review of the ADR itself is pending.

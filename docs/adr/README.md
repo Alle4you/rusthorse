@@ -19,6 +19,7 @@ supersedes the old one, which is marked as such.
 | [0010](0010-debian-package.md) | A Debian package that installs and removes cleanly | Proposed |
 | [0011](0011-first-start-from-the-manager.md) | The first start happens in the manager; the agent creates the vault | Proposed |
 | [0012](0012-import-read-by-the-agent.md) | Imports are read by the agent, and the manager can start them | Proposed |
+| [0013](0013-credential-broker.md) | A credential broker: approved programs get a grant, not the secret | Proposed |
 
 ## Writing a new ADR
 
