@@ -201,6 +201,8 @@ pub struct Agent {
     audit: AuditLog,
     /// What else locks the vault, for `status` (ADR 0009).
     lock_triggers: Arc<session_lock::Triggers>,
+    /// The watchers behind them; dropping the agent stops them.
+    session_watchers: Mutex<session_lock::Watchers>,
 }
 
 impl session_lock::Locker for Agent {
@@ -245,6 +247,7 @@ impl Agent {
             connections: Arc::new(AtomicUsize::new(0)),
             audit,
             lock_triggers: Arc::default(),
+            session_watchers: Mutex::default(),
         })
     }
 
@@ -274,7 +277,10 @@ impl Agent {
     /// Accept connections forever, one thread per connection.
     pub fn serve(self: &Arc<Self>, listener: UnixListener) -> anyhow::Result<()> {
         self.start_idle_timer();
-        session_lock::start(
+        *self
+            .session_watchers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = session_lock::start(
             Arc::downgrade(self),
             self.config.session_lock.clone(),
             Arc::clone(&self.lock_triggers),

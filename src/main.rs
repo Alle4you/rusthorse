@@ -1395,21 +1395,31 @@ fn lock_trigger_checks(triggers: &[rusthorse::protocol::LockTrigger]) -> Vec<Che
     .into_iter()
     .map(|(event, when)| {
         let of_event: Vec<_> = triggers.iter().filter(|t| t.event == event).collect();
-        let active: Vec<&str> = of_event
+        let sound: Vec<&str> = of_event
             .iter()
-            .filter(|t| t.active)
+            .filter(|t| t.active && !t.degraded)
             .map(|t| t.source.as_str())
             .collect();
-        if active.is_empty() {
+        let degraded: Vec<String> = of_event
+            .iter()
+            .filter(|t| t.active && t.degraded)
+            .map(|t| format!("{}: {}", t.source, t.note.as_deref().unwrap_or("degraded")))
+            .collect();
+        if !sound.is_empty() {
+            Check::Ok(format!(
+                "the vault locks {when} (told by {})",
+                sound.join(", ")
+            ))
+        } else if !degraded.is_empty() {
+            Check::Warn(format!(
+                "the vault locks {when}, but {}",
+                degraded.join("; ")
+            ))
+        } else {
             let why: Vec<&str> = of_event.iter().filter_map(|t| t.note.as_deref()).collect();
             Check::Warn(format!(
                 "the vault does not lock {when}: {} (the idle timer still locks it)",
                 why.join("; ")
-            ))
-        } else {
-            Check::Ok(format!(
-                "the vault locks {when} (told by {})",
-                active.join(", ")
             ))
         }
     })
@@ -1713,6 +1723,7 @@ mod tests {
             event: event.into(),
             source: source.into(),
             active,
+            degraded: false,
             note: note.map(Into::into),
         };
         let checks = lock_trigger_checks(&[
@@ -1737,6 +1748,17 @@ mod tests {
             if m.contains("does not lock when the screen locks")
                 && m.contains("no system bus; trying again")
                 && m.contains("turned off")));
+        // Watched, but logind would not wait: a warning that says why.
+        let mut slow = trigger(
+            "suspend",
+            "logind",
+            true,
+            Some("logind would not wait (denied)"),
+        );
+        slow.degraded = true;
+        let checks = lock_trigger_checks(&[slow]);
+        assert!(matches!(&checks[0], Check::Warn(m)
+            if m.contains("locks when the computer suspends, but logind: logind would not wait")));
         // An agent that predates the field.
         assert!(
             matches!(&lock_trigger_checks(&[])[..], [Check::Warn(m)] if m.contains("predates"))

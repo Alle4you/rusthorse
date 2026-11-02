@@ -409,9 +409,13 @@ the Cinnamon, GNOME, MATE and freedesktop screensavers
 what it is not told: a locker that emits none of these signals (some
 standalone X11 lockers such as `i3lock` or `slock`), a system without logind,
 or a missing bus leave only the idle timer; `rusthorse status` and `doctor`
-say which sources are watched. Without a delay inhibitor (logind refusing
-it), the lock may come only after the computer wakes, and a suspend is
-noticed by logind's signal only. A dialog already on the screen when the vault
+say which sources are watched. logind waits for the lock only up to its
+`InhibitDelayMaxSec` (5 seconds by default): a vault save in progress or a
+slow disk can make the lock come after the computer has gone to sleep, and
+without a delay inhibitor (logind refusing it, which `status` reports as
+degraded) it may come only after the computer wakes. A suspend is noticed by
+logind's signal only, accepted as a broadcast from the owner of logind's
+name. A dialog already on the screen when the vault
 locks stays until it is answered or times out; whatever it would approve then
 finds the vault locked and does nothing. Hibernation writes RAM to disk: the
 vault is locked first, but memory that held it is not guaranteed to have been
@@ -1042,4 +1046,32 @@ in `status`. A unit test checks that a lock from a signal changes the
 generation of a vault already locked (an unlock under way does nothing) and
 records nothing then. Building the test showed that a `dbus-daemon` policy
 without receive rules accepts connections but never delivers replies.
-Eleven mutations each made a test fail. Awaiting review.
+Eleven mutations each made a test fail.
+
+Review (Codex, AI-assisted, 2026-11-02; verdict: not ready; no way found for
+a signal to unlock), and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Medium — logind's sender was not authenticated: `zbus` does not check a well-known sender name locally, and a signal sent to the agent alone bypasses the bus's matching. A program that does not own `org.freedesktop.login1` sent a `PrepareForSleep` with an empty body: deserialising it failed, the watcher ended — letting go of the inhibitor — and waited to reconnect, so a real signal right after did not lock | **Fixed:** logind's signals count only as broadcasts whose sender is the current unique owner of its name (asked again when it differs); malformed signals are ignored; nothing but a lost connection ends a watcher. The end-to-end test sends both and checks: no lock, the same inhibitor held, no reconnection, and the real signal after them locks. |
+| Medium — blocking questions on the signal connection: with `Inhibit` pending, a `PrepareForSleep(true)` locked only 5.2 s later; with 100 signals queued while a session's user was asked, the reply never arrived (the bounded queue blocked the reader that would deliver it) | **Fixed:** each watcher asks its questions on a second connection, each limited to 2 seconds; the inhibitor is asked for on a helper thread, and one that arrives during a suspend is let go at once. Tested: a 3-second `Inhibit` does not delay the next suspend's lock; 200 other users' `Lock` signals before ours do not stop ours from locking. |
+| Medium — `status` and `doctor` promised protection that did not exist: on buses without logind or a screensaver, all three sources were active and `doctor` said OK; a refused inhibitor was OK too | **Fixed:** a source is active only when its service is there; a refused inhibitor is *degraded*; `doctor` warns on both, with the reason. Tested on buses without those services. |
+| Low — the watchers outlived the agent: dropped, it kept its threads, connections and inhibitor until a message came | **Fixed:** `start` returns a handle that the agent keeps; dropping it closes the connections, which lets go of the inhibitor, and joins the threads (never the current one). Tested. |
+| Low — the test checked the audit record as soon as it saw the vault locked, though the record is written after | **Fixed:** the test waits for the record. |
+| Documentation — "takes far less than the delay", "accepted only from logind", no word of the unknown-user rule, the inhibitor's limit, `doctor` warnings the code did not give | **Fixed** in ADR 0009, cli.md, architecture.md, protocol.md and L20. |
+
+Ideas from the same review, adopted: on connecting again, a watcher locks if
+a session of the agent's user is already locked or a screensaver is already
+on (tested: a screensaver on when the session bus comes back locks);
+permanent tests for a forged sender, a saturated queue and missing services.
+Not adopted yet: recording when each source last fired. Each fix was
+reverted in a copy of the tree to see a test fail (12 of 12, plus one for
+the recovery through logind). Two mutations survived at first and showed
+weak tests: the fake logind answered `Inhibit` after 3 s, past the 2-second
+limit, so the "inhibitor that arrives during the sleep" path was never
+taken — the test now has both cases, a timed-out answer (the suspend lock
+reported degraded) and a late one within the limit (let go at once); and
+the fake answered whose a session is so fast that signals never piled up —
+it now takes 500 ms for the other user's session, which made the shared-
+connection deadlock show. A check of the real buses, read only, found the
+same signals and properties as the design assumed.

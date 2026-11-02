@@ -2,6 +2,9 @@
 
 - Status: Proposed
 - Date: 2026-11-01
+- Amended: 2026-11-02, after review — how signals are trusted, a second
+  connection per watcher for questions, the inhibitor taken on a thread of
+  its own, what `status` reports, recovery on reconnecting.
 
 ## Context
 
@@ -57,9 +60,22 @@ were given. The audit log records a `lock` with outcome `suspend` or
 `screen_locked` (and the source) when the vault was unlocked.
 
 The delay inhibitor is taken at start and again after each resume
-(`PrepareForSleep(false)`); while it is held, logind waits for the agent to
-lock before the computer sleeps. Locking only drops memory, so it takes far
-less than the delay.
+(`PrepareForSleep(false)`), on a thread of its own so that a slow answer
+never holds up a lock; one that arrives while the computer goes to sleep is
+let go at once. While it is held, logind waits for the agent to lock — but
+only up to its `InhibitDelayMaxSec` (5 seconds by default), not forever.
+Locking drops the decrypted vault from memory; it waits for the agent's
+state lock, so a vault save in progress, or a slow disk under the audit
+record written before the inhibitor is let go, can make it take longer than
+logind waits.
+
+Each watcher reads signals on one connection and asks its questions — who
+owns logind's name, whose a session is, the inhibitor — on a second one,
+each question limited to 2 seconds, so that an answer never waits behind
+queued signals. When a watcher connects, or connects again, it also asks
+whether a session of the agent's user is locked already (`LockedHint`) or a
+screensaver is on (`GetActive`), and locks if so: a lock that happened while
+it was not listening is not missed.
 
 ### 2. Signals only ever lock
 
@@ -68,10 +84,16 @@ an `Unlock` or `LockedHint` turning false change nothing but the inhibitor.
 Any program of the session can emit a screensaver signal, and a program of
 another user could make a logind session lock; the worst a forged signal
 can do is lock the vault, which the human unlocks again with the master
-password. Signals from the system bus are accepted only from
-`org.freedesktop.login1`, and session signals only for sessions whose user
-is the agent's (asked of logind), so that another user locking their screen
-does not lock this vault.
+password. logind's signals count only as broadcasts from the current owner
+of `org.freedesktop.login1` (its unique name, asked again when a sender
+differs, since logind may restart): a signal sent to the agent alone, or by
+anyone else, is ignored, and so is a malformed one — none of them can make
+the agent let go of the inhibitor or stop watching. Session signals count
+only for sessions whose user is the agent's, asked of logind, so that
+another user locking their screen does not lock this vault; when logind does
+not answer within the limit, the session counts as the agent's — locking is
+the safe side — and the answer is asked again next time. Screensaver signals
+are accepted from any sender: they can only lock.
 
 A screensaver that starts without locking the screen still locks the vault:
 the person is likely away.
@@ -85,11 +107,18 @@ nobody else can touch). There is no option to unlock automatically.
 ### 4. Reporting
 
 `status` gains an optional `lock_triggers` list: for each event, the source,
-whether it is being watched now, and why not (no system bus, no session bus,
-turned off, not built in). `rusthorse status`, `rusthorse doctor` and the
-manager's Status page show it; `doctor` warns when nothing would lock the
-vault on suspend or on screen lock. A watcher whose bus goes away reports
-itself inactive and reconnects every few seconds.
+whether it is being watched now, whether it is *degraded* (watched, but
+logind would not give an inhibitor, so the lock may come after the computer
+wakes), and why not (no system bus, no session bus, logind or no screensaver
+on the bus, turned off, not built in). A source counts as watched only when
+the service is there, not merely when the subscription is in place.
+`rusthorse status`, `rusthorse doctor` and the manager's Status page show
+it; `doctor` warns when nothing watches suspend or screen lock, and when the
+suspend lock is degraded. A watcher whose bus goes away reports itself
+inactive and reconnects every few seconds.
+
+The agent holds a handle on its watchers: dropping it closes their
+connections — letting go of the inhibitor — and joins their threads.
 
 The field is optional within protocol 5: older agents leave it out, and
 clients say "not reported".

@@ -87,7 +87,9 @@ Durations are a number followed by `s`, `m` or `h`, or `0`.
 
 Besides the idle timer, the agent locks the vault when the computer is about
 to suspend or hibernate — logind waits for it, thanks to a delay inhibitor
-the agent holds — and when your session is locked or its screensaver starts
+the agent holds, up to logind's `InhibitDelayMaxSec` (5 seconds by default;
+a vault save in progress can make the lock later) — and when your session is
+locked or its screensaver starts
 (logind's session lock, Cinnamon's, GNOME's, MATE's and the freedesktop
 screensaver). Nothing ever unlocks the vault but the master password: a
 screen unlock or a resume does not. `rusthorse status` and `rusthorse doctor`
@@ -112,8 +114,12 @@ locks on:   suspend: logind (locks before the computer sleeps)
 ```
 
 `not watched` and the reason appear when a source is unavailable (no system
-bus, no session bus, turned off, a build without the `session-lock`
-feature); a watcher whose bus goes away connects again every few seconds.
+bus, no session bus, logind or no screensaver on the bus, turned off, a
+build without the `session-lock` feature); a watcher whose bus goes away
+connects again every few seconds, and on connecting locks if the session is
+locked or a screensaver on already. When logind would not give an
+inhibitor, the suspend line says so: the lock may then come only after the
+computer wakes.
 
 ## `rusthorse unlock` / `rusthorse lock`
 

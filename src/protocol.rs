@@ -576,6 +576,10 @@ pub struct StatusInfo {
     pub lock_triggers: Vec<LockTrigger>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// An event that locks the vault, and where the agent learns of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockTrigger {
@@ -587,6 +591,10 @@ pub struct LockTrigger {
     pub source: String,
     /// Whether the agent is watching it now.
     pub active: bool,
+    /// Watched, but not as well as it should be: logind would not wait
+    /// before a suspend, so the lock may come after the computer wakes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub degraded: bool,
     /// Why not, or a remark (`locks before the computer sleeps`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,

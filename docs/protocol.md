@@ -279,8 +279,11 @@ All fields are optional; omitted fields are left unchanged.
 `lock_triggers` (optional; left out by agents that predate it) lists what
 else locks the vault ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)):
 `event` is `suspend` or `screen_lock`, `source` where the agent learns of it,
-`active` whether it is watched now, and `note` why not or a remark
-(`turned off`, `connecting`, the bus error). Clients that find it missing
+`active` whether it is watched now (the service is there, not merely the
+subscription), `degraded` (optional, left out when false) whether it is
+watched less well than it should be — logind would not give a delay
+inhibitor, so the lock may come after the computer wakes — and `note` why
+not or a remark (`turned off`, `connecting`, the bus error). Clients that find it missing
 should say it is not reported, not that nothing locks.
 
 `locks_in_secs` is omitted when the vault is locked or auto-lock is off.

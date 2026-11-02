@@ -211,18 +211,26 @@ when the session is locked or the computer is about to sleep. A command that
 is already running keeps the secrets it was given.
 
 The last two come from `session_lock`
-([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)): three threads,
-each with its own D-Bus connection (`zbus`, blocking API), watch logind's
-`PrepareForSleep` on the system bus — holding a *delay* inhibitor, taken at
-start and after each resume and released once the vault is locked, so that
-logind waits for the lock before the computer sleeps —, logind's session
-`Lock` signal and `LockedHint` for sessions of the agent's user, and the
-screensavers' `ActiveChanged` on the session bus. A lock from them is the same
-as `rusthorse lock` and changes the generation even when the vault is already
+([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)): three threads
+(`zbus`, blocking API) watch logind's `PrepareForSleep` on the system bus —
+holding a *delay* inhibitor, taken at start and after each resume and
+released once the vault is locked, so that logind waits for the lock, up to
+its `InhibitDelayMaxSec` —, logind's session `Lock` signal and `LockedHint`
+for sessions of the agent's user, and the screensavers' `ActiveChanged` on
+the session bus. Each reads signals on one connection and asks its
+questions (the owner of logind's name, a session's user, the inhibitor —
+the last on a helper thread) on a second one with a 2-second limit, so that
+a reply never waits behind queued signals and a slow one never delays a
+lock. logind's signals count only as broadcasts from the current owner of
+its name; malformed ones are ignored. A lock from them is the same as
+`rusthorse lock` and changes the generation even when the vault is already
 locked, so an unlock under way does nothing. Signals only lock; no signal
 unlocks. A watcher whose bus goes away reports itself inactive in `status`
-and connects again every five seconds. The watchers exist only with the
-`session-lock` Cargo feature (on by default).
+and connects again every five seconds; on connecting it locks if a session
+is locked or a screensaver on already. The agent's handle on the watchers
+closes their connections and joins their threads when the agent is dropped.
+The watchers exist only with the `session-lock` Cargo feature (on by
+default).
 
 ## Storage format
 
