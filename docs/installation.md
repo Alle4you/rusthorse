@@ -55,7 +55,7 @@ sudo apt install ./target/debian/rusthorse_0.1.0-1_amd64.deb
 | `/usr/lib/systemd/user/rusthorse-agent.service` | The agent's service, enabled for every user |
 | `/usr/share/applications/`, `/usr/share/icons/` | The menu entry and icon of the manager |
 | `/usr/share/bash-completion/`, `zsh/`, `fish/` | Shell completions |
-| `/usr/share/doc/rusthorse/` | This documentation |
+| `/usr/share/doc/rusthorse/` | This documentation; `copyright` lists every crate compiled into the programs, with its license |
 
 The agent starts at your next login. To start it now:
 
@@ -75,9 +75,13 @@ Then [create a vault](#3-create-a-vault) — section 2 is done for you.
   `systemctl --user mask rusthorse-agent` (`unmask` undoes it).
 - Upgrading is installing a newer package the same way. Agents that are
   running keep the program they started with until your next login, or until
-  `systemctl --user restart rusthorse-agent` (which locks the vault and stops
-  the commands the agent started); `rusthorse doctor` says when one runs a
-  replaced program.
+  you restart them (which locks the vault and stops the commands the agent
+  started); `rusthorse doctor` says when one runs a replaced program:
+
+  ```sh
+  systemctl --user daemon-reload     # in case the service file changed
+  systemctl --user restart rusthorse-agent
+  ```
 
 ### From source
 
@@ -348,8 +352,8 @@ identical).
 ## Upgrading
 
 With the package, install the newer package as in
-[section 1](#debian-ubuntu-linux-mint-the-package), then restart the agent
-(or log in again). From source, install a specific release, then restart the
+[section 1](#debian-ubuntu-linux-mint-the-package), then run `systemctl
+--user daemon-reload` and restart the agent (or log in again). From source, install a specific release, then restart the
 agent so that both sides run the same version:
 
 ```sh
@@ -390,8 +394,11 @@ sudo apt remove rusthorse
 ```
 
 This removes the programs, the service file, the menu entry, the completions
-and the documentation, and first stops the agent of every user who is logged
-in (which locks their vaults and stops the commands their agents started).
+and the documentation. First it tries to stop the agent of every user who is
+logged in (which locks their vaults and stops the commands their agents
+started), and prints a warning for each one it cannot stop: that agent keeps
+running the removed program until its user logs out or runs `systemctl
+--user stop rusthorse-agent`.
 Like any package, it keeps the record of whether the service is enabled, so
 that installing the package again keeps that choice; `sudo apt purge
 rusthorse` deletes that record too, and nothing of the package is left

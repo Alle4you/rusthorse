@@ -1118,3 +1118,52 @@ and restoring the previous code makes both it and the project's test fail.
 No new medium or high finding. The reviewer's opinion: sufficient for the
 documented use, accepting the dependence on the desktop's signals and buses
 and logind's maximum delay (L20).
+
+**Debian package (2026-11-02).** At the maintainer's request — Rusthorse
+should be as easy to install and remove as any desktop application:
+[ADR 0010](adr/0010-debian-package.md), `packaging/`. The maintainer
+scripts were first simulated by hand in a temporary root (`DPKG_ROOT`)
+with stand-ins for `loginctl` and `systemctl`.
+
+Review (Codex, AI-assisted, 2026-11-02; verdict: not ready), and what was
+done:
+
+| Finding | Disposition |
+|---|---|
+| Medium — `prerm` ignored `DPKG_ROOT`: removing the package from another root (a system image built with `--root`) would have stopped the agents of this computer's users | **Fixed:** nothing is stopped when `DPKG_ROOT` is set, nor where systemd does not run. Tested: no call with `DPKG_ROOT` set, none on upgrade. |
+| Medium — the copyright file had only Rusthorse's license, not the notices of the crates compiled into the programs (the `keepass` crate's MIT notice, among others), which their licenses require to go with the binaries | **Fixed:** `packaging/copyright.py` lists every crate that Cargo.lock resolves for the three programs (173), with version, license, source and copyright notices, and the license texts they ship, each once; it fails on a crate with no text it can give. |
+| Low — `prerm` hid every failure, while the guide said removal stops every agent | **Fixed:** it asks each session whether its agent runs, stops it, and warns on standard error when the users cannot be listed, a session does not answer or an agent does not stop; the guide says it tries, and what to do. Tested with stand-ins for each case. |
+| Low — after an upgrade that changes the service file, a restart without `systemctl --user daemon-reload` keeps the old definition | **Fixed (documentation):** the guide and ADR 0010 say to reload before restarting; agents are still never restarted by the package. |
+| Low — no Debian changelog and no manual pages | **Fixed** for the changelog (`changelog.Debian.gz`). **Open:** manual pages (roadmap). |
+| Low — links of the installed documentation led nowhere (`LICENSE`, `CONTRIBUTING.md`, the manager prototype, source files) | **Fixed:** `packaging/docs.py` installs those documents and points links to the source code to GitHub at the revision built; it fails on any link that leads nowhere. |
+
+Ideas from the same review, adopted: the maintainer scripts are now tested
+automatically (`tests/packaging.rs`: stand-ins for `prerm`, and the real
+`deb-systemd-helper` in a temporary root for installation, an
+administrator's `--global disable` kept across upgrades and a reinstall,
+removal and purge). Not adopted yet: a virtual machine test with a logged-in
+user, Lintian in CI (there is no CI yet). Debhelper's mask on removal,
+which the reviewer also mentioned, is no longer created by current debhelper
+and is not used. Each fix was reverted in a copy of the tree to see a test
+fail (8 of 9). The survivor is harmless by design: `postinst`'s `was-enabled`
+check follows debhelper's template, but `deb-systemd-helper enable` already
+skips a unit whose state file exists, so an administrator's choice is kept
+either way.
+
+**First start from the manager (2026-11-02).** At the maintainer's
+request — install, open Rusthorse, start the agent if needed, create the
+vault: [ADR 0011](adr/0011-first-start-from-the-manager.md),
+`create_vault` (protocol 6). The master password of a new vault is now
+asked by the agent whenever one serves the vault, also for `rusthorse init`,
+which closes a gap: an AI that ran `init` had the password typed into a
+process it started. A new vault is linked into place, so one created
+meanwhile is never replaced. Tested end to end (creation through the
+agent's two dialogs, cancel at each, mismatch, too short, an existing vault
+without a dialog, a lock while typing, two requests at once, an unwritable
+audit log) and on Xvfb (Start agent with a stand-in `systemctl` that fails,
+then works; Create vault; a status check does not repaint the page). End-to-
+end commands now run without `DISPLAY`, so a command that tried to show a
+dialog itself would fail instead of reaching the desktop. Each fix was
+reverted in a copy of the tree to see a test fail (13 of 14); the survivor,
+the "vault exists" check before waiting for the dialog lock, is redundant
+by design — the check after the lock decides.

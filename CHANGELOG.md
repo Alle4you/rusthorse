@@ -25,9 +25,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   built with `packaging/build-deb.sh` (cargo-deb) for Ubuntu 24.04, Linux
   Mint 22, Debian 13 or later: the three programs in `/usr/bin`, the agent's
   user service enabled for every user, the manager in the applications menu,
-  shell completions and the documentation. `apt remove` stops the agents of
-  logged-in users and removes everything but users' vaults and audit logs;
-  upgrades do not restart running agents.
+  shell completions and the documentation, and a copyright file with the
+  license of every crate compiled in. `apt remove` stops the agents of
+  logged-in users (and says which it could not stop) and removes everything
+  but users' vaults and audit logs; upgrades do not restart running agents.
 - The agent **locks the vault when the screen locks or the computer
   suspends** ([ADR 0009](docs/adr/0009-lock-on-screen-lock-and-suspend.md)):
   it watches logind — holding a delay inhibitor so that the lock happens

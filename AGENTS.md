@@ -205,7 +205,7 @@ present and capture only its window, in a dark and a light theme
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
 | `tests/agent.rs` | End-to-end tests |
-| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): service file, maintainer scripts, `build-deb.sh` |
+| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): service file, maintainer scripts, `build-deb.sh`, the generated copyright file and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
 | `docs/roadmap.md` | Planned work, led by the credential broker |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

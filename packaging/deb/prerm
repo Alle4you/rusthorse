@@ -1,19 +1,45 @@
 #!/bin/sh
 # Debian package: before the files are removed (not before an upgrade).
 #
-# Stops the agent in the sessions of the users who are logged in, so that no
-# agent keeps running a program that is no longer installed. Stopping an
-# agent locks its vault and stops the commands it started. Each user's vault
-# and audit log stay in their home directory: removing the package never
-# deletes them.
+# Tries to stop the agent in the sessions of the users who are logged in, so
+# that no agent keeps running a program that is no longer installed, and
+# says so on standard error for each one it cannot stop. Stopping an agent
+# locks its vault and stops the commands it started. Each user's vault and
+# audit log stay in their home directory: removing the package never deletes
+# them.
+#
+# Nothing is stopped when dpkg works on another root directory (DPKG_ROOT,
+# for example while building a system image): the sessions of this computer
+# have nothing to do with that installation.
 set -e
 
 unit=rusthorse-agent.service
 
-if [ "$1" = remove ] && command -v loginctl >/dev/null 2>&1; then
-    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{ print $1 }'); do
+warn() {
+    echo "rusthorse: $*" >&2
+}
+
+if [ "$1" = remove ] && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    if ! users=$(loginctl list-users --no-legend 2>/dev/null); then
+        warn "cannot list the users who are logged in; an agent that is running keeps the removed program until its user logs out or runs 'systemctl --user stop $unit'"
+        exit 0
+    fi
+    echo "$users" | while read -r uid _; do
+        [ -n "$uid" ] || continue
         user=$(id -nu "$uid" 2>/dev/null) || continue
-        systemctl --user --machine="$user@" stop "$unit" >/dev/null 2>&1 || true
+        # 0: running; 3 (or 4): not running, or no such service.
+        status=0
+        systemctl --user --machine="$user@" is-active --quiet "$unit" 2>/dev/null || status=$?
+        case "$status" in
+        0)
+            systemctl --user --machine="$user@" stop "$unit" >/dev/null 2>&1 ||
+                warn "cannot stop the agent of $user; it keeps the removed program until $user logs out or runs 'systemctl --user stop $unit'"
+            ;;
+        3 | 4) ;;
+        *)
+            warn "cannot ask the session of $user whether its agent runs; if it does, it keeps the removed program until $user logs out or runs 'systemctl --user stop $unit'"
+            ;;
+        esac
     done
 fi
 

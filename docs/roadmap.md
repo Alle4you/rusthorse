@@ -173,7 +173,7 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | First start from the manager: start the agent, create the vault | Done (unreleased) | [ADR 0011](adr/0011-first-start-from-the-manager.md); the agent asks for the master password (`create_vault`). |
 | Import from the manager (GNOME Keyring, `.env`) | Planned | Next: M3 of ADR 0007. |
 | Socket activation of the agent | Idea | Would start the agent on first use without a button; the agent must still run before anything connects, to lock on screen lock and suspend (ADR 0011). |
-| Man page | Planned | Generated from the CLI definition. |
+| Man page | Planned | Generated from the CLI definition; the Debian package has none yet. |
 | Build identifier in `status` and `doctor` | Later | Needs a build script to embed it. |
 | Tests for relay-thread creation failures | Later | Needs a preloaded `pthread_create` shim; verified by review until then. |
 | Dialog layout tests with the real Pango renderer | Idea | Would check the height estimate and drawn extents against real fonts. |
