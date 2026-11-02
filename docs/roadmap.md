@@ -160,7 +160,7 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | One cgroup per approved command, with resource limits | Planned | L17 |
 | Bounded KDF parameters checked before unlocking | Planned | L12 |
 | Per-entry policies: restrict an entry to listed programs or hosts | Planned | L3, L4 |
-| List the variables that redirect a program's requests (`*_BASE_URL`, `*_API_BASE`, `HTTPS_PROXY`, …) in the run dialog (a remembered approval already requires the same environment) | Planned | L4 |
+| List the variables that redirect a program's requests (`*_BASE_URL`, `*_API_BASE`, `HTTPS_PROXY`, …) in the run dialog (a remembered approval already requires the same environment) | Done | L4 |
 | Key files and hardware keys (YubiKey challenge-response) | Later | Compatibility with KeePassXC vaults |
 
 ## Packaging and project

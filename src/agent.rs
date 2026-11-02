@@ -1396,6 +1396,20 @@ impl Agent {
                     .join(", ")
             ));
         }
+        let pairs = |vars: &[(String, String)]| {
+            vars.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let endpoints = pairs(&prepared.endpoints);
+        let routes = pairs(&prepared.routes);
+        if !routes.is_empty() {
+            warnings.push(format!(
+                "These variables route the program's connections or change which servers it \
+                 trusts; with them a requester can send your secrets elsewhere: {routes}"
+            ));
+        }
         if !run.redact {
             warnings.push(
                 "Output is NOT redacted: secret values printed by the command reach the requester."
@@ -1428,7 +1442,14 @@ impl Agent {
                 ("Program".into(), program_text),
                 ("Directory".into(), run.cwd.clone()),
                 ("Requested by (unverified)".into(), peer.describe()),
-            ],
+            ]
+            .into_iter()
+            // Where the program will send what it sends (threat model L4).
+            .chain(
+                (!endpoints.is_empty())
+                    .then(|| ("Connects to (environment)".to_string(), endpoints.clone())),
+            )
+            .collect(),
             facts: vec![
                 ("Input".into(), input.into()),
                 (
@@ -1459,7 +1480,16 @@ impl Agent {
             &effective_env,
         ))
         .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
-        self.approve(request, Some(key), run_event(peer, &run, &identities))?;
+        let mut event = run_event(peer, &run, &identities);
+        let audited: Vec<String> = [("connects to", &endpoints), ("routes", &routes)]
+            .into_iter()
+            .filter(|(_, vars)| !vars.is_empty())
+            .map(|(what, vars)| format!("{what}: {vars}"))
+            .collect();
+        if !audited.is_empty() {
+            event = event.detail(audited.join("; "));
+        }
+        self.approve(request, Some(key), event)?;
 
         // The answer may have taken a while: make sure the program and the
         // directory were not replaced meanwhile...

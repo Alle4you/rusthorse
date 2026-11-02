@@ -87,8 +87,10 @@ request, which needs no approval) and adds `VAR=URL` to the environment it
 sends with the run request — exactly what typing `VAR=https://… rusthorse
 run …` does. The agent needs no change for it.
 
-The URL is not a secret: it is not redacted, and the approval dialog does not
-list it any more than it lists the rest of the requester's environment.
+The URL is not a secret: it is not redacted. The approval dialog lists it
+under "Connects to" when its name says it is an endpoint (`OPENAI_BASE_URL`),
+as it lists any such variable of the requester's — it does not tell the two
+apart.
 `--url` is refused before the run is approved when the entry has no URL (or
 the file marks it protected), when `VAR` is already the variable of a
 secret, and when `VAR` is one of the variables that change how programs start
@@ -148,11 +150,12 @@ rusthorse run OPENAI_API_KEY=<uuid> \
   without a new ADR.
 - **Gap made visible, not created:** an approved, well-known program sends a
   key wherever its environment tells it to (`OPENAI_BASE_URL`,
-  `HTTPS_PROXY`, …), and the run dialog does not list those variables; the
-  requester controls them ([threat model L4](../threat-model.md#l4--approving-a-command-trusts-everything-it-executes)).
-  `--url` takes the endpoint from the vault instead of the requester, but
-  the dialog does not tell them apart. Listing such variables in the dialog
-  is on the [roadmap](../roadmap.md#hardening).
+  `HTTPS_PROXY`, …), and the requester controls that environment
+  ([threat model L4](../threat-model.md#l4--approving-a-command-trusts-everything-it-executes)).
+  A follow-up change made the run dialog list such variables (by name, with
+  URLs shortened to scheme, host and port) and warn about proxies and
+  certificate variables. `--url` takes the endpoint from the vault instead of
+  the requester, but the dialog does not tell them apart.
 - The endpoint stored with an API key is what the planned
   [credential broker](../roadmap.md#credential-broker-secrets-that-never-enter-the-client)
   could check a destination against; that use needs its own design.

@@ -96,7 +96,7 @@ sequenceDiagram
     alt remembering enabled and an identical request was approved
         A->>A: use remembered approval
     else
-        A->>Z: approval dialog (command, program, directory, secrets, requester, warnings)
+        A->>Z: approval dialog (command, program, directory, secrets, requester,<br/>where it connects, warnings)
         Z-->>A: Allow once / Deny (/ Allow for N, if enabled) — via a socket pair
     end
     A->>A: audit record (fail closed)
@@ -115,6 +115,15 @@ sequenceDiagram
     A-->>C: Exited{code, signal}
     C->>C: exit with the same status
 ```
+
+Cleaning the environment (`exec::prepare_env`) removes `LD_*` variables and
+sorts the others the dialog must show: variables that can make the program
+run other code (`RISKY_VARS`), variables that name where it connects
+(`exec::destination`: `*_URL`, `*_HOST`, …, shown under "Connects to") and
+variables that route its connections or change which servers it trusts
+(proxies, certificate authorities, shown as a warning). Destination values
+are shortened for the dialog and the audit record (`shown_destination`:
+scheme, host and port of a URL); the command gets them unchanged.
 
 When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
@@ -327,7 +336,10 @@ in view; when the content does not fit, **Allow** stays disabled until its end
 has been in view once (an obligation to reach the end, not proof of reading),
 and a line next to it says "Scroll to the end to allow".
 Selectable text takes the keyboard focus, so the end can be reached without a
-mouse.
+mouse. Text wraps without hyphens — Pango would otherwise draw a hyphen that
+is not in a command or a path where it breaks a long word — and the keys of
+detail rows break between words only, with a parenthesized qualifier
+("unverified", "environment") drawn small under its key.
 
 **zenity.** zenity is run from `/usr/bin` (or `/usr/local/bin`), never
 through `PATH`, under the same supervision: its own process group, a deadline

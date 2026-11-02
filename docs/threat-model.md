@@ -191,16 +191,22 @@ of variables that change what programs execute (`NODE_OPTIONS`,
 
 A well-known program can also be pointed elsewhere. Libraries read the
 address they send a key to from the environment (`OPENAI_BASE_URL`,
-`ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, …); the requester's environment is
-passed to the command, and the dialog does not list these variables. A
-requester can therefore make an approved `python app.py` send the key to a
-server of its choosing. `run --url` takes such an address from the entry's
-own metadata rather than from the requester, but the dialog does not tell
-the two apart ([ADR 0008](adr/0008-entry-kinds.md)).
-*Mitigation:* read the dialog; prefer well-known binaries with explicit
-arguments; review recent changes to scripts before approving them. Planned:
-list the variables that redirect a program's requests in the dialog
-([roadmap](roadmap.md#hardening)).
+`ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, …), and the requester's environment is
+passed to the command: a requester can make an approved `python app.py` send
+the key to a server of its choosing. The dialog therefore lists, under
+**Connects to**, the variables whose names say where a program connects
+(`*_URL`, `*_BASE_URL`, `*_HOST`, …), and warns about proxies, certificate
+authorities, switches that disable certificate checks, and name resolution
+([cli.md](cli.md#rusthorse-run)); the audit record names them too. Limits:
+the lists go by name and cannot be complete (`MY_SERVICE=https://…`, a
+configuration file or an argument escape them); a URL is shown by scheme,
+host and port only, so a different path on the same host is not visible;
+and `run --url`, which takes the address from the entry's metadata, looks
+the same as a variable the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
+*Mitigation:* read the dialog — check the host of every destination; prefer
+well-known binaries with explicit arguments; review recent changes to scripts
+before approving them. The planned credential broker would remove the
+problem for HTTP APIs: the real key would only travel to its own provider.
 
 ### L5 — Redaction only catches exact copies in the command's output
 
@@ -881,3 +887,30 @@ variables in the run dialog (already planned under L4), a kind filter in the
 manager, a "show all fields" switch in the form, and end-to-end tests for a
 changed URL under a remembered approval and for the manager against a
 protocol-4 agent (both checked by hand in this review).
+
+A follow-up checked every `--url` option before reading any entry: with
+several, a later option's name clash was found only after an earlier read,
+which may ask for the master password. The maintainer then asked for the
+"show all fields" switch, which shows every row without changing the kind
+(tested; reverting it made the test fail).
+
+**Destinations in the run dialog (2026-11-01).** At the maintainer's
+request, closing the L4 gap above as far as a dialog can: the run dialog
+lists, under "Connects to", the variables whose names say where the program
+connects (`*_URL`, `*_URI`, `*_API_BASE`, `*_ENDPOINT`, `*_HOST`, `*_ADDR`,
+`*_REGISTRY`, `PGHOST`…), and warns about proxies, certificate authorities,
+disabled certificate checks and name resolution. Values are shortened to
+scheme, host and port (user, password, path and query left out), in the
+dialog and in the audit record; the command gets them unchanged. Two
+choices made against warning fatigue, both tested: a certificate variable
+that names the system's own store (`SSL_CERT_DIR=/usr/lib/ssl/certs`, which
+Claude Code's environment sets) is not listed — judged on the text, absolute
+and without `..`, so that no symlink can be swapped after the check — and
+`NO_PROXY`, which only bypasses a proxy, is not either. Rendering the real
+dialog on a virtual display showed a defect of `rusthorse-dialog` that
+predates this change: keys of detail rows broke inside words with a hyphen
+("Dire-ctory"), and Pango may draw such a hyphen in any wrapped text,
+including a command or a path being approved. Keys now break between words
+only, a parenthesized qualifier moves under its key, and no dialog label
+inserts hyphens; a widget test on Xvfb checks it. Thirteen mutations each
+made a test fail. Awaiting review.

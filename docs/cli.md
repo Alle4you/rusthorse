@@ -224,7 +224,9 @@ endpoint — in variable `VAR`. `rusthorse run` reads the URL from the entry's
 metadata before sending the request, as `rusthorse show` would, and adds it to
 the environment it sends, exactly as if you had written
 `VAR=https://… rusthorse run …`. The URL is not a secret: it is not redacted
-from the output and the dialog does not list it.
+from the output. Like any variable that names where the program connects, it
+appears in the dialog under **Connects to** when its name says so
+(`OPENAI_BASE_URL` does; see below).
 
 `--url` is refused before anything is asked when it lacks `=`, when `VAR` is
 already the variable of a secret or of another `--url`, and when `VAR` is a
@@ -244,7 +246,27 @@ Requires approval; the dialog shows:
 - what the command reads as input (nothing, or your forwarded input);
 - that the command runs as you, outside any sandbox the requester is in;
 - warnings about removed variables (`LD_*`) and variables that can make the
-  program run other code (`NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND`, …).
+  program run other code (`NODE_OPTIONS`, `PYTHONPATH`, `GIT_SSH_COMMAND`, …);
+- **Connects to (environment)**: the variables that name where the program
+  connects — names ending in `_URL`, `_URI`, `_API_BASE`, `_ENDPOINT`,
+  `_HOST`, `_ADDR` or `_REGISTRY` (`OPENAI_BASE_URL`, `DATABASE_URL`,
+  `DOCKER_HOST`, `VAULT_ADDR`, …) and `PGHOST`-style names;
+- a warning for the variables that route its connections or change which
+  servers it trusts: proxies (`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
+  `GOPROXY`, …), certificate authorities (`SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, …), switches that turn
+  certificate checks off (`NODE_TLS_REJECT_UNAUTHORIZED`, `GIT_SSL_NO_VERIFY`,
+  …) and name resolution (`RES_OPTIONS`, `LOCALDOMAIN`). A certificate
+  variable that names the system's own store (`/etc/ssl/…`, `/usr/lib/ssl/…`,
+  which only root can change) is not listed, nor is `NO_PROXY`.
+
+The requester sets these variables, and with them it can make an approved,
+well-known program send your secret to a server of its own: check the host
+of every one. A URL is shown by its scheme, host and port only
+(`https://…@proxy:3128/…`): user names, passwords, paths and queries —
+where credentials and webhook tokens travel — are left out of the dialog and
+the audit log. The variables reach the command unchanged. The lists are not
+complete; a program can also read an address from a file or its arguments.
 
 Requests whose command line, program path or directory is longer than 1000
 characters are refused (put the command in a script): the dialog never
@@ -390,6 +412,8 @@ rusthorse audit [-n LINES] [--json]
 Prints the last records of the audit log (default 20). `--json` prints the
 raw JSON Lines. Records contain the time, action, outcome, entry names,
 requester chain and, for `run`, the command line and directory — never values.
+A `run` record's `detail` names the variables the dialog listed under
+**Connects to** and in its routing warning, shortened the same way.
 The time is when the record was written, after the decision — for an
 approval or a denial, after you answered the dialog, not when the request
 arrived. It is usually within a moment of your answer, but can be later when

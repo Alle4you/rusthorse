@@ -2882,3 +2882,96 @@ fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
         request.details
     );
 }
+
+#[test]
+fn the_run_dialog_shows_where_the_program_connects_without_credentials() {
+    let h = Harness::new();
+    h.add_secret(
+        "OPENAI_API_KEY",
+        "sk-dest-test-123456",
+        &[
+            "--kind",
+            "api-key",
+            "--url",
+            "https://api.example.invalid/v1",
+        ],
+    );
+    let run = |decision: Decision, script: &str| {
+        h.decide(&[decision]);
+        h.cmd(&[
+            "run",
+            "OPENAI_API_KEY",
+            "--url",
+            "OPENAI_BASE_URL=OPENAI_API_KEY",
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .env("https_proxy", "http://u:FAKE-proxy-pw@proxy.invalid:3128")
+        .env("SSL_CERT_FILE", "/tmp/fake-ca.pem")
+        .finish()
+    };
+
+    // Denied: nothing runs, and the dialog said where it would connect.
+    let marker = h.dir.path().join("ran");
+    let out = run(
+        Decision::Deny,
+        &format!("touch {}", marker.to_str().expect("utf8")),
+    );
+    assert_eq!(out.status.code(), Some(125));
+    assert!(!marker.exists());
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "Connects to (environment)"
+                && v == "OPENAI_BASE_URL=https://api.example.invalid/…"),
+        "{:?}",
+        request.details
+    );
+    let warning = request
+        .warnings
+        .iter()
+        .find(|w| w.contains("route the program's connections"))
+        .expect("a warning about routes");
+    // (Variables of the test's own environment may be listed too.)
+    for part in [
+        "SSL_CERT_FILE=/tmp/fake-ca.pem",
+        "https_proxy=http://…@proxy.invalid:3128",
+    ] {
+        assert!(warning.contains(part), "{warning}");
+    }
+    let shown = format!("{:?}", request);
+    assert!(!shown.contains("FAKE-proxy-pw"), "{shown}");
+
+    // Allowed: the command gets the variables unchanged.
+    let out = run(
+        Decision::AllowOnce,
+        "echo \"$https_proxy|$OPENAI_BASE_URL|$SSL_CERT_FILE\"",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(
+        "http://u:FAKE-proxy-pw@proxy.invalid:3128|https://api.example.invalid/v1|/tmp/fake-ca.pem"
+    ));
+
+    // Both attempts are audited with the same shortened values.
+    let audit = h.audit_text();
+    let runs: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains(r#""action":"run""#) && !l.contains(r#""outcome":"exited""#))
+        .collect();
+    assert_eq!(runs.len(), 2, "{audit}");
+    for record in runs {
+        for part in [
+            "connects to: OPENAI_BASE_URL=https://api.example.invalid/…",
+            "; routes: ",
+            "SSL_CERT_FILE=/tmp/fake-ca.pem",
+            "https_proxy=http://…@proxy.invalid:3128",
+        ] {
+            assert!(record.contains(part), "{record}");
+        }
+    }
+    assert!(!audit.contains("FAKE-proxy-pw"));
+}

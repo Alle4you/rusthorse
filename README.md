@@ -75,7 +75,9 @@ and keeps the value out of the agent's reach in the common case.
 - **The command you approve is the command that starts.** The agent itself
   resolves the program to an absolute path, removes dynamic-loader variables
   (`LD_PRELOAD`, …), warns about variables that can inject code
-  (`NODE_OPTIONS`, `PYTHONPATH`, …), checks after your answer that the program
+  (`NODE_OPTIONS`, `PYTHONPATH`, …), shows where the program will connect
+  (`OPENAI_BASE_URL`, proxies, certificate authorities set in its
+  environment), checks after your answer that the program
   and directory were not swapped, and starts the command as its own child.
   (What the program then reads — scripts, config files — is up to you to
   trust; see the threat model.)

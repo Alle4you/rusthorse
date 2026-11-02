@@ -163,6 +163,7 @@ fn label(text: &str, classes: &[&str], xalign: f32, selectable: bool) -> gtk::La
         .yalign(0.0)
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)
+        .attributes(&no_hyphens())
         .selectable(selectable)
         .focusable(selectable)
         .build();
@@ -170,6 +171,25 @@ fn label(text: &str, classes: &[&str], xalign: f32, selectable: bool) -> gtk::La
         label.add_css_class(class);
     }
     label
+}
+
+/// Text attributes that stop Pango from drawing a hyphen where it breaks a
+/// word: what the human approves — a command, a path — must look exactly as
+/// it is.
+fn no_hyphens() -> pango::AttrList {
+    let list = pango::AttrList::new();
+    list.insert(pango::AttrInt::new_insert_hyphens(false));
+    list
+}
+
+/// A row's key and the qualifier drawn small under it:
+/// "Requested by (unverified)" → ("Requested by", Some("unverified")), so
+/// that the key column stays narrow.
+fn key_parts(key: &str) -> (&str, Option<&str>) {
+    match key.strip_suffix(')').and_then(|k| k.rsplit_once(" (")) {
+        Some((main, note)) if !main.is_empty() && !note.is_empty() => (main, Some(note)),
+        _ => (key, None),
+    }
 }
 
 fn card(child: &impl IsA<gtk::Widget>, margin: i32) -> gtk::Box {
@@ -195,7 +215,8 @@ fn warning(text: &str) -> gtk::Box {
     card(&row, 12)
 }
 
-/// Label | value rows. A "(unverified)" suffix moves under its label.
+/// Label | value rows. A parenthesized suffix — "(unverified)" — moves
+/// under its label ([`key_parts`]); labels break between words only.
 fn grid(rows: &[(String, String)], dim_values: bool) -> gtk::Grid {
     let grid = gtk::Grid::builder()
         .column_spacing(18)
@@ -204,12 +225,12 @@ fn grid(rows: &[(String, String)], dim_values: bool) -> gtk::Grid {
     for (row, (key, value)) in rows.iter().enumerate() {
         let keys = gtk::Box::new(gtk::Orientation::Vertical, 0);
         keys.set_halign(gtk::Align::End);
-        match key.strip_suffix(" (unverified)") {
-            Some(key) => {
-                keys.append(&label(key, &["dim-label"], 1.0, false));
-                keys.append(&label("unverified", &["dim-label", "caption"], 1.0, false));
-            }
-            None => keys.append(&label(key, &["dim-label"], 1.0, false)),
+        let (key, note) = key_parts(key);
+        let main = label(key, &["dim-label"], 1.0, false);
+        main.set_wrap_mode(pango::WrapMode::Word);
+        keys.append(&main);
+        if let Some(note) = note {
+            keys.append(&label(note, &["dim-label", "caption"], 1.0, false));
         }
         let classes: &[&str] = if dim_values {
             &["dim-label"]
@@ -531,6 +552,110 @@ mod tests {
         let mut out = Vec::new();
         wire::write_frame(&mut out, value, wire::MAX_REQUEST).expect("frame");
         out
+    }
+
+    #[test]
+    fn a_parenthesized_qualifier_moves_under_its_key() {
+        assert_eq!(
+            key_parts("Requested by (unverified)"),
+            ("Requested by", Some("unverified"))
+        );
+        assert_eq!(
+            key_parts("Connects to (environment)"),
+            ("Connects to", Some("environment"))
+        );
+        for plain in ["Program", "(only)", "Odd ()", "Ends with )", ""] {
+            assert_eq!(key_parts(plain), (plain, None), "{plain}");
+        }
+    }
+
+    /// Whether Pango may not draw hyphens where it breaks this label's words.
+    fn hyphenless(l: &gtk::Label) -> bool {
+        l.attributes().is_some_and(|list| {
+            list.attributes().iter().any(|a| {
+                a.type_() == pango::AttrType::InsertHyphens
+                    && a.downcast_ref::<pango::AttrInt>()
+                        .is_some_and(|i| i.value() == 0)
+            })
+        })
+    }
+
+    /// The detail rows as GTK builds them, on a virtual display: keys break
+    /// between words only, qualifiers sit under their key, and no label
+    /// draws a hyphen that is not in the text. (Re-runs itself under
+    /// xvfb-run; skipped when it is missing, like the tests in `tests/`.)
+    #[test]
+    fn detail_rows_never_alter_what_they_show() {
+        if std::env::var_os("RUSTHORSE_DIALOG_XVFB_CHILD").is_none() {
+            use std::os::unix::process::CommandExt;
+            if !std::path::Path::new("/usr/bin/xvfb-run").exists() {
+                eprintln!("skipped: xvfb-run is not installed");
+                return;
+            }
+            let dir = tempfile::tempdir().expect("runtime");
+            std::fs::set_permissions(
+                dir.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("private");
+            let output = std::process::Command::new("/usr/bin/xvfb-run")
+                .args(["-a", "-s", "-screen 0 800x600x24"])
+                .arg(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "tests::detail_rows_never_alter_what_they_show"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LANG", "C.UTF-8")
+                .env("HOME", dir.path())
+                .env("XDG_RUNTIME_DIR", dir.path())
+                .env("GDK_BACKEND", "x11")
+                .env("GSK_RENDERER", "cairo")
+                .env("GSETTINGS_BACKEND", "memory")
+                .env("RUSTHORSE_DIALOG_XVFB_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .process_group(0)
+                .output()
+                .expect("xvfb-run");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        adw::init().expect("GTK only on Xvfb");
+        let rows = [
+            ("Directory".to_string(), "/tmp/a-long-path".to_string()),
+            (
+                "Connects to (environment)".to_string(),
+                "OPENAI_BASE_URL=https://api.example.invalid/…".to_string(),
+            ),
+        ];
+        let grid = grid(&rows, false);
+        let mut labels = Vec::new();
+        let mut stack = vec![grid.upcast::<gtk::Widget>()];
+        while let Some(w) = stack.pop() {
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                stack.push(c.clone());
+                child = c.next_sibling();
+            }
+            if let Ok(l) = w.downcast::<gtk::Label>() {
+                labels.push(l);
+            }
+        }
+        let text = |t: &str| {
+            labels
+                .iter()
+                .find(|l| l.text() == t)
+                .unwrap_or_else(|| panic!("no label {t}"))
+                .clone()
+        };
+        assert!(labels.iter().all(hyphenless));
+        assert_eq!(text("Directory").wrap_mode(), pango::WrapMode::Word);
+        assert_eq!(text("Connects to").wrap_mode(), pango::WrapMode::Word);
+        assert!(text("environment").has_css_class("caption"));
+        assert!(!labels.iter().any(|l| l.text().contains('(')));
     }
 
     #[test]

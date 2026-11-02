@@ -19,9 +19,15 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   manager's form offers, never hiding one that has a value ("Show all
   fields" shows every one). It grants nothing.
 - `run --url VAR=ENTRY` also gives the command an entry's URL, such as an
-  API's endpoint, in variable `VAR`. The URL is not a secret: it is neither
-  redacted nor listed in the approval dialog. The manager's command for an
-  API key with an endpoint includes it.
+  API's endpoint, in variable `VAR`. The URL is not a secret: it is not
+  redacted. The manager's command for an API key with an endpoint includes
+  it.
+- The `run` dialog shows where the program will connect: a **Connects to**
+  row for the variables that name an endpoint (`OPENAI_BASE_URL`,
+  `DATABASE_URL`, `DOCKER_HOST`, …), and a warning for proxies, certificate
+  authorities, disabled certificate checks and name resolution — with which a
+  requester could send a secret to a server of its own. URLs are shown by
+  scheme, host and port only; the audit record names the same variables.
 - `rusthorse-manager`, first milestone ([ADR 0007](docs/adr/0007-visual-manager.md),
   [guide](docs/manager.md)): a GTK 4 and libadwaita window, client of the
   agent, to browse, search and filter entries by group; create, edit, rename
@@ -75,6 +81,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   125 for "did not run".
 
 ### Changed
+
+- `rusthorse-dialog` draws no hyphen where it wraps a long word (a hyphen
+  that is not in a command or a path could mislead), and the keys of detail
+  rows no longer break inside words ("Dire-ctory").
 
 - **Protocol 5** (versions 2 to 4 existed only during development): data
   frames and credits, new requests, definite errors, `reveal.purpose` and

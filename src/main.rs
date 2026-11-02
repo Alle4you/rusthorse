@@ -348,7 +348,7 @@ struct RunArgs {
     #[arg(long)]
     stdin: bool,
     /// Also put an entry's URL (an API's endpoint) in variable VAR. The URL
-    /// is not a secret: it is neither redacted nor listed in the dialog.
+    /// is not a secret: it is not redacted.
     #[arg(long = "url", value_name = "VAR=ENTRY")]
     urls: Vec<String>,
     /// Secrets to expose: ENTRY (variable named like the entry) or VAR=ENTRY.
@@ -942,7 +942,8 @@ fn parse_binding(spec: &str) -> anyhow::Result<Binding> {
 /// The variables that `run --url VAR=ENTRY` adds: each entry's URL, read
 /// from its metadata. A URL is not a secret — `rusthorse show` prints it
 /// without approval — so it travels in the client's environment like any
-/// variable set in the shell: not redacted, not listed in the dialog.
+/// variable set in the shell: not redacted, and listed in the dialog only
+/// as such a variable would be (see `exec::destination`).
 fn endpoint_urls(
     client: &Client,
     specs: &[String],
