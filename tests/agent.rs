@@ -2755,3 +2755,125 @@ fn wait_for_pid(path: &Path) -> u32 {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
+    let h = Harness::new();
+    h.add_secret(
+        "OPENAI_API_KEY",
+        "sk-kind-test-123456",
+        &[
+            "--kind",
+            "api-key",
+            "--url",
+            "https://api.example.invalid/v1",
+        ],
+    );
+    h.add_secret(
+        "lab-ssh",
+        "pi-pass-123456",
+        &["--kind", "server", "--host", "10.0.0.5"],
+    );
+    h.add_secret("plain", "plain-123456", &[]);
+
+    let out = h.run(&["show", "OPENAI_API_KEY"]);
+    assert!(
+        text(&out.stdout).contains("kind:       api-key (API key)"),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = h.run(&["list", "--kind", "api-key"]);
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("OPENAI_API_KEY") && !listed.contains("lab-ssh"),
+        "{listed}"
+    );
+    let out = h.run(&["list", "--kind", "other", "--json"]);
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("\"plain\"") && !listed.contains("OPENAI_API_KEY"),
+        "{listed}"
+    );
+    let out = h.run(&["list", "--json"]);
+    assert!(text(&out.stdout).contains("\"kind\": \"server\""));
+
+    // The URL goes in its own variable; it is not a secret, so it is neither
+    // redacted nor a reason for another dialog.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&[
+        "run",
+        "OPENAI_API_KEY",
+        "--url",
+        "OPENAI_BASE_URL=OPENAI_API_KEY",
+        "--",
+        "sh",
+        "-c",
+        "echo \"base=$OPENAI_BASE_URL\"; echo len=${#OPENAI_API_KEY}",
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("base=https://api.example.invalid/v1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("len=19"), "{stdout}");
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+
+    // Mistakes are refused before anything is asked or run.
+    for (args, expected) in [
+        (vec!["--url", "OPENAI_API_KEY"], "write VAR=ENTRY"),
+        (
+            vec!["--url", "LD_PRELOAD=OPENAI_API_KEY"],
+            "cannot carry a URL",
+        ),
+        (
+            vec!["--url", "OPENAI_API_KEY=OPENAI_API_KEY"],
+            "already set by another binding",
+        ),
+        (vec!["--url", "HOST_URL=lab-ssh"], "lab-ssh has no URL"),
+    ] {
+        let mut argv = vec!["run", "OPENAI_API_KEY"];
+        argv.extend(args);
+        argv.extend(["--", "true"]);
+        let out = h.run(&argv);
+        assert!(!out.status.success());
+        assert!(
+            text(&out.stderr).contains(expected),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+
+    // `--kind other` takes the kind away; the approval dialog says so.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "lab-ssh", "--kind", "other"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "Clear" && v == "kind"),
+        "{:?}",
+        request.details
+    );
+    let out = h.run(&["show", "lab-ssh"]);
+    assert!(
+        !text(&out.stdout).contains("kind:"),
+        "{}",
+        text(&out.stdout)
+    );
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "lab-ssh", "--kind", "device"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "New kind" && v == "Device"),
+        "{:?}",
+        request.details
+    );
+}

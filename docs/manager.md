@@ -85,9 +85,27 @@ itself.
 
 ### Create an entry
 
-**New entry** opens a form for the name, group, username, URL, host, port and
-tags. These are metadata, not secrets: never type a secret in them. Choose how
-the value is made:
+**New entry** opens a form for the kind, name, group, username, URL, host,
+port and tags. These are metadata, not secrets: never type a secret in them.
+
+The **Kind** row says what the entry is for, and the form offers the fields
+that kind uses:
+
+| Kind | Fields offered | The URL is called |
+|---|---|---|
+| API key | Username, URL | Endpoint URL — e.g. `https://api.openai.com/v1` |
+| Website login | Username, URL | URL |
+| Server | Username, Host, Port | — |
+| Device | Username, URL, Host | Admin page |
+| Other | all of them | URL |
+
+A field that already has a value stays in the form whatever the kind, so
+changing the kind never hides or removes anything. The kind is stored in the
+vault (the KeePass field `Kind`) and shown under the entry's name; see
+[ADR 0008](adr/0008-entry-kinds.md). Tags stay free, for projects or
+environments (`prod`, `test`) and for search.
+
+Choose how the value is made:
 
 - **Type it in the agent's dialog** — after you click *Send to agent*, the
   agent's own password-style dialog asks for it;
@@ -111,6 +129,19 @@ The **Use it from a command** card holds a ready command, for example:
 ```sh
 rusthorse run OPENAI_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f -- your-command
 ```
+
+For an API key with an endpoint, it also passes the endpoint:
+
+```sh
+rusthorse run OPENAI_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  --url OPENAI_BASE_URL=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  -- your-command
+```
+
+The endpoint's variable is named after the key's (`OPENAI_API_KEY` →
+`OPENAI_BASE_URL`, which the OpenAI and Anthropic libraries read; otherwise
+`NAME_URL`); rename it if your program reads another one. The URL is not a
+secret: it is not redacted from the output.
 
 Replace `your-command`. After your approval the program receives the value in
 that environment variable and its output is redacted. The entry is named by

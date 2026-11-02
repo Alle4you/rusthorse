@@ -216,6 +216,7 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 | url | `URL` | no | yes |
 | host | `Host` (custom) | no | yes |
 | port | `Port` (custom) | no | yes |
+| kind | `Kind` (custom): `api-key`, `login`, `server` or `device` | no | yes |
 | notes | `Notes` | yes | **no** |
 | tags | `Tags` | — | yes |
 | group | entry's group path | — | yes |
@@ -223,6 +224,12 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 
 Entries in the recycle bin are ignored. Edits record the previous state in
 the entry's KeePass history, so KeePassXC can show and restore old versions.
+
+A `Kind` field that holds anything other than the four kinds (written by
+another client) is reported as one of the other fields, by name only, and
+the entry has no kind. A metadata field that the file marks as protected —
+`Kind` included — is withheld like a value. The kind only labels fields
+([ADR 0008](adr/0008-entry-kinds.md)); no policy reads it.
 
 ### Saving
 
@@ -403,7 +410,7 @@ CLI: it never opens the vault and never receives the master password. Its
 forms carry metadata only; every change is a request the agent approves in
 its own dialog.
 
-- **Requests.** It uses the protocol-4 requests and targets entries by UUID.
+- **Requests.** It uses the protocol-5 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
   started by the human runs at a time, on a worker thread, with bounded
   waits; closing the window shuts the connection down. A lost answer to a
@@ -420,6 +427,11 @@ its own dialog.
 - **Show.** `reveal` with purpose `show`: the value appears in a window of its
   own, as plain monospace text that is not selectable, for at most 30
   seconds or until the window loses focus. Its Copy button copies the shown value without a new approval.
+- **Kinds.** The entry form starts with a Kind row; the kind decides which
+  of Username, URL, Host and Port the form offers and what the URL is called
+  ("Endpoint URL" for an API key, "Admin page" for a device). A row with a
+  value is always shown. The command snippet of an API key with an endpoint
+  adds `--url` ([ADR 0008](adr/0008-entry-kinds.md)).
 - **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard as
   plain text and stays until something else is copied; the desktop and
   clipboard histories may keep it. See

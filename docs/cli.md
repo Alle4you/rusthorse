@@ -107,13 +107,15 @@ discards the decrypted vault and all remembered approvals immediately.
 ## `rusthorse list`
 
 ```
-rusthorse list [--tag TAG] [--search TEXT] [--json]
+rusthorse list [--tag TAG] [--kind KIND] [--search TEXT] [--json]
 rusthorse ls …
 ```
 
 Lists entries with their username, endpoint (URL, or `host:port`) and tags.
-`--search` keeps entries whose name, group, username, URL, host or tags
-contain the text (case-insensitive).
+`--kind` keeps entries of one [kind](#entry-kinds) (`other`: entries of no
+particular kind); an AI agent looking for an API key can start with
+`rusthorse list --kind api-key`. `--search` keeps entries whose name, group,
+username, URL, host or tags contain the text (case-insensitive).
 Values and notes are never included, nor any field that the KeePass file marks
 as protected. JSON output is an array of objects with the fields described in
 [protocol.md](protocol.md#entryinfo), including each entry's UUID.
@@ -124,15 +126,33 @@ as protected. JSON output is an array of objects with the fields described in
 rusthorse show NAME [--json]
 ```
 
-Shows one entry's metadata: name, group, username, URL, host, port, tags,
-whether it has a value and notes, the names of protected and other fields,
-and the last modification time.
+Shows one entry's metadata: name, group, kind, username, URL, host, port,
+tags, whether it has a value and notes, the names of protected and other
+fields, and the last modification time.
+
+## Entry kinds
+
+An entry can say what it is for, with `--kind` in `add` and `edit`:
+
+| `--kind` | For | `--url` is |
+|---|---|---|
+| `api-key` | A key or token for an API | The API's endpoint, e.g. `https://api.openai.com/v1` |
+| `login` | A sign-in to a website or web console | The sign-in page |
+| `server` | A server reached by host and port (SSH, a database, …) | — |
+| `device` | A device such as a router or a camera | Its admin page |
+| `other` | No particular kind (the default) | Any access link |
+
+The kind names the fields and decides which ones the manager's form offers
+(it never hides a field that has a value); `list --kind` filters by it. It
+is stored in the KDBX field `Kind`, which KeePassXC shows as an attribute.
+It grants and restricts nothing. See
+[ADR 0008](adr/0008-entry-kinds.md).
 
 ## `rusthorse add`
 
 ```
-rusthorse add NAME [--username USER] [--url URL] [--host HOST] [--port PORT]
-                   [--notes TEXT] [--tag TAG]... [--group PATH]
+rusthorse add NAME [--kind KIND] [--username USER] [--url URL] [--host HOST]
+                   [--port PORT] [--notes TEXT] [--tag TAG]... [--group PATH]
                    [--stdin | --generate [--length N] [--alphabet KIND]]
                    [--replace]
 ```
@@ -154,18 +174,20 @@ example a database password it will only ever use through `rusthorse run`.
 stays in the entry's history). `--group` places a new entry in a group,
 creating it if needed (`Work/Servers`).
 
-Example — a router with its access details:
+Examples — an API key with its endpoint, and a router with its access
+details:
 
 ```sh
-rusthorse add core-router --username admin --url https://10.0.0.1/ \
+rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
+rusthorse add core-router --kind device --username admin --url https://10.0.0.1/ \
     --host 10.0.0.1 --port 443 --tag network --notes "Rack 2, console on J3"
 ```
 
 ## `rusthorse edit`
 
 ```
-rusthorse edit NAME [--username USER] [--url URL] [--host HOST] [--port PORT]
-                    [--notes TEXT] [--rename NEW] [--clear FIELD]...
+rusthorse edit NAME [--kind KIND] [--username USER] [--url URL] [--host HOST]
+                    [--port PORT] [--notes TEXT] [--rename NEW] [--clear FIELD]...
                     [--add-tag TAG]... [--remove-tag TAG]...
                     [--value | --stdin | --generate [--length N] [--alphabet KIND]]
 ```
@@ -173,8 +195,9 @@ rusthorse edit NAME [--username USER] [--url URL] [--host HOST] [--port PORT]
 Changes an entry. Requires approval; the dialog lists every change. `--value`
 makes the agent ask you for a new value in a dialog; `--stdin` reads it from
 standard input; `--generate` replaces it with a new random value (to rotate a
-credential: generate, then update it at the provider with `rusthorse run`). `--clear` removes a field: `username`, `url`, `host`, `port`
-or `notes`. The previous state is kept in the entry's KeePass history.
+credential: generate, then update it at the provider with `rusthorse run`). `--clear` removes a field: `username`, `url`, `host`, `port`,
+`notes` or `kind`; `--kind other` also removes the kind. The previous state is
+kept in the entry's KeePass history.
 
 ## `rusthorse remove`
 
@@ -189,12 +212,25 @@ previous file is still available as `vault.kdbx.bak`.
 ## `rusthorse run`
 
 ```
-rusthorse run [--no-redact] [--stdin] SECRET... -- COMMAND [ARG]...
+rusthorse run [--no-redact] [--stdin] [--url VAR=NAME]... SECRET... -- COMMAND [ARG]...
 ```
 
 Runs `COMMAND` with secrets in its environment. Each `SECRET` is either
 `NAME` (the variable is named like the entry, which must then be a valid
-variable name) or `VAR=NAME`. Requires approval; the dialog shows:
+variable name) or `VAR=NAME`.
+
+`--url VAR=NAME` also puts entry `NAME`'s URL — for an API key, its
+endpoint — in variable `VAR`. `rusthorse run` reads the URL from the entry's
+metadata before sending the request, as `rusthorse show` would, and adds it to
+the environment it sends, exactly as if you had written
+`VAR=https://… rusthorse run …`. The URL is not a secret: it is not redacted
+from the output and the dialog does not list it. `--url` is refused, before
+anything is asked, when the entry has no URL (or the file marks it
+protected), when `VAR` is already a secret's variable, and when `VAR` is a
+variable that changes how programs start (`LD_*` and the risky variables
+listed below).
+
+Requires approval; the dialog shows:
 
 - the command line, the resolved program path (and the real file behind a
   symlink) and the working directory;
@@ -243,6 +279,7 @@ Examples:
 
 ```sh
 rusthorse run OPENAI_API_KEY -- python app.py
+rusthorse run OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
 rusthorse run GH_TOKEN=github-token -- gh pr create --fill
 rusthorse run PGPASSWORD=prod-db -- psql -h db.lan -U app app
 rusthorse run TOKEN=cloudflare -- sh -c 'curl -sH "Authorization: Bearer $TOKEN" https://api.cloudflare.com/client/v4/user/tokens/verify'

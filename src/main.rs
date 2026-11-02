@@ -13,8 +13,8 @@ use rusthorse::client::Client;
 use rusthorse::dialog_program::DesktopUi;
 use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
-    Binding, EntryChanges, EntryFields, EntryInfo, ErrorCode, Field, ImportedEntry, NewEntry,
-    Request, Response, RunRequest, SecretString, ValueChange,
+    Binding, EntryChanges, EntryFields, EntryInfo, EntryKind, ErrorCode, Field, ImportedEntry,
+    NewEntry, Request, Response, RunRequest, SecretString, ValueChange,
 };
 use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
@@ -76,6 +76,9 @@ enum Command {
         /// Only entries with this tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Only entries of this kind (`other`: entries of no particular kind).
+        #[arg(long, value_enum)]
+        kind: Option<KindArg>,
         /// Only entries whose name, group, username, URL, host or tags contain
         /// this text (case-insensitive).
         #[arg(long, short = 's', value_name = "TEXT")]
@@ -223,12 +226,44 @@ struct AgentArgs {
     dialog_timeout: Duration,
 }
 
+/// What an entry is for (see `EntryKind`); `other` is no particular kind.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum KindArg {
+    /// A key or token for an API; --url is its endpoint.
+    ApiKey,
+    /// A sign-in to a website or web console.
+    Login,
+    /// A server reached by host and port (SSH, a database, …).
+    Server,
+    /// A device such as a router; --url is its admin page.
+    Device,
+    /// No particular kind.
+    Other,
+}
+
+impl KindArg {
+    fn kind(self) -> Option<EntryKind> {
+        match self {
+            KindArg::ApiKey => Some(EntryKind::ApiKey),
+            KindArg::Login => Some(EntryKind::Login),
+            KindArg::Server => Some(EntryKind::Server),
+            KindArg::Device => Some(EntryKind::Device),
+            KindArg::Other => None,
+        }
+    }
+}
+
 #[derive(Args)]
 struct EntryArgs {
+    /// What the entry is for. It labels the fields (the URL of an API key is
+    /// its endpoint) and grants nothing.
+    #[arg(long, value_enum)]
+    kind: Option<KindArg>,
     /// Login name.
     #[arg(long, short = 'u')]
     username: Option<String>,
-    /// Access link, e.g. https://router.lan/ or ssh://admin@10.0.0.1.
+    /// Access link, e.g. https://router.lan/ or ssh://admin@10.0.0.1; for an
+    /// API key, the API's endpoint, e.g. https://api.openai.com/v1.
     #[arg(long)]
     url: Option<String>,
     /// Host name or IP address.
@@ -272,6 +307,7 @@ enum ClearField {
     Host,
     Port,
     Notes,
+    Kind,
 }
 
 #[derive(Args)]
@@ -311,6 +347,10 @@ struct RunArgs {
     /// command reads /dev/null (with --no-redact it always gets stdin).
     #[arg(long)]
     stdin: bool,
+    /// Also put an entry's URL (an API's endpoint) in variable VAR. The URL
+    /// is not a secret: it is neither redacted nor listed in the dialog.
+    #[arg(long = "url", value_name = "VAR=ENTRY")]
+    urls: Vec<String>,
     /// Secrets to expose: ENTRY (variable named like the entry) or VAR=ENTRY.
     #[arg(required = true, value_name = "SECRET")]
     secrets: Vec<String>,
@@ -438,7 +478,12 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
         }
         Command::Unlock => simple(client, &Request::Unlock),
         Command::Lock => simple(client, &Request::Lock),
-        Command::List { tag, search, json } => list(client, tag, search, json),
+        Command::List {
+            tag,
+            kind,
+            search,
+            json,
+        } => list(client, tag, kind, search, json),
         Command::Show { name, json } => show(client, name, json),
         Command::Add(args) => add(client, args),
         Command::Edit(args) => edit(client, args),
@@ -654,6 +699,7 @@ fn endpoint(info: &EntryInfo) -> String {
 fn list(
     client: &Client,
     tag: Option<String>,
+    kind: Option<KindArg>,
     search: Option<String>,
     json: bool,
 ) -> anyhow::Result<u8> {
@@ -662,6 +708,9 @@ fn list(
     };
     if let Some(tag) = tag {
         entries.retain(|e| e.fields.tags.contains(&tag));
+    }
+    if let Some(kind) = kind {
+        entries.retain(|e| e.fields.kind == kind.kind());
     }
     if let Some(search) = search {
         let needle = search.to_lowercase();
@@ -742,6 +791,10 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
     line("name:", Some(entry.name.clone()));
     line("id:", Some(entry.id.clone()));
     line("group:", entry.group.clone());
+    line(
+        "kind:",
+        f.kind.map(|k| format!("{} ({})", k.as_str(), k.label())),
+    );
     line("username:", f.username.clone());
     line("url:", f.url.clone());
     line("host:", f.host.clone());
@@ -786,6 +839,7 @@ fn add(client: &Client, args: AddArgs) -> anyhow::Result<u8> {
         name: args.name,
         group: args.group,
         fields: EntryFields {
+            kind: args.fields.kind.and_then(KindArg::kind),
             username: args.fields.username,
             url: args.fields.url,
             host: args.fields.host,
@@ -815,24 +869,30 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
     } else {
         None
     };
+    let mut clear: Vec<Field> = args
+        .clear
+        .into_iter()
+        .map(|f| match f {
+            ClearField::Username => Field::Username,
+            ClearField::Url => Field::Url,
+            ClearField::Host => Field::Host,
+            ClearField::Port => Field::Port,
+            ClearField::Notes => Field::Notes,
+            ClearField::Kind => Field::Kind,
+        })
+        .collect();
+    if args.fields.kind == Some(KindArg::Other) && !clear.contains(&Field::Kind) {
+        clear.push(Field::Kind);
+    }
     let changes = EntryChanges {
         rename: args.rename,
+        kind: args.fields.kind.and_then(KindArg::kind),
         username: args.fields.username,
         url: args.fields.url,
         host: args.fields.host,
         port: args.fields.port,
         notes: args.fields.notes,
-        clear: args
-            .clear
-            .into_iter()
-            .map(|f| match f {
-                ClearField::Username => Field::Username,
-                ClearField::Url => Field::Url,
-                ClearField::Host => Field::Host,
-                ClearField::Port => Field::Port,
-                ClearField::Notes => Field::Notes,
-            })
-            .collect(),
+        clear,
         add_tags: args.add_tags,
         remove_tags: args.remove_tags,
         value,
@@ -879,6 +939,46 @@ fn parse_binding(spec: &str) -> anyhow::Result<Binding> {
     })
 }
 
+/// The variables that `run --url VAR=ENTRY` adds: each entry's URL, read
+/// from its metadata. A URL is not a secret — `rusthorse show` prints it
+/// without approval — so it travels in the client's environment like any
+/// variable set in the shell: not redacted, not listed in the dialog.
+fn endpoint_urls(
+    client: &Client,
+    specs: &[String],
+    secrets: &[Binding],
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for spec in specs {
+        if !spec.contains('=') {
+            bail!("--url {spec:?}: write VAR=ENTRY, e.g. --url OPENAI_BASE_URL=OPENAI_API_KEY");
+        }
+        let Binding { var, entry } = parse_binding(spec)?;
+        if var.starts_with(rusthorse::exec::LOADER_PREFIX) || rusthorse::exec::is_risky(&var) {
+            bail!("--url {var}: this variable changes how programs start; it cannot carry a URL");
+        }
+        if secrets.iter().any(|b| b.var == var) || out.iter().any(|(v, _)| *v == var) {
+            bail!("--url {var}: the variable is already set by another binding");
+        }
+        let Response::Entry { entry: info } = check(client.call(&Request::Show {
+            name: entry.clone(),
+        })?)?
+        else {
+            bail!("unexpected response");
+        };
+        let Some(url) = info.fields.url else {
+            if info.protected_fields.iter().any(|f| f == "URL") {
+                bail!("--url {var}: the URL of {entry} is a protected field; it is not disclosed");
+            }
+            bail!(
+                "--url {var}: {entry} has no URL (add one with `rusthorse edit {entry} --url …`)"
+            );
+        };
+        out.push((var, url));
+    }
+    Ok(out)
+}
+
 fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     let outcome = (|| -> anyhow::Result<u8> {
         client.check_compatible()?;
@@ -897,6 +997,10 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
                 env.push((k.to_string(), v.to_string()));
             }
+        }
+        for (var, url) in endpoint_urls(client, &args.urls, &bindings)? {
+            env.retain(|(k, _)| *k != var);
+            env.push((var, url));
         }
         let request = RunRequest {
             bindings,

@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 4)
+  ok    rusthorse 0.1.0 (protocol 5)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/home/me/.cargo/bin/rusthorse)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
@@ -36,13 +36,21 @@ Type a value yourself — the agent asks for it in a dialog, so it never passes
 through your shell history or the terminal:
 
 ```sh
-rusthorse add OPENAI_API_KEY --url https://platform.openai.com --tag ai
+rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
+```
+
+`--kind api-key` says what the entry is, and makes its URL the API's
+endpoint (see [entry kinds](cli.md#entry-kinds)). A command can get the
+endpoint too, in a variable of its own — it is not a secret:
+
+```sh
+rusthorse run OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
 ```
 
 Store access details next to a password — URL, host or IP, port, username:
 
 ```sh
-rusthorse add core-router --username admin --url https://192.168.1.1/ \
+rusthorse add core-router --kind device --username admin --url https://192.168.1.1/ \
     --host 192.168.1.1 --port 443 --tag network --notes "Rack 2"
 ```
 
@@ -58,6 +66,7 @@ Look around — metadata only, values never appear:
 ```sh
 rusthorse list
 rusthorse list --search router
+rusthorse list --kind api-key
 rusthorse show core-router
 rusthorse open core-router        # opens https://192.168.1.1/ in your browser
 ```

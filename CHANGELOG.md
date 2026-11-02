@@ -11,6 +11,17 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- Entry **kinds** ([ADR 0008](docs/adr/0008-entry-kinds.md)): `api-key`,
+  `login`, `server` or `device`, set with `add --kind` and `edit --kind`
+  (`--kind other` or `--clear kind` removes it), shown by `show`, filtered by
+  `list --kind`, and stored in the KDBX field `Kind`. The kind names the
+  fields — the URL of an API key is its endpoint — and decides which ones the
+  manager's form offers, never hiding one that has a value. It grants
+  nothing.
+- `run --url VAR=ENTRY` also gives the command an entry's URL, such as an
+  API's endpoint, in variable `VAR`. The URL is not a secret: it is neither
+  redacted nor listed in the approval dialog. The manager's command for an
+  API key with an endpoint includes it.
 - `rusthorse-manager`, first milestone ([ADR 0007](docs/adr/0007-visual-manager.md),
   [guide](docs/manager.md)): a GTK 4 and libadwaita window, client of the
   agent, to browse, search and filter entries by group; create, edit, rename
@@ -65,9 +76,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
-- **Protocol 4** (versions 2 and 3 existed only during development): data
-  frames and credits, new requests, definite errors, and `reveal.purpose`
-  (see Added). Upgrade the agent together with its clients and restart it:
+- **Protocol 5** (versions 2 to 4 existed only during development): data
+  frames and credits, new requests, definite errors, `reveal.purpose` and
+  the entry `kind` (see Added). Upgrade the agent together with its clients and restart it:
   clients refuse an agent that speaks another version.
 - `passwd` reports when the old-password backup could not be deleted.
 - `doctor` checks the files the agent actually uses, and notices an agent

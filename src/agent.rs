@@ -1794,6 +1794,9 @@ fn list_names(names: &[&str]) -> String {
 fn describe_fields(entry: &NewEntry) -> String {
     let f = &entry.fields;
     let mut parts = Vec::new();
+    if let Some(k) = f.kind {
+        parts.push(format!("kind {}", k.label()));
+    }
     if let Some(g) = &entry.group {
         parts.push(format!("group {g}"));
     }
@@ -1832,6 +1835,9 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
     set("host", &changes.host);
     if let Some(port) = changes.port {
         out.push(("New port".into(), port.to_string()));
+    }
+    if let Some(kind) = changes.kind {
+        out.push(("New kind".into(), kind.label().into()));
     }
     if changes.notes.is_some() {
         out.push(("Notes".into(), "replaced".into()));

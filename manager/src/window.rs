@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use gtk::{gio, glib, pango};
 use rusthorse::protocol::{
-    EntryChanges, EntryInfo, Request, Response, RevealPurpose, SecretString, StatusInfo,
-    ValueChange,
+    EntryChanges, EntryInfo, EntryKind, Field, Request, Response, RevealPurpose, SecretString,
+    StatusInfo, ValueChange,
 };
 
 use crate::connection::{Failure, Job};
@@ -1067,6 +1067,10 @@ impl Manager {
         names.set_valign(gtk::Align::Center);
         names.append(&styled(&entry.name, &["title-2"]));
         let mut line = entry.group.clone().unwrap_or_else(|| "No group".into());
+        if let Some(kind) = entry.fields.kind {
+            line.push_str(" · ");
+            line.push_str(kind.label());
+        }
         if let Some(m) = &entry.modified {
             line.push_str(" · modified ");
             line.push_str(m);
@@ -1175,7 +1179,10 @@ impl Manager {
                 "Username",
                 entry.fields.username.clone().unwrap_or_default(),
             ),
-            ("URL", entry.fields.url.clone().unwrap_or_default()),
+            (
+                EntryKind::url_label(entry.fields.kind),
+                entry.fields.url.clone().unwrap_or_default(),
+            ),
             ("Host", entry.fields.host.clone().unwrap_or_default()),
             (
                 "Port",
@@ -1195,19 +1202,29 @@ impl Manager {
         }
         self.detail.append(&details);
 
+        let endpoint = entry.fields.kind == Some(EntryKind::ApiKey) && entry.fields.url.is_some();
         let usage = group(
             "Use it from a command",
-            Some(
-                "Replace your-command. The command gets the secret in this environment variable after your approval; its output is redacted. The snippet holds the entry's UUID, never the value.",
-            ),
+            Some(if endpoint {
+                "Replace your-command. The command gets the secret in the first variable after your approval; its output is redacted. It gets the endpoint URL in the second one: that is not a secret, and your program may read it under another name. The snippet holds the entry's UUID, never the value."
+            } else {
+                "Replace your-command. The command gets the secret in this environment variable after your approval; its output is redacted. The snippet holds the entry's UUID, never the value."
+            }),
         );
         let snippet = model::snippet(&entry);
         let code = gtk::Label::builder()
-            .label(rusthorse::ui::dialog_text(&snippet))
+            // Filtered line by line: the line breaks are the snippet's own.
+            .label(
+                snippet
+                    .lines()
+                    .map(rusthorse::ui::dialog_text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
             .use_markup(false)
             .selectable(true)
             .wrap(true)
-            .wrap_mode(pango::WrapMode::Char)
+            .wrap_mode(pango::WrapMode::WordChar)
             .xalign(0.0)
             .css_classes(["monospace"])
             .build();
@@ -1420,6 +1437,38 @@ impl Manager {
                 "Names, logins, URLs, hosts and tags are not secret: never type a secret here. Saving sends the change to the agent, which asks for your approval.",
             ),
         );
+        let withheld = |protected: &str| {
+            old.as_ref()
+                .is_some_and(|e| e.protected_fields.iter().any(|f| f == protected))
+        };
+        // What the entry is for: it decides which rows are offered and what
+        // the URL is called. It never hides a row that has a value.
+        let kind = adw::ComboRow::builder()
+            .title(if withheld("Kind") {
+                "Kind (protected; unchanged)"
+            } else {
+                "Kind"
+            })
+            .model(&gtk::StringList::new(
+                &model::KIND_CHOICES.map(model::kind_label),
+            ))
+            .build();
+        kind.set_selected(
+            model::KIND_CHOICES
+                .iter()
+                .position(|k| *k == initial.kind)
+                .unwrap_or(0) as u32,
+        );
+        kind.set_sensitive(!withheld("Kind"));
+        if old
+            .as_ref()
+            .is_some_and(|e| e.other_fields.iter().any(|f| f == "Kind"))
+        {
+            kind.set_subtitle(
+                "The file has a Kind field this app does not know. Choosing a kind replaces it.",
+            );
+        }
+        fields_group.add(&kind);
         let mut fields = Vec::new();
         for (name, value, protected) in [
             ("Name", &initial.name, "Title"),
@@ -1430,9 +1479,7 @@ impl Manager {
             ("Port", &initial.port, "Port"),
             ("Tags (comma separated)", &initial.tags, ""),
         ] {
-            let withheld = old
-                .as_ref()
-                .is_some_and(|e| e.protected_fields.iter().any(|f| f == protected));
+            let withheld = withheld(protected);
             let title = if withheld {
                 format!("{name} (protected; unchanged)")
             } else if name == "Group" && old.is_some() {
@@ -1449,6 +1496,16 @@ impl Manager {
             fields_group.add(&row);
             fields.push(row);
         }
+        let hidden_by_file = ["UserName", "URL", "Host", "Port"].map(withheld);
+        shape_rows(&fields, initial.kind, hidden_by_file);
+        let rows = fields.clone();
+        kind.connect_selected_notify(move |row| {
+            shape_rows(
+                &rows,
+                model::KIND_CHOICES[row.selected() as usize],
+                hidden_by_file,
+            );
+        });
         body.append(&fields_group);
         let value_group = group(
             "Value",
@@ -1506,6 +1563,7 @@ impl Manager {
         let w = window.downgrade();
         save.connect_clicked(move |_| {
             let form = Form {
+                kind: model::KIND_CHOICES[kind.selected() as usize],
                 name: fields[0].text().into(),
                 group: fields[1].text().into(),
                 username: fields[2].text().into(),
@@ -1603,6 +1661,25 @@ impl Manager {
         window.present();
         *self.editor.borrow_mut() = Some(window);
     }
+}
+
+/// Fit the entry form to `kind`: of its rows 2–5 (Username, URL, Host,
+/// Port), show those the kind offers and every one with text or withheld by
+/// the file (`withheld`, in the same order); name the URL row for the kind.
+fn shape_rows(rows: &[adw::EntryRow], kind: Option<EntryKind>, withheld: [bool; 4]) {
+    for ((row, field), withheld) in rows[2..6]
+        .iter()
+        .zip([Field::Username, Field::Url, Field::Host, Field::Port])
+        .zip(withheld)
+    {
+        row.set_visible(model::shows(kind, field, !row.text().is_empty(), withheld));
+    }
+    let url = EntryKind::url_label(kind);
+    rows[3].set_title(&if withheld[1] {
+        format!("{url} (protected; unchanged)")
+    } else {
+        url.to_string()
+    });
 }
 
 /// Empty every label under `root`, so GTK drops its copy of the text now.

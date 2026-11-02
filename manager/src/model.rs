@@ -2,11 +2,13 @@
 
 use rusthorse::generate::Spec;
 use rusthorse::protocol::{
-    EntryChanges, EntryFields, EntryInfo, Field, NewEntry, Request, ValueChange,
+    EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, Request, ValueChange,
 };
 
 #[derive(Clone, Default)]
 pub(crate) struct Form {
+    /// `None`: no particular kind ("Other").
+    pub kind: Option<EntryKind>,
     pub name: String,
     pub group: String,
     pub username: String,
@@ -19,6 +21,7 @@ pub(crate) struct Form {
 impl Form {
     pub fn from_entry(entry: &EntryInfo) -> Self {
         Self {
+            kind: entry.fields.kind,
             name: entry.name.clone(),
             group: entry.group.clone().unwrap_or_default(),
             username: entry.fields.username.clone().unwrap_or_default(),
@@ -65,6 +68,7 @@ impl Form {
                     name: self.name.clone(),
                     group: (!self.group.is_empty()).then(|| self.group.clone()),
                     fields: EntryFields {
+                        kind: self.kind,
                         username: nonempty(&self.username),
                         url: nonempty(&self.url),
                         host: nonempty(&self.host),
@@ -114,6 +118,13 @@ impl Form {
                 }
             }
         }
+        if self.kind != before.kind {
+            editable(old, "Kind")?;
+            match self.kind {
+                Some(kind) => changes.kind = Some(kind),
+                None => changes.clear.push(Field::Kind),
+            }
+        }
         if self.port != before.port {
             editable(old, "Port")?;
             if let Some(port) = port {
@@ -150,6 +161,41 @@ impl Form {
             changes,
         })
     }
+}
+
+/// Whether a form offers `field` for an entry of `kind` (`None`: every
+/// field). A field that has a value is shown whatever this says: a kind
+/// never hides data.
+pub(crate) fn offers(kind: Option<EntryKind>, field: Field) -> bool {
+    !matches!(
+        (kind, field),
+        (
+            Some(EntryKind::ApiKey | EntryKind::Login),
+            Field::Host | Field::Port
+        ) | (Some(EntryKind::Server), Field::Url)
+            | (Some(EntryKind::Device), Field::Port)
+    )
+}
+
+/// Whether the form shows the row of `field`: when the kind offers it, and
+/// always when the row has text or the file withholds the field (its row is
+/// empty, but the field exists and the row says it is protected).
+pub(crate) fn shows(kind: Option<EntryKind>, field: Field, has_text: bool, withheld: bool) -> bool {
+    offers(kind, field) || has_text || withheld
+}
+
+/// The choices of the form's Kind row, in order: "Other" first.
+pub(crate) const KIND_CHOICES: [Option<EntryKind>; 5] = [
+    None,
+    Some(EntryKind::ApiKey),
+    Some(EntryKind::Login),
+    Some(EntryKind::Server),
+    Some(EntryKind::Device),
+];
+
+/// How a kind is named in the form and the details.
+pub(crate) fn kind_label(kind: Option<EntryKind>) -> &'static str {
+    kind.map_or("Other", EntryKind::label)
 }
 
 fn nonempty(text: &str) -> Option<String> {
@@ -198,16 +244,39 @@ pub(crate) fn matches(entry: &EntryInfo, query: &str, group: Option<&str>) -> bo
 /// The command that gives an entry's value to a program. The entry is named
 /// by its UUID, which no rename or duplicate title can make ambiguous; the
 /// variable is the entry's name when that is a valid variable name.
+///
+/// For an API key with an endpoint, the command also gets the endpoint in a
+/// variable of its own ([`url_variable`]): it is not a secret.
 pub(crate) fn snippet(entry: &EntryInfo) -> String {
     let var = if is_variable_name(&entry.name) {
         entry.name.as_str()
     } else {
         "SECRET"
     };
-    format!(
-        "rusthorse run {} -- your-command",
-        rusthorse::util::shell_quote(&format!("{var}={}", entry.id))
-    )
+    let quote = rusthorse::util::shell_quote;
+    let secret = quote(&format!("{var}={}", entry.id));
+    if entry.fields.kind == Some(EntryKind::ApiKey) && entry.fields.url.is_some() {
+        // One option per line, joined by the shell's line continuation, so
+        // that it reads well and still pastes as one command.
+        let url = quote(&format!("{}={}", url_variable(var), entry.id));
+        format!("rusthorse run {secret} \\\n  --url {url} \\\n  -- your-command")
+    } else {
+        format!("rusthorse run {secret} -- your-command")
+    }
+}
+
+/// The variable that gets an API key's endpoint: `OPENAI_API_KEY` →
+/// `OPENAI_BASE_URL` (what the OpenAI and Anthropic libraries read),
+/// `GITHUB_TOKEN` → `GITHUB_BASE_URL`, anything else → `NAME_URL`.
+pub(crate) fn url_variable(var: &str) -> String {
+    for suffix in ["_API_KEY", "_API_TOKEN", "_TOKEN", "_KEY"] {
+        if let Some(stem) = var.strip_suffix(suffix)
+            && !stem.is_empty()
+        {
+            return format!("{stem}_BASE_URL");
+        }
+    }
+    format!("{var}_URL")
 }
 
 fn is_variable_name(name: &str) -> bool {
@@ -330,6 +399,109 @@ pub(crate) mod tests {
         assert_eq!(summary(&entry), "10.0.0.1");
         entry.fields.host = None;
         assert_eq!(summary(&entry), "No login or address");
+    }
+
+    #[test]
+    fn kinds_are_sent_and_taken_away() {
+        let mut form = Form {
+            kind: Some(EntryKind::ApiKey),
+            name: "FAKE".into(),
+            ..Default::default()
+        };
+        let Request::Add { entry: new, .. } = form.request(None, ValueMode::Prompt).expect("add")
+        else {
+            panic!("not add")
+        };
+        assert_eq!(new.fields.kind, Some(EntryKind::ApiKey));
+
+        let mut entry = entry();
+        entry.fields.kind = Some(EntryKind::Login);
+        form = Form::from_entry(&entry);
+        form.kind = Some(EntryKind::Device);
+        let Request::Edit { changes, .. } =
+            form.request(Some(&entry), ValueMode::Keep).expect("edit")
+        else {
+            panic!("not edit")
+        };
+        assert_eq!(changes.kind, Some(EntryKind::Device));
+        assert!(changes.clear.is_empty());
+        form.kind = None;
+        let Request::Edit { changes, .. } =
+            form.request(Some(&entry), ValueMode::Keep).expect("edit")
+        else {
+            panic!("not edit")
+        };
+        assert_eq!(changes.kind, None);
+        assert_eq!(changes.clear, [Field::Kind]);
+        // A kind the file marks as protected is withheld, so not editable.
+        entry.fields.kind = None;
+        entry.protected_fields.push("Kind".into());
+        form = Form::from_entry(&entry);
+        form.kind = Some(EntryKind::ApiKey);
+        assert!(form.request(Some(&entry), ValueMode::Keep).is_err());
+    }
+
+    #[test]
+    fn each_kind_offers_its_fields() {
+        use Field::{Host, Port, Url, Username};
+        let offered = |kind| {
+            [Username, Url, Host, Port]
+                .into_iter()
+                .filter(|f| offers(kind, *f))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offered(None), [Username, Url, Host, Port]);
+        assert_eq!(offered(Some(EntryKind::ApiKey)), [Username, Url]);
+        assert_eq!(offered(Some(EntryKind::Login)), [Username, Url]);
+        assert_eq!(offered(Some(EntryKind::Server)), [Username, Host, Port]);
+        assert_eq!(offered(Some(EntryKind::Device)), [Username, Url, Host]);
+        assert_eq!(KIND_CHOICES.len(), EntryKind::ALL.len() + 1);
+        // A kind never hides a row with text, nor one the file withholds.
+        let api = Some(EntryKind::ApiKey);
+        assert!(!shows(api, Host, false, false));
+        assert!(shows(api, Host, true, false));
+        assert!(shows(api, Host, false, true));
+    }
+
+    #[test]
+    fn an_api_key_snippet_also_passes_the_endpoint() {
+        let mut entry = entry();
+        entry.name = "OPENAI_API_KEY".into();
+        entry.fields.kind = Some(EntryKind::ApiKey);
+        // No endpoint (here the URL is withheld): nothing to pass.
+        assert!(!snippet(&entry).contains("--url"));
+        entry.fields.url = Some("https://api.example.invalid/v1".into());
+        assert_eq!(
+            snippet(&entry),
+            "rusthorse run OPENAI_API_KEY=11111111-2222-3333-4444-555555555555 \\\n  \
+             --url OPENAI_BASE_URL=11111111-2222-3333-4444-555555555555 \\\n  \
+             -- your-command"
+        );
+        // The shell reads the three lines as one command with these words.
+        let script = snippet(&entry).replacen("rusthorse run", "printf '%s\\n'", 1);
+        let words = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh");
+        assert!(words.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&words.stdout),
+            "OPENAI_API_KEY=11111111-2222-3333-4444-555555555555\n--url\n\
+             OPENAI_BASE_URL=11111111-2222-3333-4444-555555555555\n--\nyour-command\n"
+        );
+        // Other kinds keep the plain snippet.
+        entry.fields.kind = Some(EntryKind::Login);
+        assert!(!snippet(&entry).contains("--url"));
+        for (var, url) in [
+            ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+            ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+            ("GITHUB_TOKEN", "GITHUB_BASE_URL"),
+            ("STRIPE_KEY", "STRIPE_BASE_URL"),
+            ("SECRET", "SECRET_URL"),
+            ("_KEY", "_KEY_URL"),
+        ] {
+            assert_eq!(url_variable(var), url);
+        }
     }
 
     #[test]

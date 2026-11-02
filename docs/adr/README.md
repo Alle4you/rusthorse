@@ -14,6 +14,7 @@ supersedes the old one, which is marked as such.
 | [0005](0005-remembered-approvals-opt-in.md) | Remembered approvals are opt-in and bound to the vault generation | Accepted |
 | [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Accepted |
 | [0007](0007-visual-manager.md) | A visual manager that remains a client of the agent | Proposed |
+| [0008](0008-entry-kinds.md) | Entry kinds, and an API key's endpoint for `run` | Proposed |
 
 ## Writing a new ADR
 

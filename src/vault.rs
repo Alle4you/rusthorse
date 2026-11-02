@@ -12,7 +12,11 @@
 //! | host       | `Host`      | no        |
 //! | port       | `Port`      | no        |
 //! | tags       | `Tags`      | —         |
+//! | kind       | `Kind`      | no        |
 //!
+//! `Kind` holds `api-key`, `login`, `server` or `device`
+//! ([`EntryKind::as_str`]). Any other text there is left alone: the entry
+//! has no kind, and `Kind` is listed with the other fields.
 //! Entries in the recycle bin are ignored. Files written by Rusthorse open in
 //! KeePassXC and other KDBX4 clients.
 
@@ -26,13 +30,17 @@ use keepass::db::{EntryId, GroupId, Times, fields};
 use keepass::error::{DatabaseKeyError, DatabaseOpenError, DatabaseSaveError};
 use keepass::{Database, DatabaseKey};
 
-use crate::protocol::{EntryChanges, EntryFields, EntryInfo, Field, NewEntry, SecretString};
+use crate::protocol::{
+    EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, SecretString,
+};
 use crate::util::ensure_private_dir;
 
 /// Custom KDBX field holding the host name or IP address.
 pub const FIELD_HOST: &str = "Host";
 /// Custom KDBX field holding the port.
 pub const FIELD_PORT: &str = "Port";
+/// Custom KDBX field holding the entry's kind.
+pub const FIELD_KIND: &str = "Kind";
 
 /// Shown instead of a title that the KeePass file marks as protected.
 pub const PROTECTED_TITLE: &str = "[protected title]";
@@ -40,7 +48,7 @@ pub const PROTECTED_TITLE: &str = "[protected title]";
 /// Vault files larger than this are refused before anything is decrypted.
 pub const MAX_VAULT_BYTES: u64 = 128 * 1024 * 1024;
 
-const KNOWN_FIELDS: [&str; 7] = [
+const KNOWN_FIELDS: [&str; 8] = [
     fields::TITLE,
     fields::USERNAME,
     fields::PASSWORD,
@@ -48,6 +56,7 @@ const KNOWN_FIELDS: [&str; 7] = [
     fields::NOTES,
     FIELD_HOST,
     FIELD_PORT,
+    FIELD_KIND,
 ];
 
 /// Errors from vault operations.
@@ -555,6 +564,8 @@ impl Vault {
         let url = text(fields::URL);
         let host = text(FIELD_HOST);
         let port = text(FIELD_PORT).and_then(|p| p.trim().parse().ok());
+        let stored_kind = text(FIELD_KIND);
+        let kind = stored_kind.as_deref().and_then(EntryKind::parse);
         let name = match entry.fields.get(fields::TITLE) {
             Some(v) if v.is_protected() => {
                 protected_fields.insert(0, fields::TITLE.to_string());
@@ -570,12 +581,18 @@ impl Vault {
             .filter(|k| !KNOWN_FIELDS.contains(&k.as_str()))
             .cloned()
             .collect();
+        // A `Kind` that is not one of ours stays visible as a field of its
+        // own (its value undisclosed, like any other field's).
+        if stored_kind.is_some() && kind.is_none() {
+            other_fields.push(FIELD_KIND.to_string());
+        }
         other_fields.sort();
         EntryInfo {
             id: id.to_string(),
             name,
             group: (!group.is_empty()).then(|| group.join("/")),
             fields: EntryFields {
+                kind,
                 username,
                 url,
                 host,
@@ -747,6 +764,7 @@ impl Vault {
                 Field::Host => FIELD_HOST,
                 Field::Port => FIELD_PORT,
                 Field::Notes => fields::NOTES,
+                Field::Kind => FIELD_KIND,
             };
             e.fields.remove(key);
         }
@@ -755,6 +773,9 @@ impl Vault {
         set_text(&mut e, FIELD_HOST, changes.host.as_deref());
         if let Some(port) = changes.port {
             e.set_unprotected(FIELD_PORT, port.to_string());
+        }
+        if let Some(kind) = changes.kind {
+            e.set_unprotected(FIELD_KIND, kind.as_str());
         }
         match changes.notes.as_deref() {
             Some("") => {
@@ -906,6 +927,7 @@ fn write_fields(entry: &mut keepass::db::Entry, new: &NewEntry, value: &SecretSt
         fields::URL,
         FIELD_HOST,
         FIELD_PORT,
+        FIELD_KIND,
         fields::NOTES,
     ] {
         entry.fields.remove(key);
@@ -915,6 +937,9 @@ fn write_fields(entry: &mut keepass::db::Entry, new: &NewEntry, value: &SecretSt
     set_text(entry, FIELD_HOST, new.fields.host.as_deref());
     if let Some(port) = new.fields.port {
         entry.set_unprotected(FIELD_PORT, port.to_string());
+    }
+    if let Some(kind) = new.fields.kind {
+        entry.set_unprotected(FIELD_KIND, kind.as_str());
     }
     if let Some(notes) = new.notes.as_deref().filter(|n| !n.is_empty()) {
         entry.set_protected(fields::NOTES, notes);
@@ -934,6 +959,7 @@ mod tests {
         NewEntry {
             name: name.into(),
             fields: EntryFields {
+                kind: Some(EntryKind::Device),
                 username: Some("admin".into()),
                 url: Some("https://192.168.1.1/".into()),
                 host: Some("192.168.1.1".into()),
@@ -974,11 +1000,18 @@ mod tests {
         assert_eq!(info.fields.host.as_deref(), Some("192.168.1.1"));
         assert_eq!(info.fields.port, Some(443));
         assert_eq!(info.fields.tags, vec!["network".to_string()]);
+        assert_eq!(info.fields.kind, Some(EntryKind::Device));
+        assert!(info.other_fields.is_empty(), "{:?}", info.other_fields);
         assert!(info.has_password && info.has_notes);
         assert_eq!(
             reopened.secret(id).as_deref().map(String::as_str),
             Some("s3cret!")
         );
+        // Stored as a plain field that other KeePass clients show as it is.
+        let stored = reopened.db.entry(id).expect("entry");
+        let kind = stored.fields.get(FIELD_KIND).expect("Kind field");
+        assert_eq!(kind.get().as_str(), "device");
+        assert!(!kind.is_protected());
         assert!(dir.path().join("sub").join("vault.kdbx.bak").exists());
     }
 
@@ -1241,6 +1274,76 @@ mod tests {
         assert!(validate_name(" x").is_err());
         assert!(validate_name("a\nb").is_err());
         assert!(validate_name("evil\u{202E}txt").is_err());
+    }
+
+    #[test]
+    fn the_kind_is_set_changed_and_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault
+            .add(&entry("key"), &secret("abcd"), false)
+            .expect("add");
+        let id = vault.find("key").expect("find");
+        let set = EntryChanges {
+            kind: Some(EntryKind::ApiKey),
+            ..EntryChanges::default()
+        };
+        assert!(set.touches_metadata());
+        vault.edit(id, &set, None).expect("set");
+        assert_eq!(vault.info(id).fields.kind, Some(EntryKind::ApiKey));
+        let clear = EntryChanges {
+            clear: vec![Field::Kind],
+            ..EntryChanges::default()
+        };
+        vault.edit(id, &clear, None).expect("clear");
+        let info = vault.info(id);
+        assert_eq!(info.fields.kind, None);
+        assert!(
+            !vault
+                .db
+                .entry(id)
+                .expect("entry")
+                .fields
+                .contains_key(FIELD_KIND)
+        );
+        // Replacing an entry replaces its kind too.
+        let mut plain = entry("key");
+        plain.fields.kind = None;
+        vault.add(&plain, &secret("efgh"), true).expect("replace");
+        assert_eq!(
+            vault.info(vault.find("key").expect("find")).fields.kind,
+            None
+        );
+    }
+
+    #[test]
+    fn a_kind_written_by_someone_else_is_read_with_care() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, _) = new_vault(&dir);
+        vault.add(&entry("x"), &secret("abcd"), false).expect("add");
+        let id = vault.find("x").expect("find");
+        let set = |vault: &mut Vault, value: &str, protected: bool| {
+            let mut e = vault.db.entry_mut(id).expect("entry");
+            if protected {
+                e.set_protected(FIELD_KIND, value);
+            } else {
+                e.set_unprotected(FIELD_KIND, value);
+            }
+        };
+        // Typed by a person in another client: case and spaces forgiven.
+        set(&mut vault, " API-Key ", false);
+        assert_eq!(vault.info(id).fields.kind, Some(EntryKind::ApiKey));
+        // Not one of ours: no kind, and the field stays visible by name.
+        set(&mut vault, "personal", false);
+        let info = vault.info(id);
+        assert_eq!(info.fields.kind, None);
+        assert_eq!(info.other_fields, vec!["Kind"]);
+        // Protected: withheld like any protected field.
+        set(&mut vault, "api-key", true);
+        let info = vault.info(id);
+        assert_eq!(info.fields.kind, None);
+        assert_eq!(info.protected_fields, vec!["Kind"]);
+        assert!(info.other_fields.is_empty());
     }
 
     #[test]

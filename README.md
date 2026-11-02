@@ -14,7 +14,7 @@ its environment and scrubs the value from the output. The caller gets the
 result, never the secret.
 
 ```console
-$ rusthorse add OPENAI_API_KEY --url https://api.openai.com --tag ai
+$ rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
 OPENAI_API_KEY added                       # you typed the value in a dialog
 
 $ rusthorse run OPENAI_API_KEY -- python summarize.py

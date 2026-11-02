@@ -26,13 +26,19 @@ use zeroize::Zeroizing;
 /// was not changed and no command was started), which clients rely on;
 /// `status.agent_executable`, `status.agent_executable_id`,
 /// `status.agent_executable_replaced`.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// 4: `reveal.purpose`.
+///
+/// 5: the entry `kind` (in entries, `edit.kind`, and `kind` in
+/// `edit.clear`). A version-4 agent would drop it without a word.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
 // what the manager does (version 4; builds that reported 3 promised a single
-// paste for `copy`). The version must never go back below 4.
-const _: () = assert!(PROTOCOL_VERSION >= 4);
+// paste for `copy`), and that the agent keeps an entry's `kind` (version 5).
+// The version must never go back below 5.
+const _: () = assert!(PROTOCOL_VERSION >= 5);
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -192,9 +198,74 @@ impl Request {
     }
 }
 
+/// What an entry is for. It decides which fields a form offers and how they
+/// are labelled (the URL of an API key is its endpoint); it never hides a
+/// field that has a value, and it grants or restricts nothing.
+///
+/// Stored in the KDBX custom field `Kind` as [`EntryKind::as_str`]. An entry
+/// without one is of no particular kind ("Other": every field is offered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntryKind {
+    /// A key or token for an API; its URL is the API's endpoint.
+    ApiKey,
+    /// A sign-in to a website or web console: username and URL.
+    Login,
+    /// A server reached by host and port, e.g. over SSH or a database.
+    Server,
+    /// A device such as a router or a camera: host, admin page, username.
+    Device,
+}
+
+impl EntryKind {
+    /// Every kind, in the order forms offer them.
+    pub const ALL: [EntryKind; 4] = [Self::ApiKey, Self::Login, Self::Server, Self::Device];
+
+    /// The stored and serialized form: `api-key`, `login`, `server`, `device`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api-key",
+            Self::Login => "login",
+            Self::Server => "server",
+            Self::Device => "device",
+        }
+    }
+
+    /// The kind stored as `text`; `None` for anything else (surrounding
+    /// spaces and case are forgiven, as a person may have typed it).
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str().eq_ignore_ascii_case(text))
+    }
+
+    /// A short name for people: "API key", "Website login", …
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ApiKey => "API key",
+            Self::Login => "Website login",
+            Self::Server => "Server",
+            Self::Device => "Device",
+        }
+    }
+
+    /// What the KeePass `URL` field means for this kind.
+    pub fn url_label(kind: Option<Self>) -> &'static str {
+        match kind {
+            Some(Self::ApiKey) => "Endpoint URL",
+            Some(Self::Device) => "Admin page",
+            _ => "URL",
+        }
+    }
+}
+
 /// Entry metadata that clients may read without approval.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryFields {
+    /// What the entry is for; `None` for no particular kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EntryKind>,
     /// Login name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -251,6 +322,8 @@ pub enum Field {
     Port,
     /// The notes.
     Notes,
+    /// The kind (the entry becomes of no particular kind).
+    Kind,
 }
 
 /// How an edit changes the secret value.
@@ -283,6 +356,9 @@ pub struct EntryChanges {
     /// New port.
     #[serde(default)]
     pub port: Option<u16>,
+    /// New kind (to remove it, put [`Field::Kind`] in `clear`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EntryKind>,
     /// New notes.
     #[serde(default)]
     pub notes: Option<String>,
@@ -308,6 +384,7 @@ impl EntryChanges {
             || self.url.is_some()
             || self.host.is_some()
             || self.port.is_some()
+            || self.kind.is_some()
             || self.notes.is_some()
             || !self.clear.is_empty()
             || !self.add_tags.is_empty()
@@ -1021,6 +1098,50 @@ mod tests {
             .expect("write");
         let err = recv_frame(&b).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn the_entry_kind_json_shape_is_stable() {
+        for kind in EntryKind::ALL {
+            assert_eq!(
+                serde_json::to_value(kind).expect("json"),
+                serde_json::json!(kind.as_str())
+            );
+            assert_eq!(EntryKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(EntryKind::parse("api_key"), None);
+        // In an entry the kind sits with the other fields, and is omitted
+        // when there is none (what a protocol-4 client would have sent).
+        let info = EntryInfo {
+            id: "u".into(),
+            name: "OPENAI_API_KEY".into(),
+            group: None,
+            fields: EntryFields {
+                kind: Some(EntryKind::ApiKey),
+                url: Some("https://api.openai.com/v1".into()),
+                ..EntryFields::default()
+            },
+            protected_fields: vec![],
+            has_password: true,
+            has_notes: false,
+            other_fields: vec![],
+            modified: None,
+        };
+        let json = serde_json::to_value(&info).expect("json");
+        assert_eq!(json["kind"], "api-key");
+        assert_eq!(json["url"], "https://api.openai.com/v1");
+        let none = serde_json::to_value(EntryFields::default()).expect("json");
+        assert!(none.get("kind").is_none());
+        let edit = serde_json::to_value(Request::Edit {
+            name: "x".into(),
+            changes: EntryChanges {
+                clear: vec![Field::Kind],
+                ..EntryChanges::default()
+            },
+        })
+        .expect("json");
+        assert_eq!(edit["changes"]["clear"], serde_json::json!(["kind"]));
+        assert!(edit["changes"].get("kind").is_none());
     }
 
     #[test]

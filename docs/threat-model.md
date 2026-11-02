@@ -188,8 +188,19 @@ plugins the program loads. The same applies to `sh -c '…'` and interpreters
 with inline code. The agent removes `LD_*` variables and warns about a list
 of variables that change what programs execute (`NODE_OPTIONS`,
 `PYTHONPATH`, `GIT_SSH_COMMAND`, …), but such a list cannot be complete.
+
+A well-known program can also be pointed elsewhere. Libraries read the
+address they send a key to from the environment (`OPENAI_BASE_URL`,
+`ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, …); the requester's environment is
+passed to the command, and the dialog does not list these variables. A
+requester can therefore make an approved `python app.py` send the key to a
+server of its choosing. `run --url` takes such an address from the entry's
+own metadata rather than from the requester, but the dialog does not tell
+the two apart ([ADR 0008](adr/0008-entry-kinds.md)).
 *Mitigation:* read the dialog; prefer well-known binaries with explicit
-arguments; review recent changes to scripts before approving them.
+arguments; review recent changes to scripts before approving them. Planned:
+list the variables that redirect a program's requests in the dialog
+([roadmap](roadmap.md#hardening)).
 
 ### L5 — Redaction only catches exact copies in the command's output
 
@@ -203,9 +214,11 @@ defense against exfiltration by a command written to leak.
 ### L6 — Metadata is visible without approval
 
 While the vault is unlocked, any process of your user can list entry names,
-usernames, URLs, hosts, ports and tags (fields marked protected in the KDBX
-file are withheld). This is deliberate — an agent needs to know what exists
-and where it points — but do not put secrets in those fields.
+kinds, usernames, URLs, hosts, ports and tags (fields marked protected in the
+KDBX file are withheld). This is deliberate — an agent needs to know what
+exists and where it points — but do not put secrets in those fields. A kind
+is a label: nothing grants or restricts access by it
+([ADR 0008](adr/0008-entry-kinds.md)).
 
 ### L7 — Memory hygiene is best effort
 

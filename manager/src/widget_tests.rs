@@ -85,15 +85,9 @@ fn entry_rows(root: &impl IsA<gtk::Widget>) -> Vec<adw::EntryRow> {
         .into_iter()
         .filter_map(|w| w.downcast::<adw::EntryRow>().ok())
         .collect();
-    // `descendants` lists children before their parents, last child first
-    // within each level; put the rows back in the order the form shows them.
-    rows.sort_by_key(|r| {
-        let root = r.root().expect("root");
-        let point = r
-            .compute_point(&root, &gtk::graphene::Point::zero())
-            .expect("on screen");
-        (point.y() * 100.0) as i64
-    });
+    // Put the rows in the order the form lists them: their index in the
+    // list, which hidden rows (a kind may hide some) have too.
+    rows.sort_by_key(|r| r.index());
     rows
 }
 
@@ -323,10 +317,43 @@ fn desktop_flow() {
     assert_eq!(inputs[0].title(), "Name");
     inputs[0].set_text("FAKE_DESKTOP_KEY");
     inputs[1].set_text("AI");
+    // The kind decides which rows are offered and what the URL is called;
+    // a row with a value is never hidden.
+    let kind = descendants(&editor)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ComboRow>().ok())
+        .find(|c| c.title() == "Kind")
+        .expect("kind row");
+    assert_eq!(kind.selected(), 0, "Other");
+    assert!(inputs[2..6].iter().all(|r| r.is_visible()));
+    kind.set_selected(1);
+    assert_eq!(inputs[3].title(), "Endpoint URL");
+    assert!(inputs[2].is_visible() && inputs[3].is_visible());
+    assert!(!inputs[4].is_visible() && !inputs[5].is_visible());
     inputs[3].set_text("https://example.invalid");
+    kind.set_selected(3);
+    assert_eq!(inputs[3].title(), "URL");
+    assert!(
+        inputs[3].is_visible(),
+        "a server offers no URL, but this one has a value"
+    );
+    assert!(inputs[4].is_visible() && inputs[5].is_visible());
+    kind.set_selected(4);
+    assert_eq!(inputs[3].title(), "Admin page");
+    assert!(!inputs[5].is_visible());
+    // A row the file withholds stays, with its warning, whatever the kind.
+    let loose: Vec<adw::EntryRow> = (0..7).map(|_| adw::EntryRow::new()).collect();
+    shape_rows(&loose, Some(EntryKind::ApiKey), [false, true, true, false]);
+    assert!(loose[4].is_visible() && !loose[5].is_visible());
+    assert_eq!(loose[3].title(), "Endpoint URL (protected; unchanged)");
+    kind.set_selected(1);
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
+    snapshot_window(&editor, "editor.png");
     button(&editor, "Send to agent…").emit_clicked();
     settle(&s);
     assert_eq!(s.entries.borrow().len(), 1);
+    assert_eq!(s.entries.borrow()[0].fields.kind, Some(EntryKind::ApiKey));
     let id = s.entries.borrow()[0].id.clone();
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
     assert_eq!(s.current().unwrap().id, id);
@@ -367,12 +394,29 @@ fn desktop_flow() {
     s.search.set_text("");
     s.populate_rows();
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
+    // An API key's details call the URL its endpoint, and the command gets
+    // the endpoint too.
+    assert!(descendants(&s.detail).iter().any(|w| {
+        w.clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|l| l.text() == "Endpoint URL")
+    }));
     button(&s.detail, "Copy command snippet").emit_clicked();
     let copied = glib::MainContext::default()
         .block_on(s.window.clipboard().read_text_future())
         .unwrap()
         .unwrap();
     assert!(copied.contains(&id));
+    assert!(
+        copied.contains(&format!("--url FAKE_DESKTOP_BASE_URL={id}")),
+        "{copied}"
+    );
+    // Drawn on three lines, as copied: no escaped line breaks.
+    assert!(descendants(&s.detail).iter().any(|w| {
+        w.clone()
+            .downcast::<gtk::Label>()
+            .is_ok_and(|l| l.text() == copied.as_str())
+    }));
     assert!(!copied.contains("FAKE-desktop-value"));
 
     allowed.store(false, Ordering::SeqCst);

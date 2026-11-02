@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **4** (`PROTOCOL_VERSION` in
+Protocol version: **5** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -13,6 +13,7 @@ Protocol version: **4** (`PROTOCOL_VERSION` in
 | 2 | Data frames and per-channel credit for `run` with redaction (stdin credit granted when the command starts); `add.generate`, `change_password`, `backup`, `reveal.notes`, `status.audit_log`. |
 | 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`. |
 | 4 | `reveal.purpose` (`show`, `copy`): what the client says it will do with a revealed value, named in the approval dialog and the audit log. Unreleased builds that reported protocol 3 had this field with another meaning for `copy` (one paste, then cleared); clients of protocol 4 refuse those agents. |
+| 5 | The entry `kind` (see [Entry kinds](#entry-kinds)): in `NewEntry.fields`, `EntryInfo`, `EntryChanges.kind`, and `"kind"` in `EntryChanges.clear`. An agent of version 4 would silently drop it, so the version changed. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -158,6 +159,7 @@ another. Clients leave the field out when they have no purpose to state.
   "name": "core-router",
   "group": "Network/Core",
   "fields": {
+    "kind": "device",
     "username": "admin",
     "url": "https://10.0.0.1/",
     "host": "10.0.0.1",
@@ -170,6 +172,27 @@ another. Clients leave the field out when they have no purpose to state.
 
 Every field except `name` is optional.
 
+### Entry kinds
+
+`kind` says what an entry is for. It is one of:
+
+| `kind` | For | What the `url` is |
+|---|---|---|
+| `api-key` | A key or token for an API | The API's endpoint, e.g. `https://api.openai.com/v1` |
+| `login` | A sign-in to a website or web console | The sign-in page |
+| `server` | A server reached by host and port (SSH, a database, …) | — |
+| `device` | A device such as a router or a camera | Its admin page |
+
+An entry without `kind` is of no particular kind. The kind changes how
+clients label and offer the fields; the agent attaches no meaning to it — it
+grants nothing, restricts nothing and is not checked against the other
+fields. It is metadata like the URL: readable without approval.
+
+The vault stores it in the KDBX custom field `Kind`, as the text above. A
+`Kind` field holding anything else (written by another KeePass client, say) is
+not a kind: `EntryInfo` has no `kind`, and `Kind` appears in `other_fields`.
+Surrounding spaces and letter case are ignored when reading it.
+
 ### EntryChanges
 
 All fields are optional; omitted fields are left unchanged.
@@ -179,7 +202,8 @@ All fields are optional; omitted fields are left unchanged.
 | `rename` | string | New name. |
 | `username`, `url`, `host`, `notes` | string | New value (an empty string removes the field). |
 | `port` | integer 0–65535 | New port. |
-| `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"` | Fields to remove. |
+| `kind` | `"api-key"`, `"login"`, `"server"` or `"device"` | New kind (protocol 5). To remove the kind, put `"kind"` in `clear`. |
+| `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"`, `"kind"` | Fields to remove. |
 | `add_tags`, `remove_tags` | array of strings | Tag changes. |
 | `value` | `"prompt"`, `{"provided": "…"}` or `{"generate": {"length": N, "alphabet": "…"}}` | New secret value: ask the human, use the given one, or generate one. |
 
@@ -229,7 +253,7 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 4,
+  "protocol_version": 5,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -269,6 +293,7 @@ Clients should check `protocol_version` and refuse to continue on a mismatch.
   "id": "8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f",
   "name": "core-router",
   "group": "Network/Core",
+  "kind": "device",
   "username": "admin",
   "url": "https://10.0.0.1/",
   "host": "10.0.0.1",
@@ -282,10 +307,10 @@ Clients should check `protocol_version` and refuse to continue on a mismatch.
 ```
 
 `id` is the entry's KeePass UUID. Optional fields are omitted when empty.
-`protected_fields` lists metadata fields (`UserName`, `URL`, `Host`, `Port`)
-that the file marks as protected; their values are withheld. `other_fields`
-lists the names of custom fields other than `Host` and `Port`; their values
-are not disclosed.
+`protected_fields` lists metadata fields (`UserName`, `URL`, `Host`, `Port`,
+`Kind`) that the file marks as protected; their values are withheld.
+`other_fields` lists the names of custom fields other than `Host`, `Port` and
+a valid `Kind`; their values are not disclosed.
 
 ## Errors
 
@@ -323,7 +348,7 @@ treat the outcome as unknown.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-4 requests above, with the same
+`rusthorse-manager` uses the version-5 requests above, with the same
 approvals as the CLI. It targets entries by UUID, sends `reveal` with purpose
 `show` or `copy` for its Show and Copy actions, and never sends a master
 password. See [ADR 0007](adr/0007-visual-manager.md); the configuration,

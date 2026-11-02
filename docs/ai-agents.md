@@ -29,10 +29,14 @@ from the vault straight into the approved program.
 1. Store the secrets the agent will need, with names it can use directly:
 
    ```sh
-   rusthorse add ANTHROPIC_API_KEY --url https://console.anthropic.com --tag ai
-   rusthorse add github --username me --url https://github.com --tag dev
-   rusthorse add core-router --username admin --url https://10.0.0.1/ --host 10.0.0.1 --tag network
+   rusthorse add ANTHROPIC_API_KEY --kind api-key --url https://api.anthropic.com --tag ai
+   rusthorse add github --kind login --username me --url https://github.com --tag dev
+   rusthorse add core-router --kind device --username admin --url https://10.0.0.1/ --host 10.0.0.1 --tag network
    ```
+
+   The [kind](cli.md#entry-kinds) tells the agent what each entry is; for an
+   API key, `--url` is the API's endpoint, which the agent can pass to a
+   program with `rusthorse run --url` (it is not a secret).
 
 2. Tell the agent how to use them. Put this in `CLAUDE.md`, `AGENTS.md` or the
    equivalent instructions file:
@@ -40,10 +44,13 @@ from the vault straight into the approved program.
    ```markdown
    ## Secrets
    - Secrets are managed by Rusthorse. `rusthorse list --json` shows what
-     exists (names, usernames, URLs, hosts, ports, tags — never values).
+     exists (names, kinds, usernames, URLs, hosts, ports, tags — never
+     values); `rusthorse list --kind api-key` lists the API keys.
    - To use a secret, run the command through Rusthorse:
      `rusthorse run NAME -- command args` or `rusthorse run VAR=NAME -- …`.
-     The human approves each use in a dialog.
+     The human approves each use in a dialog. For an API key with an
+     endpoint, add `--url VAR=NAME` to pass the endpoint too, e.g.
+     `rusthorse run OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- …`.
    - Never ask the human for a secret value, never print or echo secrets,
      never write them to files, and never use `rusthorse reveal`.
    - Exit status 125 with a `rusthorse:` message means Rusthorse refused or
@@ -56,7 +63,8 @@ from the vault straight into the approved program.
      have run, so check before repeating anything that is not idempotent.
      (A command can also exit with 124 or 125 itself; the `rusthorse:` message
      tells them apart.)
-   - To store a new secret, run `rusthorse add NAME [--url …] [--username …]`;
+   - To store a new secret, run
+     `rusthorse add NAME [--kind …] [--url …] [--username …]`;
      the human types the value in a dialog. Do not pipe values into
      `rusthorse add --stdin`.
    - Commands run by `rusthorse run` read no input unless you add `--stdin`,
