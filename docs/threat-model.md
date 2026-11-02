@@ -202,8 +202,10 @@ that programs could read differently — a backslash, two `@`, an unusual
 host, a numeric host other than `a.b.c.d`, a query naming another server
 (libpq's `hostaddr`), a `#`, anything outside printable ASCII — is not
 shown but warned about. The aim is that the dialog never names a host other
-than the one the program uses; it is met for the readings of common URL
-parsers and libpq known to differ, which tests pin down. Limits: the lists go
+than the one the program uses. It has been checked against the readings of
+common URL parsers and libpq that four rounds of review found to differ,
+each pinned down by a test; it is not a guarantee for every program, and
+each round found narrower cases. Limits: the lists go
 by name and cannot be complete (`MY_SERVICE=https://…`, a configuration file
 or an argument escape them); a URL is shown by scheme, host and port only,
 so a different path on the same host is not visible; the forms judged
@@ -974,5 +976,20 @@ imitations of each program:
 | Low — a bare number passed as a word in any variable: `PGHOST=2130706433` (libpq connected to 127.0.0.1), `HTTPS_PROXY=0x7f000001` | **Fixed:** words and numbers are shown as they are only for switches and ports (`GIT_SSL_NO_VERIFY`, `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`, `PGPORT`); elsewhere a bare number is a host and must be `a.b.c.d`. |
 | Low (noise) — `GOPROXY=https://proxy.golang.org, direct` warned, though Go trims each item | **Fixed:** `GOPROXY` items are trimmed of spaces. |
 | Documentation — "does not name a host that common parsers would not use" was false for the `#` case; "split as the program splits it" did not hold for Unicode spaces or `GOPROXY` padding; F1, F3 and F6 were recorded as fixed | **Fixed:** the docs state the aim and what it is checked against; the previous table records those three as partly fixed. |
+
+Each fix was reverted in a copy of the tree to see a test fail.
+
+Third verification (Codex, AI-assisted, 2026-11-01; verdict: not ready).
+Confirmed fixed: the `#` case, Unicode spaces, bare numbers in host
+variables, `GOPROXY` padding, the partial records. New findings:
+
+| Finding | Disposition |
+|---|---|
+| High — libpq looks for the `@` of user information up to the first `/`, past a `?`, where URL parsers stop: `postgresql://expected.invalid?x=fake@127.0.0.1:PORT/postgres` showed `expected.invalid`, and the fake `PGPASSWORD` reached 127.0.0.1; `postgresql://fake:12345?x=rest@db.invalid/app` showed part of the password, also after a denial | **Fixed:** a `?` and an `@` both before the first `/` make the value not shown. |
+| Low (noise) — several hosts in PostgreSQL and MongoDB URLs, and in `PGHOST`/`PGPORT`, were not shown | **Fixed:** `postgres:`, `postgresql:` and `mongodb:` authorities may list plain hosts separated by `,`; `PGHOST`, `PGHOSTADDR` and `PGPORT` are lists at `,`. |
+| Low (noise) — `sqlite:///./development.db` was not shown | **Fixed:** `sqlite` is a local scheme (judged by the part before a `+`; four slashes for an absolute path accepted). |
+| Low (noise) — `LOCALDOMAIN` and `RES_OPTIONS` lists were not shown | **Fixed:** both are lists at spaces; the warning stays. |
+| Low — `CARGO_REGISTRIES_<NAME>_INDEX` was not classified | **Fixed:** it is an endpoint. |
+| Documentation — "are left out" and "the aim … is met" were contradicted by the `?` case | **Fixed:** the docs say the rules were checked against the readings found to differ, case by case, and are an aid, not a guarantee. |
 
 Each fix was reverted in a copy of the tree to see a test fail.

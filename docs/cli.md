@@ -269,29 +269,36 @@ connections the program will make. Only unambiguous values are shown, and
 only values of printable ASCII: anything else (U+00A0, which Python splits
 at like a space; a control character) is not shown at all. A list variable
 is judged item by item, at the separators its program uses — `GOPROXY` at
-`,` and `|`, each item trimmed of spaces as Go does; `PIP_EXTRA_INDEX_URL`,
-`PIP_TRUSTED_HOST`, `UV_EXTRA_INDEX_URL`, `UV_INDEX` and `UV_INSECURE_HOST`
-at spaces — and uv's `name=URL` items keep their name. Any other value is
-one item, never split, and is not shown if it contains a space. Shown:
+`,` and `|`, each item trimmed of spaces as Go does; libpq's `PGHOST`,
+`PGHOSTADDR` and `PGPORT` at `,`; `PIP_EXTRA_INDEX_URL`, `PIP_TRUSTED_HOST`,
+`UV_EXTRA_INDEX_URL`, `UV_INDEX`, `UV_INSECURE_HOST`, and the resolver's
+`LOCALDOMAIN` and `RES_OPTIONS` at spaces — and uv's `name=URL` items keep
+their name. Any other value is one item, never split, and is not shown if it
+contains a space. Shown:
 
 - a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
-  names, passwords, paths, queries and fragments — where credentials and
-  webhook tokens travel — are left out;
+  names, passwords, paths and queries — where credentials and webhook
+  tokens travel — are left out; `postgres:`, `postgresql:` and `mongodb:`
+  URLs may list several hosts (`…@h1:5432,h2:5433/…`);
 - `user:password@host` without a scheme as `…@host`; a host name
   (`direct` and `off` read as such), a canonical IPv4 address (`10.0.0.1`)
   or a bracketed IPv6 address as it is;
 - the value of a switch or a port — `GIT_SSL_NO_VERIFY`,
   `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`, `PGPORT` — as it is
   when it is one word or number;
-- a local socket or file (`unix:///run/docker.sock`), the paths of
-  certificate variables, and absolute paths, as they are.
+- a local socket, file or database (`unix:///run/docker.sock`,
+  `sqlite:///./app.db`), the paths of certificate variables, and absolute
+  paths, as they are.
 
 Anything else appears as `(not shown)`, and a warning names the variable:
-a backslash anywhere; two `@`; a `#` (libpq reads it as part of a value and
-goes on reading parameters); a host with characters other than letters,
+a backslash anywhere; two `@`; a `?` and an `@` both before the first `/`
+(libpq takes what precedes the `@` for user information, past the `?`, and
+connects to the host after it, while URL parsers stop at the `?`); a `#`
+(libpq reads it as part of a value and goes on reading parameters); a host
+with characters other than letters,
 digits, `.`, `-` and `_`; a numeric host other than `a.b.c.d` (`127.1`,
 `0x7f.1`, `2130706433`, which resolvers turn into `127.0.0.1` each in its
-own way); an empty host outside `unix:` and `file:` (`https:///host/…`,
+own way); an empty host outside `unix:`, `file:` and `sqlite:` (`https:///host/…`,
 `https:/host`); a path that starts with `//`; and a URL whose query names
 another destination (`host`, `hostaddr`, `port`, `service` — libpq connects
 to those, not to the URL's host) or has a parameter name with characters
@@ -301,10 +308,12 @@ after it names another), so a host drawn from them could be the wrong one,
 and copying them could disclose a credential. The audit log gets the same
 shortened text; the variables reach the command unchanged.
 
-These rules cover the readings of common URL parsers (WHATWG as in Node,
-Python's, curl's) and of libpq that are known to differ; they are not a
-proof about every program. The lists are not complete either: a program can
-read an address from a file or its arguments, and a name outside them
+These rules were checked, case by case, against the readings of common URL
+parsers (WHATWG as in Node, Python's, curl's) and of libpq that reviews
+found to differ; tests pin each case down. They are an aid for reading the
+dialog, not a proof about every program: another library may read the same
+text another way. The lists are not complete either: a program can read an
+address from a file or its arguments, and a name outside them
 (`MY_SERVICE=https://…`) is not listed.
 
 Requests whose command line, program path or directory is longer than 1000

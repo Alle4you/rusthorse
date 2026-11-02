@@ -185,6 +185,8 @@ pub fn destination(name: &str) -> Option<Destination> {
         Some(Destination::Route)
     } else if listed(ENDPOINT_VARS, ENDPOINT_SUFFIXES)
         || ENDPOINT_PREFIXES.iter().any(|p| name.starts_with(p))
+        // Cargo's alternative registries: `CARGO_REGISTRIES_<NAME>_INDEX`.
+        || (name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_INDEX"))
     {
         Some(Destination::Endpoint)
     } else {
@@ -193,12 +195,18 @@ pub fn destination(name: &str) -> Option<Destination> {
 }
 
 /// Destination variables whose value is a list, and how each separates its
-/// items, as the program that reads it does: `GOPROXY` by `,` or `|`; the
-/// indexes and trusted hosts of pip and uv by spaces. Any other value is one
+/// items, as the program that reads it does: `GOPROXY` by `,` or `|`;
+/// libpq's hosts and ports by `,`; the indexes and trusted hosts of pip and
+/// uv, and the resolver's domains and options, by spaces. Any other value is one
 /// item, so that a comma or a space inside a URL — in a password, in a
 /// path — never splits it.
 pub const LIST_VARS: &[(&str, &[char])] = &[
     ("GOPROXY", &[',', '|']),
+    ("PGHOST", &[',']),
+    ("PGHOSTADDR", &[',']),
+    ("PGPORT", &[',']),
+    ("LOCALDOMAIN", &[' ']),
+    ("RES_OPTIONS", &[' ']),
     ("PIP_EXTRA_INDEX_URL", &[' ']),
     ("PIP_TRUSTED_HOST", &[' ']),
     ("UV_EXTRA_INDEX_URL", &[' ']),
@@ -227,7 +235,14 @@ pub const NAMED_ITEM_VARS: &[&str] = &["UV_INDEX", "UV_DEFAULT_INDEX"];
 /// URL schemes whose authority may be empty because they name a local
 /// socket or file (`unix:///run/docker.sock`). For any other scheme an empty
 /// authority is not shown: `https:///host/…` reaches `host`.
-pub const LOCAL_SCHEMES: &[&str] = &["unix", "file"];
+/// (`sqlite`, as in SQLAlchemy's `sqlite+pysqlite:///./app.db`, is judged by
+/// the part before the `+`, and may have an absolute path after four
+/// slashes.)
+pub const LOCAL_SCHEMES: &[&str] = &["unix", "file", "sqlite"];
+
+/// URL schemes whose authority may list several hosts separated by `,`
+/// (libpq, MongoDB): each must be a plain host.
+pub const MULTI_HOST_SCHEMES: &[&str] = &["postgres", "postgresql", "mongodb"];
 
 /// Query parameters with which a connection library takes its destination
 /// from the query instead of the URL's host — libpq's `host`, `hostaddr`,
@@ -284,21 +299,24 @@ pub fn shown_destination(name: &str, value: &str) -> (String, bool) {
         return not_shown();
     }
     let upper = name.to_ascii_uppercase();
+    let separators: &[char] = LIST_VARS
+        .iter()
+        .find(|(list, _)| *list == upper)
+        .map_or(&[], |(_, separators)| separators);
     if WORD_VARS.contains(&upper.as_str()) {
-        let word = !value.is_empty()
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-        return if word {
+        // One word or number, or a list of them (`PGPORT=5432,5433`).
+        let words = value.split(separators).all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        });
+        return if words {
             (value.to_string(), false)
         } else {
             not_shown()
         };
     }
-    let separators: &[char] = LIST_VARS
-        .iter()
-        .find(|(list, _)| *list == upper)
-        .map_or(&[], |(_, separators)| separators);
     let trimmed = TRIMMED_ITEM_VARS.contains(&upper.as_str());
     // A space is a separator, or an item's padding, or not shown at all.
     if value.contains(' ') && !trimmed && !separators.contains(&' ') {
@@ -383,18 +401,38 @@ fn shown_item(item: &str) -> Option<String> {
         if !scheme_ok {
             return None;
         }
+        // libpq looks for the `@` of user information up to the first `/`,
+        // past a `?`; URL parsers stop at the `?`. With both before the
+        // first `/`, they name different hosts (and a password may follow
+        // the `?`).
+        let before_path = rest.split('/').next().unwrap_or_default();
+        if before_path.contains('?') && before_path.contains('@') {
+            return None;
+        }
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(end);
+        let scheme_lower = scheme.to_ascii_lowercase();
+        let base = scheme_lower.split('+').next().unwrap_or_default();
         if authority.is_empty() {
-            // A local socket or file: the path is the destination.
-            let local = LOCAL_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str());
-            return (local && absolute_paths(tail)).then(|| format!("{scheme}://{tail}"));
+            // A local socket, file or database: the path is the destination.
+            let path = if base == "sqlite" {
+                format!("/{}", tail.trim_start_matches('/'))
+            } else {
+                tail.to_string()
+            };
+            let local = LOCAL_SCHEMES.contains(&base);
+            return (local && absolute_paths(&path)).then(|| format!("{scheme}://{tail}"));
         }
         if redirecting_query(tail) {
             return None;
         }
         let (user, host) = split_user(authority)?;
-        return host_port(host).then(|| format!("{scheme}://{user}{host}{}", more(tail)));
+        let hosts_ok = if MULTI_HOST_SCHEMES.contains(&scheme_lower.as_str()) {
+            host.split(',').all(host_port)
+        } else {
+            host_port(host)
+        };
+        return hosts_ok.then(|| format!("{scheme}://{user}{host}{}", more(tail)));
     }
     if item.starts_with('/') {
         return absolute_paths(item).then(|| item.to_string());
@@ -815,6 +853,8 @@ mod tests {
             ("AWS_ENDPOINT_URL_DYNAMODB", Some(Destination::Endpoint)),
             ("UV_INDEX", Some(Destination::Endpoint)),
             ("UV_DEFAULT_INDEX", Some(Destination::Endpoint)),
+            ("CARGO_REGISTRIES_MY_REG_INDEX", Some(Destination::Endpoint)),
+            ("LOCALDOMAIN", Some(Destination::Route)),
             ("HOSTNAME", None),
             ("DBUS_SESSION_BUS_ADDRESS", None),
             ("PATH", None),
@@ -876,6 +916,34 @@ mod tests {
                 "(not shown)",
             ),
             ("https://h.invalid/#frag", "(not shown)"),
+            // libpq takes `expected.invalid?x=fake` for a user name and
+            // connects to 127.0.0.1; URL parsers stop at the `?`.
+            (
+                "postgresql://expected.invalid?x=fake@127.0.0.1:9/postgres",
+                "(not shown)",
+            ),
+            (
+                "postgresql://fake:12345?x=rest@db.invalid/app",
+                "(not shown)",
+            ),
+            // Several hosts only where the scheme defines them.
+            (
+                "postgresql://u@h1.invalid:5432,h2.invalid:5433/db?sslmode=require",
+                "postgresql://…@h1.invalid:5432,h2.invalid:5433/…",
+            ),
+            (
+                "mongodb://u:FAKE@h1.invalid,h2.invalid/db?replicaSet=rs",
+                "mongodb://…@h1.invalid,h2.invalid/…",
+            ),
+            ("https://h1.invalid,h2.invalid", "(not shown)"),
+            ("postgresql://h1.invalid,127.1/db", "(not shown)"),
+            // A local database.
+            ("sqlite:///./development.db", "sqlite:///./development.db"),
+            (
+                "sqlite+pysqlite:////var/app.db",
+                "sqlite+pysqlite:////var/app.db",
+            ),
+            ("https:////var/app.db", "(not shown)"),
             ("pg://u@a.invalid/db?a?b=c", "(not shown)"),
             // Outside printable ASCII nothing is shown (U+00A0 splits for
             // Python), nor a space in a value that is not a list.
@@ -930,6 +998,28 @@ mod tests {
             ("PGPORT", "5432", "5432"),
             ("PGPORT", "5432 x", "(not shown)"),
             ("PGHOST", "2130706433", "(not shown)"),
+            (
+                "PGHOST",
+                "db1.invalid,db2.invalid",
+                "db1.invalid,db2.invalid",
+            ),
+            ("PGHOST", "/var/run/postgresql", "/var/run/postgresql"),
+            ("PGPORT", "5432,5433", "5432,5433"),
+            (
+                "LOCALDOMAIN",
+                "corp.invalid dev.corp.invalid",
+                "corp.invalid dev.corp.invalid",
+            ),
+            (
+                "RES_OPTIONS",
+                "ndots:5 attempts:2 rotate",
+                "ndots:5 attempts:2 rotate",
+            ),
+            (
+                "CARGO_REGISTRIES_MY_INDEX",
+                "sparse+https://cargo.invalid/index/",
+                "sparse+https://cargo.invalid/…",
+            ),
             ("HTTPS_PROXY", "0x7f000001", "(not shown)"),
         ] {
             let (text, _) = shown_destination(name, value);
