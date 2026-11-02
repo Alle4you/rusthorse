@@ -279,7 +279,9 @@ Every change is saved immediately:
    (mode `0600`) and `fsync`ed.
 2. The current file is hard-linked to `vault.kdbx.bak`.
 3. The temporary file is renamed over `vault.kdbx` (atomic) and the directory
-   is `fsync`ed.
+   is `fsync`ed. A new vault is linked into place instead (and the temporary
+   name removed): a link fails if `vault.kdbx` exists, so creating a vault
+   never replaces one that another program created meanwhile.
 
 Before step 1, and again just before step 3, the agent compares the file's
 device, inode, size and modification time with what it loaded. If another
@@ -454,7 +456,12 @@ CLI: it never opens the vault and never receives the master password. Its
 forms carry metadata only; every change is a request the agent approves in
 its own dialog.
 
-- **Requests.** It uses the protocol-5 requests and targets entries by UUID.
+- **First start.** With no vault, it offers **Create vault…**, which sends
+  `create_vault`: the agent asks for the new master password in its own
+  dialogs. With nothing listening on the socket, it offers **Start agent**,
+  which runs `systemctl --user start rusthorse-agent.service` — systemd, not
+  the manager, starts the agent ([ADR 0011](adr/0011-first-start-from-the-manager.md)).
+- **Requests.** It uses the protocol-6 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
   started by the human runs at a time, on a worker thread, with bounded
   waits; closing the window shuts the connection down. A lost answer to a

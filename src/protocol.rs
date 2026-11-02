@@ -31,7 +31,9 @@ use zeroize::Zeroizing;
 ///
 /// 5: the entry `kind` (in entries, `edit.kind`, and `kind` in
 /// `edit.clear`). A version-4 agent would drop it without a word.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// 6: `create_vault`, and `already_exists` also for the vault file.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
@@ -92,6 +94,10 @@ pub enum Request {
     Status,
     /// Unlock the vault (the agent asks the human for the master password).
     Unlock,
+    /// Create the vault file, which must not exist yet, at the agent's vault
+    /// path. The agent asks the human for the new master password (twice) in
+    /// its own dialogs; the new vault is left unlocked.
+    CreateVault,
     /// Lock the vault and forget remembered approvals.
     Lock,
     /// List entries (metadata only).
@@ -192,6 +198,7 @@ impl Request {
             | Request::Edit { .. }
             | Request::Remove { .. }
             | Request::ChangePassword
+            | Request::CreateVault
             | Request::Backup { .. }
             | Request::Run(_) => true,
         }
@@ -618,7 +625,8 @@ pub enum ErrorCode {
     VaultChanged,
     /// No such entry.
     NotFound,
-    /// An entry with that name already exists.
+    /// An entry with that name already exists; for `create_vault`, the
+    /// vault file does.
     AlreadyExists,
     /// The name matches several entries; use a `Group/Name` path.
     Ambiguous,

@@ -1,7 +1,7 @@
 //! The `rusthorse` command-line interface. See `docs/cli.md`.
 
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -52,7 +52,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new, empty vault.
+    /// Create a new, empty vault. When the agent runs for that vault, it
+    /// asks for the master password in its own dialogs.
     Init {
         /// Vault file to create.
         #[arg(long, env = paths::ENV_VAULT, value_name = "PATH")]
@@ -466,7 +467,7 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
         client.check_compatible()?;
     }
     match command {
-        Command::Init { vault } => init(vault.unwrap_or_else(paths::vault)).map(|_| 0),
+        Command::Init { vault } => init(client, vault.unwrap_or_else(paths::vault)),
         Command::Agent(args) => run_agent(args, client.socket().to_path_buf()).map(|_| 0),
         Command::Status { json } => status(client, json),
         Command::Passwd => simple(client, &Request::ChangePassword),
@@ -539,9 +540,21 @@ fn simple(client: &Client, request: &Request) -> anyhow::Result<u8> {
     }
 }
 
-fn init(vault: PathBuf) -> anyhow::Result<()> {
+fn init(client: &Client, vault: PathBuf) -> anyhow::Result<u8> {
     if vault.exists() {
         bail!("a vault already exists at {}", vault.display());
+    }
+    // An agent that serves this vault creates it, asking for the master
+    // password in its own dialogs: the password then never enters this
+    // process, which an AI agent may have started and could inspect.
+    if let Ok(Response::Status(info)) = client.call(&Request::Status)
+        && Path::new(&info.vault) == vault
+    {
+        client.check_compatible()?;
+        eprintln!("The agent asks for the new master password in a dialog.");
+        let status = simple(client, &Request::CreateVault)?;
+        eprintln!("Next: `rusthorse add NAME`, or open Rusthorse from the applications menu.");
+        return Ok(status);
     }
     let password = new_master_password()?;
     Vault::create(&vault, password, KdfParams::DEFAULT)?;
@@ -549,7 +562,7 @@ fn init(vault: PathBuf) -> anyhow::Result<()> {
     println!(
         "Next: start the agent (`systemctl --user enable --now rusthorse-agent`), then `rusthorse add NAME`."
     );
-    Ok(())
+    Ok(0)
 }
 
 fn new_master_password() -> anyhow::Result<SecretString> {
@@ -631,6 +644,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
             session_bus: None,
             refresh_every: None,
         },
+        new_vault_kdf: KdfParams::DEFAULT,
     };
     let ui = DesktopUi {
         remember_for: args.remember,

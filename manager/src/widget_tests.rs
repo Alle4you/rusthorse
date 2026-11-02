@@ -208,70 +208,97 @@ fn snapshot_window(window: &impl IsA<gtk::Window>, name: &str) {
     }
 }
 
+/// Run the test `name` again in a child process, on a private Xvfb display
+/// and D-Bus session with an empty environment; returns true in that child,
+/// where the test itself runs. `systemctl` on the child's `PATH` is a
+/// stand-in that only records its arguments in `$HOME/systemctl.calls` (and
+/// fails while `$HOME/systemctl.fails` exists): no test starts a real
+/// service.
+fn on_xvfb(name: &str) -> bool {
+    if std::env::var_os("RUSTHORSE_MANAGER_XVFB_CHILD").is_some() {
+        return true;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().expect("isolated runtime");
+    // A runtime directory must be private, whatever the umask.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("systemctl"),
+        "#!/bin/sh\n\
+         echo \"$*\" >> \"$HOME/systemctl.calls\"\n\
+         if [ -e \"$HOME/systemctl.fails\" ]; then\n\
+         echo 'Failed to start rusthorse-agent.service: Unit rusthorse-agent.service not found.' >&2\n\
+         exit 5\n\
+         fi\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("systemctl"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let log = std::fs::File::create(dir.path().join("test.log")).unwrap();
+    let mut cmd = Command::new("/usr/bin/xvfb-run");
+    cmd.args([
+        "-a",
+        "-s",
+        "-screen 0 1400x1000x24",
+        "/usr/bin/dbus-run-session",
+        "--",
+    ])
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", &format!("window::tests::{name}"), "--nocapture"])
+    .env_clear()
+    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+    // Window titles hold non-ASCII text ("—"): X11 clients such as
+    // xdotool cannot read them in the C locale.
+    .env("LANG", "C.UTF-8")
+    .env("HOME", dir.path())
+    .env("TMPDIR", dir.path())
+    .env("XDG_RUNTIME_DIR", dir.path())
+    .env("XDG_CONFIG_HOME", dir.path())
+    .env("XDG_DATA_HOME", dir.path())
+    .env("RUSTHORSE_SOCKET", dir.path().join("unused.sock"))
+    .env("RUSTHORSE_VAULT", dir.path().join("unused.kdbx"))
+    .env("RUSTHORSE_AUDIT_LOG", dir.path().join("unused.jsonl"))
+    .env("GDK_BACKEND", "x11")
+    .env("GSK_RENDERER", "cairo")
+    .env("GSETTINGS_BACKEND", "memory")
+    .env("RUSTHORSE_MANAGER_XVFB_CHILD", "1")
+    .stdin(Stdio::null())
+    .stdout(log.try_clone().unwrap())
+    .stderr(log)
+    .process_group(0);
+    if let Some(path) = std::env::var_os("MANAGER_TEST_SCREENSHOTS") {
+        cmd.env("MANAGER_TEST_SCREENSHOTS", path);
+    }
+    let mut child = cmd.spawn().expect("xvfb-run and dbus-run-session required");
+    let until = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .status();
+            let _ = child.wait();
+            panic!("Xvfb test timed out; process group stopped");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = std::fs::read_to_string(dir.path().join("test.log")).unwrap();
+    assert!(status.success(), "{output}");
+    false
+}
+
 #[test]
 fn desktop_flow() {
-    if std::env::var_os("RUSTHORSE_MANAGER_XVFB_CHILD").is_none() {
-        use std::os::unix::process::CommandExt;
-        use std::process::{Command, Stdio};
-        let dir = tempfile::tempdir().expect("isolated runtime");
-        // A runtime directory must be private, whatever the umask.
-        std::fs::set_permissions(
-            dir.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let log = std::fs::File::create(dir.path().join("test.log")).unwrap();
-        let mut cmd = Command::new("/usr/bin/xvfb-run");
-        cmd.args([
-            "-a",
-            "-s",
-            "-screen 0 1400x1000x24",
-            "/usr/bin/dbus-run-session",
-            "--",
-        ])
-        .arg(std::env::current_exe().unwrap())
-        .args(["--exact", "window::tests::desktop_flow", "--nocapture"])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        // Window titles hold non-ASCII text ("—"): X11 clients such as
-        // xdotool cannot read them in the C locale.
-        .env("LANG", "C.UTF-8")
-        .env("HOME", dir.path())
-        .env("TMPDIR", dir.path())
-        .env("XDG_RUNTIME_DIR", dir.path())
-        .env("XDG_CONFIG_HOME", dir.path())
-        .env("XDG_DATA_HOME", dir.path())
-        .env("RUSTHORSE_SOCKET", dir.path().join("unused.sock"))
-        .env("RUSTHORSE_VAULT", dir.path().join("unused.kdbx"))
-        .env("RUSTHORSE_AUDIT_LOG", dir.path().join("unused.jsonl"))
-        .env("GDK_BACKEND", "x11")
-        .env("GSK_RENDERER", "cairo")
-        .env("GSETTINGS_BACKEND", "memory")
-        .env("RUSTHORSE_MANAGER_XVFB_CHILD", "1")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .process_group(0);
-        if let Some(path) = std::env::var_os("MANAGER_TEST_SCREENSHOTS") {
-            cmd.env("MANAGER_TEST_SCREENSHOTS", path);
-        }
-        let mut child = cmd.spawn().expect("xvfb-run and dbus-run-session required");
-        let until = Instant::now() + Duration::from_secs(90);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= until {
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .status();
-                let _ = child.wait();
-                panic!("Xvfb test timed out; process group stopped");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let output = std::fs::read_to_string(dir.path().join("test.log")).unwrap();
-        assert!(status.success(), "{output}");
+    if !on_xvfb("desktop_flow") {
         return;
     }
     adw::init().expect("GTK only on Xvfb");
@@ -298,6 +325,7 @@ fn desktop_flow() {
             request_timeout: Duration::from_secs(5),
             send_buffer: None,
             session_lock: Default::default(),
+            new_vault_kdf: rusthorse::vault::KdfParams::INSECURE_FOR_TESTS,
         },
         Box::new(Scripted(
             Arc::clone(&allowed),
@@ -817,4 +845,124 @@ fn desktop_flow() {
     );
     app.emit_by_name::<()>("shutdown", &[]);
     assert!(s.revealed.borrow().is_none());
+}
+
+/// The title of the first step the detail pane shows, if any.
+fn first_step(s: &Manager) -> Option<(String, String)> {
+    s.detail
+        .first_child()
+        .and_then(|w| w.downcast::<adw::StatusPage>().ok())
+        .map(|page| {
+            (
+                page.title().to_string(),
+                page.description()
+                    .map(|d| d.to_string())
+                    .unwrap_or_default(),
+            )
+        })
+}
+
+/// From nothing to an open vault: the agent is not running, then it is but
+/// there is no vault, then the vault is created — all from the window.
+#[test]
+fn first_start() {
+    if !on_xvfb("first_start") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let calls = || std::fs::read_to_string(home.join("systemctl.calls")).unwrap_or_default();
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("first.kdbx");
+    let socket = dir.path().join("run/agent.sock");
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket.clone());
+    s.window.present();
+    s.refresh();
+    settle(&s);
+
+    // Nothing listens on the socket: the window offers to start the agent.
+    assert_eq!(s.pill.text(), "Not running");
+    assert_eq!(s.lock.label().as_deref(), Some("Start agent"));
+    assert_eq!(
+        first_step(&s).map(|(title, _)| title).as_deref(),
+        Some("The agent is not running")
+    );
+    // systemctl fails (the service is not installed): the window says why.
+    std::fs::write(home.join("systemctl.fails"), "").unwrap();
+    button(&s.detail, "Start agent").emit_clicked();
+    spin_until(|| !s.starting.get());
+    assert!(
+        s.message.text().contains("not found"),
+        "{}",
+        s.message.text()
+    );
+    assert!(s.message.has_css_class("error"));
+    std::fs::remove_file(home.join("systemctl.fails")).unwrap();
+    // It works: the agent is asked of systemd, never started by the window.
+    s.lock.emit_clicked();
+    spin_until(|| !s.starting.get());
+    assert_eq!(
+        calls(),
+        "--user start rusthorse-agent.service\n--user start rusthorse-agent.service\n"
+    );
+    // The stand-in starts nothing; this test's agent stands in for the one
+    // systemd would start.
+    let agent = Agent::new(
+        AgentConfig {
+            vault: vault.clone(),
+            socket: socket.clone(),
+            audit_log: dir.path().join("first.jsonl"),
+            idle_timeout: Duration::ZERO,
+            request_timeout: Duration::from_secs(5),
+            send_buffer: None,
+            session_lock: Default::default(),
+            new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+        },
+        Box::new(Scripted(
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )),
+    );
+    let listener = Agent::bind(&socket).unwrap();
+    // This thread exists only in this test's subprocess; no daemon outlives it.
+    std::thread::spawn(move || {
+        agent.serve(listener).unwrap();
+    });
+
+    // No vault yet: the window offers to create it, and says where.
+    spin_until(|| s.pill.text() == "No vault");
+    assert_eq!(s.lock.label().as_deref(), Some("Create vault…"));
+    let (title, description) = first_step(&s).expect("a first step");
+    assert_eq!(title, "Create your vault");
+    assert!(
+        description.contains(&vault.display().to_string()),
+        "{description}"
+    );
+    assert!(description.contains("never sees it"), "{description}");
+    // A status check does not repaint the page.
+    let page = s.detail.first_child().unwrap();
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.detail.first_child().unwrap(), page);
+
+    // The agent asks for the master password (scripted here), creates the
+    // vault and keeps it open.
+    button(&s.detail, "Create vault…").emit_clicked();
+    settle(&s);
+    spin_until(|| s.pill.text() == "Unlocked");
+    assert!(vault.exists());
+    assert!(s.entries.borrow().is_empty());
+    assert_eq!(s.lock.label().as_deref(), Some("Lock now"));
+    assert_ne!(
+        first_step(&s).map(|(title, _)| title).as_deref(),
+        Some("Create your vault")
+    );
+    s.window.close();
 }

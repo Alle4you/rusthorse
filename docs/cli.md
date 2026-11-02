@@ -58,10 +58,21 @@ Create a new, empty vault.
 rusthorse init [--vault PATH]
 ```
 
-Asks for the master password twice (in the terminal, or in dialogs without a
-terminal) — the only time the CLI itself handles a master password. Fails if
-the file exists. New vaults use Argon2id with 64 MiB and
-20 passes (about 0.7 s per unlock on a desktop CPU).
+When the agent is running and serves that vault (the path `rusthorse status`
+shows — with the default settings, always), the agent creates it: it asks
+for the master password twice in its own dialogs, so that the password never
+enters the `rusthorse` process — which an AI agent may have started — and
+leaves the new vault unlocked. The manager's **Create vault…** does the same.
+
+Otherwise — no agent, or one that serves another vault — `init` creates the
+file itself and asks for the master password twice, in the terminal or, without
+a terminal, in dialogs: the only time the CLI itself handles a master
+password. Run it in your own terminal, not through an AI agent.
+
+Either way it fails if the file exists, and never replaces a file that
+appears while it works. Exits 4 when a dialog is cancelled or not answered.
+New vaults use Argon2id with 64 MiB and 20 passes (about 0.7 s per unlock on
+a desktop CPU).
 
 ## `rusthorse agent`
 

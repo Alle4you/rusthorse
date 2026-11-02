@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 5)
+  ok    rusthorse 0.1.0 (protocol 6)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/usr/bin/rusthorse)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
@@ -23,9 +23,15 @@ important limitation to understand (see [§6](#6-know-the-limits)).
 
 ## 2. Create the vault
 
+Open **Rusthorse** from the applications menu and click **Create vault…**
+(see [the manager guide](manager.md#first-start)), or run:
+
 ```sh
 rusthorse init
 ```
+
+Either way, the agent asks for the new master password, twice, in its own
+dialog.
 
 Choose a long passphrase. There is no recovery if you forget it. Check again
 with `rusthorse doctor`: every line should now be `ok` (or the X11 warning).

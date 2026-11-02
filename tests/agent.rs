@@ -162,6 +162,7 @@ impl Harness {
             request_timeout,
             send_buffer,
             session_lock,
+            new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -181,7 +182,12 @@ impl Harness {
             .env("RUSTHORSE_AUDIT_LOG", &self.audit)
             .env("RUSTHORSE_VAULT", self.dir.path().join("vault.kdbx"))
             .current_dir(self.dir.path())
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            // Only the agent shows dialogs, and in these tests it scripts
+            // them: a command that tried to show one itself (as `init`
+            // without an agent does) fails instead of reaching the desktop.
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY");
         cmd
     }
 
@@ -813,6 +819,181 @@ fn a_lock_while_the_password_is_typed_keeps_the_vault_locked() {
     let status: serde_json::Value =
         serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
     assert_eq!(status["locked"], true);
+}
+
+/// A harness whose vault does not exist yet.
+fn without_vault() -> Harness {
+    let h = Harness::new();
+    std::fs::remove_file(h.vault_path()).expect("remove the vault");
+    h
+}
+
+/// The outcomes of the audit records of `action`, in order.
+fn audit_outcomes(h: &Harness, action: &str) -> Vec<String> {
+    h.audit_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["action"] == action)
+        .map(|record| record["outcome"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn init_with_an_agent_creates_the_vault_through_the_agents_dialogs() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = without_vault();
+    let new = "a long new master password";
+    h.ui.passwords
+        .lock()
+        .unwrap()
+        .extend([Some(new.to_string()), Some(new.to_string())]);
+    let out = h.run(&["init"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("vault created at"),
+        "{}",
+        text(&out.stderr)
+    );
+    // Both dialogs were the agent's: the command asked for nothing itself.
+    let prompts = h.ui.password_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(
+        prompts[0].contains("Choose the master password"),
+        "{}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains("cannot be recovered"), "{}", prompts[0]);
+    assert!(
+        prompts[0].contains(&h.vault_path().display().to_string()),
+        "{}",
+        prompts[0]
+    );
+    assert!(prompts[1].contains("again"), "{}", prompts[1]);
+    // Left unlocked, private, and it opens with the new password.
+    let status: serde_json::Value =
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
+    assert_eq!(status["locked"], false);
+    assert!(h.run(&["list"]).status.success());
+    let mode = std::fs::metadata(h.vault_path())
+        .expect("vault")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    Vault::open(&h.vault_path(), SecretString::new(new.to_string())).expect("opens");
+    assert_eq!(audit_outcomes(&h, "create_vault"), ["created"]);
+}
+
+#[test]
+fn creating_a_vault_creates_nothing_unless_both_passwords_are_given_and_match() {
+    // (passwords typed, outcome recorded, message)
+    let cases: [(&[Option<&str>], &str, &str); 4] = [
+        (&[None], "cancelled", "cancelled"),
+        (&[Some("first password"), None], "cancelled", "cancelled"),
+        (
+            &[Some("first password"), Some("second password")],
+            "mismatch",
+            "do not match",
+        ),
+        (&[Some("short"), Some("short")], "too_short", "at least 8"),
+    ];
+    for (typed, outcome, message) in cases {
+        let h = without_vault();
+        h.ui.passwords
+            .lock()
+            .unwrap()
+            .extend(typed.iter().map(|t| t.map(String::from)));
+        let out = h.run(&["init"]);
+        assert!(!out.status.success(), "{outcome}");
+        let expected = if outcome == "cancelled" { 4 } else { 1 };
+        assert_eq!(out.status.code(), Some(expected), "{outcome}");
+        assert!(text(&out.stderr).contains(message), "{}", text(&out.stderr));
+        assert!(!h.vault_path().exists(), "{outcome}: a vault was created");
+        assert_eq!(audit_outcomes(&h, "create_vault"), [outcome]);
+    }
+}
+
+#[test]
+fn an_unwritable_audit_log_creates_no_vault() {
+    let h = without_vault();
+    std::fs::create_dir_all(&h.audit).expect("block the audit path with a directory");
+    let out = h.run(&["init"]);
+    assert!(!out.status.success());
+    assert!(
+        !h.vault_path().exists(),
+        "a vault was created without a record"
+    );
+}
+
+#[test]
+fn creating_a_vault_where_one_exists_shows_no_dialog() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    let h = Harness::new();
+    let before = std::fs::read(h.vault_path()).expect("vault");
+    match h.call(&Request::CreateVault) {
+        Response::Error { code, message } => {
+            assert_eq!(code, ErrorCode::AlreadyExists);
+            assert!(message.contains("already exists"), "{message}");
+        }
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert!(h.ui.password_prompts.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(h.vault_path()).expect("vault"), before);
+    assert!(audit_outcomes(&h, "create_vault").is_empty());
+}
+
+#[test]
+fn a_lock_while_the_new_password_is_typed_creates_the_vault_locked() {
+    let h = without_vault();
+    let socket = h.socket.clone();
+    *h.ui.on_password.lock().unwrap() = Some(Box::new(move || {
+        rusthorse::client::Client::new(socket)
+            .call(&rusthorse::protocol::Request::Lock)
+            .expect("lock");
+    }));
+    let out = h.run(&["init"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("locked meanwhile"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(h.vault_path().exists());
+    let status: serde_json::Value =
+        serde_json::from_slice(&h.run(&["status", "--json"]).stdout).expect("json");
+    assert_eq!(status["locked"], true);
+}
+
+#[test]
+fn of_two_requests_to_create_the_vault_the_second_finds_it_created() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    let h = without_vault();
+    let socket = h.socket.clone();
+    let second = Arc::new(Mutex::new(None));
+    let started = Arc::clone(&second);
+    // While the first creation's dialog is open, a second request arrives;
+    // it must wait for the dialog, not open its own.
+    *h.ui.on_password.lock().unwrap() = Some(Box::new(move || {
+        let handle = std::thread::spawn(move || {
+            rusthorse::client::Client::new(socket)
+                .call(&Request::CreateVault)
+                .expect("second request")
+        });
+        *started.lock().unwrap() = Some(handle);
+        std::thread::sleep(Duration::from_millis(200));
+    }));
+    let out = h.run(&["init"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let handle = second
+        .lock()
+        .unwrap()
+        .take()
+        .expect("second request started");
+    match handle.join().expect("join") {
+        Response::Error { code, .. } => assert_eq!(code, ErrorCode::AlreadyExists),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 2);
+    assert_eq!(audit_outcomes(&h, "create_vault"), ["created"]);
 }
 
 #[test]

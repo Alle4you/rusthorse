@@ -70,6 +70,10 @@ pub(crate) struct Manager {
     actions: RefCell<Vec<gtk::Button>>,
     revealed: RefCell<Option<adw::Window>>,
     editor: RefCell<Option<adw::Window>>,
+    /// The last status check found nothing listening on the socket.
+    agent_down: Cell<bool>,
+    /// `systemctl --user start` is running.
+    starting: Cell<bool>,
 }
 
 /// Plain text: never markup, and drawn through the same character filter
@@ -517,6 +521,8 @@ impl Manager {
             actions: RefCell::new(vec![]),
             revealed: RefCell::new(None),
             editor: RefCell::new(None),
+            agent_down: Cell::new(false),
+            starting: Cell::new(false),
         });
         manager.actions.replace(vec![
             refresh.clone(),
@@ -672,6 +678,19 @@ impl Manager {
     }
 
     fn toggle_lock(self: &Rc<Self>) {
+        if self.agent_down.get() {
+            self.start_agent();
+            return;
+        }
+        if self
+            .status
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| !s.vault_exists)
+        {
+            self.create_vault();
+            return;
+        }
         let locked = self.status.borrow().as_ref().is_none_or(|s| s.locked);
         if locked {
             self.submit(Request::Unlock, Pending::Change);
@@ -680,6 +699,78 @@ impl Manager {
             self.clear_entries();
             self.submit(Request::Lock, Pending::Change);
         }
+    }
+
+    /// Ask the agent to create the vault. The agent, not this app, asks for
+    /// the master password: this app never sees it.
+    fn create_vault(self: &Rc<Self>) {
+        self.submit(Request::CreateVault, Pending::Change);
+    }
+
+    /// Ask systemd to start the agent's service. The agent must not be a
+    /// child of this app (or of any program an AI controls): started by
+    /// systemd, it runs outside their process trees, as at login.
+    fn start_agent(self: &Rc<Self>) {
+        if self.starting.get() || self.job.borrow().is_some() {
+            return;
+        }
+        let started = gio::Subprocess::newv(
+            &[
+                std::ffi::OsStr::new("systemctl"),
+                std::ffi::OsStr::new("--user"),
+                std::ffi::OsStr::new("start"),
+                std::ffi::OsStr::new("rusthorse-agent.service"),
+            ],
+            gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_PIPE,
+        );
+        let process = match started {
+            Ok(process) => process,
+            Err(e) => {
+                self.feedback(
+                    &format!(
+                        "Cannot run systemctl: {e}. Start the agent as the installation guide says."
+                    ),
+                    true,
+                );
+                return;
+            }
+        };
+        self.starting.set(true);
+        self.set_busy(true);
+        self.feedback("Starting the agent…", false);
+        let weak = Rc::downgrade(self);
+        let waited = process.clone();
+        process.communicate_utf8_async(None, gio::Cancellable::NONE, move |result| {
+            let Some(s) = weak.upgrade() else { return };
+            s.starting.set(false);
+            s.set_busy(false);
+            match result {
+                Ok(_) if waited.is_successful() => {
+                    s.feedback("The agent was started.", false);
+                    s.refresh();
+                    // The agent needs a moment to listen on its socket.
+                    let weak = Rc::downgrade(&s);
+                    glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                        if let Some(s) = weak.upgrade()
+                            && s.agent_down.get()
+                        {
+                            s.refresh();
+                        }
+                    });
+                }
+                Ok((_, stderr)) => {
+                    let why = stderr.map(|e| e.trim().to_string()).unwrap_or_default();
+                    s.feedback(
+                        &format!(
+                            "The agent could not be started ({}). Install it as the installation guide says.",
+                            if why.is_empty() { "systemctl failed" } else { why.as_str() }
+                        ),
+                        true,
+                    );
+                }
+                Err(e) => s.feedback(&format!("Cannot run systemctl: {e}."), true),
+            }
+        });
     }
 
     /// Check the status in the background, also while a request waits for
@@ -835,22 +926,108 @@ impl Manager {
         }
     }
 
-    fn unreachable(&self, failure: &Failure) {
+    fn unreachable(self: &Rc<Self>, failure: &Failure) {
         self.status.borrow_mut().take();
-        self.pill.set_text("Unavailable");
+        self.agent_down.set(failure.not_running);
+        self.pill.set_text(if failure.not_running {
+            "Not running"
+        } else {
+            "Unavailable"
+        });
         self.pill.remove_css_class("success");
         self.pill.add_css_class("warning");
-        self.lock.set_label("Unlock");
+        self.lock.set_label(if failure.not_running {
+            "Start agent"
+        } else {
+            "Unlock"
+        });
         self.lock_hint.set_text("");
-        self.hide_revealed();
-        self.clear_entries();
         clear(&self.status_page);
         let g = group("Agent", None);
         g.add(&label(&failure.text()));
         self.status_page.append(&g);
+        const DOWN: &str = "The agent is not running";
+        const DOWN_TEXT: &str = "The agent keeps your vault and asks you before every use of a \
+             secret. It is a service of your session, which systemd starts when you log in. \
+             Start it now to continue.";
+        // The status is checked every few seconds: keep the page as it is.
+        if failure.not_running && self.showing_first_step(DOWN, DOWN_TEXT) {
+            return;
+        }
+        self.hide_revealed();
+        self.clear_entries();
+        if failure.not_running {
+            self.paint_first_step(DOWN, DOWN_TEXT, "Start agent", Self::start_agent);
+        }
+    }
+
+    /// Whether the detail pane already shows this first step.
+    fn showing_first_step(&self, title: &str, description: &str) -> bool {
+        self.detail
+            .first_child()
+            .and_then(|w| w.downcast::<adw::StatusPage>().ok())
+            .is_some_and(|page| {
+                page.title() == title && page.description().as_deref() == Some(description)
+            })
+    }
+
+    /// The detail pane when there is nothing to show yet: what to do next,
+    /// and a button that does it. `description` is markup.
+    fn paint_first_step(
+        self: &Rc<Self>,
+        title: &str,
+        description: &str,
+        action_label: &str,
+        action: fn(&Rc<Manager>),
+    ) {
+        clear(&self.detail);
+        let page = adw::StatusPage::builder()
+            .icon_name("dialog-password-symbolic")
+            .title(title)
+            .build();
+        page.set_description(Some(description));
+        let go = button(action_label, None);
+        go.add_css_class("suggested-action");
+        go.add_css_class("pill");
+        go.set_halign(gtk::Align::Center);
+        page.set_child(Some(&go));
+        let weak = Rc::downgrade(self);
+        go.connect_clicked(move |_| {
+            if let Some(s) = weak.upgrade()
+                && s.job.borrow().is_none()
+            {
+                action(&s);
+            }
+        });
+        self.detail.append(&page);
     }
 
     fn apply_status(self: &Rc<Self>, info: StatusInfo, list: bool) {
+        self.agent_down.set(false);
+        if !info.vault_exists {
+            // First start: no vault yet. Creating it is the next step.
+            self.pill.set_text("No vault");
+            self.pill.remove_css_class("success");
+            self.pill.add_css_class("warning");
+            self.lock.set_label("Create vault…");
+            self.lock_hint.set_text("");
+            self.paint_status(&info);
+            let description = format!(
+                "Rusthorse keeps your secrets in one encrypted KeePass file:\n<tt>{}</tt>\n\n\
+                 The agent asks you to choose its master password in a window of its own; this \
+                 app never sees it. A forgotten master password cannot be recovered.",
+                rusthorse::ui::markup_text(&info.vault)
+            );
+            *self.status.borrow_mut() = Some(info);
+            const CREATE: &str = "Create your vault";
+            if self.showing_first_step(CREATE, &description) {
+                return;
+            }
+            self.hide_revealed();
+            self.clear_entries();
+            self.paint_first_step(CREATE, &description, "Create vault…", Self::create_vault);
+            return;
+        }
         let was_locked = self.status.borrow().as_ref().is_none_or(|s| s.locked);
         let locked = info.locked;
         self.pill
@@ -911,7 +1088,7 @@ impl Manager {
                 if info.vault_exists {
                     "Yes"
                 } else {
-                    "No — create it with rusthorse init"
+                    "No — create it with Create vault…, or rusthorse init"
                 }
                 .to_string(),
             ),

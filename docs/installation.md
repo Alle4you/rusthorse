@@ -199,13 +199,18 @@ systemctl --user import-environment DISPLAY XAUTHORITY WAYLAND_DISPLAY
 
 ## 3. Create a vault
 
+Open **Rusthorse** from the applications menu: on a first start it offers
+**Start agent** if the agent is not running yet, then **Create vault…**
+([manager guide](manager.md#first-start)). Or, in a terminal:
+
 ```sh
 rusthorse init
 ```
 
-Run it in a terminal: it asks for the new master password twice, without
-echoing it. (Without a terminal, it uses dialogs instead.) The vault is
-created at `~/.local/share/rusthorse/vault.kdbx` with mode `0600`.
+Either way, when the agent is running, the agent asks for the new master
+password twice in its own dialog. (Without an agent, `init` asks in the
+terminal, without echoing it.) The vault is created at
+`~/.local/share/rusthorse/vault.kdbx` with mode `0600`, and left unlocked.
 
 Choose a long master password — a passphrase of five or more random words is a
 good choice. Rusthorse refuses passwords shorter than 8 characters and warns

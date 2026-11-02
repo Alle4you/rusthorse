@@ -218,12 +218,21 @@ impl std::fmt::Debug for Vault {
 }
 
 impl Vault {
-    /// Create a new, empty vault file. Fails if `path` already exists.
+    /// Create a new, empty vault file. Fails if `path` already exists —
+    /// also when another program creates it while this one is being written:
+    /// a new vault never replaces a file.
     pub fn create(
         path: &Path,
         password: SecretString,
         kdf: KdfParams,
     ) -> Result<Vault, VaultError> {
+        let mut vault = Self::unsaved(path, password, kdf)?;
+        vault.write_file(false)?;
+        Ok(vault)
+    }
+
+    /// A new, empty vault that is not on disk yet.
+    fn unsaved(path: &Path, password: SecretString, kdf: KdfParams) -> Result<Vault, VaultError> {
         if fs::symlink_metadata(path).is_ok() {
             return Err(VaultError::Exists(path.to_path_buf()));
         }
@@ -232,7 +241,7 @@ impl Vault {
         }
         let mut db = Database::with_config(kdf.database_config());
         db.root_mut().name = "Rusthorse".to_string();
-        let mut vault = Vault {
+        Ok(Vault {
             db,
             path: path.to_path_buf(),
             password,
@@ -247,9 +256,7 @@ impl Vault {
             fail_cleanup: false,
             #[cfg(test)]
             fail_dir_sync: false,
-        };
-        vault.write_file(false)?;
-        Ok(vault)
+        })
     }
 
     /// Open and decrypt an existing vault.
@@ -406,10 +413,23 @@ impl Vault {
                 let _ = fs::remove_file(&tmp);
                 return Err(e.into());
             }
-        }
-        if let Err(e) = fs::rename(&tmp, &self.path) {
+            if let Err(e) = fs::rename(&tmp, &self.path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        } else {
+            // A new vault: a link, unlike a rename, fails if the name exists,
+            // so a vault that another program (another `init`, another agent)
+            // created meanwhile is never replaced.
+            let linked = fs::hard_link(&tmp, &self.path);
             let _ = fs::remove_file(&tmp);
-            return Err(e.into());
+            match linked {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(VaultError::Exists(self.path.clone()));
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         // From here on the new file is in place: a failure no longer means
         // "not saved". The renamed file is the one we wrote (same inode),
@@ -1129,6 +1149,42 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn a_vault_created_by_another_program_meanwhile_is_not_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join("vault.kdbx");
+        let mut vault = Vault::unsaved(
+            &path,
+            secret("correct horse"),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("new vault");
+        vault.before_rename = Some(Box::new(|path: &Path| {
+            fs::write(path, b"theirs").expect("another program creates the vault");
+        }));
+        assert!(matches!(
+            vault.write_file(false),
+            Err(VaultError::Exists(_))
+        ));
+        assert_eq!(fs::read(&path).expect("read"), b"theirs");
+        let leftovers = fs::read_dir(path.parent().expect("dir"))
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "the temporary file was left behind");
+        // Without the other program, the same steps create the vault.
+        fs::remove_file(&path).expect("remove theirs");
+        let mut vault = Vault::unsaved(
+            &path,
+            secret("correct horse"),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("new vault");
+        vault.write_file(false).expect("create");
+        Vault::open(&path, secret("correct horse")).expect("the new vault opens");
     }
 
     #[test]

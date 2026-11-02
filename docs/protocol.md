@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **5** (`PROTOCOL_VERSION` in
+Protocol version: **6** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -14,6 +14,7 @@ Protocol version: **5** (`PROTOCOL_VERSION` in
 | 3 | Every error other than `outcome_unknown` is definite: the vault file was not changed and no command was started (see [Errors](#errors)); a save that fails after replacing the file is `outcome_unknown`. `status.agent_executable`, `status.agent_executable_id`, `status.agent_executable_replaced`. Added later, optional: `status.dialogs`. |
 | 4 | `reveal.purpose` (`show`, `copy`): what the client says it will do with a revealed value, named in the approval dialog and the audit log. Unreleased builds that reported protocol 3 had this field with another meaning for `copy` (one paste, then cleared); clients of protocol 4 refuse those agents. |
 | 5 | The entry `kind` (see [Entry kinds](#entry-kinds)): in `NewEntry.fields`, `EntryInfo`, `EntryChanges.kind`, and `"kind"` in `EntryChanges.clear`. An agent of version 4 would silently drop it, so the version changed. |
+| 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -100,6 +101,7 @@ Every request is an object with a `type` field.
 |---|---|---|
 | `status` | — | `status` |
 | `unlock` | — | `ok` |
+| `create_vault` | — | `ok` |
 | `lock` | — | `ok` |
 | `list` | — | `entries` |
 | `show` | `name` | `entry` |
@@ -131,6 +133,20 @@ carry `"generate": {"length": 32, "alphabet": "alnum"}` (alphabets `alnum`,
 `symbols`, `hex`; length 8–1024): the agent generates the value after
 approval. `change_password` makes the agent ask for the current and the new
 master password in its own dialogs.
+
+`create_vault` creates the vault file at the agent's vault path (the one
+`status` reports), which must not exist: if it does, the answer is
+`already_exists` and no dialog is shown. Otherwise the agent asks the human
+for the new master password twice, in its own dialogs, so that it never
+passes through a client; at least 8 characters, and both must match
+(`invalid_request` otherwise, `cancelled` when a dialog is cancelled or not
+answered). It records the attempt in the audit log (`create_vault`, outcome
+`created`, `cancelled`, `timed_out`, `mismatch`, `too_short` or `failed`)
+before the file is written, never replaces a file that appears meanwhile,
+and leaves the new vault unlocked — unless the vault was locked while the
+dialogs were open (by `lock`, a screen lock or a suspend),
+in which case it is created locked and the `ok` message says so. Requests
+are handled one at a time: of two, the second gets `already_exists`.
 
 ### Reveal
 
@@ -253,7 +269,7 @@ All fields are optional; omitted fields are left unchanged.
 ```json
 {
   "type": "status",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -340,7 +356,7 @@ a valid `Kind`; their values are not disclosed.
 | `vault_missing` | There is no vault file yet. |
 | `vault_changed` | Another program changed the vault file since it was unlocked. |
 | `not_found` | No such entry, or the entry has no value. |
-| `already_exists` | An entry with that name exists (use `replace`). |
+| `already_exists` | An entry with that name exists (use `replace`); for `create_vault`, the vault file exists. |
 | `ambiguous` | Several entries match; use a `Group/Name` path. |
 | `invalid_request` | Malformed or disallowed request (bad name, missing fds, details too long, program replaced after approval, …). |
 | `outcome_unknown` | The request may have taken effect, but the agent cannot confirm it: a `run` command started but its result could not be determined, or a change was written to the vault file but the file's directory could not be synced, so it may not survive a crash (the vault is then locked; unlocking reads what the file holds). Do not simply retry. |
@@ -350,8 +366,8 @@ a valid `Kind`; their values are not disclosed.
 changed and no command was started.** (The audit log may record the attempt,
 the vault may have been locked, and a `backup` whose copy does not verify
 leaves that copy, which the message names.) A client that sends a request
-with effects — `add`, `import`, `edit`, `remove`, `change_password`,
-`backup`, `run` — and gets no answer, or one it cannot parse, must likewise
+with effects — `create_vault`, `add`, `import`, `edit`, `remove`,
+`change_password`, `backup`, `run` — and gets no answer, or one it cannot parse, must likewise
 treat the outcome as unknown.
 
 ## Compatibility
@@ -365,9 +381,9 @@ treat the outcome as unknown.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-5 requests above, with the same
+`rusthorse-manager` uses the version-6 requests above, with the same
 approvals as the CLI. It targets entries by UUID, sends `reveal` with purpose
-`show` or `copy` for its Show and Copy actions, and never sends a master
-password. See [ADR 0007](adr/0007-visual-manager.md); the configuration,
+`show` or `copy` for its Show and Copy actions, sends `create_vault` when
+there is no vault yet, and never sends a master password. See [ADR 0007](adr/0007-visual-manager.md); the configuration,
 grant, history and restore requests it proposes for later milestones do not
 exist yet.

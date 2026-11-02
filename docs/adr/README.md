@@ -17,6 +17,7 @@ supersedes the old one, which is marked as such.
 | [0008](0008-entry-kinds.md) | Entry kinds, and an API key's endpoint for `run` | Proposed |
 | [0009](0009-lock-on-screen-lock-and-suspend.md) | The agent locks when the screen locks or the computer suspends | Proposed |
 | [0010](0010-debian-package.md) | A Debian package that installs and removes cleanly | Proposed |
+| [0011](0011-first-start-from-the-manager.md) | The first start happens in the manager; the agent creates the vault | Proposed |
 
 ## Writing a new ADR
 

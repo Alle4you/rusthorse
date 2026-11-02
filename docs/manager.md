@@ -15,6 +15,7 @@ awaiting an independent review: try it with fake entries first.
 
 | Available | Comes later (ADR 0007) |
 |---|---|
+| First start: start the agent, create the vault | |
 | Status of the agent, including what else locks it; unlock and lock | |
 | Browse, search and filter entries by group | Moving an entry to another group; editing notes |
 | Create, edit, rename and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
@@ -28,9 +29,9 @@ missing and what to do meanwhile.
 
 ## Before you start
 
-- The agent must be running (`rusthorse status` answers) and the vault must
-  exist (`rusthorse init`). The manager does not install, start or restart
-  anything.
+- Nothing else: on a first start the window starts the agent and creates
+  the vault ([First start](#first-start)). It never installs or restarts
+  anything, and never starts the agent's program itself.
 - The Debian package installs it: open **Rusthorse** from the applications
   menu. Building it from source needs Rust 1.92 or later and the GTK 4.12+
   and libadwaita 1.4+ development packages — the same as `rusthorse-dialog`
@@ -69,6 +70,27 @@ the details, which take any extra width. It fits a screen 1024 pixels wide
 Selecting an entry fetches nothing secret. The manager checks the agent's
 status every five seconds in the background; that does not count as using
 the vault, so it never postpones the automatic lock.
+
+## First start
+
+What the window shows depends on what is missing
+([ADR 0011](adr/0011-first-start-from-the-manager.md)):
+
+- **Not running** in the sidebar, and "The agent is not running": nothing
+  answers on the agent's socket — after installing the package, the agent
+  starts only at your next login. **Start agent** asks systemd to start the
+  service (`systemctl --user start rusthorse-agent.service`), so the agent
+  runs outside the manager, as at login. If systemctl fails, the window
+  shows why; a source installation needs the service file of the
+  [installation guide](installation.md#2-run-the-agent-as-a-systemd-user-service).
+- **No vault**, and "Create your vault" with the file's path: **Create
+  vault…** makes the agent ask you, in its own dialog, to choose the master
+  password, then to type it again. The manager never sees it. Choose a long
+  passphrase and keep it somewhere safe: it cannot be recovered. The vault
+  is then open, with no entries. Cancelling either dialog creates nothing.
+
+To use an existing KeePass file instead of creating one, point the agent at
+it before the first start ([installation guide](installation.md#using-an-existing-keepass-database-instead)).
 
 ## Everyday tasks
 
@@ -235,7 +257,9 @@ the new password in its own dialogs. The manager never receives them.
 
 | What you see | What it means and what to do |
 |---|---|
-| **Unavailable** in the sidebar | The agent does not answer. `rusthorse status` in a terminal says why; `systemctl --user status rusthorse-agent` shows the service. The manager does not start it. |
+| **Not running** in the sidebar | Nothing listens on the agent's socket. Click **Start agent** ([First start](#first-start)). |
+| **Unavailable** in the sidebar | The agent does not answer as it should (it is busy, or something else listens on its socket). `rusthorse status` in a terminal says why; `systemctl --user status rusthorse-agent` shows the service. |
+| "The agent could not be started (…)" | `systemctl --user start rusthorse-agent.service` failed; its message is in the parentheses. Without the package, install the service file as the installation guide says. |
 | "Outcome unknown. The operation may have taken effect…" | The answer to a change was lost. The change may have happened: refresh and look before trying again. Never repeat it blindly. |
 | A master-password dialog you did not expect | The vault locked between two of the manager's requests (for example the idle timer fired just then), and listing needs it open. Answer it, or cancel it. |
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |

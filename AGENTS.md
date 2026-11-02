@@ -83,10 +83,10 @@ Breaking one of these is a security bug, whatever the tests say.
 
 1. **Only the agent handles secrets taken from the vault.** A client — the
    CLI or the manager — holds a secret only when the user supplies one —
-   `init` (the new master password), `add --stdin`, `import` (values read
-   from a `.env` file or the Secret Service, sent to the agent) — or asked
-   for one: `reveal`, after approval (the manager's Show and Copy are
-   reveals). The manager's forms carry metadata only: they never ask for a
+   `init` without an agent (the new master password), `add --stdin`,
+   `import` (values read from a `.env` file or the Secret Service, sent to
+   the agent) — or asked for one: `reveal`, after approval (the manager's
+   Show and Copy are reveals). The manager's forms carry metadata only: they never ask for a
    master password or a value.
 2. **Never** log, audit or put in an error message a secret value, the master
    password or notes. A value leaves a client only where the human asked for
@@ -96,10 +96,11 @@ Breaking one of these is a security bug, whatever the tests say.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
 4. **Approval and secret-entry dialogs are shown by the agent**, never by
-   a client — except `init` without a terminal, which asks for the new
-   master password itself because no agent exists yet. Default button **Deny**; only the exact expected
-   zenity results count as approval (`ui::decision_from`); an unanswered
-   dialog is `timed_out`, a denial.
+   a client — except `init` without a terminal when no agent serves that
+   vault, which asks for the new master password itself; with an agent,
+   `init` and the manager send `create_vault` and the agent asks. Default
+   button **Deny**; only the exact expected zenity results count as approval
+   (`ui::decision_from`); an unanswered dialog is `timed_out`, a denial.
 5. **Everything a requester controls that a dialog shows goes through
    `ui::dialog_text`** (in markup, through `ui::markup_text`, which calls it).
    Only ordinary characters are drawn as themselves; the rest become

@@ -12,6 +12,8 @@ use rusthorse::protocol::{self, ErrorCode, Request, Response};
 pub(crate) struct Failure {
     pub message: String,
     pub uncertain: bool,
+    /// Nothing listens on the agent's socket: the agent is not running.
+    pub not_running: bool,
 }
 
 impl Failure {
@@ -19,6 +21,7 @@ impl Failure {
         Self {
             message: message.into(),
             uncertain,
+            not_running: false,
         }
     }
     /// The worker ended without an answer: the request may have been sent.
@@ -189,11 +192,19 @@ fn connect_by(path: &Path, cancel: &Mutex<Cancellation>) -> Result<UnixStream, F
             Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => {
                 thread::sleep(Duration::from_millis(20))
             }
+            // No socket, or nobody listening on it.
+            Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ECONNREFUSED) => {
+                return Err(Failure {
+                    not_running: true,
+                    ..Failure::new(
+                        "The agent is not running. Start it with Start agent, or see the installation guide.",
+                        false,
+                    )
+                });
+            }
             Err(e) => {
                 return Err(Failure::new(
-                    format!(
-                        "Cannot reach the agent: {e}. See the installation guide; this app does not start services."
-                    ),
+                    format!("Cannot reach the agent: {e}. See the installation guide."),
                     false,
                 ));
             }

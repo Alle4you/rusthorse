@@ -11,6 +11,16 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **First start from the manager**
+  ([ADR 0011](docs/adr/0011-first-start-from-the-manager.md)): with no
+  vault, the window offers **Create vault…**; with no agent running, **Start
+  agent**, which asks systemd to start the service (the manager never starts
+  the agent itself). A new request, `create_vault`, makes the agent create
+  the vault and ask for its master password in its own dialogs; the new vault
+  is left unlocked.
+- `rusthorse init` uses `create_vault` when the agent serves that vault, so
+  the new master password never enters the `rusthorse` process; it creates
+  the file itself only without such an agent.
 - A **Debian package** ([ADR 0010](docs/adr/0010-debian-package.md)),
   built with `packaging/build-deb.sh` (cargo-deb) for Ubuntu 24.04, Linux
   Mint 22, Debian 13 or later: the three programs in `/usr/bin`, the agent's
@@ -99,6 +109,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- Creating a vault never replaces a file that appeared meanwhile (another
+  `init` or agent): the file is linked into place instead of renamed.
 - The service file (`contrib/systemd/rusthorse-agent.service`) lets systemd
   create the socket's directory and remove it, with the socket, when the
   agent stops (`RuntimeDirectory=rusthorse`); before, a stopped agent left
@@ -112,10 +124,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   that is not in a command or a path could mislead), and the keys of detail
   rows no longer break inside words ("Dire-ctory").
 
-- **Protocol 5** (versions 2 to 4 existed only during development): data
-  frames and credits, new requests, definite errors, `reveal.purpose` and
-  the entry `kind` (see Added). Upgrade the agent together with its clients and restart it:
-  clients refuse an agent that speaks another version.
+- **Protocol 6** (versions 2 to 5 existed only during development): data
+  frames and credits, new requests (among them `create_vault`), definite
+  errors, `reveal.purpose` and the entry `kind` (see Added);
+  `already_exists` also means that the vault file exists. Upgrade the agent
+  together with its clients and restart it: clients refuse an agent that
+  speaks another version.
 - `passwd` reports when the old-password backup could not be deleted.
 - `doctor` checks the files the agent actually uses, and notices an agent
   still running a build that an upgrade replaced; `status` shows the agent's

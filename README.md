@@ -115,7 +115,9 @@ sudo apt install ./target/debian/rusthorse_0.1.0-1_amd64.deb
 # 2. Start the agent now (it starts by itself at your next login)
 systemctl --user start rusthorse-agent
 
-# 3. Create the vault (choose a strong master password)
+# 3. Create the vault: open Rusthorse from the applications menu and click
+#    Create vault…, or run init — either way the agent asks, in its own
+#    dialog, for a strong master password
 rusthorse init
 
 # 4. Add a secret — the agent asks for the value in a dialog

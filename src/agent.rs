@@ -52,7 +52,7 @@ use crate::redact::Redactor;
 use crate::session_lock;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
-use crate::vault::{Vault, VaultError};
+use crate::vault::{KdfParams, Vault, VaultError};
 
 /// How many wrong master passwords are tolerated per unlock.
 const UNLOCK_ATTEMPTS: u32 = 3;
@@ -98,6 +98,10 @@ pub struct AgentConfig {
     /// Lock when the screen locks or the computer suspends, and which buses
     /// to watch (ADR 0009). The default watches nothing.
     pub session_lock: crate::session_lock::Settings,
+    /// Key-derivation settings of a vault created through `create_vault`:
+    /// [`KdfParams::DEFAULT`] in production; tests use weaker ones to run
+    /// fast.
+    pub new_vault_kdf: KdfParams,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -133,10 +137,8 @@ impl From<VaultError> for Failure {
             VaultError::Missing(_) => ErrorCode::VaultMissing,
             VaultError::Invalid(_) => ErrorCode::InvalidRequest,
             VaultError::NotDurable(_) => ErrorCode::OutcomeUnknown,
-            VaultError::Exists(_)
-            | VaultError::Open(_)
-            | VaultError::Save(_)
-            | VaultError::Io(_) => ErrorCode::Internal,
+            VaultError::Exists(_) => ErrorCode::AlreadyExists,
+            VaultError::Open(_) | VaultError::Save(_) | VaultError::Io(_) => ErrorCode::Internal,
         };
         Failure::new(code, e.to_string())
     }
@@ -430,6 +432,7 @@ impl Agent {
                 self.ensure_unlocked(peer)?;
                 Ok(ok("vault unlocked"))
             }
+            Request::CreateVault => self.create_vault(peer),
             Request::List => self.with_vault(peer, |v| Ok(Response::Entries { entries: v.list() })),
             Request::Show { name } => self.with_vault(peer, |v| {
                 let id = v.find(&name)?;
@@ -1195,6 +1198,126 @@ impl Agent {
                  It still opens with the old password — delete it yourself"
             ),
         }))
+    }
+
+    /// Create the vault file at the configured path, asking the human for
+    /// its master password, twice, in the agent's own dialogs: the password
+    /// never passes through a client. The new vault is left unlocked —
+    /// unless the vault was locked while the dialogs were open (a screen
+    /// lock, a suspend, `rusthorse lock`).
+    fn create_vault(&self, peer: &Peer) -> Result<Response, Failure> {
+        let path = self.config.vault.clone();
+        let exists = || {
+            Failure::new(
+                ErrorCode::AlreadyExists,
+                format!("a vault already exists at {}", path.display()),
+            )
+        };
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(exists());
+        }
+        // One dialog at a time: of two requests, the second waits here and
+        // then finds the vault the first created.
+        let _dialog = self.dialog()?;
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(exists());
+        }
+        let started = self.state().generation;
+        let event = AuditEvent::new("create_vault", peer);
+        let shown = path.display().to_string();
+        let prompt = |headline: &str, explanation: &str, field: &str, confirm: &str| Prompt {
+            title: "Rusthorse — create a vault".into(),
+            headline: headline.into(),
+            explanation: explanation.into(),
+            notice: None,
+            details: vec![
+                ("Vault file".into(), shown.clone()),
+                ("Requested by (unverified)".into(), peer.describe()),
+            ],
+            field: field.into(),
+            confirm: confirm.into(),
+        };
+        let first_prompt = prompt(
+            "Choose the master password of your new vault.",
+            "It encrypts every secret in the vault, and it cannot be recovered: if you \
+             forget it, the secrets are lost. Write it down somewhere safe. At least 8 \
+             characters; a passphrase of five or more random words is recommended.",
+            "New master password",
+            "Next",
+        );
+        let text = crate::ui::prompt_text(&first_prompt);
+        if text.chars().count() > MAX_DIALOG_CHARS
+            || (self.ui.limits_height()
+                && crate::ui::prompt_height(&text) > crate::ui::metrics::MAX_HEIGHT)
+        {
+            return Err(Failure::invalid(
+                "the dialog would be too long to show (vault path or requester chain)",
+            ));
+        }
+        let ask = |prompt: Prompt| -> Result<SecretString, Failure> {
+            let (outcome, failure) = match self.ui.master_password(&prompt)? {
+                Typed::Value(value) => return Ok(value),
+                Typed::Cancelled => (
+                    "cancelled",
+                    Failure::new(ErrorCode::Cancelled, "cancelled; no vault was created"),
+                ),
+                Typed::TimedOut => (
+                    "timed_out",
+                    Failure::new(
+                        ErrorCode::Cancelled,
+                        "nobody answered the dialog in time; no vault was created",
+                    ),
+                ),
+            };
+            self.record(event.clone().outcome(outcome))?;
+            Err(failure)
+        };
+        let first = ask(first_prompt)?;
+        let second = ask(prompt(
+            "Type the new master password again.",
+            "",
+            "New master password, again",
+            "Create vault",
+        ))?;
+        if *first != *second {
+            self.record(event.outcome("mismatch"))?;
+            return Err(Failure::invalid(
+                "the passwords do not match; no vault was created",
+            ));
+        }
+        if first.chars().count() < 8 {
+            self.record(event.outcome("too_short"))?;
+            return Err(Failure::invalid(
+                "the master password must have at least 8 characters; no vault was created",
+            ));
+        }
+        // Record first: if the audit log cannot be written, nothing is created.
+        self.record(event.clone().outcome("created"))?;
+        let vault = match Vault::create(&path, first, self.config.new_vault_kdf) {
+            Ok(vault) => vault,
+            Err(e) => {
+                let failure = match e {
+                    VaultError::Exists(_) => exists(),
+                    other => Failure::from(other),
+                };
+                let _ = self.audit.record(&event.outcome("failed"));
+                return Err(failure);
+            }
+        };
+        let mut state = self.state();
+        if state.generation != started || state.vault.is_some() {
+            // Locked while the password was typed: the vault exists, locked.
+            drop(state);
+            drop(vault);
+            return Ok(ok(format!(
+                "vault created at {}; it was locked meanwhile — unlock it to use it",
+                path.display()
+            )));
+        }
+        state.vault = Some(vault);
+        state.last_used = Instant::now();
+        state.generation += 1;
+        Ok(ok(format!("vault created at {}", path.display())))
     }
 
     fn reveal(
@@ -2364,6 +2487,7 @@ mod tests {
                 request_timeout: Duration::from_secs(10),
                 send_buffer: None,
                 session_lock: Default::default(),
+                new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
             },
             Box::new(NoDialogs),
         );
@@ -2415,6 +2539,7 @@ mod tests {
                 request_timeout: Duration::from_secs(10),
                 send_buffer: None,
                 session_lock: Default::default(),
+                new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
             },
             Box::new(NoDialogs),
         );
