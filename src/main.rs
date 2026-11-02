@@ -1171,6 +1171,7 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
         add_tags: args.add_tags,
         remove_tags: args.remove_tags,
         value,
+        broker: None,
     };
     if changes.is_empty() {
         bail!("nothing to change (see `rusthorse edit --help`)");
@@ -1287,6 +1288,7 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
         }
         let request = RunRequest {
             bindings,
+            brokered: Vec::new(),
             argv: args.command,
             cwd,
             env,
@@ -2555,6 +2557,7 @@ mod tests {
             has_notes: true,
             other_fields: vec!["f".into()],
             modified: Some("2026-01-01T00:00:00Z".into()),
+            broker: None,
         };
         let json = serde_json::to_value(&info).expect("json");
         let sentence = guide

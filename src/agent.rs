@@ -485,6 +485,10 @@ impl Agent {
                 replace,
             } => self.import_from(peer, source, tags, replace),
             Request::Run(_) => Err(Failure::invalid("run requests carry file descriptors")),
+            // Placeholders until the agent serves grants (ADR 0013).
+            Request::Grants | Request::RevokeGrant { .. } => {
+                Err(Failure::invalid("broker grants are not available yet"))
+            }
         }
     }
 
@@ -523,6 +527,9 @@ impl Agent {
                 crate::dialog_program::Located::Unusable(why) => format!("none: {why}"),
             }),
             lock_triggers: self.lock_triggers.snapshot(),
+            // Left out until the agent serves grants (ADR 0013).
+            broker: None,
+            grants: None,
         }
     }
 
@@ -1249,6 +1256,12 @@ impl Agent {
         if changes.is_empty() {
             return Err(Failure::invalid("nothing to change"));
         }
+        // Placeholder until the agent serves grants (ADR 0013): the dialog
+        // must show the whole new profile and how many grants the edit ends,
+        // which this one cannot. (Clearing a profile is shown as it is.)
+        if changes.broker.is_some() {
+            return Err(Failure::invalid("broker profiles cannot be set yet"));
+        }
         let generation = self.generation(peer)?;
         let (current, destination) = self.with_vault(peer, |v| {
             let id = v.find(name)?;
@@ -1721,6 +1734,11 @@ impl Agent {
         };
         if run.argv.is_empty() {
             return Err(Failure::invalid("empty command"));
+        }
+        // Placeholder until the agent serves grants (ADR 0013): never run
+        // the command without the grants it asked for, or with the values.
+        if !run.brokered.is_empty() {
+            return Err(Failure::invalid("broker grants are not available yet"));
         }
         if run.bindings.is_empty() {
             return Err(Failure::invalid("no secrets requested"));

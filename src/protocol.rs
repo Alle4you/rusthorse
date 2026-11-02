@@ -16,6 +16,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::broker_profile::{AutomaticLocks, BrokerProfile, Preset, ProfileRequest};
+
 /// Protocol version spoken by this build. Bumped on incompatible changes.
 ///
 /// 2: data frames, per-channel credit (stdin credit granted when the
@@ -37,14 +39,21 @@ use zeroize::Zeroizing;
 ///
 /// 7: `edit.group` moves an entry to another group. A version-6 agent would
 /// drop it without a word and report the edit done.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// 8: the credential broker (ADR 0013): `run.brokered`, the entry's `broker`
+/// profile, `edit.broker` and `broker` in `edit.clear`, the `grants` and
+/// `revoke_grant` requests and the `grants` response, `status.broker` and
+/// `status.grants`. A version-7 agent would drop `run.brokered` and
+/// `edit.broker` without a word.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
 // what the manager does (version 4; builds that reported 3 promised a single
-// paste for `copy`), and that the agent keeps an entry's `kind` (version 5).
-// The version must never go back below 5.
-const _: () = assert!(PROTOCOL_VERSION >= 5);
+// paste for `copy`), that the agent keeps an entry's `kind` (version 5), and
+// that it understands broker bindings and profiles (version 8). The version
+// must never go back below 8.
+const _: () = assert!(PROTOCOL_VERSION >= 8);
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -194,6 +203,16 @@ pub enum Request {
         #[serde(default)]
         replace: bool,
     },
+    /// List the grants of the credential broker (ADR 0013); never a token.
+    /// Needs no approval.
+    Grants,
+    /// End grants of the credential broker. Needs no approval, like
+    /// [`Request::Lock`]: it only takes away.
+    RevokeGrant {
+        /// The grant's ID; `None` ends every grant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// Where [`Request::ImportFrom`] reads the values.
@@ -275,6 +294,8 @@ impl Request {
             | Request::ImportFrom { .. }
             | Request::Run(_) => true,
             Request::KeyringItems | Request::DotenvNames { .. } => false,
+            // Like `lock`: ending a grant twice does no harm.
+            Request::Grants | Request::RevokeGrant { .. } => false,
         }
     }
 }
@@ -405,6 +426,9 @@ pub enum Field {
     Notes,
     /// The kind (the entry becomes of no particular kind).
     Kind,
+    /// The broker profile (the entry can no longer be used through the
+    /// credential broker).
+    Broker,
 }
 
 /// How an edit changes the secret value.
@@ -459,6 +483,11 @@ pub struct EntryChanges {
     /// New secret value.
     #[serde(default)]
     pub value: Option<ValueChange>,
+    /// New broker profile (ADR 0013), from the defaults of the latest
+    /// revision of its preset (to remove it, put [`Field::Broker`] in
+    /// `clear`). Since protocol 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<ProfileRequest>,
 }
 
 impl EntryChanges {
@@ -470,6 +499,7 @@ impl EntryChanges {
             || self.host.is_some()
             || self.port.is_some()
             || self.kind.is_some()
+            || self.broker.is_some()
             || self.group.is_some()
             || self.notes.is_some()
             || !self.clear.is_empty()
@@ -504,12 +534,18 @@ pub struct EntryInfo {
     pub has_password: bool,
     /// Whether the entry has notes (their content is not disclosed).
     pub has_notes: bool,
-    /// Names of other fields (their values are not disclosed).
+    /// Names of other fields (their values are not disclosed). An unusable
+    /// broker profile is listed here, by its field's name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other_fields: Vec<String>,
     /// Last modification time, RFC 3339 in UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<String>,
+    /// The entry's broker profile (ADR 0013), when it has a usable one: a
+    /// protected profile is in `protected_fields`, an unusable one in
+    /// `other_fields`. Since protocol 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<BrokerProfile>,
 }
 
 impl EntryInfo {
@@ -536,11 +572,33 @@ pub struct Binding {
     pub entry: String,
 }
 
+/// Gives a command a grant of the credential broker for an entry instead of
+/// its value (ADR 0013, `run --broker VAR=ENTRY`): the command receives a
+/// token, never the entry's value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerBinding {
+    /// Environment variable that receives the token.
+    pub var: String,
+    /// Entry name or `Group/Name` path; the entry needs a value and a usable
+    /// broker profile.
+    pub entry: String,
+    /// Environment variable that receives the broker's address
+    /// (`http://127.0.0.1:PORT` and the profile's base path) instead of the
+    /// entry's own URL: `--url URLVAR=ENTRY` for the same entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_var: Option<String>,
+}
+
 /// A request to run a command with secrets in its environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRequest {
     /// Which secrets go into which variables.
     pub bindings: Vec<Binding>,
+    /// Which entries the command uses through the credential broker, each
+    /// with a grant of its own (ADR 0013). An entry is either here or in
+    /// `bindings`, never both. Since protocol 8.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brokered: Vec<BrokerBinding>,
     /// The command line; `argv[0]` is resolved against the client's `PATH`.
     pub argv: Vec<String>,
     /// Absolute working directory.
@@ -596,6 +654,11 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         empty: Vec<String>,
     },
+    /// Answer to [`Request::Grants`].
+    Grants {
+        /// The grants, oldest first.
+        grants: Vec<GrantInfo>,
+    },
     /// The command started by [`Request::Run`] finished.
     Exited {
         /// Exit code, when the command exited normally.
@@ -624,10 +687,50 @@ impl Response {
             Response::Secret { .. } => "secret",
             Response::KeyringItems { .. } => "keyring_items",
             Response::Names { .. } => "names",
+            Response::Grants { .. } => "grants",
             Response::Exited { .. } => "exited",
             Response::Error { .. } => "error",
         }
     }
+}
+
+/// A grant of the credential broker, as [`Request::Grants`] lists it
+/// (ADR 0013). Never its token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantInfo {
+    /// The grant's public ID: `g` and 16 hexadecimal digits.
+    pub id: String,
+    /// The entry, as dialogs and the audit log identify it
+    /// ([`EntryInfo::identity`]).
+    pub entry: String,
+    /// The environment variable that holds the token in the command.
+    pub var: String,
+    /// The destination: the profile's origin and base path.
+    pub destination: String,
+    /// The profile's preset.
+    pub preset: Preset,
+    /// The command, as a shell would read it.
+    pub command: String,
+    /// Who asked for it, as dialogs describe the requester (unverified).
+    pub requester: String,
+    /// `active`; `exhausted` (its request limit is reached: no new request
+    /// is admitted, those admitted finish); or `revoked` (it has ended; its
+    /// broker answers `403` until the command ends).
+    pub state: String,
+    /// When it was created: RFC 3339, local time with its offset, like the
+    /// audit log's times.
+    pub started: String,
+    /// Seconds until its maximum lifetime passes.
+    pub ends_in_secs: u64,
+    /// Requests admitted so far.
+    pub requests: u64,
+    /// The profile's request limit; `None` for no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
+    /// Requests being forwarded now.
+    pub in_flight: u32,
+    /// Whether the automatic locks end it.
+    pub automatic_locks: AutomaticLocks,
 }
 
 /// Answer to [`Request::Status`].
@@ -678,6 +781,15 @@ pub struct StatusInfo {
     /// per event and source (ADR 0009). Left out by agents that predate it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lock_triggers: Vec<LockTrigger>,
+    /// The credential broker's program (ADR 0013): the path of
+    /// `rusthorse-broker`, or `none: ` and why it cannot be used. Left out
+    /// by agents that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<String>,
+    /// The number of active grants of the credential broker. Left out by
+    /// agents that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<usize>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -761,6 +873,28 @@ pub fn send_frame<T: Serialize>(
 
     let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
     send_raw(stream, &frame, &raw)
+}
+
+/// Write a frame that is already encoded (its length word included),
+/// attaching `fds` (at most [`MAX_FDS`]) as `SCM_RIGHTS` to its first byte.
+/// For channels framed like this one, such as the broker's control channel
+/// ([`crate::broker_protocol`]).
+pub(crate) fn send_encoded(
+    stream: &UnixStream,
+    frame: &[u8],
+    fds: &[BorrowedFd<'_>],
+) -> io::Result<()> {
+    if fds.len() > MAX_FDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many file descriptors",
+        ));
+    }
+    if frame.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty frame"));
+    }
+    let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    send_raw(stream, frame, &raw)
 }
 
 /// Send `data`, attaching `fds` as `SCM_RIGHTS` to its first byte; the rest
@@ -893,31 +1027,7 @@ pub fn recv_frame_before(
 
 /// Read one frame of either kind, by `deadline` if one is given.
 pub fn recv_any_before(stream: &UnixStream, deadline: Option<Instant>) -> io::Result<Frame> {
-    let arm = || -> io::Result<()> {
-        if let Some(deadline) = deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the request did not arrive in time",
-                ));
-            }
-            stream.set_read_timeout(Some(left))?;
-        }
-        Ok(())
-    };
-    let mut header = [0u8; 4];
-    arm()?;
-    let (mut got, fds) = recv_with_fds(stream, &mut header)?;
-    if got == 0 {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    let mut reader = stream;
-    while got < header.len() {
-        arm()?;
-        got += read_some(&mut reader, &mut header[got..])?;
-    }
-    let word = u32::from_be_bytes(header);
+    let (word, fds) = recv_length_word(stream, deadline)?;
     let is_data = word & DATA_FLAG != 0;
     let len = (word & !DATA_FLAG) as usize;
     let limit = if is_data {
@@ -937,15 +1047,7 @@ pub fn recv_any_before(stream: &UnixStream, deadline: Option<Instant>) -> io::Re
             "file descriptors attached to a data frame",
         ));
     }
-    let mut body = Zeroizing::new(vec![0u8; len]);
-    let mut filled = 0;
-    while filled < len {
-        arm()?;
-        filled += read_some(&mut reader, &mut body[filled..])?;
-    }
-    if deadline.is_some() {
-        stream.set_read_timeout(None)?;
-    }
+    let body = recv_body(stream, len, deadline)?;
     if is_data {
         let channel = body[0];
         let data = Zeroizing::new(body[1..].to_vec());
@@ -953,6 +1055,84 @@ pub fn recv_any_before(stream: &UnixStream, deadline: Option<Instant>) -> io::Re
     } else {
         Ok(Frame::Message(body, fds))
     }
+}
+
+/// Read one frame of a channel that has no data frames, such as the
+/// broker's control channel ([`crate::broker_protocol`]): a length word of
+/// at most `max`, checked before the body is read, then the body; by
+/// `deadline` if one is given. Returns the body and the file descriptors
+/// attached to it.
+pub(crate) fn recv_message_before(
+    stream: &UnixStream,
+    deadline: Option<Instant>,
+    max: usize,
+) -> io::Result<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)> {
+    let (word, fds) = recv_length_word(stream, deadline)?;
+    let len = word as usize;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes is invalid (limit {max})"),
+        ));
+    }
+    let body = recv_body(stream, len, deadline)?;
+    Ok((body, fds))
+}
+
+/// Set the read timeout of `stream` to what is left until `deadline`, if
+/// one is given; fail with [`io::ErrorKind::TimedOut`] once it has passed.
+fn arm_deadline(stream: &UnixStream, deadline: Option<Instant>) -> io::Result<()> {
+    if let Some(deadline) = deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the request did not arrive in time",
+            ));
+        }
+        stream.set_read_timeout(Some(left))?;
+    }
+    Ok(())
+}
+
+/// Read a frame's 4-byte length word, taking ownership of the file
+/// descriptors attached to its first byte.
+fn recv_length_word(
+    stream: &UnixStream,
+    deadline: Option<Instant>,
+) -> io::Result<(u32, Vec<OwnedFd>)> {
+    let mut header = [0u8; 4];
+    arm_deadline(stream, deadline)?;
+    let (mut got, fds) = recv_with_fds(stream, &mut header)?;
+    if got == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let mut reader = stream;
+    while got < header.len() {
+        arm_deadline(stream, deadline)?;
+        got += read_some(&mut reader, &mut header[got..])?;
+    }
+    Ok((u32::from_be_bytes(header), fds))
+}
+
+/// Read the `len` bytes of a frame's body, then clear the read timeout that
+/// a `deadline` set.
+fn recv_body(
+    stream: &UnixStream,
+    len: usize,
+    deadline: Option<Instant>,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut body = Zeroizing::new(vec![0u8; len]);
+    let mut reader = stream;
+    let mut filled = 0;
+    while filled < len {
+        arm_deadline(stream, deadline)?;
+        filled += read_some(&mut reader, &mut body[filled..])?;
+    }
+    if deadline.is_some() {
+        stream.set_read_timeout(None)?;
+    }
+    Ok(body)
 }
 
 /// One `read`, treating end-of-file as an error and retrying on `EINTR`.
@@ -1073,10 +1253,14 @@ mod tests {
             agent_executable_replaced: None,
             dialogs: None,
             lock_triggers: vec![],
+            broker: None,
+            grants: None,
         };
         let json = serde_json::to_value(&status).expect("json");
         assert!(json.get("agent_executable_replaced").is_none(), "{json}");
         assert!(json.get("agent_executable_id").is_none(), "{json}");
+        assert!(json.get("broker").is_none(), "{json}");
+        assert!(json.get("grants").is_none(), "{json}");
         assert!(!json.to_string().contains("null"), "{json}");
     }
 
@@ -1260,6 +1444,7 @@ mod tests {
             has_notes: false,
             other_fields: vec![],
             modified: None,
+            broker: None,
         };
         let json = serde_json::to_value(&info).expect("json");
         assert_eq!(json["kind"], "api-key");
@@ -1312,6 +1497,187 @@ mod tests {
         assert_eq!(
             resp,
             serde_json::json!({"type": "error", "code": "denied", "message": "no"})
+        );
+    }
+
+    #[test]
+    fn protocol_8_fields_are_left_out_when_empty_and_older_json_still_parses() {
+        // A run request of protocol 7 has no broker bindings.
+        let old: Request = serde_json::from_value(serde_json::json!({
+            "type": "run",
+            "bindings": [{"var": "KEY", "entry": "k"}],
+            "argv": ["true"],
+            "cwd": "/",
+            "env": [],
+            "redact": true
+        }))
+        .expect("a protocol-7 run request");
+        let Request::Run(run) = old else {
+            panic!("not a run request")
+        };
+        assert!(run.brokered.is_empty());
+        let json = serde_json::to_value(Request::Run(run)).expect("json");
+        assert!(json.get("brokered").is_none(), "{json}");
+        let run = RunRequest {
+            bindings: vec![],
+            brokered: vec![
+                BrokerBinding {
+                    var: "ANTHROPIC_AUTH_TOKEN".into(),
+                    entry: "AI/anthropic".into(),
+                    url_var: Some("ANTHROPIC_BASE_URL".into()),
+                },
+                BrokerBinding {
+                    var: "OPENAI_API_KEY".into(),
+                    entry: "openai".into(),
+                    url_var: None,
+                },
+            ],
+            argv: vec!["claude".into()],
+            cwd: "/".into(),
+            env: vec![],
+            redact: false,
+            forward_stdin: false,
+        };
+        let json = serde_json::to_value(&run).expect("json");
+        assert_eq!(
+            json["brokered"],
+            serde_json::json!([
+                {"var": "ANTHROPIC_AUTH_TOKEN", "entry": "AI/anthropic", "url_var": "ANTHROPIC_BASE_URL"},
+                {"var": "OPENAI_API_KEY", "entry": "openai"}
+            ])
+        );
+        let back: RunRequest = serde_json::from_value(json).expect("back");
+        assert_eq!(back.brokered, run.brokered);
+
+        // An edit of protocol 7 has no profile; one of protocol 8 may set
+        // or clear it, and setting one is a change of metadata.
+        let old: EntryChanges =
+            serde_json::from_value(serde_json::json!({"rename": "x"})).expect("old edit");
+        assert!(old.broker.is_none());
+        let json = serde_json::to_value(&old).expect("json");
+        assert!(json.get("broker").is_none(), "{json}");
+        let set = EntryChanges {
+            broker: Some(ProfileRequest::new(Preset::Anthropic)),
+            ..EntryChanges::default()
+        };
+        assert!(set.touches_metadata() && !set.is_empty());
+        assert_eq!(
+            serde_json::to_value(&set).expect("json")["broker"],
+            serde_json::json!({"preset": "anthropic"})
+        );
+        let clear = EntryChanges {
+            clear: vec![Field::Broker],
+            ..EntryChanges::default()
+        };
+        assert!(clear.touches_metadata());
+        assert_eq!(
+            serde_json::to_value(&clear).expect("json")["clear"],
+            serde_json::json!(["broker"])
+        );
+        // A profile request with a field this build does not know is
+        // refused, not applied in part.
+        assert!(
+            serde_json::from_value::<EntryChanges>(serde_json::json!({
+                "broker": {"preset": "openai", "routes": ["POST /v1/files"]}
+            }))
+            .is_err()
+        );
+
+        // An entry of protocol 7 has no profile; a usable one is shown whole.
+        let old: EntryInfo = serde_json::from_value(serde_json::json!({
+            "id": "u", "name": "n", "has_password": true, "has_notes": false
+        }))
+        .expect("old entry");
+        assert!(old.broker.is_none());
+        let json = serde_json::to_value(&old).expect("json");
+        assert!(json.get("broker").is_none(), "{json}");
+        let profile = ProfileRequest::new(Preset::Openai)
+            .resolve()
+            .expect("profile");
+        let with = EntryInfo {
+            broker: Some(profile.clone()),
+            ..old
+        };
+        let json = serde_json::to_value(&with).expect("json");
+        assert_eq!(json["broker"]["origin"], "https://api.openai.com");
+        assert_eq!(json["broker"]["base_path"], "/v1");
+        assert_eq!(json["broker"]["preset"], "openai");
+        let back: EntryInfo = serde_json::from_value(json).expect("back");
+        assert_eq!(back.broker, Some(profile));
+
+        // A status of protocol 7 has neither broker field.
+        let status: StatusInfo = serde_json::from_value(serde_json::json!({
+            "protocol_version": 7, "agent_version": "x", "vault": "/v",
+            "vault_exists": true, "locked": true, "idle_timeout_secs": 0,
+            "remembered_approvals": 0
+        }))
+        .expect("old status");
+        assert_eq!((status.broker, status.grants), (None, None));
+    }
+
+    #[test]
+    fn grant_requests_and_responses_have_a_stable_shape() {
+        assert_eq!(
+            serde_json::to_value(Request::Grants).expect("json"),
+            serde_json::json!({"type": "grants"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::RevokeGrant { id: None }).expect("json"),
+            serde_json::json!({"type": "revoke_grant"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::RevokeGrant {
+                id: Some("g0123456789abcdef".into())
+            })
+            .expect("json"),
+            serde_json::json!({"type": "revoke_grant", "id": "g0123456789abcdef"})
+        );
+        let all: Request =
+            serde_json::from_value(serde_json::json!({"type": "revoke_grant"})).expect("all");
+        assert!(matches!(all, Request::RevokeGrant { id: None }));
+        // Like `lock`: ending a grant twice does no harm.
+        assert!(!Request::Grants.has_effects());
+        assert!(!Request::RevokeGrant { id: None }.has_effects());
+
+        let grant = GrantInfo {
+            id: "g0123456789abcdef".into(),
+            entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
+            var: "ANTHROPIC_AUTH_TOKEN".into(),
+            destination: "https://api.anthropic.com".into(),
+            preset: Preset::Anthropic,
+            command: "claude".into(),
+            requester: "claude (pid 4242)".into(),
+            state: "active".into(),
+            started: "2026-11-02T18:00:00-03:00".into(),
+            ends_in_secs: 43_200,
+            requests: 3,
+            max_requests: None,
+            in_flight: 1,
+            automatic_locks: AutomaticLocks::Continue,
+        };
+        let response = Response::Grants {
+            grants: vec![grant.clone()],
+        };
+        assert_eq!(response.kind(), "grants");
+        let json = serde_json::to_value(&response).expect("json");
+        assert_eq!(json["type"], "grants");
+        let listed = &json["grants"][0];
+        assert!(listed.get("max_requests").is_none(), "{listed}");
+        assert_eq!(listed["preset"], "anthropic");
+        assert_eq!(listed["automatic_locks"], "continue");
+        assert_eq!(listed["state"], "active");
+        let back: Response = serde_json::from_value(json).expect("back");
+        let Response::Grants { grants } = back else {
+            panic!("not a grants response")
+        };
+        assert_eq!(grants, vec![grant]);
+        let limited = GrantInfo {
+            max_requests: Some(200),
+            ..grants[0].clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&limited).expect("json")["max_requests"],
+            200
         );
     }
 }

@@ -1860,6 +1860,7 @@ fn descriptors_go_with_unredacted_runs_only() {
                 var: "T".into(),
                 entry: "T".into(),
             }],
+            brokered: Vec::new(),
             argv: vec!["true".into()],
             cwd: "/".into(),
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -1923,6 +1924,7 @@ fn raw_run(h: &Harness, argv: &[&str], forward_stdin: bool) -> std::os::unix::ne
             var: "T".into(),
             entry: "T".into(),
         }],
+        brokered: Vec::new(),
         argv: argv.iter().map(|a| a.to_string()).collect(),
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -2043,6 +2045,7 @@ fn the_library_input_reader_stops_when_the_run_returns() {
             var: "T".into(),
             entry: "T".into(),
         }],
+        brokered: Vec::new(),
         argv: vec!["true".into()],
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -2079,6 +2082,7 @@ fn run_request(h: &Harness, argv: &[&str], forward_stdin: bool) -> rusthorse::pr
             var: "T".into(),
             entry: "T".into(),
         }],
+        brokered: Vec::new(),
         argv: argv.iter().map(|a| a.to_string()).collect(),
         cwd: h.dir.path().to_str().expect("utf8").into(),
         env: vec![("PATH".into(), "/usr/bin:/bin".into())],
@@ -2867,6 +2871,8 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     agent_executable_replaced: None,
                     dialogs: None,
                     lock_triggers: vec![],
+                    broker: None,
+                    grants: None,
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -2920,6 +2926,8 @@ fn fake_agent(
                     agent_executable_replaced: None,
                     dialogs: None,
                     lock_triggers: vec![],
+                    broker: None,
+                    grants: None,
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -3135,6 +3143,8 @@ fn fake_import_agent(
                         agent_executable_replaced: None,
                         dialogs: None,
                         lock_triggers: vec![],
+                        broker: None,
+                        grants: None,
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }

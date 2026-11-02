@@ -372,6 +372,7 @@ pub(crate) mod tests {
             has_notes: true,
             other_fields: vec![],
             modified: None,
+            broker: None,
         }
     }
 

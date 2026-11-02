@@ -19,6 +19,11 @@
 //! - [`ui`]: approval and password dialogs (zenity).
 //! - [`dialog_program`]: showing dialogs with `rusthorse-dialog`, or zenity.
 //! - [`dialog_protocol`]: the protocol between the agent and `rusthorse-dialog`.
+//! - [`broker_profile`]: the credential broker's profiles and presets, and the
+//!   rules a grant enforces (routes, headers, tokens), shared with
+//!   `rusthorse-broker`.
+//! - [`broker_protocol`]: the control channel between the agent and
+//!   `rusthorse-broker`, tokens and grant IDs, and the broker's limits.
 //! - [`exec`]: program resolution and environment preparation for `run`.
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`session_lock`]: locking when the screen locks or the computer suspends.
@@ -34,6 +39,8 @@
 
 pub mod agent;
 pub mod audit;
+pub mod broker_profile;
+pub mod broker_protocol;
 pub mod client;
 pub mod dialog_program;
 pub mod dialog_protocol;

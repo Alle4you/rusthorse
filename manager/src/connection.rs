@@ -223,6 +223,7 @@ fn validate(request: &Request, response: Response) -> Result<Response, Failure> 
         Request::Reveal { .. } => "secret",
         Request::KeyringItems => "keyring_items",
         Request::DotenvNames { .. } => "names",
+        Request::Grants => "grants",
         _ => "ok",
     };
     if response.kind() != expected {
