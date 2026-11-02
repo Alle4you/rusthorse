@@ -1314,16 +1314,26 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                 .context("the file's path is not valid UTF-8")?
                 .to_string();
             eprintln!("The agent asks before it shows the names in the file to this command.");
-            let Response::Names { names } =
+            let Response::Names { names, empty } =
                 check(client.call(&Request::DotenvNames { path: path.clone() })?)?
             else {
                 bail!("unexpected response from the agent");
             };
             let prefix = prefix.map(|p| p.to_uppercase()).filter(|p| !p.is_empty());
-            let names: Vec<String> = names
-                .into_iter()
-                .map(|name| format!("{}{name}", prefix.as_deref().unwrap_or_default()))
-                .collect();
+            let prefixed = |names: Vec<String>| -> Vec<String> {
+                names
+                    .into_iter()
+                    .map(|name| format!("{}{name}", prefix.as_deref().unwrap_or_default()))
+                    .collect()
+            };
+            let (names, empty) = (prefixed(names), prefixed(empty));
+            // Said, never skipped without a word.
+            if !empty.is_empty() {
+                eprintln!(
+                    "not imported, because they have no value: {}",
+                    empty.join(", ")
+                );
+            }
             if dry_run {
                 return import_preview(client, names, replace);
             }

@@ -1278,3 +1278,18 @@ every value — passed. Findings:
 Each fix was reverted in a copy of the tree to see a test fail (9 of 9; for
 the requester's room, a test with the longest chain the agent can describe
 was added first).
+
+Sixth review (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Confirmed fixed: the batch cap, a lock during a listing, the requester's
+room, the ADR's rows; the normal flow — create, import 34 fake items,
+compare every value, back up, reopen the backup — passed. Findings:
+
+| Finding | Disposition |
+|---|---|
+| High — characters the libraries treat as blanks or line breaks where Rusthorse did not: a byte-order mark before a quote (Rust's `trim` keeps it, so the value was read unquoted) and a lone carriage return ending a comment (a line break for Node) still let lines of a value come back as names | **Fixed:** the characters of a file are checked first: lines end with LF or CRLF, the only blanks are spaces and tabs, and a byte-order mark, a lone carriage return, a control character or any other blank or separator refuses the file, naming the line. Tested with both reproductions, end to end. |
+| Medium — lines Rusthorse does not read (`NAME: fake`) were skipped without a word: an import said it succeeded and held part of the file | **Fixed:** every line that is not blank or a comment must be a `NAME=value` line of the dialect, or the file is refused; variables with an empty value are named (`empty` in `dotenv_names`, "not imported, because they have no value" in the CLI, "no value" in the manager), and asking for one is refused. |
+| Documentation — "both read alike" and "any other file is refused" were not true | **Fixed** with the above, and checked: some 31,000 generated fake files, of which about 5,300 accepted (without repeated names), are read with the same names and values by python-dotenv 1.2.2 and Node's dotenv 17.4.2. The check found one more difference — python-dotenv keeps back quotes that Node's dotenv takes off — so a value in back quotes is refused too. |
+
+Each fix was reverted in a copy of the tree to see a test fail (8 of 9;
+the survivor, refusing a lone carriage return as a control character, is
+redundant: Rust counts it as a blank too, which the next check refuses).

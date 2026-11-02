@@ -579,8 +579,12 @@ pub enum Response {
     },
     /// Answer to [`Request::DotenvNames`].
     Names {
-        /// The variable names, in the file's order.
+        /// The names of the variables with a value, in the file's order.
         names: Vec<String>,
+        /// The names of the variables with an empty value, which cannot be
+        /// imported.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        empty: Vec<String>,
     },
     /// The command started by [`Request::Run`] finished.
     Exited {

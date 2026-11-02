@@ -63,12 +63,16 @@ not be another place that holds secrets.
    answers it), an item whose secret is not UTF-8 text, a `.env` path that
    is not absolute, not a regular file or larger than 1 MiB, a name that is
    not in the source, and the usual: invalid or duplicate names. `.env`
-   files are read in the one dialect that python-dotenv and Node's dotenv
-   both read alike — one-line
-   values, quoted without a backslash or their own quote inside, or
-   unquoted with a `#` only after a space — and any other file is refused
-   as a whole, naming the line: the readers disagree on the rest, and
-   reading on could take part of a value for more names. Values over
+   files are read in a small dialect — LF or CRLF line ends, spaces and
+   tabs as the only blanks, blank, comment and `NAME=value` lines, one-line
+   values in single or double quotes without a backslash or their own quote
+   inside, or unquoted with a `#` only after a blank — chosen so that
+   python-dotenv and Node's dotenv read every accepted file as Rusthorse
+   does (checked on some 5,000 generated files against python-dotenv 1.2.2
+   and dotenv 17.4.2). Any other file is refused as a whole, naming the
+   line, with nothing skipped: the libraries disagree on the rest, and
+   reading on could take part of a value for more names, or import a file
+   in part. Values over
    several lines (a PEM key) are added with `rusthorse add` instead. Clients
    size their batches with the agent's own dialog builder, for the longest
    dialog a batch could have (every entry existing, the longest requester

@@ -19,6 +19,8 @@ struct Candidate {
     /// Its attributes (keyring), from which a name can come.
     attributes: std::collections::BTreeMap<String, String>,
     locked: bool,
+    /// A `.env` variable with an empty value: it cannot be imported.
+    empty: bool,
     check: gtk::CheckButton,
     row: adw::ActionRow,
     status: gtk::Label,
@@ -160,8 +162,13 @@ impl Manager {
     }
 
     /// Choose `.env` variables to import.
-    pub(super) fn pick_dotenv(self: &Rc<Self>, path: String, names: Vec<String>) {
-        if names.is_empty() {
+    pub(super) fn pick_dotenv(
+        self: &Rc<Self>,
+        path: String,
+        names: Vec<String>,
+        empty: Vec<String>,
+    ) {
+        if names.is_empty() && empty.is_empty() {
             self.feedback("The file has no NAME=value lines.", false);
             return;
         }
@@ -169,10 +176,16 @@ impl Manager {
             .title("Prefix for every name (optional)")
             .use_markup(false)
             .build();
-        let candidates = names
+        let mut candidates: Vec<Candidate> = names
             .into_iter()
             .map(|name| candidate(name, String::new(), None, Default::default(), false))
             .collect();
+        // Shown, never left out without a word.
+        candidates.extend(empty.into_iter().map(|name| {
+            let mut c = candidate(name, String::new(), None, Default::default(), false);
+            c.empty = true;
+            c
+        }));
         self.pick(
             "Import from a .env file",
             "Tick the variables to import. The agent reads their values itself when you import; this window sees only their names.",
@@ -304,6 +317,7 @@ impl Manager {
                 for (c, name) in candidates.iter().zip(&names) {
                     let problem = match name {
                         _ if c.locked => Some("locked".to_string()),
+                        Some(n) if c.empty => Some(format!("{n} — no value, cannot be imported")),
                         None => Some("no such attribute".to_string()),
                         Some(n) if rusthorse::vault::validate_name(n).is_err() => {
                             Some(format!("{n} — name not allowed"))
@@ -327,7 +341,7 @@ impl Manager {
                         (None, None) => String::new(),
                     };
                     c.status.set_text(&rusthorse::ui::dialog_text(&text));
-                    c.check.set_sensitive(!c.locked);
+                    c.check.set_sensitive(!c.locked && !c.empty);
                     if c.check.is_active() {
                         chosen += 1;
                         if problem.is_some() {
@@ -385,7 +399,7 @@ impl Manager {
             let state = Rc::clone(&state);
             all.connect_clicked(move |_| {
                 for c in &state.0 {
-                    if c.row.is_visible() && !c.locked {
+                    if c.row.is_visible() && !c.locked && !c.empty {
                         c.check.set_active(true);
                     }
                 }
@@ -579,6 +593,7 @@ fn candidate(
         id,
         attributes,
         locked,
+        empty: false,
         check,
         row,
         status,

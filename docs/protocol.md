@@ -173,9 +173,11 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
   No secret is read and nothing is unlocked. The agent asks the human first
   — the requester learns the labels and attributes — and refuses a keyring
   of more than 10 000 items.
-- `dotenv_names` answers `{"type": "names", "names": [...]}`: the variable
-  names of the file, in its order (a name can appear twice). The agent asks
-  the human first, then reads the file and drops the values.
+- `dotenv_names` answers `{"type": "names", "names": [...], "empty": [...]}`:
+  the names of the file's variables with a value, in its order (a name can
+  appear twice), and, when there are any, those with an empty value, which
+  cannot be imported. The agent asks the human first, then reads the file
+  and drops the values.
 - `import_from` imports at most 100 entries, after one approval. Keyring
   items can be imported only from the last `keyring_items` listing that
   the human allowed **this program** (the same process) to see, in the last
@@ -197,10 +199,10 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
   entries are skipped unless `replace`.
 - A `.env` path must be absolute and name a regular file of at most 1 MiB,
   in UTF-8. The agent opens it without waiting (a FIFO is refused, not
-  waited on) and reads it as the user it runs as, in the one dialect
-  python-dotenv and Node's dotenv both read alike (see [cli.md](cli.md#rusthorse-import-dotenv)):
-  any other file — a value over several lines among others — is refused
-  (`invalid_request`, naming the line only).
+  waited on) and reads it as the user it runs as, in the small dialect
+  described in [cli.md](cli.md#rusthorse-import-dotenv), which python-dotenv
+  and Node's dotenv read as Rusthorse does; any other file is refused as a
+  whole (`invalid_request`, naming the line only), nothing in it skipped.
 - A request uses the Secret Service once — the listing, or the reading
   after the approval — and each call is limited to 10 seconds, the whole
   use, connecting and authenticating included, to 30; past them the agent
@@ -322,7 +324,7 @@ All fields are optional; omitted fields are left unchanged.
 | `entry` | `entry`: [EntryInfo](#entryinfo) |
 | `secret` | `value` (string) |
 | `keyring_items` | `items`: array of `{id, label, attributes, locked}`, sorted by label |
-| `names` | `names`: array of strings |
+| `names` | `names`: array of strings; `empty` (array, optional): names with an empty value |
 | `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome |
 | `error` | `code` (see [Errors](#errors)), `message` (string) |
 

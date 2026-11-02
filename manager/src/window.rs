@@ -987,8 +987,8 @@ impl Manager {
                 );
             }
             Ok(Response::KeyringItems { items }) => self.pick_keyring(items),
-            Ok(Response::Names { names }) => match purpose {
-                Pending::DotenvNames { path } => self.pick_dotenv(path, names),
+            Ok(Response::Names { names, empty }) => match purpose {
+                Pending::DotenvNames { path } => self.pick_dotenv(path, names, empty),
                 _ => self.feedback("Unexpected answer. Refresh and look before retrying.", true),
             },
             Ok(Response::Secret { value }) => match purpose {

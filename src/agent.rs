@@ -1048,11 +1048,11 @@ impl Agent {
             None,
             AuditEvent::new("dotenv_names", peer).detail(path),
         )?;
-        let names = read_dotenv(path, None)?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        Ok(Response::Names { names })
+        let parsed = read_dotenv(path, None)?;
+        Ok(Response::Names {
+            names: parsed.pairs.into_iter().map(|(name, _)| name).collect(),
+            empty: parsed.empty,
+        })
     }
 
     /// Import secrets that the agent reads itself (ADR 0012): the requester
@@ -1137,9 +1137,15 @@ impl Agent {
                 let file = path.clone();
                 self.import_entries(peer, entries, replace, Origin::Dotenv(&path), move || {
                     // After approval: the file as it is now.
-                    let mut found = read_dotenv(&file, prefix.as_deref())?;
+                    let parsed = read_dotenv(&file, prefix.as_deref())?;
+                    let mut found = parsed.pairs;
                     let mut values = Vec::with_capacity(names.len());
                     for name in &names {
+                        if parsed.empty.contains(name) {
+                            return Err(Failure::invalid(format!(
+                                "{name} has no value in {file}; nothing was imported"
+                            )));
+                        }
                         let mut matching = found.iter().filter(|(n, _)| n == name);
                         if matching.next().is_none() {
                             return Err(Failure::invalid(format!(
@@ -2258,7 +2264,7 @@ fn check_dotenv_path(path: &str) -> Result<(), Failure> {
 /// before each name. Only a regular file of at most [`MAX_DOTENV_BYTES`]
 /// is read: opening does not wait (a FIFO would block), and the type is
 /// checked on the opened file.
-fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<Vec<(String, SecretString)>, Failure> {
+fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<crate::import::Dotenv, Failure> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let cannot = |e: std::io::Error| Failure::invalid(format!("cannot read {path}: {e}"));
@@ -2288,11 +2294,20 @@ fn read_dotenv(path: &str, prefix: Option<&str>) -> Result<Vec<(String, SecretSt
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| Failure::invalid(format!("{path} is not text (UTF-8)")))?;
     let prefix = prefix.unwrap_or_default().to_uppercase();
-    Ok(crate::import::parse_dotenv(text)
-        .map_err(|e| Failure::invalid(format!("{path}, {e}; nothing was read from it")))?
-        .into_iter()
-        .map(|(name, value)| (format!("{prefix}{name}"), value))
-        .collect())
+    let parsed = crate::import::parse_dotenv(text)
+        .map_err(|e| Failure::invalid(format!("{path}, {e}; nothing was read from it")))?;
+    Ok(crate::import::Dotenv {
+        pairs: parsed
+            .pairs
+            .into_iter()
+            .map(|(name, value)| (format!("{prefix}{name}"), value))
+            .collect(),
+        empty: parsed
+            .empty
+            .into_iter()
+            .map(|name| format!("{prefix}{name}"))
+            .collect(),
+    })
 }
 
 fn describe_fields(entry: &NewEntry) -> String {

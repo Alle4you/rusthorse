@@ -1170,7 +1170,7 @@ fn import_windows() {
 
     // A .env file: the agent asks before showing the names; a prefix.
     let env = dir.path().join("app.env");
-    std::fs::write(&env, "FAKE_C=fake-c-value\n").unwrap();
+    std::fs::write(&env, "FAKE_C=fake-c-value\nFAKE_EMPTY=\n").unwrap();
     let path = env.display().to_string();
     s.submit(
         Request::DotenvNames { path: path.clone() },
@@ -1186,6 +1186,19 @@ fn import_windows() {
     prefix.set_text("app_");
     button(&picker, "Tick shown").emit_clicked();
     assert!(shown(&picker).contains("APP_FAKE_C — new"));
+    // A variable without a value is shown, and cannot be ticked.
+    assert!(shown(&picker).contains("APP_FAKE_EMPTY — no value, cannot be imported"));
+    let empty_check = descendants(&picker)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ActionRow>().ok())
+        .find(|r| r.title() == "FAKE_EMPTY")
+        .and_then(|r| {
+            descendants(&r)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::CheckButton>().ok())
+        })
+        .expect("the empty variable's box");
+    assert!(!empty_check.is_sensitive() && !empty_check.is_active());
     // Denied: the message says that nothing was imported.
     allowed.store(false, Ordering::SeqCst);
     button(&picker, "Import 1").emit_clicked();

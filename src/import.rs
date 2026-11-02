@@ -3,7 +3,6 @@
 //! Keyring is read by [`keyring`](crate::keyring).
 
 use crate::protocol::SecretString;
-use crate::util::is_valid_env_name;
 
 use crate::ui::ApprovalRequest;
 
@@ -164,60 +163,88 @@ pub fn batch_sizes(entries: &[Planned], dotenv: Option<&str>, limit_height: bool
     sizes
 }
 
-/// Parse a `.env` file in the one dialect that the common `.env` libraries —
-/// python-dotenv and Node's dotenv — both read alike, so that what is
-/// imported is what a program that uses the file through them would read,
-/// and nothing of a value can be taken for a name. (Docker's `--env-file`
-/// keeps quotes as part of the value, and shells do not take spaces around
-/// `=`: files written for them may be read differently.)
+/// What a `.env` file holds, as [`parse_dotenv`] reads it.
+pub struct Dotenv {
+    /// The variables with a value, in the file's order.
+    pub pairs: Vec<(String, SecretString)>,
+    /// The variables with an empty value: they cannot be imported.
+    pub empty: Vec<String>,
+}
+
+/// Parse a `.env` file in a small dialect, chosen so that python-dotenv and
+/// Node's dotenv read every file Rusthorse accepts as Rusthorse does — the
+/// same names, the same values — and so that nothing of a value can be taken
+/// for a name. (Docker's `--env-file` keeps quotes as part of the value, and
+/// shells take no spaces around `=`: files written for them may differ.)
 ///
-/// - blank lines and `#` comment lines;
-/// - `NAME=value` lines, with an optional `export ` and spaces around `=`;
-///   `NAME` is a variable name (letters, digits, `_`; not starting with a
-///   digit);
-/// - a value on one line: either in single, double or back quotes, with
-///   neither that quote nor a backslash inside, then only spaces or a `#`
-///   comment; or without quotes, where a `#` is allowed only after a space
-///   (a comment, cut off) and spaces at the ends are trimmed.
+/// - Lines end with LF or CRLF. The only blanks are spaces and tabs.
+/// - A line is blank, a comment (`#` first), or `NAME=value`, with an
+///   optional `export ` before it and blanks around `=`. `NAME` is made of
+///   ASCII letters, digits, `_`, `.` and `-` (whether the vault takes it is
+///   decided when importing).
+/// - A value is on one line: in single or double quotes, with neither that
+///   quote nor a backslash inside, followed only by blanks or a `#`
+///   comment; or unquoted, not starting with a back quote, where a `#` after
+///   a blank starts a comment and blanks at both ends are dropped.
 ///
-/// Anything else refuses the whole file — a value over several lines, a
-/// backslash in quotes, text after a closing quote, a `#` without a space
-/// before it in an unquoted value, a line that is not `NAME=value` but holds
-/// a quote — because the readers disagree on it, or because reading on
-/// could take part of a value for more lines. Errors name the line, never
-/// its text. Lines that are not `NAME=value` and hold no quote are skipped,
-/// as are empty values.
-pub fn parse_dotenv(text: &str) -> Result<Vec<(String, SecretString)>, String> {
-    let mut pairs = Vec::new();
-    for (index, raw) in text.lines().enumerate() {
+/// Every other file is refused as a whole, naming the line and never its
+/// text: a byte-order mark, a lone carriage return, a control character,
+/// any other blank or line separator, a value over several lines, a
+/// backslash in quotes, a value in back quotes, a `#` without a blank before
+/// it in an unquoted value, and any line that is not one of the three above — nothing is
+/// skipped without a word, so a file is imported whole or not at all.
+pub fn parse_dotenv(text: &str) -> Result<Dotenv, String> {
+    let mut parsed = Dotenv {
+        pairs: Vec::new(),
+        empty: Vec::new(),
+    };
+    for (index, raw) in text.split('\n').enumerate() {
         let number = index + 1;
-        let line = raw.trim();
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(c) = line.chars().find(|&c| {
+            c == '\u{FEFF}'
+                || (c.is_control() && c != '\t')
+                || (c.is_whitespace() && c != ' ' && c != '\t')
+        }) {
+            return Err(format!(
+                "line {number}: a character that .env readers do not all read alike ({})",
+                match c {
+                    '\r' => "a carriage return without a line feed".to_string(),
+                    '\u{FEFF}' => "a byte-order mark".to_string(),
+                    c => format!("U+{:04X}", u32::from(c)),
+                }
+            ));
+        }
+        let line = line.trim_matches([' ', '\t']);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let unsupported =
+            || format!("line {number}: not a NAME=value line in the form Rusthorse reads");
         let binding = line
             .strip_prefix("export")
             .filter(|rest| rest.starts_with([' ', '\t']))
-            .map_or(line, str::trim_start);
+            .map_or(line, |rest| rest.trim_start_matches([' ', '\t']));
         let length = binding
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
             .unwrap_or(binding.len());
         let (name, rest) = binding.split_at(length);
-        let value = rest
-            .trim_start()
+        let Some(value) = rest
+            .trim_start_matches([' ', '\t'])
             .strip_prefix('=')
-            .filter(|_| is_valid_env_name(name));
-        let Some(value) = value else {
-            if line.contains(['"', '\'', '`']) {
+            .filter(|_| !name.is_empty())
+        else {
+            return Err(unsupported());
+        };
+        let value = value.trim_matches([' ', '\t']);
+        let value = match value.chars().next() {
+            Some('`') => {
                 return Err(format!(
-                    "line {number}: not a NAME=value line, and it holds a quote"
+                    "line {number}: a value in back quotes, which python-dotenv keeps and Node's \
+                     dotenv takes off"
                 ));
             }
-            continue;
-        };
-        let value = value.trim();
-        let parsed = match value.chars().next() {
-            Some(quote @ ('"' | '\'' | '`')) => {
+            Some(quote @ ('"' | '\'')) => {
                 let inner = &value[1..];
                 let Some(end) = inner.find(quote) else {
                     return Err(format!(
@@ -226,7 +253,7 @@ pub fn parse_dotenv(text: &str) -> Result<Vec<(String, SecretString)>, String> {
                     ));
                 };
                 let content = &inner[..end];
-                let after = inner[end + 1..].trim();
+                let after = inner[end + 1..].trim_start_matches([' ', '\t']);
                 if content.contains('\\') {
                     return Err(format!(
                         "line {number}: a backslash in a quoted value, which .env readers do not \
@@ -241,7 +268,7 @@ pub fn parse_dotenv(text: &str) -> Result<Vec<(String, SecretString)>, String> {
             _ => match value.find('#') {
                 None => value.to_string(),
                 Some(at) if value[..at].ends_with([' ', '\t']) => {
-                    value[..at].trim_end().to_string()
+                    value[..at].trim_end_matches([' ', '\t']).to_string()
                 }
                 Some(_) => {
                     return Err(format!(
@@ -251,11 +278,15 @@ pub fn parse_dotenv(text: &str) -> Result<Vec<(String, SecretString)>, String> {
                 }
             },
         };
-        if !parsed.is_empty() {
-            pairs.push((name.to_string(), SecretString::new(parsed)));
+        if value.is_empty() {
+            parsed.empty.push(name.to_string());
+        } else {
+            parsed
+                .pairs
+                .push((name.to_string(), SecretString::new(value)));
         }
     }
-    Ok(pairs)
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -359,31 +390,47 @@ mod tests {
         assert!(dialogs_limit_height(None));
     }
 
-    #[test]
-    fn the_common_dialect_is_read_as_every_reader_reads_it() {
-        let text = "# a comment with \"quotes\"\n\
-                    A=\"x y\" # comment\n\
-                    B='it is'\n\
-                    C=`back`\n\
-                    export D = plain # comment\n\
-                    E=a\"b'c\n\
-                    F=\"\"\n\
-                    G=no-comment\n\
-                    bare words are skipped\n";
-        let pairs: Vec<(String, String)> = parse_dotenv(text)
+    fn values(text: &str) -> Vec<(String, String)> {
+        parse_dotenv(text)
             .expect("parse")
+            .pairs
             .into_iter()
             .map(|(n, v)| (n, v.to_string()))
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn the_dialect_is_read_as_both_libraries_read_it() {
+        let text = "# a comment with \"quotes\" and = signs\r\n\
+                    A=\"x y\" # comment\n\
+                    B='it is'\n\
+                    C=mid`back`quotes\n\
+                    export D = plain # comment\n\
+                    E=a\"b'c\n\
+                    \tF.dotted-name=\"  inner  \"\n\
+                    G=no-comment\r\n\
+                    H=p\u{e4}ss\n";
         let expected = [
             ("A", "x y"),
             ("B", "it is"),
-            ("C", "back"),
+            ("C", "mid`back`quotes"),
             ("D", "plain"),
             ("E", "a\"b'c"),
+            ("F.dotted-name", "  inner  "),
             ("G", "no-comment"),
+            ("H", "p\u{e4}ss"),
         ];
-        assert_eq!(pairs, expected.map(|(n, v)| (n.to_string(), v.to_string())));
+        assert_eq!(
+            values(text),
+            expected.map(|(n, v)| (n.to_string(), v.to_string()))
+        );
+    }
+
+    #[test]
+    fn empty_values_are_reported_not_skipped() {
+        let parsed = parse_dotenv("A=\nB=''\nC=x # c\nD=\"\" # quoted empty\n").expect("parse");
+        assert_eq!(parsed.empty, ["A", "B", "D"]);
+        assert_eq!(parsed.pairs.len(), 1);
     }
 
     #[test]
@@ -404,53 +451,46 @@ mod tests {
                 "K=\"FAKE\\\\\"\n# note \"\nN=x\n",
                 "line 1: a backslash in a quoted value",
             ),
-            ("K=`FAKE\\n`\n", "line 1: a backslash in a quoted value"),
+            ("K=`FAKE`\n", "line 1: a value in back quotes"),
             (
                 "K=\"FAKE_A\" trailing\n",
                 "line 1: text after a quoted value",
             ),
             ("K=FAKE#cut\n", "line 1: a # in a value without quotes"),
-            // Node's `NAME: value`, also with `=` in its value.
+            // Node reads "" and python-dotenv "# FAKE".
+            ("K= # FAKE\n", "line 1: a # in a value without quotes"),
+            // Lines that are not NAME=value, quoted or not: Node's
+            // `NAME: value`, a bare word, a name with other characters.
             (
                 "KEY: \"start=value\nFAKE_PRIVATE=x\nend=tail\"\nNORMAL=x\n",
-                "line 1: not a NAME=value line, and it holds a quote",
-            ),
-            (
-                "my-key=\"FAKE\nHIDDEN=x\n\"\n",
                 "line 1: not a NAME=value line",
             ),
+            ("NAME: FAKE\nX=ok\n", "line 1: not a NAME=value line"),
+            ("X=ok\nFAKE words\n", "line 2: not a NAME=value line"),
+            ("my key=FAKE\n", "line 1: not a NAME=value line"),
+            // Characters the readers treat differently: a byte-order mark
+            // (in front or before a quote), a lone carriage return (a line
+            // break for both libraries), other blanks and separators.
+            ("\u{FEFF}K=FAKE\n", "line 1: a character"),
+            (
+                "KEY=\u{FEFF}\"start\nFAKE_PRIVATE_MATERIAL==\nend=tail\"\nNORMAL=x\n",
+                "line 1: a character",
+            ),
+            (
+                "# comment\rKEY=\"start\nFAKE_PRIVATE_MATERIAL==\nend=tail\"\nNORMAL=x\n",
+                "line 1: a character",
+            ),
+            ("A=one\rB=FAKE\n", "line 1: a character"),
+            ("K=FAKE\u{A0}x\n", "line 1: a character"),
+            ("K=FAKE\u{2028}X=y\n", "line 1: a character"),
+            ("K=FAKE\u{85}\n", "line 1: a character"),
+            ("K=FAKE\u{1}\n", "line 1: a character"),
         ] {
-            let refused = parse_dotenv(text).expect_err(text);
+            let Err(refused) = parse_dotenv(text) else {
+                panic!("accepted: {text:?}");
+            };
             assert!(refused.starts_with(error), "{text:?}: {refused}");
             assert!(!refused.contains("FAKE"), "{refused}");
         }
-    }
-
-    #[test]
-    fn dotenv_parsing() {
-        let text = "\
-# comment
-OPENAI_API_KEY=sk-abc
-export TOKEN=\"quoted value\"
-SINGLE='x y'
-EMPTY=
-bad-name=1
-  SPACED = trimmed
-NOEQUALS
-";
-        let pairs: Vec<(String, String)> = parse_dotenv(text)
-            .expect("parse")
-            .into_iter()
-            .map(|(k, v)| (k, v.to_string()))
-            .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("OPENAI_API_KEY".into(), "sk-abc".into()),
-                ("TOKEN".into(), "quoted value".into()),
-                ("SINGLE".into(), "x y".into()),
-                ("SPACED".into(), "trimmed".into()),
-            ]
-        );
     }
 }

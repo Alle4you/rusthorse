@@ -2748,12 +2748,10 @@ fn fake_import_agent(
                 }
                 Request::DotenvNames { path } => {
                     let text = std::fs::read_to_string(&path).expect("the .env file");
-                    let names = rusthorse::import::parse_dotenv(&text)
-                        .expect("parse")
-                        .into_iter()
-                        .map(|(name, _)| name)
-                        .collect();
-                    send_frame(&stream, &Response::Names { names }, &[]).expect("names");
+                    let parsed = rusthorse::import::parse_dotenv(&text).expect("parse");
+                    let names = parsed.pairs.into_iter().map(|(name, _)| name).collect();
+                    let empty = parsed.empty;
+                    send_frame(&stream, &Response::Names { names, empty }, &[]).expect("names");
                 }
                 Request::ImportFrom { .. } => {
                     let Some(reply) = replies.next() else {
@@ -4474,6 +4472,18 @@ mod import_from {
                 "line 1:",
             ),
             ("OK=1\nKEY=\"FAKE\\\\\"\n# note \"\nNORMAL=x\n", "line 2:"),
+            // A byte-order mark before the quote, a lone carriage return
+            // (a line break for the libraries) in a comment, and a line in
+            // a form Rusthorse does not read, which is never skipped.
+            (
+                "KEY=\u{FEFF}\"start\nFAKE_PRIVATE_MATERIAL==\nend=tail\"\nNORMAL=x\n",
+                "line 1:",
+            ),
+            (
+                "# comment\rKEY=\"start\nFAKE_PRIVATE_MATERIAL==\nend=tail\"\nNORMAL=x\n",
+                "line 1:",
+            ),
+            ("NAME: FAKE\nX=ok\n", "line 1:"),
         ] {
             match names(&h, text) {
                 Response::Error { code, message } => {
@@ -4485,10 +4495,47 @@ mod import_from {
             }
         }
         // The common dialect.
-        let Response::Names { names: found } = names(&h, "A='x'\nexport B=\"y\" # c\nC=z\n") else {
+        let Response::Names { names: found, .. } = names(&h, "A='x'\nexport B=\"y\" # c\nC=z\n")
+        else {
             panic!("no names");
         };
         assert_eq!(found, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn variables_without_a_value_are_named_not_skipped() {
+        let h = Harness::new();
+        std::fs::write(h.dir.path().join("app.env"), "EMPTY_ONE=\nFAKE_ONE=fake\n").unwrap();
+        assert!(h.run(&["unlock"]).status.success());
+        h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+        let out = h.run(&["import", "dotenv", "app.env"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("not imported, because they have no value: EMPTY_ONE"),
+            "{}",
+            text(&out.stderr)
+        );
+        let list = text(&h.run(&["list"]).stdout);
+        assert!(
+            list.contains("FAKE_ONE") && !list.contains("EMPTY_ONE"),
+            "{list}"
+        );
+        // Asked for by name, it is refused once allowed.
+        h.decide(&[Decision::AllowOnce]);
+        match h.call(&Request::ImportFrom {
+            source: ImportSource::Dotenv {
+                path: h.dir.path().join("app.env").display().to_string(),
+                prefix: None,
+                names: vec!["EMPTY_ONE".into()],
+            },
+            tags: Vec::new(),
+            replace: false,
+        }) {
+            Response::Error { message, .. } => {
+                assert!(message.contains("has no value"), "{message}")
+            }
+            other => panic!("unexpected {}", other.kind()),
+        }
     }
 
     #[test]

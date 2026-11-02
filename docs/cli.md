@@ -470,15 +470,19 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
-Imports `NAME=value` lines in the one `.env` dialect that python-dotenv and
-Node's dotenv both read alike (Docker's `--env-file` keeps quotes in the
-value, and shells take no spaces around `=`): an optional `export`, `#` comment lines, one-line values either
-in single, double or back quotes with neither that quote nor a backslash
-inside (then only spaces or a comment), or unquoted, where a `#` after a
-space starts a comment. Any other file — a value over several lines, a
-backslash in quotes, a `#` without a space before it in an unquoted value,
-a quote on a line that is not `NAME=value` — is refused, naming the line
-only: add such values with `rusthorse add`.
+Imports `NAME=value` lines in a small `.env` dialect, chosen so that
+python-dotenv and Node's dotenv read every file Rusthorse accepts as it does
+(Docker's `--env-file` keeps quotes in the value, and shells take no spaces
+around `=`): lines end with LF or CRLF; the only blanks are spaces and
+tabs; a line is blank, a `#` comment, or `NAME=value` with an optional
+`export` and blanks around `=`, `NAME` made of ASCII letters, digits, `_`,
+`.` and `-`; a value is on one line, either in single or double quotes with
+neither that quote nor a backslash inside, or unquoted — not starting with a
+back quote — where a `#` after a blank starts a comment. Any other file is
+refused as a whole, naming the line only: nothing in it is skipped, so a
+file is imported whole or not at all. Add values the dialect cannot hold
+(over several lines, with backslashes) with `rusthorse add`. Variables with
+an empty value cannot be imported; the command names them.
 The agent reads the file itself ([ADR 0012](adr/0012-import-read-by-the-agent.md)):
 this command never holds a value. It first asks the agent for the names in
 the file — the agent asks you in a dialog before it shows them — then sends
