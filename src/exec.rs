@@ -414,6 +414,10 @@ fn shown_item(item: &str) -> Option<String> {
         let scheme_lower = scheme.to_ascii_lowercase();
         let base = scheme_lower.split('+').next().unwrap_or_default();
         if authority.is_empty() {
+            // An in-memory SQLite database: `sqlite://`, `sqlite:///:memory:`.
+            if base == "sqlite" && matches!(tail, "" | "/:memory:") {
+                return Some(format!("{scheme}://{tail}"));
+            }
             // A local socket, file or database: the path is the destination.
             let path = if base == "sqlite" {
                 format!("/{}", tail.trim_start_matches('/'))
@@ -944,6 +948,10 @@ mod tests {
                 "sqlite+pysqlite:////var/app.db",
             ),
             ("https:////var/app.db", "(not shown)"),
+            ("sqlite:///:memory:", "sqlite:///:memory:"),
+            ("sqlite+pysqlite://", "sqlite+pysqlite://"),
+            ("unix://", "(not shown)"),
+            ("sqlite:///:memory:x", "(not shown)"),
             ("pg://u@a.invalid/db?a?b=c", "(not shown)"),
             // Outside printable ASCII nothing is shown (U+00A0 splits for
             // Python), nor a space in a value that is not a list.

@@ -993,3 +993,16 @@ variables, `GOPROXY` padding, the partial records. New findings:
 | Documentation — "are left out" and "the aim … is met" were contradicted by the `?` case | **Fixed:** the docs say the rules were checked against the readings found to differ, case by case, and are an aid, not a guarantee. |
 
 Each fix was reverted in a copy of the tree to see a test fail.
+
+Fourth verification (Codex, AI-assisted, 2026-11-01): **ready, as an aid
+for reading the dialog.** Every finding of the third verification
+confirmed fixed; 135 PostgreSQL cases compared with libpq and 62 HTTP and
+FTP cases compared with Node, urllib, requests and libcurl showed no shown
+host that differs from the one used, and no fake credential, path or query
+marker in what is shown — which is not exhaustive. The reviewer's opinion:
+sufficient for its limited role, with conservative omissions warned about
+and incomplete coverage documented; a guarantee of destination needs
+control where the credential is sent (the planned credential broker). One
+low finding, noise: `sqlite:///:memory:` was not shown — **fixed**
+(`sqlite://` and `sqlite:///:memory:` are in-memory databases; tested,
+and reverting it made the test fail).

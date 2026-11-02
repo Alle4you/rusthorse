@@ -287,8 +287,8 @@ contains a space. Shown:
   `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`, `PGPORT` — as it is
   when it is one word or number;
 - a local socket, file or database (`unix:///run/docker.sock`,
-  `sqlite:///./app.db`), the paths of certificate variables, and absolute
-  paths, as they are.
+  `sqlite:///./app.db`, `sqlite:///:memory:`), the paths of certificate
+  variables, and absolute paths, as they are.
 
 Anything else appears as `(not shown)`, and a warning names the variable:
 a backslash anywhere; two `@`; a `?` and an `@` both before the first `/`
