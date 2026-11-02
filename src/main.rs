@@ -2210,7 +2210,8 @@ mod tests {
 
     /// The `rusthorse …` command lines of the AI guide, each cut at the end
     /// of its code span or line: inline code in the prose (whose lines are
-    /// joined first, as Markdown does), and the lines of code blocks.
+    /// joined first, as Markdown does), and the lines of code blocks (a line
+    /// that ends with `\` continued by the next, as the shell does).
     fn guide_command_lines(guide: &str) -> Vec<String> {
         fn collect(text: &str, ends: &[char], into: &mut Vec<String>) {
             for (at, _) in text.match_indices("rusthorse ") {
@@ -2226,12 +2227,21 @@ mod tests {
         let mut lines = Vec::new();
         let mut prose = String::new();
         let mut fenced = false;
+        let mut continued = String::new();
         for line in guide.lines() {
             if line.trim_start().starts_with("```") {
+                assert!(continued.is_empty(), "a code block ends with `\\`");
                 fenced = !fenced;
                 prose.push('\n');
             } else if fenced {
-                collect(line, &['\n'], &mut lines);
+                match line.strip_suffix('\\') {
+                    Some(start) => continued.push_str(start),
+                    None => {
+                        continued.push_str(line);
+                        collect(&continued, &['\n'], &mut lines);
+                        continued.clear();
+                    }
+                }
             } else {
                 prose.push_str(line);
                 prose.push(' ');
@@ -2242,55 +2252,115 @@ mod tests {
         lines
     }
 
-    /// Every subcommand and option the AI guide names exists: the guide is
-    /// built into the binary, and an AI agent follows it to the letter.
-    #[test]
-    fn the_ai_guide_names_only_real_commands_and_options() {
-        let mut cli = Cli::command();
-        cli.build();
-        let guide = GuideTopic::Ai.text();
-        let lines = guide_command_lines(&guide);
-        let mut options = 0;
-        for line in &lines {
-            // The command's own words start after `--`; a shell's `|`, `#`,
-            // `;` and `&&` end the `rusthorse` part.
-            let mut words = line
-                .split_whitespace()
-                .take_while(|w| !matches!(*w, "--" | "|" | "#" | ";" | "&&"));
-            let name = words.next().unwrap_or_else(|| panic!("`rusthorse {line}`"));
-            let mut command = cli
-                .find_subcommand(name)
-                .unwrap_or_else(|| panic!("`rusthorse {line}`: no command {name:?}"));
-            if command.has_subcommands() {
-                let sub = words.next().unwrap_or_else(|| panic!("`rusthorse {line}`"));
-                command = command
-                    .find_subcommand(sub)
-                    .unwrap_or_else(|| panic!("`rusthorse {line}`: no command {sub:?}"));
-            }
-            for word in words {
-                let word = word.trim_matches(['[', ']']);
-                let known = if let Some(long) = word.strip_prefix("--") {
-                    let long = long.split(['=', '|', ']']).next().expect("split");
-                    command.get_arguments().any(|a| a.get_long() == Some(long))
-                } else if let Some(short) = word.strip_prefix('-') {
-                    let mut chars = short.chars();
-                    let (Some(short), None) = (chars.next(), chars.next()) else {
-                        panic!("`rusthorse {line}`: {word:?}");
-                    };
-                    command
-                        .get_arguments()
-                        .any(|a| a.get_short() == Some(short))
-                } else {
-                    continue;
-                };
-                assert!(
-                    known,
-                    "`rusthorse {line}`: {word} is not an option of {name}"
-                );
-                options += 1;
+    /// The words of a command line as `sh` splits them: quotes removed, a
+    /// `#` at the start of a word starting a comment, and the line ending at
+    /// a `|`, `||`, `&&` or `;` word.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut quote = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => word.push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                (None, c) if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                (None, '#') if !in_word => break,
+                (None, c) => {
+                    word.push(c);
+                    in_word = true;
+                }
             }
         }
-        // An option named alone (`--no-redact`) belongs to some command.
+        assert!(quote.is_none(), "a quote is not closed in {line:?}");
+        if in_word {
+            words.push(word);
+        }
+        words
+            .into_iter()
+            .take_while(|w| !matches!(w.as_str(), "|" | "||" | "&&" | ";"))
+            .collect()
+    }
+
+    /// Every command line the AI guide shows is one the CLI accepts, with
+    /// its options and their values: the guide is built into the binary, and
+    /// an AI agent follows it to the letter. A mention of a command without
+    /// its arguments (`rusthorse reveal`) may leave a required argument out,
+    /// and nothing else.
+    #[test]
+    fn the_ai_guide_shows_only_command_lines_the_cli_accepts() {
+        use clap::error::ErrorKind;
+        let mention = |kind: ErrorKind| {
+            matches!(
+                kind,
+                ErrorKind::MissingRequiredArgument | ErrorKind::DisplayHelp
+            )
+        };
+        let guide = GuideTopic::Ai.text();
+        let lines = guide_command_lines(&guide);
+        let mut complete = 0;
+        for line in &lines {
+            let argv = std::iter::once("rusthorse".to_string()).chain(shell_words(line));
+            match Cli::try_parse_from(argv) {
+                Ok(_) => complete += 1,
+                Err(e) if mention(e.kind()) => {}
+                Err(e) => panic!("`rusthorse {line}`:\n{e}"),
+            }
+        }
+        // The scan found the commands: a broken scan checks nothing.
+        assert!(
+            lines.len() > 30 && complete > 20,
+            "{} lines, {complete} complete",
+            lines.len()
+        );
+        // It reads inline code across a line break and a code-block line
+        // continued with `\`, and stops a code-block line at its comment.
+        let found = guide_command_lines(
+            "a `rusthorse list\n  --json` b\n```\nrusthorse ls # x\nrusthorse list \\\n  --tag t\n```",
+        );
+        let found: Vec<_> = found.iter().map(|l| shell_words(l)).collect();
+        assert_eq!(
+            found,
+            [
+                vec!["ls"],
+                vec!["list", "--tag", "t"],
+                vec!["list", "--json"]
+            ]
+        );
+        assert_eq!(
+            shell_words(r#"run T=x -- sh -c 'a "$T" b' # c"#),
+            ["run", "T=x", "--", "sh", "-c", r#"a "$T" b"#]
+        );
+        // A mention leaves an argument out; a wrong word is another error.
+        let e = Cli::try_parse_from(["rusthorse", "guide"]).err();
+        assert!(mention(e.expect("error").kind()));
+        for wrong in [
+            &["guide", "nope"][..],
+            &["list", "--definitely-not-an-option"],
+            &["add", "N", "--generate", "--length", "nope"],
+            &["add", "N", "--generate", "--alphabet", "invented"],
+            &["add", "--stdin", "--bogus"],
+            &["import", "nope"],
+        ] {
+            let argv = std::iter::once(&"rusthorse").chain(wrong);
+            let e = Cli::try_parse_from(argv).err().expect("error");
+            assert!(!mention(e.kind()), "{wrong:?}: {:?}", e.kind());
+        }
+    }
+
+    /// An option the AI guide names alone (`--no-redact`) belongs to some
+    /// command.
+    #[test]
+    fn the_ai_guide_names_only_real_options() {
         fn longs(command: &clap::Command, into: &mut Vec<String>) {
             for arg in command.get_arguments() {
                 into.extend(arg.get_long().map(str::to_string));
@@ -2299,8 +2369,11 @@ mod tests {
                 longs(sub, into);
             }
         }
+        let mut cli = Cli::command();
+        cli.build();
         let mut all = Vec::new();
         longs(&cli, &mut all);
+        let guide = GuideTopic::Ai.text();
         let alone: Vec<_> = guide
             .split('`')
             .skip(1)
@@ -2312,17 +2385,6 @@ mod tests {
         for long in alone {
             assert!(all.iter().any(|a| a == long), "--{long} is no option");
         }
-        // The scan found the commands: a broken scan checks nothing.
-        assert!(
-            lines.len() > 30 && options > 25,
-            "{} lines, {options} options",
-            lines.len()
-        );
-        // It reads inline code across a line break, and stops a code-block
-        // line at its comment.
-        let found =
-            guide_command_lines("a `rusthorse list\n  --json` b\n```\nrusthorse ls # x\n```");
-        assert_eq!(found, ["ls # x", "list   --json"]);
     }
 
     /// The facts of the AI guide that tests cannot draw from its commands:
@@ -2342,13 +2404,27 @@ mod tests {
             .map(|k| k.to_possible_value().expect("value").get_name().to_string())
             .collect();
         assert_eq!(kinds.split(", ").collect::<Vec<_>>(), real);
-        // The exit statuses, each a row of its table.
-        for status in [0, 1, 2, EXIT_DENIED, EXIT_UNKNOWN, EXIT_RUN_FAILURE]
-            .into_iter()
-            .filter(|s| *s != 0)
-        {
-            assert!(guide.contains(&format!("\n| `{status}` |")), "{status}");
+        // The exit statuses: exactly the rows of each table. An invalid
+        // command line is clap's usage error.
+        fn statuses(section: &str) -> Vec<u8> {
+            section
+                .lines()
+                .filter_map(|l| l.strip_prefix("| `"))
+                .map(|l| l.split('`').next().and_then(|n| n.parse().ok()))
+                .map(|n| n.expect("a status"))
+                .collect()
         }
+        let section = |from: &str, to: &str| {
+            let start = guide.find(from).expect("section") + from.len();
+            let rest = &guide[start..];
+            rest[..rest.find(to).expect("section end")].to_string()
+        };
+        let run = section("### `rusthorse run`", "### Other commands");
+        let other = section("### Other commands", "\n## ");
+        assert_eq!(statuses(&run), [EXIT_RUN_FAILURE, EXIT_UNKNOWN, 2]);
+        assert_eq!(statuses(&other), [0, 1, 2, EXIT_DENIED, EXIT_UNKNOWN]);
+        let usage = Cli::try_parse_from(["rusthorse", "run", "--bogus"]).err();
+        assert_eq!(usage.expect("error").exit_code(), 2);
         // The JSON fields it names are fields of `list --json`.
         let info = EntryInfo {
             id: "id".into(),
@@ -2378,11 +2454,26 @@ mod tests {
         assert!(named.len() >= 10, "{named:?}");
         assert!(guide.contains("`protected_fields`"));
         named.push("protected_fields");
-        for field in named {
+        for field in &named {
             assert!(
                 json.get(field).is_some(),
                 "`{field}` is not a field of list --json"
             );
+        }
+        // "Fields without a value are left out."
+        assert!(guide.contains("Fields without a value are left out."));
+        let bare = EntryInfo {
+            group: None,
+            fields: EntryFields::default(),
+            protected_fields: Vec::new(),
+            other_fields: Vec::new(),
+            modified: None,
+            ..info
+        };
+        let json = serde_json::to_value(&bare).expect("json");
+        for field in named {
+            let always = ["id", "name", "has_password"].contains(&field);
+            assert_eq!(json.get(field).is_some(), always, "{field}");
         }
     }
 }

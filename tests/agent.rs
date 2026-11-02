@@ -2321,17 +2321,27 @@ fn the_ai_guide_needs_no_agent_and_the_help_points_to_it() {
     ] {
         assert!(guide.contains(rule), "{rule}");
     }
-    // A reader that stops early is no error.
-    let mut child = rusthorse()
-        .args(["guide", "ai"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    drop(child.stdout.take());
-    let out = child.wait_with_output().expect("wait");
+    // A reader that stops early is no error: the pipe has no reader left
+    // before the guide is written.
+    let guide_to = |stdout: Stdio| {
+        let child = rusthorse()
+            .args(["guide", "ai"])
+            .stdout(stdout)
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        within(TEST_LIMIT, move || child.wait_with_output().expect("wait"))
+    };
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = guide_to(writer.into());
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    // Any other failure to write is an error.
+    let full = std::fs::File::create("/dev/full").expect("/dev/full");
+    let out = guide_to(full.into());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("cannot print the guide"));
     // An unknown guide is a command-line error.
     let out = rusthorse().args(["guide", "nope"]).finish();
     assert_eq!(out.status.code(), Some(2));

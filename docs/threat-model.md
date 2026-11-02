@@ -1338,3 +1338,28 @@ listed, so a file with an error starts no import, and the import saves
 batch by batch. The reviewer's opinion: ready for the planned first real
 use; deleting the originals stays the last step, after each entry is used
 and an independent backup is checked.
+
+**Guide for AI agents (2026-11-02).** At the maintainer's request — an AI
+agent should learn how to use Rusthorse from the `rusthorse` it runs, not
+from a pasted snippet that goes out of date — `rusthorse guide ai` prints a
+guide built into the binary ([§6](#the-guide-for-ai-agents-is-advice): it is
+advice, not a mechanism). The instructions file only points to it.
+
+Review of the guide (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+No new way for a value to leave the agent; the metadata, `--url`, the
+approval of a dry run and the quoting of the `sh -c` example matched the
+code. Findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — "the dialog approves what the script contains at that moment": the agent checks the identity of the program and the directory, not the contents of what the command reads (L4); the reviewer replaced a script after its approval and the new version ran | **Fixed:** the guide says that the dialog shows the script's name, not its contents, that the approval trusts the script and every file the command reads as they are when it reads them, to show the script to the human, and not to change these files while a request is waiting or running. |
+| Medium — "processes it leaves in the background are stopped": descendants that leave the process group (`setsid`) keep running (L17) | **Fixed:** the guide limits it to the process group, says that a program that detaches itself keeps running with the secret, and not to start servers or daemons with `run`. |
+| Medium — the exit status table gave `2` as an invalid command line for every command, while `run` passes on any status of the command (the reviewer ran commands that exited with 1, 2 and 4 after doing their work) | **Fixed:** `run` has its own section: once the command has started, any status is the command's, `1`, `2`, `4`, `124` and `125` included, and a status from Rusthorse comes with a `rusthorse:` (or, for an invalid command line, `error:`) message; its table lists `125`, `124` and `2`. The other commands have their own table, with `0`. |
+| Medium — the tests let wrong examples through (a code-block line continued with `\`, `--length nope`, `--alphabet invented`, `guide nope`, an extra status row) and refused a valid one (`rusthorse --socket PATH list`) | **Fixed:** every command line the guide shows, inline or in a code block (continued lines joined), is split as the shell splits it and parsed by the CLI's own parser, which checks subcommands, options and their values; a mention of a command may only leave a required argument out. Each status table must have exactly the expected rows. The reproductions are test cases. |
+| Low — the closed-pipe test raced the write: the guide fits in a pipe's buffer, so `guide` could finish before the reader was closed | **Fixed:** the reader is closed before `guide` starts; a write to `/dev/full` is tested to be an error. |
+| Low — "each run asks once" left out remembered approvals and unlocking; "the command reads nothing unless `--stdin`" holds only with redaction | **Fixed:** the guide states both conditions. |
+
+Each test fix was checked against the mistakes it must catch, made in a copy
+of the tree (12 of 12: the reviewer's examples, a dropped or made-up status
+row, an unknown command, option or guide, a closed pipe taken for an error
+and the opposite); the wording fixes are documentation, checked by review.

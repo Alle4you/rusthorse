@@ -79,9 +79,11 @@ not a secret and is not redacted.
 - Prefer programs that read the credential from their environment
   (`GH_TOKEN`, `PGPASSWORD`, `OPENAI_API_KEY`). Other processes can see
   command-line arguments.
-- Each run asks once. Put all the work that needs the secret into one
-  command. Before you run it, tell the human in one line what it does and
-  which secret it uses, so they recognise the dialog.
+- Each run asks the human once, so put all the work that needs the secret
+  into one command. (A locked vault asks for the master password first. If
+  the human turned on remembered approvals, an identical run may not ask at
+  all.) Before you run it, tell the human in one line what it does and which
+  secret it uses, so they recognise the dialog.
 - The dialog shows the command line, the program, the directory, the
   secrets, and the variables that name where the program connects
   (`*_URL`, `*_HOST`, …). It warns about proxies, certificate settings and
@@ -91,32 +93,50 @@ not a secret and is not redacted.
 - Output is redacted. Every occurrence of a secret value (4 characters or
   longer) in the command's standard output and error becomes
   `[REDACTED:NAME]`. Do not add `--no-redact` unless the human asks for it.
-- The command reads nothing (`/dev/null`) unless you add `--stdin`, and it
-  sees pipes, not a terminal. A program that prompts for a password on the
-  terminal cannot get one there. Use its way of taking it from the
-  environment instead: `sshpass -e` reads `SSHPASS`, and ssh can use
-  `SSH_ASKPASS` with `SSH_ASKPASS_REQUIRE=force`.
+- With redaction (the default), the command reads nothing (`/dev/null`)
+  unless you add `--stdin`, and it sees pipes, not a terminal. (With
+  `--no-redact` it gets your standard input, output and error as they are.)
+  A program that prompts for a password on the terminal cannot get one
+  there. Use its way of taking it from the environment instead:
+  `sshpass -e` reads `SSHPASS`, and ssh can use `SSH_ASKPASS` with
+  `SSH_ASKPASS_REQUIRE=force`.
 - The command runs as the human, outside any sandbox you are in, in your
-  current directory. Processes it leaves in the background are stopped when
-  it exits, so do not use `rusthorse run` to start a server that should keep
-  running.
+  current directory. When it exits, the processes it left in its process
+  group are stopped, but a program that detaches itself (a daemon, `setsid`)
+  keeps running with the secret. Do not start servers or daemons with
+  `rusthorse run`.
 - A command line, program path or directory longer than 1000 characters is
-  refused. Put a long command in a script, and tell the human that the dialog
-  approves what the script contains at that moment.
+  refused. Put a long command in a script and show it to the human. The
+  dialog shows the script's name, not its contents: the approval trusts the
+  script, and every file the command reads, as they are when the command
+  reads them. Do not change them while a request is waiting or running.
 
 ## Exit statuses
 
+### `rusthorse run`
+
+Once the command has started, `rusthorse run` exits with the command's own
+status, whatever it is: `0` for success, `128 + N` if signal `N` killed it,
+and any other number the command chooses, `1`, `2`, `4`, `124` and `125`
+included. Rusthorse's own statuses are the three below, and each comes with
+a message on standard error that starts with `rusthorse:` (or `error:` for
+an invalid command line):
+
 | Status | Meaning | What to do |
 |---|---|---|
-| `125` | `run` only: Rusthorse refused or failed before the command started (denied, timed out, the agent is not running or is out of date, the entry is missing). The command did not run. | Read the `rusthorse:` message on standard error. If it was denied or timed out, stop and ask the human. |
-| `124` | The outcome is unknown. The command may or may not have run, and a change may or may not have been saved. | Check (`rusthorse list`, `rusthorse audit -n 5`) before you repeat anything that is not idempotent. |
-| `4` | Every other command: the human denied or cancelled the request, or the dialog timed out. | Stop and ask the human. |
-| `1` | Every other command: an error (the agent is not running, the entry was not found, the input is invalid, …). | Read the message. |
-| `2` | Invalid command line. | Check `--help`. |
-| other | `run` only: the command's own status (`128 + N` if signal `N` killed it). | |
+| `125` | Rusthorse refused or failed before the command started (denied, timed out, the agent is not running or is out of date, the entry is missing). The command did not run. | Read the message. If it was denied or timed out, stop and ask the human. |
+| `124` | The outcome is unknown: the command may or may not have run. | Check whether its effects happened before you repeat anything that is not idempotent. `rusthorse audit -n 5` shows whether it was approved and, when the agent knows, how it ended. |
+| `2` | Invalid command line, with `error:` and the usage. Nothing was asked and nothing ran. | Check `rusthorse run --help`. |
 
-A command can also exit with `124` or `125` itself. A `rusthorse:` message on
-standard error tells the two apart.
+### Other commands
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `0` | Success. | |
+| `1` | An error: the agent is not running, the entry was not found, the input is invalid, … | Read the message. |
+| `2` | Invalid command line. | Check the command's `--help`. |
+| `4` | The human denied or cancelled the request, or the dialog timed out. | Stop and ask the human. |
+| `124` | The outcome is unknown: a change may or may not have been saved. | Check with `rusthorse list` or `rusthorse show NAME` before you repeat it. |
 
 ## Storing secrets
 
