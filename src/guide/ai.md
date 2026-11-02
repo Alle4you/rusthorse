@@ -120,14 +120,15 @@ status, whatever it is: `0` for success, `128 + N` if signal `N` killed it,
 and any other number the command chooses, `1`, `2`, `4`, `124` and `125`
 included. Rusthorse's own statuses are the four below. `125` and `124` come
 with a message on standard error that starts with `rusthorse:`, `2` with
-`error:` and the usage, and `141` with no message:
+`error:` and the usage, and `141` with no message. (A crash of `rusthorse`
+itself, status `101` with a `panicked` message, tells as little as `124`.)
 
 | Status | Meaning | What to do |
 |---|---|---|
 | `125` | Rusthorse refused or failed before the command started (denied, timed out, the agent is not running or is out of date, the entry is missing). The command did not run. | Read the message. If it was denied or timed out, stop and ask the human. |
 | `124` | The outcome is unknown: the command may or may not have run. | Check whether its effects happened before you repeat anything that is not idempotent. `rusthorse audit -n 5` can help, but an approval there does not prove that the command ran, and a missing record of its end does not prove that it did not. |
 | `2` | Invalid command line, with `error:` and the usage. Nothing was asked and nothing ran. | Check `rusthorse run --help`. |
-| `141` | Rusthorse could not write the command's output: whatever read it stopped early (such as `head`), or the disk is full. Rusthorse stopped the command if it was still running. The command may have done some or all of its work, and a command killed by `SIGPIPE` exits with `141` too. | Do not take it for the command's result. Check its effects before you repeat it, and let `rusthorse run` write its whole output (to a file, if it is long). |
+| `141` | With redaction, Rusthorse could not write the command's output: whatever read it stopped early (such as `head`), or the disk is full. It asks the agent to stop the command and returns at once, so the command may go on for a few seconds, and it may have done some or all of its work. A command killed by `SIGPIPE` exits with `141` too. | Do not take it for the command's result. Wait a few seconds, check its effects before you repeat it, and let `rusthorse run` write its whole output (to a file, if it is long). |
 
 ### Other commands
 

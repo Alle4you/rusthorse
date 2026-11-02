@@ -21,6 +21,17 @@ use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
 use rusthorse::{audit, paths};
 
+/// `eprintln!` that never panics. The standard one panics when standard
+/// error cannot be written (`2>/dev/full`), which would turn an exit status
+/// that means something — `125`: the command did not run — into a crash
+/// (`101`). A message that cannot be written is dropped instead.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Exit status for `run` when Rusthorse refused or failed and the command
 /// did not run (as `env` and `docker run` do).
 const EXIT_RUN_FAILURE: u8 = 125;
@@ -2263,15 +2274,30 @@ mod tests {
     }
 
     /// The words of a command line as `sh` splits them: quotes removed, a
-    /// `#` at the start of a word starting a comment, and the command ending
-    /// at an unquoted `|`, `;`, `&`, `<` or `>` (a pipe, a list, a
-    /// redirection).
+    /// `#` at the start of a word starting a comment, redirections (`>file`,
+    /// `2>&1`) left out, and the command ending at an unquoted `|`, `;` or
+    /// `&` (a pipe, a list).
     fn shell_words(line: &str) -> Vec<String> {
+        /// End the word being read: an argument, or the target of a
+        /// redirection, which is none.
+        fn end(words: &mut Vec<String>, word: &mut String, in_word: &mut bool, target: &mut bool) {
+            if *in_word {
+                let done = std::mem::take(word);
+                if *target {
+                    *target = false;
+                } else {
+                    words.push(done);
+                }
+                *in_word = false;
+            }
+        }
         let mut words = Vec::new();
         let mut word = String::new();
         let mut in_word = false;
+        let mut target = false;
         let mut quote = None;
-        for c in line.chars() {
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
             match (quote, c) {
                 (Some(q), c) if c == q => quote = None,
                 (Some(_), c) => word.push(c),
@@ -2280,13 +2306,23 @@ mod tests {
                     in_word = true;
                 }
                 (None, c) if c.is_whitespace() => {
-                    if in_word {
-                        words.push(std::mem::take(&mut word));
-                        in_word = false;
-                    }
+                    end(&mut words, &mut word, &mut in_word, &mut target);
                 }
                 (None, '#') if !in_word => break,
-                (None, '|' | ';' | '&' | '<' | '>') => break,
+                (None, '<' | '>') => {
+                    // The descriptor number before it (`2>`) is no argument.
+                    if in_word && !target && word.chars().all(|c| c.is_ascii_digit()) {
+                        word.clear();
+                        in_word = false;
+                    } else {
+                        end(&mut words, &mut word, &mut in_word, &mut target);
+                    }
+                    while let Some('<' | '>' | '&') = chars.peek() {
+                        chars.next();
+                    }
+                    target = true;
+                }
+                (None, '|' | ';' | '&') => break,
                 (None, c) => {
                     word.push(c);
                     in_word = true;
@@ -2294,34 +2330,35 @@ mod tests {
             }
         }
         assert!(quote.is_none(), "a quote is not closed in {line:?}");
-        if in_word {
-            words.push(word);
-        }
+        end(&mut words, &mut word, &mut in_word, &mut target);
+        assert!(!target, "a redirection without a target in {line:?}");
         words
     }
 
-    /// Whether the CLI accepts a command line of the AI guide. An example in
-    /// a code block must be complete. A mention in inline code may leave out
-    /// the arguments a command needs, and so may a `--help` line, which is
-    /// checked without its `--help` (clap stops reading at it).
+    /// The mentions of a command in the AI guide's prose that leave out
+    /// arguments it needs; any other command line must be complete.
+    const GUIDE_MENTIONS: &[&str] = &["run", "reveal", "add --stdin", "edit --stdin"];
+
+    /// Whether the CLI accepts a command line of the AI guide. It must be
+    /// complete, except a mention listed in [`GUIDE_MENTIONS`] in inline
+    /// code, and a line asking for help, which is checked without its
+    /// `--help` or `-h` (clap stops reading there).
     fn guide_line_accepted(line: &str, shown: Shown) -> Result<(), String> {
         use clap::error::ErrorKind;
-        let mut words = shell_words(line);
+        let words = shell_words(line);
         let end = words.iter().position(|w| w == "--").unwrap_or(words.len());
-        let before = words.len();
-        words = words
-            .iter()
+        let (help, words): (Vec<_>, Vec<_>) = words
+            .into_iter()
             .enumerate()
-            .filter(|(i, w)| *i >= end || w.as_str() != "--help")
-            .map(|(_, w)| w.clone())
-            .collect();
-        let help = words.len() < before;
+            .partition(|(i, w)| *i < end && matches!(w.as_str(), "--help" | "-h"));
+        let words: Vec<String> = words.into_iter().map(|(_, w)| w).collect();
+        let mention = shown == Shown::Inline && GUIDE_MENTIONS.contains(&words.join(" ").as_str());
         let argv = std::iter::once("rusthorse".to_string()).chain(words);
         match Cli::try_parse_from(argv) {
             Ok(_) => Ok(()),
             Err(e)
                 if e.kind() == ErrorKind::MissingRequiredArgument
-                    && (shown == Shown::Inline || help) =>
+                    && (mention || !help.is_empty()) =>
             {
                 Ok(())
             }
@@ -2370,16 +2407,25 @@ mod tests {
             ["run", "T=x", "--", "sh", "-c", r#"a "$T" | b"#]
         );
         assert_eq!(shell_words("show ';' --json | jq"), ["show", ";", "--json"]);
-        // A mention may leave arguments out; an example may not; nothing may
-        // be wrong.
+        // A listed mention may leave arguments out; nothing else may, and
+        // nothing may be wrong.
         assert!(guide_line_accepted("reveal", Shown::Inline).is_ok());
         assert!(guide_line_accepted("run --help", Shown::Inline).is_ok());
+        assert!(guide_line_accepted("run -h", Shown::Block).is_ok());
         assert!(guide_line_accepted("--socket /tmp/x.sock list", Shown::Block).is_ok());
+        assert!(guide_line_accepted("list 2>&1 >/dev/null --json", Shown::Block).is_ok());
         for (wrong, shown) in [
             ("reveal", Shown::Block),
+            ("show", Shown::Inline),
+            (
+                "add --generate --length 48 --alphabet symbols",
+                Shown::Inline,
+            ),
             ("add --kind server --host db.lan --generate", Shown::Block),
             ("show ';' --kind api-key", Shown::Inline),
+            ("list >/dev/null --kind invented", Shown::Block),
             ("list --help --kind invented", Shown::Inline),
+            ("list -h --kind invented", Shown::Inline),
             ("guide nope", Shown::Inline),
             ("list --definitely-not-an-option", Shown::Inline),
             ("add N --generate --length nope", Shown::Block),
@@ -2390,6 +2436,16 @@ mod tests {
             assert!(
                 guide_line_accepted(wrong, shown).is_err(),
                 "{wrong:?} ({shown:?})"
+            );
+        }
+        assert_eq!(shell_words("x 2> err >>out y 2>&1 z"), ["x", "y", "z"]);
+        // Every listed mention is in the guide: the list does not grow stale.
+        for mention in GUIDE_MENTIONS {
+            assert!(
+                lines
+                    .iter()
+                    .any(|(l, s)| *s == Shown::Inline && shell_words(l).join(" ") == *mention),
+                "{mention}"
             );
         }
     }

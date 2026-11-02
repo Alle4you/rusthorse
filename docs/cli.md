@@ -382,10 +382,14 @@ therefore see pipes rather than a terminal. With `--no-redact`, the command
 gets the caller's descriptors directly (including stdin).
 
 If `rusthorse run` cannot write the command's output — it was closed early
-(for example `rusthorse run … | head`) or the disk is full — it stops the
-command and exits with status 141, like a program killed by `SIGPIPE`, and
-prints no message. The command may already have done some or all of its
-work, so 141 does not tell what it did. With `--stdin`, input is read only once
+(for example `rusthorse run … | head`) or the disk is full — it closes its
+connection, which makes the agent stop the command, and exits at once with
+status 141, like a program killed by `SIGPIPE`, without a message. The agent
+stops the command as said below (`SIGTERM`, then `SIGKILL` 3 seconds later),
+so it may still be running when `rusthorse run` exits, and it may have done
+some or all of its work: 141 does not tell what it did. This is the relay of
+redacted output; with `--no-redact` the command writes to your output itself,
+and its own exit status comes back. With `--stdin`, input is read only once
 the command has started, so a denied request never consumes it.
 
 When the command exits, anything it left running in its process group (for
@@ -605,8 +609,9 @@ a value; no `reveal`; stop after a denial), how to find entries and read
 their metadata, how to use `run`, the exit statuses and what to do about
 each, and how to store secrets without seeing them. It is built into the
 binary, so it describes the version that prints it. A test parses every
-command line it shows with the CLI's own parser (an example in a code block
-must be complete) and checks the exit status tables row by row. Point an agent to it from its
+command line it shows with the CLI's own parser — complete, apart from a few
+listed mentions of a command in the prose — and checks the exit status
+tables row by row. Point an agent to it from its
 instructions file ([ai-agents.md](ai-agents.md#setting-up-an-agent)). A
 reader that stops early (`rusthorse guide ai | head`) is not an error.
 

@@ -1380,3 +1380,17 @@ without a message. Findings:
 Each test fix was checked against the mistakes it must catch, made in a copy
 of the tree (7 of 7: the reviewer's examples, a row without backquotes, the
 `141` row changed, options after `--help`, a mention in a code block).
+
+Third review of the guide (Codex, AI-assisted, 2026-11-02; verdict: not
+ready). Confirmed fixed: the status rows, the audit log, the reviewer's
+earlier examples. Findings:
+
+| Finding | Disposition |
+|---|---|
+| Medium — `141` was said to mean that Rusthorse had stopped the command, but the client closes its connection and exits at once; the reviewer's command, which ignored `SIGTERM`, acted after `rusthorse run` had returned 141 and ended about 3 seconds later (the `SIGKILL`). With `--no-redact` there is no relay, and the command's own status came back | **Fixed:** the guide, `docs/cli.md` and `AGENTS.md` say that `run` asks the agent to stop the command and returns at once, that the command may go on for a few seconds, and that this is the relay of redacted output; the guide says to wait before checking the command's effects. |
+| Medium — the tests let wrong examples through: options after a redirection (`list >/dev/null --kind invented`: the split ended at `>`), and an example in inline code without its required name (any inline code could be a mention) | **Fixed:** the split leaves out a redirection and its target and goes on reading; only the mentions listed in the test (`run`, `reveal`, `add --stdin`, `edit --stdin`) may leave out an argument, and each must appear in the guide. |
+| Low — `eprintln!` panics when standard error cannot be written, so `rusthorse run … 2>/dev/full` without an agent exited with 101 instead of 125 | **Fixed:** the CLI's `eprintln!` drops a message it cannot write; an end-to-end test checks 125. The guide also says that a crash of `rusthorse` (101) tells as little as 124. |
+| Low — the test refused `-h`, which clap reads like `--help` | **Fixed:** `-h` is checked like `--help`, without stopping there. |
+
+Each fix was checked against the mistake it must catch, made in a copy of
+the tree (5 of 5); the 141 wording is documentation, checked by review.

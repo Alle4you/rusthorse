@@ -2637,6 +2637,17 @@ fn a_missing_or_old_agent_means_did_not_run() {
         .stdin(Stdio::null())
         .finish();
     assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
+    // Also when the message cannot be written: no crash (101).
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["run", "T", "--", "true"])
+        .env("RUSTHORSE_SOCKET", dir.path().join("nobody.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create("/dev/full").expect("/dev/full"))
+        .spawn()
+        .expect("spawn");
+    let status = within(TEST_LIMIT, move || child.wait().expect("wait"));
+    assert_eq!(status.code(), Some(125));
     // An agent speaking an older protocol.
     let socket = dir.path().join("old.sock");
     // Protocol 3: its dialogs for `reveal.purpose` say something else.

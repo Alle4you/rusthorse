@@ -128,6 +128,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- A message that cannot be written to standard error (`2>/dev/full`) no
+  longer makes the CLI crash with status 101: the message is dropped and
+  the exit status keeps its meaning (125: the run did not start).
 - `.env` files are read in a small dialect that python-dotenv and Node's
   dotenv read alike (one-line values, in single or double quotes without
   backslashes, or unquoted with a ` #` comment; no `${…}`, no name set
