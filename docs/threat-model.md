@@ -1092,3 +1092,18 @@ race. New findings, and what was done:
 
 Each fix was reverted in a copy of the tree to see a test fail (10 of 10;
 an eleventh mutation found a redundant status update, removed).
+
+Second verification (Codex, AI-assisted, 2026-11-02; verdict: not ready).
+Confirmed fixed: the late inhibitor during a lock, stopping with a mute bus,
+recovery without an answer, logind's absence in `status`, the saturated
+queue (reverting the separate connection now fails the test). One new
+finding, from the previous fix:
+
+| Finding | Disposition |
+|---|---|
+| Medium — the refresh let go of the inhibitor when logind's name changed hands, without looking at the phase: with a lock held up (a vault save) and logind restarting, the inhibitor was let go with no lock done. A failed `GetNameOwner` led there too. And the premise was wrong: systemd keeps inhibitors when logind restarts, so a new unique name does not make the descriptor useless | **Fixed:** only a completed lock lets the inhibitor go. logind's presence (asked with `NameHasOwner`; no answer is not absence) changes only `status`; when logind is there and no inhibitor is held, one is asked for. Tested: logind's name changing hands while a lock is held up keeps the inhibitor until the lock is done; logind leaving keeps it, shows in `status`, and coming back is watched again with the same inhibitor, whose next suspend lock lets it go. The earlier disposition ("lets go of an inhibitor given by a logind that left or restarted") is replaced by this one. |
+
+Each fix was reverted in a copy of the tree to see a test fail (3 of 3). A
+mutation script had counted syntax errors as failing tests; the one earlier
+mutation that might have been such a case was redone as valid code and
+still failed the test.

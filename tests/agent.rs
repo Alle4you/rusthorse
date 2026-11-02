@@ -3684,8 +3684,9 @@ mod session_lock {
         wait_for("the suspend watcher", || {
             trigger(&h, "suspend", "logind").is_some_and(|t| t["active"] == true)
         });
-        // logind goes: the suspend lock is no longer promised, and the
-        // inhibitor it gave, which means nothing now, is let go.
+        // logind goes: the suspend lock is no longer promised. The
+        // inhibitor is kept — systemd keeps inhibitors when logind restarts,
+        // and only a lock lets it go.
         first.close().unwrap();
         wait_for("logind's absence to show", || {
             trigger(&h, "suspend", "logind").is_some_and(|t| {
@@ -3696,16 +3697,22 @@ mod session_lock {
                         .contains("not on the system bus")
             })
         });
-        wait_for("the stale inhibitor's release", || {
-            released(&inhibitors.lock().unwrap()[0])
-        });
-        // It comes back (a new unique name): a new inhibitor, watched again.
-        let _second = logind(&system, &inhibitors, &delay);
-        wait_for("a new inhibitor", || inhibitors.lock().unwrap().len() == 2);
+        assert!(!released(&inhibitors.lock().unwrap()[0]));
+        // It comes back (a new unique name): watched again, with the same
+        // inhibitor.
+        let second = logind(&system, &inhibitors, &delay);
         wait_for("the suspend lock watched again", || {
             trigger(&h, "suspend", "logind").is_some_and(|t| t["active"] == true)
         });
-        assert!(!released(&inhibitors.lock().unwrap()[1]));
+        assert_eq!(inhibitors.lock().unwrap().len(), 1);
+        assert!(!released(&inhibitors.lock().unwrap()[0]));
+        // And the new logind's signal is the one that counts.
+        unlock(&h);
+        emit(&second, MANAGER_PATH, MANAGER, "PrepareForSleep", &(true,));
+        wait_for("the suspend lock from the new logind", || locked(&h));
+        wait_for("the inhibitor's release", || {
+            released(&inhibitors.lock().unwrap()[0])
+        });
     }
 
     /// The system bus is not there when the agent starts; the vault is
@@ -3925,6 +3932,14 @@ mod session_lock {
         assert!(
             !released(&inhibitors.lock().unwrap()[1]),
             "let go before the vault was locked"
+        );
+        // Nor when logind's name changes hands meanwhile (a restart).
+        logind.close().unwrap();
+        let _again = self::logind(&system, &inhibitors, &delay);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(
+            !released(&inhibitors.lock().unwrap()[1]),
+            "let go on logind's restart, before the vault was locked"
         );
         gate.set(true);
         wait_for("its release once locked", || {

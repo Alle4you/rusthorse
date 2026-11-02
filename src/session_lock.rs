@@ -501,6 +501,21 @@ mod watch {
             if name.as_str().ends_with(".ServiceUnknown") || name.as_str().ends_with(".NameHasNoOwner"))
     }
 
+    /// Whether logind is on the bus; `None` when the bus does not answer
+    /// (in time) — which is not the same as its absence.
+    fn logind_present(queries: &Connection) -> Option<bool> {
+        queries
+            .call_method(
+                Some(BUS_NAME),
+                BUS_PATH,
+                Some(BUS_NAME),
+                "NameHasOwner",
+                &(LOGIND_NAME,),
+            )
+            .and_then(|reply| reply.body().deserialize::<bool>())
+            .ok()
+    }
+
     /// The unique name that owns `name` now, if any.
     fn owner_of(queries: &Connection, name: &str) -> Option<String> {
         queries
@@ -559,12 +574,12 @@ mod watch {
         Asleep,
     }
 
+    /// The inhibitor and the phase. Only `locked` lets the inhibitor go:
+    /// not a change of logind's owner (systemd keeps inhibitors when logind
+    /// restarts), not its absence (which only `status` reflects).
     #[derive(Default)]
     struct Held {
         fd: Option<OwnedFd>,
-        /// The unique name of the logind that gave it: one from a logind
-        /// gone or restarted means nothing.
-        from: Option<String>,
         phase: Phase,
     }
 
@@ -609,7 +624,6 @@ mod watch {
                         ),
                     )
                     .and_then(|reply| reply.body().deserialize::<OwnedFd>());
-                let from = owner_of(&queries, LOGIND_NAME);
                 me.asking.store(false, Ordering::SeqCst);
                 match answer {
                     Ok(fd) => {
@@ -620,7 +634,6 @@ mod watch {
                             // locking, `locked` lets it go afterwards).
                             if held.phase != Phase::Asleep && held.fd.is_none() {
                                 held.fd = Some(fd);
-                                held.from = from;
                             }
                         }
                         triggers.set(
@@ -657,22 +670,14 @@ mod watch {
             let mut held = lock_of(&self.held);
             held.phase = Phase::Asleep;
             held.fd = None;
-            held.from = None;
         }
 
         fn woke(&self) {
             lock_of(&self.held).phase = Phase::Awake;
         }
 
-        /// Let go of an inhibitor given by a logind that is no longer the
-        /// owner of its name (`current`); whether one is still held.
-        fn still_held(&self, current: Option<&str>) -> bool {
-            let mut held = lock_of(&self.held);
-            if held.fd.is_some() && held.from.as_deref() != current {
-                held.fd = None;
-                held.from = None;
-            }
-            held.fd.is_some()
+        fn holds(&self) -> bool {
+            lock_of(&self.held).fd.is_some()
         }
     }
 
@@ -692,17 +697,29 @@ mod watch {
         let mut owner = Owner::new(queries);
         let inhibitor = Arc::new(Inhibitor::default());
         inhibitor.acquire(&ctx.triggers, &ctx.shared, queries);
-        // From time to time: is logind still there, is the inhibitor still
-        // its own? Ask again when there is none (logind may come later,
-        // restart, or have refused).
+        // From time to time: is logind still there (for `status`), and is
+        // there an inhibitor? Ask for one when there is none (logind may
+        // come later, or have refused). One held is never let go here.
         let alive = Arc::new(());
         {
             let (inhibitor, shared) = (Arc::clone(&inhibitor), Arc::clone(&ctx.shared));
             refresh(ctx, queries, &alive, move |queries, triggers| {
-                let current = owner_of(queries, LOGIND_NAME);
-                // Without one (logind gone: the request says so in status).
-                if !inhibitor.still_held(current.as_deref()) {
-                    inhibitor.acquire(triggers, &shared, queries);
+                match logind_present(queries) {
+                    Some(false) => triggers.set(
+                        SUSPEND,
+                        LOGIND,
+                        State::Inactive,
+                        Some("logind is not on the system bus".into()),
+                    ),
+                    Some(true) if inhibitor.holds() => triggers.set(
+                        SUSPEND,
+                        LOGIND,
+                        State::Watching,
+                        Some("locks before the computer sleeps".into()),
+                    ),
+                    Some(true) => inhibitor.acquire(triggers, &shared, queries),
+                    // No answer: nothing is known, nothing changes.
+                    None => {}
                 }
             });
         }
@@ -753,7 +770,9 @@ mod watch {
         }
         let alive = Arc::new(());
         refresh(ctx, queries, &alive, |queries, triggers| {
-            report_logind(triggers, owner_of(queries, LOGIND_NAME).is_some());
+            if let Some(present) = logind_present(queries) {
+                report_logind(triggers, present);
+            }
         });
         let mut users: HashMap<String, bool> = HashMap::new();
         for message in iter {

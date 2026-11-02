@@ -63,9 +63,10 @@ The delay inhibitor is taken at start and again after each resume
 (`PrepareForSleep(false)`), on a thread of its own so that a slow answer
 never holds up a lock. It is let go only once the vault is locked: one that
 arrives while the lock is under way is kept until the lock is done, one
-that arrives after it is let go at once. One given by a logind that has
-since left or restarted means nothing and is let go; a new one is asked
-for. While it is held, logind waits for the agent to lock — but
+that arrives after it is let go at once. Nothing else lets it go: not
+logind leaving the bus, not its name changing hands — systemd keeps
+inhibitors when logind restarts — which only change what `status` says.
+While it is held, logind waits for the agent to lock — but
 only up to its `InhibitDelayMaxSec` (5 seconds by default), not forever.
 Locking drops the decrypted vault from memory; it waits for the agent's
 state lock, so a vault save in progress, or a slow disk under the audit

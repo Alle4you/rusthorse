@@ -229,7 +229,8 @@ unlocks. A watcher whose bus goes away reports itself inactive in `status`
 and connects again every five seconds; on connecting — and when a
 screensaver appears — it locks if a session is locked or a screensaver on
 already, or if it gets no answer in time. The inhibitor is let go only once
-the lock is done. The agent's handle on the watchers closes their
+the lock is done — never because logind left or restarted (systemd keeps
+inhibitors across restarts); that only changes `status`. The agent's handle on the watchers closes their
 connections and waits up to 3 seconds for their threads when the agent is
 dropped.
 The watchers exist only with the `session-lock` Cargo feature (on by
