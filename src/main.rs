@@ -948,18 +948,25 @@ fn endpoint_urls(
     specs: &[String],
     secrets: &[Binding],
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out: Vec<(String, String)> = Vec::new();
+    // Every option is checked before any entry is read: reading one may make
+    // the agent ask for the master password.
+    let mut wanted: Vec<Binding> = Vec::new();
     for spec in specs {
         if !spec.contains('=') {
             bail!("--url {spec:?}: write VAR=ENTRY, e.g. --url OPENAI_BASE_URL=OPENAI_API_KEY");
         }
-        let Binding { var, entry } = parse_binding(spec)?;
-        if var.starts_with(rusthorse::exec::LOADER_PREFIX) || rusthorse::exec::is_risky(&var) {
+        let binding = parse_binding(spec)?;
+        let var = &binding.var;
+        if var.starts_with(rusthorse::exec::LOADER_PREFIX) || rusthorse::exec::is_risky(var) {
             bail!("--url {var}: this variable changes how programs start; it cannot carry a URL");
         }
-        if secrets.iter().any(|b| b.var == var) || out.iter().any(|(v, _)| *v == var) {
+        if secrets.iter().chain(&wanted).any(|b| b.var == *var) {
             bail!("--url {var}: the variable is already set by another binding");
         }
+        wanted.push(binding);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for Binding { var, entry } in wanted {
         let Response::Entry { entry: info } = check(client.call(&Request::Show {
             name: entry.clone(),
         })?)?

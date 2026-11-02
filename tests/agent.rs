@@ -2831,6 +2831,11 @@ fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
             "already set by another binding",
         ),
         (vec!["--url", "HOST_URL=lab-ssh"], "lab-ssh has no URL"),
+        // Checked before any entry is read (a read may ask to unlock).
+        (
+            vec!["--url", "A=no-such-entry", "--url", "A=OPENAI_API_KEY"],
+            "already set by another binding",
+        ),
     ] {
         let mut argv = vec!["run", "OPENAI_API_KEY"];
         argv.extend(args);
