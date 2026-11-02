@@ -515,7 +515,9 @@ pub struct EntryInfo {
 impl EntryInfo {
     /// How dialogs and the audit log identify the entry: its full path and
     /// the start of its UUID, e.g. `Production/API_KEY (8d2f6c1e)`. Two entries
-    /// with the same title in different groups never look the same.
+    /// with the same title in different groups do not look the same, unless
+    /// a file written by another program gave them UUIDs that start alike
+    /// (threat model L9).
     pub fn identity(&self) -> String {
         let short: String = self.id.chars().take(8).collect();
         match &self.group {
