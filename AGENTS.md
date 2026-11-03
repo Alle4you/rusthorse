@@ -200,7 +200,8 @@ not guaranteed.
   process, with a certificate authority made for the test and fake keys;
   nothing leaves the loopback interface. Those that need the broker to
   reach that destination need its `test-upstream` feature (`--all-features`);
-  the others run in both builds.
+  a few that check what a build without it ignores and refuses run only
+  without it (`--no-default-features`); the others run in both builds.
 - **`test-upstream` is for tests only, never in a release**: with it the
   broker trusts certificate authorities and addresses named in its
   environment and may reach loopback destinations. A build without debug
