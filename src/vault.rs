@@ -26,9 +26,17 @@
 //! any protected field.
 //! Entries in the recycle bin are ignored. Files written by Rusthorse open in
 //! KeePassXC and other KDBX4 clients.
+//!
+//! A vault opened or created with a [`FingerprintKey`] also fingerprints the
+//! encrypted bytes of its file as it reads and writes them
+//! ([`Vault::content_fingerprint`]): the agent keeps the last fingerprint
+//! across a lock, to tell at the next unlock whether another program changed
+//! the file meanwhile (ADR 0013, the unlock barrier).
 
+use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::hash::{BuildHasher, Hasher};
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -189,6 +197,140 @@ impl Fingerprint {
     }
 }
 
+/// The key of the fingerprints of a vault file's encrypted bytes
+/// ([`ContentFingerprint`]): one random key of the standard library's keyed
+/// hash ([`RandomState`]: 128 bits, for SipHash-1-3 today), chosen once
+/// (the agent chooses one when it starts), kept in memory only and never
+/// shown. A program that does not know it, and never sees a fingerprint,
+/// cannot make a changed file have the fingerprint of the file it replaced,
+/// except by chance.
+#[derive(Clone)]
+pub struct FingerprintKey {
+    state: RandomState,
+}
+
+impl FingerprintKey {
+    /// A new random key, which the standard library draws, as a best effort,
+    /// from a secure random source of the operating system, without
+    /// blocking. It is drawn on a thread of its own when one can be started:
+    /// the standard library draws one key for each thread and derives from
+    /// it the keys of the hash tables that thread makes later, so that this
+    /// key is not related to the keys of the agent's hash tables.
+    pub fn random() -> Self {
+        let state = std::thread::Builder::new()
+            .name("rusthorse-key".into())
+            .spawn(RandomState::new)
+            .ok()
+            .and_then(|drawing| drawing.join().ok())
+            .unwrap_or_default();
+        Self { state }
+    }
+}
+
+impl std::fmt::Debug for FingerprintKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FingerprintKey(<hidden>)")
+    }
+}
+
+/// A fingerprint of the encrypted bytes of a vault file, as a [`Vault`] read
+/// or wrote them, keyed with a [`FingerprintKey`]: two 64-bit values of the
+/// keyed hash of those bytes under that one key, each preceded by a byte of
+/// its own, for 128 bits. Equal for the same bytes under the same key; for
+/// other bytes, whatever the file's name, times or inode, equal only by
+/// chance — odds of about 2^-128 if the keyed hash, under a key one does not
+/// know, behaves as a random function. The standard library promises less:
+/// a hash that resists HashDoS attacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentFingerprint([u64; 2]);
+
+/// The bytes are hashed in blocks of this size, whatever sizes the reads and
+/// writes have: the standard library's hashers do not promise that two
+/// `write` calls hash like one with the bytes of both.
+const FINGERPRINT_BLOCK: usize = 64;
+
+/// Computes a [`ContentFingerprint`] as the bytes go by.
+struct ContentHasher {
+    hashers: [DefaultHasher; 2],
+    block: [u8; FINGERPRINT_BLOCK],
+    filled: usize,
+    total: u64,
+}
+
+impl ContentHasher {
+    fn new(key: &FingerprintKey) -> Self {
+        let mut hashers = [key.state.build_hasher(), key.state.build_hasher()];
+        // Two hashes of the same bytes under one key: each begins with a
+        // byte of its own.
+        for (first, hasher) in (0u8..).zip(&mut hashers) {
+            hasher.write_u8(first);
+        }
+        Self {
+            hashers,
+            block: [0; FINGERPRINT_BLOCK],
+            filled: 0,
+            total: 0,
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total += data.len() as u64;
+        while !data.is_empty() {
+            let take = (FINGERPRINT_BLOCK - self.filled).min(data.len());
+            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+            self.filled += take;
+            data = &data[take..];
+            if self.filled == FINGERPRINT_BLOCK {
+                for hasher in &mut self.hashers {
+                    hasher.write(&self.block);
+                }
+                self.filled = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> ContentFingerprint {
+        let tail = &self.block[..self.filled];
+        for hasher in &mut self.hashers {
+            hasher.write(tail);
+            hasher.write_u64(self.total);
+        }
+        ContentFingerprint([self.hashers[0].finish(), self.hashers[1].finish()])
+    }
+}
+
+/// A reader that fingerprints what it reads.
+struct HashingReader<'a, R> {
+    inner: R,
+    hasher: &'a mut ContentHasher,
+}
+
+impl<R: Read> Read for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// A writer that fingerprints what it writes.
+struct HashingWriter<'a, W> {
+    inner: W,
+    hasher: &'a mut ContentHasher,
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// A test hook run during a save.
 #[cfg(test)]
 type SaveHook = Box<dyn FnOnce(&Path) + Send>;
@@ -199,6 +341,11 @@ pub struct Vault {
     path: PathBuf,
     password: SecretString,
     fingerprint: Option<Fingerprint>,
+    /// The key of `content`, for a vault that fingerprints its file.
+    content_key: Option<FingerprintKey>,
+    /// The fingerprint of the file's bytes as this vault last read or wrote
+    /// them (see [`Vault::content_fingerprint`]).
+    content: Option<ContentFingerprint>,
     /// Remove `<name>.bak` after the next successful save (it is encrypted
     /// with a password that is no longer current).
     discard_backup: bool,
@@ -242,6 +389,20 @@ impl Vault {
         Ok(vault)
     }
 
+    /// [`Vault::create`], fingerprinting the file it writes, and every file
+    /// it saves later, with `key` ([`Vault::content_fingerprint`]).
+    pub fn create_fingerprinted(
+        path: &Path,
+        password: SecretString,
+        kdf: KdfParams,
+        key: &FingerprintKey,
+    ) -> Result<Vault, VaultError> {
+        let mut vault = Self::unsaved(path, password, kdf)?;
+        vault.content_key = Some(key.clone());
+        vault.write_file(false)?;
+        Ok(vault)
+    }
+
     /// A new, empty vault that is not on disk yet.
     fn unsaved(path: &Path, password: SecretString, kdf: KdfParams) -> Result<Vault, VaultError> {
         if fs::symlink_metadata(path).is_ok() {
@@ -257,6 +418,8 @@ impl Vault {
             path: path.to_path_buf(),
             password,
             fingerprint: None,
+            content_key: None,
+            content: None,
             discard_backup: false,
             cleanup_error: None,
             #[cfg(test)]
@@ -272,6 +435,24 @@ impl Vault {
 
     /// Open and decrypt an existing vault.
     pub fn open(path: &Path, password: SecretString) -> Result<Vault, VaultError> {
+        Self::open_with(path, password, None)
+    }
+
+    /// [`Vault::open`], fingerprinting the bytes it reads, and every file it
+    /// saves later, with `key` ([`Vault::content_fingerprint`]).
+    pub fn open_fingerprinted(
+        path: &Path,
+        password: SecretString,
+        key: &FingerprintKey,
+    ) -> Result<Vault, VaultError> {
+        Self::open_with(path, password, Some(key))
+    }
+
+    fn open_with(
+        path: &Path,
+        password: SecretString,
+        key: Option<&FingerprintKey>,
+    ) -> Result<Vault, VaultError> {
         let mut file = match File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -288,17 +469,31 @@ impl Vault {
             )));
         }
         let fingerprint = Fingerprint::of(&meta);
-        let db = Database::open(&mut file, DatabaseKey::new().with_password(&password)).map_err(
-            |e| match e {
-                DatabaseOpenError::Key(DatabaseKeyError::IncorrectKey) => VaultError::WrongPassword,
-                other => VaultError::Open(other),
-            },
-        )?;
+        // The library reads the whole file before it decrypts anything, so
+        // the fingerprint covers every byte of it.
+        let mut hasher = key.map(ContentHasher::new);
+        let database_key = DatabaseKey::new().with_password(&password);
+        let opened = match &mut hasher {
+            Some(hasher) => Database::open(
+                &mut HashingReader {
+                    inner: &mut file,
+                    hasher,
+                },
+                database_key,
+            ),
+            None => Database::open(&mut file, database_key),
+        };
+        let db = opened.map_err(|e| match e {
+            DatabaseOpenError::Key(DatabaseKeyError::IncorrectKey) => VaultError::WrongPassword,
+            other => VaultError::Open(other),
+        })?;
         Ok(Vault {
             db,
             path: path.to_path_buf(),
             password,
             fingerprint: Some(fingerprint),
+            content_key: key.cloned(),
+            content: hasher.map(ContentHasher::finish),
             discard_backup: false,
             cleanup_error: None,
             #[cfg(test)]
@@ -315,6 +510,14 @@ impl Vault {
     /// The vault file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The fingerprint of the vault file's encrypted bytes as this vault
+    /// last read or wrote them — when it was opened or created, or by its
+    /// last save that replaced the file — keyed with the key it was opened
+    /// or created with; `None` for a vault opened without a key.
+    pub fn content_fingerprint(&self) -> Option<ContentFingerprint> {
+        self.content
     }
 
     /// Whether `candidate` is the current master password (compared in
@@ -381,21 +584,36 @@ impl Vault {
             .into_owned();
         let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
 
-        let result = (|| -> Result<Fingerprint, VaultError> {
+        let result = (|| -> Result<(Fingerprint, Option<ContentFingerprint>), VaultError> {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            self.db
-                .save(&mut file, DatabaseKey::new().with_password(&self.password))
-                .map_err(VaultError::Save)?;
+            // A new file, written from its start: what is fingerprinted is
+            // exactly what it holds.
+            let mut hasher = self.content_key.as_ref().map(ContentHasher::new);
+            let database_key = DatabaseKey::new().with_password(&self.password);
+            match &mut hasher {
+                Some(hasher) => self.db.save(
+                    &mut HashingWriter {
+                        inner: &mut file,
+                        hasher,
+                    },
+                    database_key,
+                ),
+                None => self.db.save(&mut file, database_key),
+            }
+            .map_err(VaultError::Save)?;
             file.flush()?;
             file.sync_all()?;
-            Ok(Fingerprint::of(&file.metadata()?))
+            Ok((
+                Fingerprint::of(&file.metadata()?),
+                hasher.map(ContentHasher::finish),
+            ))
         })();
-        let written = match result {
-            Ok(fingerprint) => fingerprint,
+        let (written, content) = match result {
+            Ok(written) => written,
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 return Err(e);
@@ -446,6 +664,9 @@ impl Vault {
         // "not saved". The renamed file is the one we wrote (same inode),
         // whatever the path points to by now.
         self.fingerprint = Some(written);
+        if content.is_some() {
+            self.content = content;
+        }
         #[cfg(test)]
         let synced = if self.fail_dir_sync {
             Err(std::io::Error::other("injected directory sync failure"))
@@ -2263,6 +2484,130 @@ mod tests {
         let id = vault.find("gone").expect("find");
         vault.remove(id);
         assert!(matches!(vault.find("gone"), Err(VaultError::NotFound(_))));
+    }
+
+    #[test]
+    fn the_content_fingerprint_follows_the_bytes_of_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        let key = FingerprintKey::random();
+        let mut vault = Vault::create_fingerprinted(
+            &path,
+            secret("correct horse"),
+            KdfParams::INSECURE_FOR_TESTS,
+            &key,
+        )
+        .expect("create");
+        let created = vault.content_fingerprint().expect("fingerprinted");
+        let reopened = |key: &FingerprintKey| {
+            Vault::open_fingerprinted(&path, secret("correct horse"), key)
+                .expect("open")
+                .content_fingerprint()
+                .expect("fingerprinted")
+        };
+        // The bytes it wrote are the bytes a later open reads.
+        assert_eq!(reopened(&key), created);
+        // Another key, another fingerprint of the same bytes.
+        assert_ne!(reopened(&FingerprintKey::random()), created);
+        // Its own save: the fingerprint of what it wrote, which is again
+        // what an open reads.
+        vault
+            .add(&entry("mine"), &secret("one1"), false)
+            .expect("add");
+        vault.save().expect("save");
+        let saved = vault.content_fingerprint().expect("fingerprinted");
+        assert_ne!(saved, created);
+        assert_eq!(reopened(&key), saved);
+        // A save that is refused (the file changed underneath) keeps the
+        // fingerprint of what it last read or wrote.
+        let mut theirs = Vault::open(&path, secret("correct horse")).expect("open");
+        assert_eq!(theirs.content_fingerprint(), None, "opened without a key");
+        theirs
+            .add(&entry("theirs"), &secret("two2"), false)
+            .expect("add");
+        theirs.save().expect("save");
+        assert_eq!(theirs.content_fingerprint(), None);
+        vault
+            .add(&entry("refused"), &secret("three3"), false)
+            .expect("add");
+        assert!(matches!(vault.save(), Err(VaultError::ChangedOnDisk)));
+        assert_eq!(vault.content_fingerprint(), Some(saved));
+        // The other program's change shows at the next open.
+        let changed = reopened(&key);
+        assert_ne!(changed, saved);
+        // The name, times and inode do not count: the same bytes in another
+        // file, with other times, have the same fingerprint.
+        let bytes = fs::read(&path).expect("read");
+        fs::remove_file(&path).expect("rm");
+        fs::write(&path, &bytes).expect("write");
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(old)
+            .expect("set the time");
+        assert_eq!(reopened(&key), changed);
+        // A failed open gives no vault, and so no fingerprint to keep.
+        assert!(matches!(
+            Vault::open_fingerprinted(&path, secret("wrong"), &key),
+            Err(VaultError::WrongPassword)
+        ));
+        assert!(format!("{key:?}").contains("hidden"));
+    }
+
+    #[test]
+    fn the_fingerprint_does_not_depend_on_how_the_bytes_arrive() {
+        let key = FingerprintKey::random();
+        let fingerprint = |chunks: &[&[u8]]| {
+            let mut hasher = ContentHasher::new(&key);
+            for chunk in chunks {
+                hasher.update(chunk);
+            }
+            hasher.finish()
+        };
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let whole = fingerprint(&[&data]);
+        // Its two halves are hashes of different inputs, not one twice.
+        let [first, second] = whole.0;
+        assert_ne!(first, second);
+        for size in [1, 3, 63, 64, 65, 128, 200, 999, 1000] {
+            let chunks: Vec<&[u8]> = data.chunks(size).collect();
+            assert_eq!(fingerprint(&chunks), whole, "chunks of {size}");
+        }
+        assert_eq!(fingerprint(&[&[], &data, &[]]), whole);
+        // Another byte, one more or one less, is another fingerprint.
+        let mut flipped = data.clone();
+        flipped[500] ^= 1;
+        assert_ne!(fingerprint(&[&flipped]), whole);
+        assert_ne!(fingerprint(&[&data[..999]]), whole);
+        assert_ne!(fingerprint(&[&data, &[0]]), whole);
+        assert_ne!(
+            fingerprint(&[&data[..64]]),
+            fingerprint(&[&data[..64], &[0]])
+        );
+        assert_ne!(fingerprint(&[]), fingerprint(&[&[0]]));
+        // Through the reader and the writer as through the hasher.
+        let mut hasher = ContentHasher::new(&key);
+        let mut read = Vec::new();
+        HashingReader {
+            inner: &data[..],
+            hasher: &mut hasher,
+        }
+        .read_to_end(&mut read)
+        .expect("read");
+        assert_eq!(read, data);
+        assert_eq!(hasher.finish(), whole);
+        let mut hasher = ContentHasher::new(&key);
+        let mut written = Vec::new();
+        HashingWriter {
+            inner: &mut written,
+            hasher: &mut hasher,
+        }
+        .write_all(&data)
+        .expect("write");
+        assert_eq!(written, data);
+        assert_eq!(hasher.finish(), whole);
     }
 }
 

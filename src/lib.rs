@@ -27,6 +27,9 @@
 //! - [`broker_protocol`]: the control channel between the agent and
 //!   `rusthorse-broker`, tokens and grant IDs, the broker's limits and the
 //!   file of certificate authorities it trusts.
+//! - `broker_host`: the agent's side of the credential broker: the registry
+//!   of grants, starting and supervising one broker per grant, admission,
+//!   revocation and expiry.
 //! - [`exec`]: program resolution and environment preparation for `run`.
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`session_lock`]: locking when the screen locks or the computer suspends.
@@ -42,6 +45,7 @@
 
 pub mod agent;
 pub mod audit;
+mod broker_host;
 pub mod broker_profile;
 pub mod broker_protocol;
 pub mod client;
