@@ -236,8 +236,11 @@ impl Manager {
             .text("imported")
             .build();
         options.add(&tag);
+        // A replaced entry gets only what the import gives it: never a
+        // broker profile, which only an approved edit sets (ADR 0013).
         let replace = adw::SwitchRow::builder()
             .title("Replace entries that already exist")
+            .subtitle("Replacing an entry removes its broker profile, which ends its grants.")
             .build();
         options.add(&replace);
         body.append(&options);

@@ -1,11 +1,15 @@
 //! Widgets with a real agent and scripted decisions, exclusively on Xvfb.
+//! The grants of the credential broker need a broker program, which a test
+//! agent cannot start: their page is driven by a fake agent instead.
 #![allow(clippy::unwrap_used)]
 use super::*;
 use rusthorse::agent::{Agent, AgentConfig};
+use rusthorse::broker_profile::{AutomaticLocks, Preset};
+use rusthorse::protocol::{ErrorCode, PROTOCOL_VERSION};
 use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -1372,6 +1376,18 @@ fn import_windows() {
         !shown(&picker).contains("fake-a-value"),
         "a value in the window"
     );
+    // Replacing says what it takes from the entry it replaces (vault.rs
+    // writes a replaced entry without its broker profile).
+    let replace = descendants(&picker)
+        .into_iter()
+        .find_map(|w| w.downcast::<adw::SwitchRow>().ok())
+        .expect("the replace switch");
+    assert_eq!(replace.title(), "Replace entries that already exist");
+    assert_eq!(
+        replace.subtitle().as_deref(),
+        Some("Replacing an entry removes its broker profile, which ends its grants.")
+    );
+    drop(replace);
     // Names from the attribute "nome"; only the segredo items, ticked.
     let from = descendants(&picker)
         .into_iter()
@@ -1523,5 +1539,935 @@ fn import_windows() {
         assert_eq!(file.secret(id).unwrap().as_str(), value);
     }
     assert!(file.find("FAKE_LOCKED").is_err());
+    s.window.close();
+}
+
+/// What the fake agent answers, and what it was asked.
+struct FakeState {
+    locked: bool,
+    /// The protocol version its status reports.
+    protocol: u32,
+    entries: Vec<EntryInfo>,
+    grants: Vec<GrantInfo>,
+    /// Answer `grants` with this refusal.
+    refuse_grants: Option<String>,
+    /// Answer `revoke_grant` with this refusal, revoking nothing.
+    refuse_revoke: Option<String>,
+    /// Requests of this type wait for their answer — made when they arrive —
+    /// while it is set: a slow agent, or one that shows a dialog.
+    hold: Option<&'static str>,
+    /// How many answers are waiting.
+    held: usize,
+    /// Requests of this type wait while it is set, before anything is done
+    /// for them: an agent waiting for the human's answer, which then acts.
+    stall: Option<&'static str>,
+    /// How many requests have waited so.
+    stalled: usize,
+    /// Every request, in the order it arrived (a stalled one when it is
+    /// carried out).
+    requests: Vec<serde_json::Value>,
+}
+
+fn fake_state(locked: bool) -> Arc<Mutex<FakeState>> {
+    Arc::new(Mutex::new(FakeState {
+        locked,
+        protocol: PROTOCOL_VERSION,
+        entries: vec![],
+        grants: vec![],
+        refuse_grants: None,
+        refuse_revoke: None,
+        hold: None,
+        held: 0,
+        stall: None,
+        stalled: 0,
+        requests: vec![],
+    }))
+}
+
+/// Serve `state` on `socket`: one thread per connection, as the agent does,
+/// so that an answer held back does not hold back the others.
+fn fake_agent(socket: &std::path::Path, state: &Arc<Mutex<FakeState>>) {
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let state = Arc::clone(state);
+    // These threads exist only in this test's subprocess.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let Ok(request) = rusthorse::protocol::read_message::<serde_json::Value>(&stream)
+                else {
+                    return;
+                };
+                let kind = request["type"].as_str();
+                let stalled = {
+                    let mut s = state.lock().unwrap();
+                    let stalled = s.stall.is_some() && s.stall == kind;
+                    s.stalled += usize::from(stalled);
+                    stalled
+                };
+                if stalled {
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while state.lock().unwrap().stall == kind && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                let (answer, held) = fake_answer(&state, &request);
+                if held {
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while state.lock().unwrap().hold == request["type"].as_str()
+                        && Instant::now() < until
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                let _ = rusthorse::protocol::send_frame(&stream, &answer, &[]);
+                if held {
+                    state.lock().unwrap().held -= 1;
+                }
+            });
+        }
+    });
+}
+
+/// The fake agent's answer to `request`, and whether it is held back.
+fn fake_answer(state: &Mutex<FakeState>, request: &serde_json::Value) -> (Response, bool) {
+    let mut s = state.lock().unwrap();
+    s.requests.push(request.clone());
+    let kind = request["type"].as_str().unwrap_or_default();
+    // Only what an agent of this protocol reads is answered.
+    let understood = serde_json::from_value::<Request>(request.clone()).is_ok();
+    let answer = match kind {
+        _ if !understood => Response::Error {
+            code: ErrorCode::InvalidRequest,
+            message: format!("fake: a malformed {kind} request"),
+        },
+        "status" => Response::Status(StatusInfo {
+            protocol_version: s.protocol,
+            agent_version: "fake".into(),
+            vault: "/fake/vault.kdbx".into(),
+            vault_exists: true,
+            audit_log: "/fake/audit.jsonl".into(),
+            locked: s.locked,
+            idle_timeout_secs: 0,
+            locks_in_secs: None,
+            remembered_approvals: 0,
+            agent_executable: "/fake/rusthorse".into(),
+            agent_executable_id: None,
+            agent_executable_replaced: None,
+            dialogs: None,
+            lock_triggers: vec![],
+            broker: Some("/fake/rusthorse-broker".into()),
+            grants: Some(s.grants.iter().filter(|g| g.state != "revoked").count()),
+        }),
+        "list" => Response::Entries {
+            entries: s.entries.clone(),
+        },
+        "unlock" => {
+            s.locked = false;
+            Response::Ok {
+                message: "fake: unlocked".into(),
+            }
+        }
+        "lock" => {
+            // The explicit lock ends every grant.
+            s.locked = true;
+            for g in &mut s.grants {
+                g.state = "revoked".into();
+            }
+            Response::Ok {
+                message: "fake: locked".into(),
+            }
+        }
+        "grants" => match &s.refuse_grants {
+            Some(why) => Response::Error {
+                code: ErrorCode::InvalidRequest,
+                message: why.clone(),
+            },
+            None => Response::Grants {
+                grants: s.grants.clone(),
+            },
+        },
+        "remove" => {
+            // The entry goes, and its grants end with it (here every grant
+            // the fake lists is that entry's); then its answer is lost.
+            for g in &mut s.grants {
+                g.state = "revoked".into();
+            }
+            Response::Error {
+                code: ErrorCode::OutcomeUnknown,
+                message: "fake: the answer was lost".into(),
+            }
+        }
+        "revoke_grant" if s.refuse_revoke.is_some() => Response::Error {
+            code: ErrorCode::NotFound,
+            message: s.refuse_revoke.clone().unwrap_or_default(),
+        },
+        "revoke_grant" => {
+            // As the agent does: a revoked grant is listed until its
+            // command ends.
+            let id = request["id"].as_str();
+            let mut ended = 0;
+            for g in s
+                .grants
+                .iter_mut()
+                .filter(|g| g.state != "revoked" && id.is_none_or(|id| g.id == id))
+            {
+                g.state = "revoked".into();
+                ended += 1;
+            }
+            Response::Ok {
+                message: format!("fake: {ended} revoked"),
+            }
+        }
+        _ => Response::Error {
+            code: ErrorCode::InvalidRequest,
+            message: format!("fake: {kind} is not served"),
+        },
+    };
+    let held = s.hold == Some(kind);
+    if held {
+        s.held += 1;
+    }
+    (answer, held)
+}
+
+/// The texts of the labels under `root`.
+fn texts(root: &impl IsA<gtk::Widget>) -> Vec<String> {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .map(|l| l.text().to_string())
+        .collect()
+}
+
+/// Show the page `name`, as a click in the sidebar does.
+fn show_page(s: &Manager, name: &str) {
+    let row = descendants(&s.window)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::ListBoxRow>().ok())
+        .find(|r| r.widget_name() == name)
+        .unwrap_or_else(|| panic!("no page {name}"));
+    row.parent()
+        .and_downcast::<gtk::ListBox>()
+        .unwrap()
+        .select_row(Some(&row));
+}
+
+/// Whether a button named `name` is under `root`.
+fn has_button(root: &impl IsA<gtk::Widget>, name: &str) -> bool {
+    descendants(root)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Button>().ok())
+        .any(|b| b.widget_name() == name)
+}
+
+/// The grants page, driven by a fake agent: it lists what the agent lists,
+/// also while the vault is locked and says so, refreshes, and sends the
+/// right revocations.
+#[test]
+fn grants_page() {
+    if !on_xvfb("grants_page") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let state = fake_state(true);
+    // What the requester controls is drawn as plain text, through the
+    // dialogs' filter: no markup, no line break or reordering of its own.
+    let mut first = crate::model::tests::grant("g0123456789abcdef", "active");
+    first.command = "sh -c '<b>fake</b>'\u{202e}gpj.exe\nrm -rf fake".into();
+    first.requester = "bash ← fake\u{200b}agent".into();
+    let mut second = crate::model::tests::grant("gfedcba9876543210", "exhausted");
+    second.preset = Preset::Openai;
+    second.destination = "https://api.openai.com/v1".into();
+    second.max_requests = Some(3);
+    second.in_flight = 0;
+    second.automatic_locks = AutomaticLocks::End;
+    state.lock().unwrap().grants = vec![first, second];
+    fake_agent(&socket, &state);
+    let asked = |kind: &str| {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["type"] == kind)
+            .count()
+    };
+    let revocations = || -> Vec<serde_json::Value> {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["type"] == "revoke_grant")
+            .cloned()
+            .collect()
+    };
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket.clone());
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Locked");
+    // The Status page reports the broker program and the active grants.
+    let status = texts(&s.status_page);
+    assert!(
+        status.iter().any(|t| t == "/fake/rusthorse-broker"),
+        "{status:#?}"
+    );
+    let at = status
+        .iter()
+        .position(|t| t == "Active grants")
+        .expect("the active grants");
+    // A key's value follows it.
+    assert_eq!(status.get(at + 1).map(String::as_str), Some("2"));
+
+    // Listed once the page is shown, not before; nothing to revoke until
+    // then.
+    assert_eq!(asked("grants"), 0);
+    assert!(!s.revoke_all.is_sensitive());
+    assert!(s.grants_job.borrow().is_none());
+    show_page(&s, "grants");
+    assert!(
+        s.grants_job.borrow().is_some(),
+        "listed as soon as shown, not at the next tick"
+    );
+    spin_until(|| asked("grants") == 1 && s.grants_job.borrow().is_none());
+    // The vault is locked: the page says so, and lists all the same.
+    assert!(s.grants_locked.is_visible());
+    assert_eq!(s.grants_locked.title(), "The vault is locked");
+    assert!(
+        s.grants_locked
+            .description()
+            .unwrap()
+            .contains("you can revoke them")
+    );
+    let titles: Vec<String> = descendants(&s.grants_list)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
+        .map(|g| g.title().to_string())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Grant g0123456789abcdef", "Grant gfedcba9876543210"]
+    );
+    assert_eq!(s.grants_summary.text(), "2 grants, oldest first.");
+    let shown = texts(&s.grants_list);
+    for expected in [
+        "AI/ANTHROPIC_API_KEY (11111111)",
+        "https://api.anthropic.com (Anthropic)",
+        "sh -c '<b>fake</b>'\\u{202e}gpj.exe\\u{a}rm -rf fake",
+        "Requested by (unverified)",
+        "bash ← fake\\u{200b}agent",
+        "ANTHROPIC_AUTH_TOKEN",
+        "Active",
+        "2026-11-02T10:15:00-03:00",
+        "in 11h43m at the latest",
+        "3 (no limit); 1 in flight",
+        "Do not end it: it keeps working while the screen or the vault is locked",
+        "g0123456789abcdef",
+        "https://api.openai.com/v1 (OpenAI)",
+        "3 of 3; 0 in flight",
+        "End it: the screen locking, suspend and the idle timeout",
+    ] {
+        assert!(
+            shown.iter().any(|t| t == expected),
+            "{expected:?} is not in {shown:#?}"
+        );
+    }
+    assert!(
+        shown
+            .iter()
+            .all(|t| !t.contains(['\u{202e}', '\u{200b}', '\n'])),
+        "{shown:#?}"
+    );
+    // The rows hold what the agent sent: plain text. (A group's own title
+    // is markup, which is why only an ID of the exact form goes there.)
+    let rows: Vec<adw::PreferencesRow> = descendants(&s.grants_list)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::PreferencesRow>().ok())
+        .collect();
+    assert_eq!(rows.len(), 22, "eleven rows a grant");
+    assert!(rows.iter().all(|row| {
+        descendants(row)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .all(|l| !l.uses_markup())
+    }));
+    spin_until(|| s.window.width() > 0);
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
+    snapshot(&s, "grants.png");
+    if std::env::var_os("MANAGER_TEST_SCREENSHOTS").is_some() {
+        let styles = adw::StyleManager::default();
+        styles.set_color_scheme(adw::ColorScheme::ForceDark);
+        let settle_frame = Instant::now() + Duration::from_millis(250);
+        spin_until(|| Instant::now() >= settle_frame);
+        snapshot(&s, "grants-dark.png");
+        styles.set_color_scheme(adw::ColorScheme::Default);
+    }
+
+    // A listing that shows the same draws nothing anew: the buttons stay
+    // under the pointer.
+    let one = named(&s.grants_list, "revoke-g0123456789abcdef");
+    let before = asked("grants");
+    s.list_grants();
+    spin_until(|| asked("grants") > before && s.grants_job.borrow().is_none());
+    assert_eq!(named(&s.grants_list, "revoke-g0123456789abcdef"), one);
+
+    // Revoke one: its ID, and only it. The page lists again.
+    assert!(one.is_sensitive() && s.revoke_all.is_sensitive());
+    assert!(gtk::test_accessible_has_property(
+        &one,
+        gtk::AccessibleProperty::Label
+    ));
+    let before = asked("grants");
+    one.emit_clicked();
+    spin_until(|| {
+        s.revoke_job.borrow().is_none()
+            && s.grants_job.borrow().is_none()
+            && asked("grants") > before
+    });
+    assert_eq!(
+        revocations(),
+        [serde_json::json!({"type": "revoke_grant", "id": "g0123456789abcdef"})]
+    );
+    assert_eq!(s.message.text(), "fake: 1 revoked");
+    // Ended, it is listed until its command ends, with nothing to revoke.
+    assert!(!named(&s.grants_list, "revoke-g0123456789abcdef").is_sensitive());
+    assert!(named(&s.grants_list, "revoke-gfedcba9876543210").is_sensitive());
+    assert!(
+        texts(&s.grants_list)
+            .iter()
+            .any(|t| t.starts_with("Revoked: "))
+    );
+    // Revoke all: no ID. Then nothing is left to revoke.
+    assert!(s.revoke_all.is_sensitive());
+    s.revoke_all.emit_clicked();
+    spin_until(|| {
+        s.revoke_job.borrow().is_none()
+            && s.grants_job.borrow().is_none()
+            && !s.revoke_all.is_sensitive()
+    });
+    assert_eq!(
+        revocations().last(),
+        Some(&serde_json::json!({"type": "revoke_grant"}))
+    );
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .grants
+            .iter()
+            .all(|g| g.state == "revoked")
+    );
+    assert!(!named(&s.grants_list, "revoke-gfedcba9876543210").is_sensitive());
+
+    // Listed again every few seconds while shown, and not while hidden.
+    let before = asked("grants");
+    spin_until(|| asked("grants") > before);
+    show_page(&s, "entries");
+    spin_until(|| s.grants_job.borrow().is_none());
+    let before = asked("grants");
+    let quiet = Instant::now() + Duration::from_secs(6);
+    spin_until(|| Instant::now() >= quiet);
+    assert_eq!(asked("grants"), before, "listed while not shown");
+    // A revocation is followed by a listing, timer or not.
+    s.revoke(Some("g0123456789abcdef".into()));
+    spin_until(|| {
+        s.revoke_job.borrow().is_none()
+            && asked("grants") > before
+            && s.grants_job.borrow().is_none()
+    });
+    show_page(&s, "grants");
+    assert!(s.grants_job.borrow().is_some(), "listed again when shown");
+    spin_until(|| asked("grants") > before + 1 && s.grants_job.borrow().is_none());
+
+    // A revocation does not wait for a request of the human's: here the
+    // agent holds Unlock, as if its password dialog were open.
+    {
+        let mut st = state.lock().unwrap();
+        st.grants = vec![crate::model::tests::grant("g1111111111111111", "active")];
+        st.hold = Some("unlock");
+    }
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-g1111111111111111")
+    });
+    s.lock.emit_clicked();
+    spin_until(|| state.lock().unwrap().held == 1);
+    assert!(s.job.borrow().is_some());
+    named(&s.grants_list, "revoke-g1111111111111111").emit_clicked();
+    spin_until(|| s.revoke_job.borrow().is_none());
+    assert!(s.job.borrow().is_some(), "the unlock is still waiting");
+    assert_eq!(
+        revocations().last(),
+        Some(&serde_json::json!({"type": "revoke_grant", "id": "g1111111111111111"}))
+    );
+    state.lock().unwrap().hold = None;
+    settle(&s);
+    assert_eq!(s.pill.text(), "Unlocked");
+    // Unlocked: no note.
+    assert!(!s.grants_locked.is_visible());
+
+    // A list the agent made before a revocation ended is not shown: the
+    // page lists again. Held back here, it shows the grant active, with a
+    // request more.
+    state.lock().unwrap().grants = vec![crate::model::tests::grant("g2222222222222222", "active")];
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-g2222222222222222")
+    });
+    {
+        let mut st = state.lock().unwrap();
+        st.grants[0].requests = 4;
+        st.hold = Some("grants");
+    }
+    s.list_grants();
+    spin_until(|| state.lock().unwrap().held == 1);
+    named(&s.grants_list, "revoke-g2222222222222222").emit_clicked();
+    spin_until(|| s.revoke_job.borrow().is_none());
+    assert_eq!(state.lock().unwrap().grants[0].state, "revoked");
+    state.lock().unwrap().hold = None;
+    spin_until(|| {
+        let shown = texts(&s.grants_list);
+        assert!(
+            !(shown.iter().any(|t| t == "4 (no limit); 1 in flight")
+                && shown.iter().any(|t| t == "Active")),
+            "a list made before the revocation was shown: {shown:#?}"
+        );
+        s.grants_job.borrow().is_none()
+            && state.lock().unwrap().held == 0
+            && shown.iter().any(|t| t.starts_with("Revoked: "))
+    });
+    // The same with Lock now, which ends every grant.
+    state.lock().unwrap().grants = vec![crate::model::tests::grant("g3333333333333333", "active")];
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-g3333333333333333")
+    });
+    {
+        let mut st = state.lock().unwrap();
+        st.grants[0].requests = 4;
+        st.hold = Some("grants");
+    }
+    s.list_grants();
+    spin_until(|| state.lock().unwrap().held == 1);
+    assert_eq!(s.lock.label().as_deref(), Some("Lock now"));
+    s.lock.emit_clicked();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Locked");
+    assert!(s.grants_locked.is_visible());
+    state.lock().unwrap().hold = None;
+    spin_until(|| {
+        let shown = texts(&s.grants_list);
+        assert!(
+            !(shown.iter().any(|t| t == "4 (no limit); 1 in flight")
+                && shown.iter().any(|t| t == "Active")),
+            "a list made before the lock was shown: {shown:#?}"
+        );
+        s.grants_job.borrow().is_none()
+            && state.lock().unwrap().held == 0
+            && shown.iter().any(|t| t.starts_with("Revoked: "))
+    });
+    // Nor one made while a request of the human's waited, when that request
+    // has ended grants since: here a removal waits for its approval, a
+    // listing is made meanwhile, then the entry goes with its grant and the
+    // answer is lost, so that no refresh follows.
+    state.lock().unwrap().grants = vec![crate::model::tests::grant("g5555555555555555", "active")];
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-g5555555555555555")
+    });
+    state.lock().unwrap().stall = Some("remove");
+    s.submit(
+        Request::Remove {
+            name: "11111111-2222-3333-4444-555555555555".into(),
+        },
+        Pending::Change,
+    );
+    spin_until(|| state.lock().unwrap().stalled == 1);
+    {
+        let mut st = state.lock().unwrap();
+        st.grants[0].requests = 4;
+        st.hold = Some("grants");
+    }
+    s.list_grants();
+    spin_until(|| state.lock().unwrap().held == 1);
+    state.lock().unwrap().stall = None;
+    settle(&s);
+    assert!(
+        s.message.text().starts_with("Outcome unknown."),
+        "{}",
+        s.message.text()
+    );
+    state.lock().unwrap().hold = None;
+    spin_until(|| {
+        let shown = texts(&s.grants_list);
+        assert!(
+            !(shown.iter().any(|t| t == "4 (no limit); 1 in flight")
+                && shown.iter().any(|t| t == "Active")),
+            "a list made before the removal ended was shown: {shown:#?}"
+        );
+        s.grants_job.borrow().is_none()
+            && state.lock().unwrap().held == 0
+            && shown.iter().any(|t| t.starts_with("Revoked: "))
+    });
+
+    // An ID not of the form of one is drawn as plain text, never as a
+    // group's title, which is markup.
+    state.lock().unwrap().grants = vec![crate::model::tests::grant("<b>g</b>&", "active")];
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-<b>g</b>&")
+    });
+    let titles: Vec<String> = descendants(&s.grants_list)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
+        .map(|g| g.title().to_string())
+        .collect();
+    assert_eq!(titles, ["Grant"]);
+    assert!(texts(&s.grants_list).iter().any(|t| t == "<b>g</b>&"));
+
+    // A refusal is shown on the page, in place of the list. Revoke all
+    // stays: it may work all the same, and only takes away.
+    state.lock().unwrap().refuse_grants = Some("fake: grants are refused".into());
+    s.list_grants();
+    spin_until(|| s.grants_job.borrow().is_none() && s.grants_summary.has_css_class("error"));
+    assert_eq!(s.grants_summary.text(), "fake: grants are refused");
+    assert!(descendants(&s.grants_list).is_empty());
+    assert!(s.revoke_all.is_sensitive());
+
+    // A refused revocation is reported as the manager reports other
+    // errors, at the bottom of the window; nothing was revoked, and the
+    // buttons can be used again.
+    {
+        let mut st = state.lock().unwrap();
+        st.refuse_grants = None;
+        st.refuse_revoke = Some("fake: no grant g4444444444444444".into());
+        st.grants = vec![crate::model::tests::grant("g4444444444444444", "active")];
+    }
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-g4444444444444444")
+    });
+    assert!(!s.grants_summary.has_css_class("error"));
+    named(&s.grants_list, "revoke-g4444444444444444").emit_clicked();
+    spin_until(|| s.revoke_job.borrow().is_none());
+    assert_eq!(s.message.text(), "fake: no grant g4444444444444444");
+    assert!(s.message.has_css_class("error"));
+    spin_until(|| s.grants_job.borrow().is_none());
+    assert!(named(&s.grants_list, "revoke-g4444444444444444").is_sensitive());
+    assert!(s.revoke_all.is_sensitive());
+
+    // A revocation the agent does not answer is reported once the page
+    // has waited long enough, and the page can be used again. Revoking has
+    // no effect that a lost answer would leave unknown: it can be retried.
+    {
+        let mut st = state.lock().unwrap();
+        st.refuse_revoke = None;
+        st.hold = Some("revoke_grant");
+    }
+    s.revoke_all.emit_clicked();
+    spin_until(|| state.lock().unwrap().held == 1);
+    assert!(!s.revoke_all.is_sensitive(), "one revocation at a time");
+    assert!(!named(&s.grants_list, "revoke-g4444444444444444").is_sensitive());
+    let waited = Instant::now();
+    spin_until(|| s.revoke_job.borrow().is_none());
+    assert!(waited.elapsed() < GRANTS_LIMIT + Duration::from_secs(2));
+    assert_eq!(
+        s.message.text(),
+        "No complete answer arrived from the agent."
+    );
+    assert!(s.message.has_css_class("error"));
+    state.lock().unwrap().hold = None;
+    spin_until(|| state.lock().unwrap().held == 0 && s.grants_job.borrow().is_none());
+    // The agent did revoke it: the list says so.
+    assert!(
+        texts(&s.grants_list)
+            .iter()
+            .any(|t| t.starts_with("Revoked: "))
+    );
+    // So is a listing, in place of the list.
+    state.lock().unwrap().hold = Some("grants");
+    s.list_grants();
+    spin_until(|| state.lock().unwrap().held >= 1);
+    spin_until(|| s.grants_job.borrow().is_none() && s.grants_summary.has_css_class("error"));
+    assert_eq!(
+        s.grants_summary.text(),
+        "No complete answer arrived from the agent."
+    );
+    assert!(descendants(&s.grants_list).is_empty());
+    assert!(s.revoke_all.is_sensitive());
+    state.lock().unwrap().hold = None;
+    spin_until(|| state.lock().unwrap().held == 0);
+
+    // No grant: the page says so, and there is nothing to revoke.
+    state.lock().unwrap().grants.clear();
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && s.grants_summary.text().starts_with("No grants.")
+    });
+    assert_eq!(
+        s.grants_summary.text(),
+        "No grants. A command started with rusthorse run --broker gets one for each entry it uses through the broker, until it ends."
+    );
+    assert!(!s.grants_summary.has_css_class("error"));
+    assert!(descendants(&s.grants_list).is_empty());
+    assert!(!s.revoke_all.is_sensitive());
+
+    // An agent of an older protocol is asked its status, nothing more.
+    state.lock().unwrap().protocol = PROTOCOL_VERSION - 1;
+    let before = asked("grants");
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none()
+            && s.grants_summary
+                .text()
+                .starts_with("Incompatible agent protocol")
+    });
+    assert_eq!(asked("grants"), before);
+    // Such an agent cannot say whether the vault is locked: the note goes.
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Unavailable");
+    assert!(!s.grants_locked.is_visible());
+
+    // No agent at all: the page says so, and Revoke all may be tried; it
+    // says the same.
+    std::fs::remove_file(&socket).unwrap();
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none()
+            && s.grants_summary
+                .text()
+                .starts_with("The agent is not running.")
+    });
+    assert!(s.revoke_all.is_sensitive());
+    let before = revocations().len();
+    s.revoke_all.emit_clicked();
+    spin_until(|| s.revoke_job.borrow().is_none());
+    assert!(
+        s.message.text().starts_with("The agent is not running."),
+        "{}",
+        s.message.text()
+    );
+    assert_eq!(revocations().len(), before);
+    s.window.close();
+}
+
+/// An entry's broker profile in its details — read-only, or why it cannot
+/// be used — and the command snippet that uses it, with a fake agent that
+/// lists entries as the vault reports them.
+#[test]
+fn broker_profiles() {
+    if !on_xvfb("broker_profiles") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let state = fake_state(false);
+    let entry = |id: &str, name: &str, kind: EntryKind| {
+        let mut e = crate::model::tests::entry();
+        e.id = id.into();
+        e.name = name.into();
+        e.fields.kind = Some(kind);
+        e.protected_fields.clear();
+        e
+    };
+    let mut usable = entry(
+        "10000000-0000-4000-8000-000000000001",
+        "ANTHROPIC_API_KEY",
+        EntryKind::ApiKey,
+    );
+    usable.broker = Some(crate::model::tests::usable(Preset::Anthropic));
+    let mut unusable = entry(
+        "10000000-0000-4000-8000-000000000002",
+        "OLD_KEY",
+        EntryKind::ApiKey,
+    );
+    unusable.other_fields = vec!["Rusthorse.Broker".into()];
+    let mut protected = entry(
+        "10000000-0000-4000-8000-000000000003",
+        "SEALED_KEY",
+        EntryKind::ApiKey,
+    );
+    protected.protected_fields = vec!["Rusthorse.Broker".into()];
+    let absent = entry(
+        "10000000-0000-4000-8000-000000000004",
+        "PLAIN_KEY",
+        EntryKind::ApiKey,
+    );
+    let device = entry(
+        "10000000-0000-4000-8000-000000000005",
+        "core-router",
+        EntryKind::Device,
+    );
+    state.lock().unwrap().entries = vec![
+        usable.clone(),
+        unusable.clone(),
+        protected.clone(),
+        absent.clone(),
+        device.clone(),
+    ];
+    fake_agent(&socket, &state);
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket);
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.entries.borrow().len(), 5);
+    let select = |e: &EntryInfo| {
+        let row = (0..)
+            .map_while(|i| s.rows.row_at_index(i))
+            .find(|r| r.widget_name() == e.id.as_str())
+            .expect("its row");
+        s.rows.select_row(Some(&row));
+        assert_eq!(s.current().map(|c| c.id), Some(e.id.clone()));
+    };
+    let groups = |s: &Manager| {
+        descendants(&s.detail)
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
+            .collect::<Vec<_>>()
+    };
+    let broker = |s: &Manager| {
+        groups(s)
+            .into_iter()
+            .find(|g| g.widget_name() == "credential-broker")
+    };
+    let usage = |s: &Manager| {
+        groups(s)
+            .into_iter()
+            .find(|g| g.title() == "Use it from a command")
+            .and_then(|g| g.description())
+            .map(|d| d.to_string())
+            .expect("the usage")
+    };
+    let snippet_shown = |s: &Manager| {
+        descendants(&s.detail)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.has_css_class("monospace"))
+            .map(|l| l.text().to_string())
+            .expect("the snippet")
+    };
+
+    // Usable: the profile as approval dialogs show it, read-only.
+    select(&usable);
+    let g = broker(&s).expect("the profile");
+    assert_eq!(g.title(), "Credential broker");
+    let shown = texts(&g);
+    for (key, value) in crate::model::profile_facts(usable.broker.as_ref().unwrap()) {
+        assert!(
+            shown.contains(&key) && shown.contains(&value),
+            "{key}: {value} is not in {shown:#?}"
+        );
+    }
+    assert!(shown.contains(&"Anthropic (anthropic), revision 1".to_string()));
+    assert!(
+        g.description()
+            .unwrap()
+            .contains("rusthorse edit ENTRY --broker PRESET")
+    );
+    assert!(
+        descendants(&g).iter().all(|w| {
+            !w.is::<gtk::Button>() && !w.is::<gtk::Editable>() && !w.is::<gtk::Switch>()
+        })
+    );
+    // A screenshot of the profile, for reviewers: the details scrolled down.
+    spin_until(|| s.window.width() > 0);
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
+    let scroll = s
+        .detail
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+        .expect("the details scroll");
+    scroll.vadjustment().set_value(scroll.vadjustment().upper());
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
+    snapshot(&s, "details-broker.png");
+    // Its command goes through the broker, and copies as shown.
+    let expected = crate::model::snippet(&usable);
+    assert!(
+        expected.starts_with(&format!(
+            "rusthorse run \\\n  --broker ANTHROPIC_AUTH_TOKEN={} \\\n  \
+             --url ANTHROPIC_BASE_URL={} ",
+            usable.id, usable.id
+        )),
+        "{expected}"
+    );
+    assert_eq!(snippet_shown(&s), expected);
+    assert!(usage(&s).contains("temporary token"), "{}", usage(&s));
+    button(&s.detail, "Copy command snippet").emit_clicked();
+    let copied = glib::MainContext::default()
+        .block_on(s.window.clipboard().read_text_future())
+        .unwrap()
+        .unwrap();
+    assert_eq!(copied.as_str(), expected);
+    // The Edit form says that a change ends the entry's grants.
+    s.edit(s.current());
+    let editor = s.editor.borrow().as_ref().unwrap().clone();
+    assert!(
+        texts(&editor)
+            .iter()
+            .any(|t| t.starts_with("Any change to this entry ends its grants"))
+    );
+    button(&editor, "Cancel").emit_clicked();
+    spin_until(|| !editor.is_visible());
+    drop(editor);
+
+    // Unusable or protected: said so, with how to fix it; the command
+    // gives the value, and says why.
+    for (e, said) in [(&unusable, "Unusable: "), (&protected, "Withheld: ")] {
+        select(e);
+        let g = broker(&s).expect("the profile's state");
+        let shown = texts(&g);
+        assert!(shown.iter().any(|t| t.starts_with(said)), "{shown:#?}");
+        assert!(g.description().unwrap().contains("--clear broker"));
+        assert_eq!(snippet_shown(&s), crate::model::snippet(e));
+        assert!(!snippet_shown(&s).contains("--broker"));
+        assert!(
+            usage(&s).starts_with("The entry's broker profile cannot be used"),
+            "{}",
+            usage(&s)
+        );
+        s.edit(s.current());
+        let editor = s.editor.borrow().as_ref().unwrap().clone();
+        assert!(
+            !texts(&editor)
+                .iter()
+                .any(|t| t.starts_with("Any change to this entry ends its grants"))
+        );
+        button(&editor, "Cancel").emit_clicked();
+        spin_until(|| !editor.is_visible());
+    }
+    // No profile: an API key is told how to give it one; other entries
+    // say nothing about it.
+    select(&absent);
+    let shown = texts(&broker(&s).expect("how to give it one"));
+    assert!(
+        shown
+            .iter()
+            .any(|t| t == "None: commands get the value itself.")
+    );
+    assert!(!snippet_shown(&s).contains("--broker"));
+    assert!(!usage(&s).contains("broker"));
+    select(&device);
+    assert!(broker(&s).is_none());
     s.window.close();
 }

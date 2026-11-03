@@ -70,7 +70,14 @@ impl Job {
         Self::with_limit(path, request, Duration::from_secs(600))
     }
 
-    fn with_limit(path: PathBuf, request: Request, limit: Duration) -> Result<Self, String> {
+    /// Like [`Job::start`], with `limit` for the agent's answer to `request`
+    /// instead of ten minutes: for requests that ask the human nothing, so
+    /// that an agent that does not answer is reported sooner.
+    pub(crate) fn with_limit(
+        path: PathBuf,
+        request: Request,
+        limit: Duration,
+    ) -> Result<Self, String> {
         let cancel = Arc::new(Mutex::new(Cancellation::default()));
         let (tx, result) = mpsc::sync_channel(1);
         let worker_cancel = Arc::clone(&cancel);
