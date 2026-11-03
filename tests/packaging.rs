@@ -725,15 +725,49 @@ check.main()
 "#;
 
 // What ships: packaging/check-broker.py --packages on stand-in packages
-// (tar archives, unpacked by a stand-in `dpkg-deb -x`), on a real package
-// where dpkg-deb is installed, and packaging/build-deb.sh run whole on
-// stand-ins for cargo and dpkg-deb.
+// (unpacked by a stand-in `dpkg-deb -x`), on a real package where dpkg-deb
+// is installed, and packaging/build-deb.sh run whole on stand-ins for cargo
+// and dpkg-deb.
 
 use std::process::Stdio;
 
-/// A directory `bin` in `dir` holding a stand-in `dpkg-deb`: `-x ARCHIVE
-/// DIR` unpacks a tar archive into DIR, as dpkg-deb unpacks a package, and
-/// anything else fails. It appends its arguments to `dir/dpkg-deb-calls`.
+/// A stand-in package of the files that the tar archive `tar` holds: an ar
+/// archive that begins as a Debian package does, with a member
+/// debian-binary, then a member data.tar, the tar archive, which starts
+/// `STAND_IN_DATA` bytes in. It has no control member, which only the real
+/// dpkg-deb would need.
+fn stand_in_package(tar: &[u8]) -> Vec<u8> {
+    let mut package = b"!<arch>\n".to_vec();
+    package.extend_from_slice(&ar_header("debian-binary", 4));
+    package.extend_from_slice(b"2.0\n");
+    package.extend_from_slice(&ar_header("data.tar", tar.len()));
+    assert_eq!(package.len(), STAND_IN_DATA);
+    package.extend_from_slice(tar);
+    if tar.len() % 2 == 1 {
+        package.push(b'\n');
+    }
+    package
+}
+
+/// Where data.tar starts in a stand-in package: after the ar magic, the
+/// header and the contents of debian-binary, and its own header.
+const STAND_IN_DATA: usize = 8 + 60 + 4 + 60;
+
+/// The header of a member `name` of `size` bytes in an ar archive, as
+/// cargo-deb and dpkg-deb write it.
+fn ar_header(name: &str, size: usize) -> Vec<u8> {
+    let header = format!(
+        "{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n",
+        0, 0, 0, 100644
+    );
+    assert_eq!(header.len(), 60, "{header}");
+    header.into_bytes()
+}
+
+/// A directory `bin` in `dir` holding a stand-in `dpkg-deb`: `-x PACKAGE
+/// DIR` unpacks the data.tar of a stand-in package into DIR, as dpkg-deb
+/// unpacks a package, and anything else fails. It appends its arguments to
+/// `dir/dpkg-deb-calls`.
 fn dpkg_deb_stand_in(dir: &Path) -> PathBuf {
     let bin = dir.join("bin");
     fs::create_dir_all(&bin).expect("mkdir");
@@ -742,24 +776,26 @@ fn dpkg_deb_stand_in(dir: &Path) -> PathBuf {
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
              [ $# = 3 ] && [ \"$1\" = -x ] || {{ echo \"dpkg-deb stand-in: $*\" >&2; exit 2; }}\n\
-             mkdir -p \"$3\" && tar -xf \"$2\" -C \"$3\"\n",
-            dir.join("dpkg-deb-calls").display()
+             mkdir -p \"$3\" && tail -c +{} \"$2\" | tar -xf - -C \"$3\"\n",
+            dir.join("dpkg-deb-calls").display(),
+            STAND_IN_DATA + 1
         ),
     );
     bin
 }
 
-/// A stand-in package at `path`: a tar archive of the directory `stage`.
+/// A stand-in package at `path` of the files of the directory `stage`.
 fn pack(stage: &Path, path: &Path) {
     let out = Command::new("tar")
         .arg("-cf")
-        .arg(path)
+        .arg("-")
         .arg("-C")
         .arg(stage)
         .arg(".")
         .output()
         .expect("tar");
     assert!(out.status.success(), "{out:?}");
+    fs::write(path, stand_in_package(&out.stdout)).expect("write the package");
 }
 
 /// packaging/check-broker.py --packages, with `path` as PATH, the package
@@ -954,22 +990,283 @@ fn a_package_whose_broker_is_not_a_release_build_is_deleted() {
     assert!(!deb.exists() && other.exists());
     assert_eq!(fs::read_dir(&scratch).expect("scratch").count(), 0);
     // Whatever stops the check (here, no directory to unpack in), no
-    // package is left behind.
+    // package is left behind, whatever its name, and it says so.
     let deb = package("rusthorse.deb", &[(broker, &release)]);
-    let out = check_packages(&path, &[&deb], &dir.path().join("gone"));
+    let pkg = package("rusthorse.pkg", &[(broker, &release)]);
+    let out = check_packages(&path, &[&deb, &pkg], &dir.path().join("gone"));
     assert!(!out.status.success(), "{out:?}");
-    assert!(!deb.exists());
+    assert!(!deb.exists() && !pkg.exists());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!(
+            "check-broker.py: the packages could not all be checked; deleted {}, {}\n",
+            deb.display(),
+            pkg.display()
+        )),
+        "{said}"
+    );
 }
 
-/// `python3 -c PACK_HIDDEN STAGE ARCHIVE`: a tar archive of STAGE, in which
-/// usr/lib/hidden has no permissions.
+#[test]
+fn a_refused_run_deletes_its_packages_whatever_their_names_and_nothing_else() {
+    if !python3() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dpkg_deb_stand_in(dir.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("mkdir");
+    let broker = "usr/bin/rusthorse-broker";
+    // A package at `path` whose broker answers `answer`.
+    let package = |path: &Path, answer: &str| {
+        let stage = dir.path().join("stage");
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(stage.join("usr/bin")).expect("mkdir");
+        write_broker(&stage.join(broker), answer);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        pack(&stage, path);
+        path.to_path_buf()
+    };
+    let at = |name: &str| dir.path().join(name);
+    let release = release_answer();
+    let for_tests = for_tests_answer();
+    let refused = |package: &Path| {
+        format!(
+            "{broker} in {} is a build for tests (its --check reports test_upstream): \
+             refusing to package it; ",
+            package.display()
+        )
+    };
+
+    // cargo-deb's --output can name a package anything: with an extension
+    // that is not .deb, without one, in capitals. Each begins as a Debian
+    // package does, and is deleted with every other package of the run.
+    // So is one called as a package, in any case, that does not begin as
+    // one (cut short, say).
+    let pkg = package(&at("release.pkg"), &for_tests);
+    let bare = package(&at("release"), &release);
+    let capitals = package(&at("X.DEB"), &release);
+    let short = at("short.DDEB");
+    fs::write(&short, "!<arch>\n").expect("write");
+    let out = check_packages(&path, &[&pkg, &bare, &capitals, &short], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted {}, {}, {}, {}. A package must",
+            refused(&pkg),
+            pkg.display(),
+            bare.display(),
+            capitals.display(),
+            short.display()
+        ),
+    );
+    for named in [&pkg, &bare, &capitals, &short] {
+        assert!(!named.exists(), "{}", named.display());
+    }
+
+    // Nothing else it names is deleted, whatever its name: not a file that
+    // is not a package, nor an ar archive that is not one (a library), nor
+    // a directory; a path with nothing there is not mentioned.
+    let deb = package(&at("rusthorse.deb"), &for_tests);
+    let notes = at("notes.pkg");
+    fs::write(&notes, "kept").expect("write");
+    let library = at("libkept.a");
+    let library_bytes = [&b"!<arch>\n"[..], &ar_header("kept.o/", 0)].concat();
+    fs::write(&library, &library_bytes).expect("write");
+    let directory = at("directory.deb");
+    fs::create_dir(&directory).expect("mkdir");
+    let nothing = at("nothing.deb");
+    let out = check_packages(
+        &path,
+        &[&deb, &notes, &library, &directory, &nothing],
+        &scratch,
+    );
+    assert_refused(
+        &out,
+        &format!("{}deleted {}. A package must", refused(&deb), deb.display()),
+    );
+    assert!(!deb.exists());
+    assert_eq!(fs::read_to_string(&notes).expect("notes"), "kept");
+    assert_eq!(fs::read(&library).expect("library"), library_bytes);
+    assert!(directory.is_dir());
+
+    // A package is emptied before it is deleted: another hard link to it
+    // (cargo-deb writes a package in place) does not keep it.
+    let linked = package(&at("linked.pkg"), &for_tests);
+    let other = at("elsewhere/other-link");
+    fs::create_dir_all(other.parent().expect("parent")).expect("mkdir");
+    fs::hard_link(&linked, &other).expect("ln");
+    let out = check_packages(&path, &[&linked], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted {}. A package must",
+            refused(&linked),
+            linked.display()
+        ),
+    );
+    assert!(!linked.exists());
+    assert_eq!(fs::metadata(&other).expect("other link").len(), 0);
+
+    // A symbolic link is not followed: cargo-deb wrote the package where it
+    // leads, which is kept, and the message names the link.
+    let target = package(&at("elsewhere/target.pkg"), &for_tests);
+    let before = fs::read(&target).expect("target");
+    let link = at("link.pkg");
+    std::os::unix::fs::symlink(&target, &link).expect("ln -s");
+    let out = check_packages(&path, &[&link], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted nothing; not deleted: {} (a symbolic link, not followed: delete by \
+             hand the package it leads to). A package must",
+            refused(&link),
+            link.display()
+        ),
+    );
+    assert!(link.is_symlink());
+    assert_eq!(fs::read(&target).expect("target"), before);
+
+    // One that cannot be deleted is named (it is emptied all the same), and
+    // the others are deleted.
+    if nix::unistd::geteuid().is_root() {
+        // Root deletes in any directory.
+        return;
+    }
+    let locked = at("locked");
+    let stuck = package(&locked.join("stuck.pkg"), &for_tests);
+    let after = package(&at("after.deb"), &release);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("chmod");
+    let out = check_packages(&path, &[&stuck, &after], &scratch);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted {}; not deleted: {} (Permission denied: delete it by hand). A \
+             package must",
+            refused(&stuck),
+            after.display(),
+            stuck.display()
+        ),
+    );
+    assert!(!after.exists());
+    assert_eq!(fs::metadata(&stuck).expect("stuck").len(), 0);
+
+    // One that cannot be read is deleted if it is called as a package;
+    // otherwise it may hold one, and is named.
+    let deb = package(&at("refused.deb"), &for_tests);
+    let unreadable_deb = package(&at("unreadable.deb"), &release);
+    let unreadable_pkg = package(&at("unreadable.pkg"), &release);
+    for file in [&unreadable_deb, &unreadable_pkg] {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o000)).expect("chmod");
+    }
+    let out = check_packages(&path, &[&deb, &unreadable_deb, &unreadable_pkg], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted {}, {}; not deleted: {} (Permission denied: delete it by hand). A \
+             package must",
+            refused(&deb),
+            deb.display(),
+            unreadable_deb.display(),
+            unreadable_pkg.display()
+        ),
+    );
+    assert!(!deb.exists() && !unreadable_deb.exists() && unreadable_pkg.exists());
+}
+
+/// packaging/check-broker.py's deletion of PATH, where another program puts
+/// a symbolic link to TARGET in place of the file PATH just after the
+/// script examined it (WHEN `examined`: `os.lstat`) or opened it to read
+/// its start (WHEN `opened`): `probe.py SCRIPT WHEN PATH TARGET` prints what
+/// the deletion says.
+const SWAP_PROBE: &str = r#"
+import builtins, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("check_broker", sys.argv[1])
+check = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(check)
+when, path, target = sys.argv[2:5]
+def swap():
+    os.remove(path)
+    os.symlink(target, path)
+def then_swap(call):
+    def called(name, *args, **kwargs):
+        done = call(name, *args, **kwargs)
+        if name == path:
+            swap()
+        return done
+    return called
+if when == "examined":
+    os.lstat = then_swap(os.lstat)
+else:
+    check.open = then_swap(builtins.open)
+print(check.delete_packages([path]))
+"#;
+
+#[test]
+fn a_link_put_in_place_of_a_package_once_examined_is_not_followed() {
+    if !python3() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stage = dir.path().join("stage");
+    fs::create_dir_all(stage.join("usr/bin")).expect("mkdir");
+    write_broker(&stage.join("usr/bin/rusthorse-broker"), &release_answer());
+    let path = dir.path().join("swapped.pkg");
+    let package = dir.path().join("elsewhere.pkg");
+    pack(&stage, &package);
+    let other = dir.path().join("elsewhere.txt");
+    fs::write(&other, "not a package").expect("write");
+    let probe = dir.path().join("probe.py");
+    fs::write(&probe, SWAP_PROBE).expect("write the probe");
+    let script = root().join("packaging/check-broker.py");
+    // The link leads to a package, or to a file that is not one, which
+    // would leave nothing to say if it were read through the link.
+    for (when, target) in [
+        ("examined", &package),
+        ("opened", &package),
+        ("examined", &other),
+    ] {
+        let before = fs::read(target).expect("target");
+        let _ = fs::remove_file(&path);
+        pack(&stage, &path);
+        let out = python(
+            &probe,
+            &[
+                script.as_os_str(),
+                when.as_ref(),
+                path.as_os_str(),
+                target.as_os_str(),
+            ],
+        );
+        assert!(out.status.success(), "{when}: {out:?}");
+        // Neither read nor emptied through the link: the file it leads to
+        // is whole, and the path is named, since it may hold a package.
+        assert_eq!(fs::read(target).expect("target"), before, "{when}");
+        assert!(path.is_symlink(), "{when}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "deleted nothing; not deleted: {} (Too many levels of symbolic links: delete \
+                 it by hand)\n",
+                path.display()
+            ),
+            "{when}"
+        );
+    }
+}
+
+/// `python3 -c PACK_HIDDEN STAGE`: a tar archive of STAGE, in which
+/// usr/lib/hidden has no permissions, on standard output.
 const PACK_HIDDEN: &str = r#"
 import sys, tarfile
 def hide(info):
     if info.name == "./usr/lib/hidden":
         info.mode = 0
     return info
-with tarfile.open(sys.argv[2], "w") as archive:
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
     archive.add(sys.argv[1], arcname=".", filter=hide)
 "#;
 
@@ -995,10 +1292,10 @@ fn a_directory_of_the_package_that_cannot_be_read_is_refused() {
     let out = Command::new("/usr/bin/python3")
         .args(["-I", "-B", "-c", PACK_HIDDEN])
         .arg(&stage)
-        .arg(&deb)
         .output()
         .expect("python3");
     assert!(out.status.success(), "{out:?}");
+    fs::write(&deb, stand_in_package(&out.stdout)).expect("write the package");
     let scratch = dir.path().join("scratch");
     fs::create_dir_all(&scratch).expect("mkdir");
     let out = check_packages(
@@ -1044,26 +1341,33 @@ fn what_ships_is_checked_with_the_real_dpkg_deb() {
     let deb = dir.path().join("rusthorse.deb");
     let scratch = dir.path().join("scratch");
     fs::create_dir_all(&scratch).expect("mkdir");
-    let build = |answer: &str| {
+    let build = |answer: &str, package: &Path| {
         write_broker(&stage.join("usr/bin/rusthorse-broker"), answer);
         let out = Command::new("/usr/bin/dpkg-deb")
             .args(["--build", "--root-owner-group"])
             .arg(&stage)
-            .arg(&deb)
+            .arg(package)
             .output()
             .expect("dpkg-deb --build");
         assert!(out.status.success(), "{out:?}");
     };
-    build(&release_answer());
+    build(&release_answer(), &deb);
     let out = check_packages("/usr/bin:/bin", &[&deb], &scratch);
     assert!(out.status.success(), "{out:?}");
     assert!(deb.exists());
-    build(&for_tests_answer());
+    build(&for_tests_answer(), &deb);
     assert_refused(
         &check_packages("/usr/bin:/bin", &[&deb], &scratch),
         "usr/bin/rusthorse-broker in",
     );
     assert!(!deb.exists());
+    // Whatever its name: what dpkg-deb writes begins as what cargo-deb
+    // writes does.
+    let pkg = dir.path().join("rusthorse.pkg");
+    build(&for_tests_answer(), &pkg);
+    let out = check_packages("/usr/bin:/bin", &[&pkg], &scratch);
+    assert_refused(&out, &format!("; deleted {}. ", pkg.display()));
+    assert!(!pkg.exists());
 }
 
 /// A run of packaging/build-deb.sh on stand-ins, in a temporary directory
@@ -1072,11 +1376,13 @@ fn what_ships_is_checked_with_the_real_dpkg_deb() {
 /// writes them there; `metadata --no-deps` describes a workspace whose
 /// target directory is F/target; `deb` packages F/target/release's broker
 /// (or F/shipped-broker, if there is one) as usr/bin/rusthorse-broker, in a
-/// tar archive written to `--output DIR` or F/target/debian, and prints its
-/// path, as cargo-deb does; whatever else it is asked (copyright.py's
-/// `metadata` and `tree`) goes to the real cargo. Its `dpkg-deb -x` unpacks
-/// those archives. Everything else is real: the checks, the copyright file
-/// and the documentation, which are generated in F/target/release/packaging.
+/// stand-in package written to F/target/debian or where `--output` says (the
+/// package itself if it has an extension and is no directory, as cargo-deb
+/// takes it; a directory otherwise), and prints its path, as cargo-deb does;
+/// whatever else it is asked (copyright.py's `metadata` and `tree`) goes to
+/// the real cargo. Its `dpkg-deb -x` unpacks those packages. Everything else
+/// is real: the checks, the copyright file and the documentation, which are
+/// generated in F/target/release/packaging.
 struct DebBuild(tempfile::TempDir);
 
 /// The stand-in `cargo` of `DebBuild`; F, REAL_CARGO and DEB are set before
@@ -1099,12 +1405,22 @@ deb)
         [ "$1" = --output ] && out=$2
         shift
     done
+    deb=$out/$DEB
+    case ${out##*/} in
+    *.*) [ -d "$out" ] || deb=$out ;;
+    esac
     broker=$F/target/release/rusthorse-broker
     [ -e "$F/shipped-broker" ] && broker=$F/shipped-broker
-    mkdir -p "$F/stage/usr/bin" "$out"
+    mkdir -p "$F/stage/usr/bin" "${deb%/*}"
     cp -p "$broker" "$F/stage/usr/bin/rusthorse-broker"
-    tar -cf "$out/$DEB" -C "$F/stage" .
-    printf '%s\n' "$out/$DEB"
+    tar -cf "$F/data.tar" -C "$F/stage" .
+    size=$(wc -c < "$F/data.tar")
+    {
+        printf '!<arch>\n%-16s%-12s%-6s%-6s%-8s%-10s`\n2.0\n' debian-binary 0 0 0 100644 4
+        printf '%-16s%-12s%-6s%-6s%-8s%-10s`\n' data.tar 0 0 0 100644 $size
+        cat "$F/data.tar"
+    } > "$deb"
+    printf '%s\n' "$deb"
     ;;
 *)
     exec "$REAL_CARGO" "$@"
@@ -1266,6 +1582,21 @@ fn the_package_is_built_without_features_and_only_after_the_broker_is_checked() 
         run.cargo_calls()
     );
     assert!(!deb.exists());
+    assert!(out.stdout.is_empty(), "{out:?}");
+    // Whatever name --output gives that package.
+    let run = DebBuild::new(&release);
+    write_broker(&run.path("shipped-broker"), &for_tests);
+    let named = run.path("out/release.pkg");
+    let out = run.run(&["--output", named.to_str().expect("UTF-8")], &[]);
+    assert_refused(
+        &out,
+        &format!(
+            "usr/bin/rusthorse-broker in {0} is a build for tests (its --check reports \
+             test_upstream): refusing to package it; deleted {0}. ",
+            named.display()
+        ),
+    );
+    assert!(!named.exists());
     assert!(out.stdout.is_empty(), "{out:?}");
 
     // What would install the package before its check, or build it for
