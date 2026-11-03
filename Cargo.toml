@@ -15,7 +15,7 @@ exclude = ["/.github"]
 [workspace]
 # The dialog and manager need GTK 4 and libadwaita to build; plain
 # `cargo build` and `cargo test` here build `rusthorse` only.
-members = [".", "dialog", "manager"]
+members = [".", "dialog", "manager", "broker"]
 default-members = ["."]
 
 [features]
