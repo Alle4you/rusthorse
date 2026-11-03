@@ -19,8 +19,7 @@
 //! Every key is fake (`sk-…-test-…`), nothing leaves the loopback interface
 //! and no dialog is shown. The whole file needs the broker's `test-upstream`
 //! feature (`cargo test -p rusthorse-broker --all-features`): without it, it
-//! compiles to nothing. Tests marked `#[ignore]` show findings fixed on
-//! other branches: run them with `--ignored` once those are merged.
+//! compiles to nothing.
 //!
 //! What the tests need of the machine, besides Linux:
 //!
@@ -2079,7 +2078,6 @@ fn the_broker_reaches_the_profiles_destination_whatever_the_environment_says() {
 /// reaches no loopback destination, and sends nothing (the request gets
 /// the `502` of a destination that cannot be reached).
 #[test]
-#[ignore = "P05: fixed in broker-p1-fix-broker; run with --ignored once it is merged"]
 fn a_broker_built_for_tests_that_the_agent_starts_reaches_no_loopback_destination() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
@@ -2977,7 +2975,6 @@ fn an_unlock_cancelled_by_a_lock_keeps_the_last_fingerprint_and_the_next_one_end
 /// waits — the log is a full pipe nobody reads yet. Once the record
 /// fails, the unlock fails, and the vault stays locked.
 #[test]
-#[ignore = "P01: fixed in broker-p1-fix-agent; run with --ignored once it is merged"]
 fn the_unlock_barrier_cuts_streams_before_the_unlock_is_recorded() {
     let sys = System::new();
     let streams = Streams::default();
