@@ -616,7 +616,7 @@ presents anything but the token in `x-api-key` or `Authorization`); and
 `rusthorse run` passes on, stops the requests it would make straight to
 `api.anthropic.com`. An `env` block in Claude Code's settings files
 overrides the variables `run` sets, and an `apiKeyHelper` there gives it
-another key: check them first.
+another key: check them first ([guide for AI agents](#rusthorse-guide)).
 
 ## `rusthorse grants`
 
@@ -889,7 +889,8 @@ rusthorse guide ai
 Prints a guide in Markdown on standard output; it needs no agent. `ai` is
 written for AI agents: the rules they follow (never ask for, print or write
 a value; no `reveal`; stop after a denial), how to find entries and read
-their metadata, how to use `run`, the exit statuses and what to do about
+their metadata, how to use `run` (and `run --broker` for an entry with a
+broker profile, Claude Code included), the exit statuses and what to do about
 each, and how to store secrets without seeing them. It is built into the
 binary, so it describes the version that prints it. A test parses every
 command line it shows with the CLI's own parser — complete, apart from a few

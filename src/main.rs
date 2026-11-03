@@ -4006,7 +4006,11 @@ mod tests {
             has_notes: true,
             other_fields: vec!["f".into()],
             modified: Some("2026-01-01T00:00:00Z".into()),
-            broker: None,
+            broker: Some(
+                ProfileRequest::new(Preset::Anthropic)
+                    .resolve()
+                    .expect("profile"),
+            ),
         };
         let json = serde_json::to_value(&info).expect("json");
         let sentence = guide
@@ -4032,6 +4036,7 @@ mod tests {
             protected_fields: Vec::new(),
             other_fields: Vec::new(),
             modified: None,
+            broker: None,
             ..info
         };
         let json = serde_json::to_value(&bare).expect("json");
