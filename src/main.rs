@@ -2021,20 +2021,30 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
             println!("{}", serde_json::to_string(&event)?);
             continue;
         }
-        let mut line = format!("{}  {:<8} {:<20}", event.time, event.action, event.outcome);
-        if !event.entries.is_empty() {
-            line.push_str(&format!(" [{}]", event.entries.join(", ")));
-        }
-        if let Some(argv) = &event.argv {
-            line.push_str(&format!(" $ {}", rusthorse::util::shell_join(argv)));
-        }
-        if let Some(detail) = &event.detail {
-            line.push_str(&format!(" ({detail})"));
-        }
-        line.push_str(&format!("  by {}", event.requester));
-        println!("{line}");
+        println!("{}", audit_line(&event));
     }
     Ok(0)
+}
+
+/// One audit record as `rusthorse audit` prints it: the time, action and
+/// outcome, then what the record has — the entries, the command line, the
+/// detail — and the requester. Control and invisible characters are escaped
+/// ([`rusthorse::util::visible`]): any program of the user can write the log
+/// (threat model L13), and a value written to rewrite the terminal, or to
+/// look like another record, shows as what it is.
+fn audit_line(event: &audit::AuditEvent) -> String {
+    let mut line = format!("{}  {:<8} {:<20}", event.time, event.action, event.outcome);
+    if !event.entries.is_empty() {
+        line.push_str(&format!(" [{}]", event.entries.join(", ")));
+    }
+    if let Some(argv) = &event.argv {
+        line.push_str(&format!(" $ {}", rusthorse::util::shell_join(argv)));
+    }
+    if let Some(detail) = &event.detail {
+        line.push_str(&format!(" ({detail})"));
+    }
+    line.push_str(&format!("  by {}", event.requester));
+    rusthorse::util::visible(&line)
 }
 
 #[cfg(test)]
@@ -2223,6 +2233,49 @@ mod tests {
             agent_executable_check("", None, None),
             Check::Warn(_)
         ));
+    }
+
+    #[test]
+    fn audit_lines_escape_what_any_program_can_write() {
+        use rusthorse::audit::AuditEvent;
+        use rusthorse::peer::Peer;
+        // Records are printed as they always were.
+        let lock = AuditEvent::new("lock", &Peer::agent()).outcome("requested");
+        assert_eq!(
+            audit_line(&lock),
+            format!(
+                "{}  lock     requested             by {}",
+                lock.time, lock.requester
+            )
+        );
+        let mut run = AuditEvent::new("run", &Peer::agent())
+            .outcome("allowed_once")
+            .entries(vec!["KEY (8d2f6c1e)".into()])
+            .detail("exit 0");
+        run.argv = Some(vec!["sh".into(), "-c".into(), "echo hi".into()]);
+        assert_eq!(
+            audit_line(&run),
+            format!(
+                "{}  run      allowed_once         [KEY (8d2f6c1e)] $ sh -c 'echo hi' (exit 0)  by {}",
+                run.time, run.requester
+            )
+        );
+        // Anyone can write to the log: what it holds cannot rewrite the
+        // terminal or start a line that looks like another record.
+        let mut forged = AuditEvent::new("run", &Peer::agent())
+            .outcome("denied")
+            .entries(vec!["\u{1b}[8mKEY".into()]);
+        forged.argv = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            "x\n2026-11-02T00:00:00-03:00  run allowed_once".into(),
+        ]);
+        forged.detail = Some("\u{202e}evil".into());
+        let line = audit_line(&forged);
+        assert!(!line.contains(['\n', '\u{1b}', '\u{202e}']), "{line:?}");
+        for escaped in [r"\u{a}2026-11-02", r"\u{1b}[8mKEY", r"\u{202e}evil"] {
+            assert!(line.contains(escaped), "{escaped}: {line}");
+        }
     }
 
     /// Where a command line of the AI guide is.

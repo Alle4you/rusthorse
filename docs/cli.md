@@ -584,6 +584,11 @@ other records are being written or the disk is slow. It comes from the system
 clock, so setting the clock back can make a later record show an earlier
 time.
 
+Any program of yours can write to the log (threat model L13): control and
+invisible characters in a record are shown escaped (`\u{…}`), so that a
+record cannot rewrite the terminal or look like two. `--json` prints the
+records as they are.
+
 ## `rusthorse doctor`
 
 ```
