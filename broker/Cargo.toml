@@ -11,13 +11,15 @@ publish = false
 
 [features]
 # For tests only, never in a release (like the main package's
-# `fake-keyring`): the broker then reads RUSTHORSE_BROKER_TEST_* from its
-# environment (extra trusted roots, fixed addresses, a resolver delay,
-# shorter deadlines, a panic) and may reach a loopback destination. A build
-# without debug assertions refuses the feature, and `--check` reports it.
-# Without it the broker's own code reads no environment variable (tokio
-# and the C library read a few of their own, unset in the empty
-# environment the agent gives it: see src/config.rs).
+# `fake-keyring`): when RUSTHORSE_BROKER_TEST_ROOTS is set in its
+# environment, the broker reads RUSTHORSE_BROKER_TEST_* there (an extra
+# trusted authority, fixed addresses, a resolver delay, shorter deadlines,
+# a panic) and may reach a loopback destination; without that variable, as
+# in the empty environment the agent gives it, it runs as a release build.
+# A build without debug assertions refuses the feature, and `--check`
+# reports it. Without the feature the broker's own code reads no
+# environment variable (tokio and the C library read a few of their own,
+# unset in the empty environment the agent gives it: see src/config.rs).
 test-upstream = []
 
 [dependencies]

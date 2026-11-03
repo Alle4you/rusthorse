@@ -24,7 +24,10 @@
 //! response bodies) and [`control`] (the control channel once ready);
 //! [`config`] holds the deadlines and the hooks of the `test-upstream`
 //! feature, which is for tests only and never in a release: a build
-//! without debug assertions refuses it, and `--check` reports it.
+//! without debug assertions refuses it, `--check` reports it, and a build
+//! with it runs as a release one unless its environment names a test
+//! authority (`RUSTHORSE_BROKER_TEST_ROOTS`), which the agent's empty
+//! environment never does.
 //!
 //! `rusthorse-broker --check` prints its version and the control channel's
 //! protocol version as JSON, for `rusthorse doctor`, and exits. A build with

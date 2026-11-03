@@ -6,8 +6,11 @@
 //!
 //! Tests that need the broker to reach the fake destination need its
 //! `test-upstream` feature (`cargo test -p rusthorse-broker
-//! --all-features`); the others run in both builds, and one shows that a
-//! build without the feature refuses a loopback destination.
+//! --all-features`) and an environment that names the test's authority
+//! (`RUSTHORSE_BROKER_TEST_ROOTS`, which `Options` sets); the others run in
+//! both builds. Some show that a build without the feature, and any build
+//! started with an empty environment as the agent starts it, refuse a
+//! loopback destination.
 
 mod support;
 
@@ -1383,6 +1386,77 @@ fn a_build_without_the_test_feature_refuses_a_loopback_destination() {
         destination.connections(),
         0,
         "a loopback destination was reached"
+    );
+}
+
+/// The agent starts every broker with an empty environment: a build with
+/// the test feature then runs as a release one, and its destination may not
+/// be on loopback any more than a release build's.
+#[test]
+fn a_broker_started_with_an_empty_environment_refuses_a_loopback_destination() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    let mut options = Options::anthropic(&destination.origin(), &ca);
+    options.env.clear();
+    let broker = Broker::start(options);
+    // localhost resolves to loopback addresses, on the system's resolver.
+    broker
+        .send(&broker.request("GET", "/v1/models", &[], b""))
+        .assert_unreachable();
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::NotForwarded,
+            status: Some(502),
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    assert_eq!(
+        destination.connections(),
+        0,
+        "a loopback destination was reached"
+    );
+}
+
+/// Without the test's authority in its environment, a build with the test
+/// feature reads none of the other test variables: not those that would
+/// stop it, nor a fixed address, nor a panic.
+#[cfg(feature = "test-upstream")]
+#[test]
+fn without_a_test_authority_a_test_build_reads_no_test_variable() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    // Options fix the address 127.0.0.1, which the system's resolver gives
+    // too: the address does not matter, loopback does.
+    let options = Options::anthropic(&destination.origin(), &ca)
+        .without_env("RUSTHORSE_BROKER_TEST_ROOTS")
+        .timeouts("nap=1")
+        .env("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon")
+        .env("RUSTHORSE_BROKER_TEST_PANIC", "request");
+    assert!(
+        options
+            .env
+            .iter()
+            .any(|(name, _)| name == "RUSTHORSE_BROKER_TEST_ADDRESSES")
+    );
+    let mut broker = Broker::start(options);
+    broker
+        .send(&broker.request("GET", "/v1/models", &[], b""))
+        .assert_unreachable();
+    assert!(matches!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            outcome: RequestOutcome::NotForwarded,
+            status: Some(502),
+            ..
+        }
+    ));
+    assert_eq!(destination.connections(), 0);
+    assert!(
+        broker.exit_within(Duration::from_millis(200)).is_none(),
+        "the broker stopped"
     );
 }
 

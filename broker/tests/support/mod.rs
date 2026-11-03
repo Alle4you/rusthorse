@@ -41,7 +41,9 @@ pub fn program() -> &'static str {
 }
 
 /// Whether the broker was built with its `test-upstream` feature: only then
-/// does it trust the test's authority and reach a loopback destination.
+/// does it trust the test's authority and reach a loopback destination, and
+/// only when its environment names that authority
+/// (`RUSTHORSE_BROKER_TEST_ROOTS`, which [`Options`] sets).
 pub const TEST_UPSTREAM: bool = cfg!(feature = "test-upstream");
 
 // ===== The certificate authority =====
@@ -458,13 +460,15 @@ pub struct Options {
     pub max_connections: u32,
     pub lifetime_secs: u64,
     pub admit: Admit,
-    /// Environment variables (the agent gives none; the tests' hooks).
+    /// Environment variables (the agent gives none; the tests' hooks, which
+    /// a broker built for tests reads only when the authority is among them).
     pub env: Vec<(String, String)>,
 }
 
 impl Options {
     /// An Anthropic grant for `origin`, admitting everything, reaching
-    /// `127.0.0.1` only, with the test's authority trusted (`ca`).
+    /// `127.0.0.1` only, with the test's authority trusted (`ca`, which
+    /// also asks a broker built for tests to read the other hooks).
     pub fn anthropic(origin: &str, ca: &TestCa) -> Options {
         Self::preset(Preset::Anthropic, origin, ca)
     }
