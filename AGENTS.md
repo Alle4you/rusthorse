@@ -207,10 +207,12 @@ not guaranteed.
   environment and may reach loopback destinations. A build without debug
   assertions refuses it (`compile_error!`; the CI checks a release build),
   the broker's `--check` reports it, `rusthorse doctor` fails on such a
-  build, and `packaging/build-deb.sh` refuses to package one: it checks the
-  broker it built and every broker in the packages cargo-deb wrote, and
-  deletes those packages if one is refused (`packaging/check-broker.py`).
-  Never turn it on outside tests.
+  build, and `packaging/build-deb.sh` refuses to package one
+  (`packaging/check-broker.py`): it checks the broker it built and every
+  broker in the packages cargo-deb wrote, and if one is refused it deletes
+  those packages, whatever their names, and names any it cannot delete,
+  such as one behind a symbolic link, which it does not follow. Never turn
+  it on outside tests.
 - **The packaging tests** (`tests/packaging.rs`) run the scripts of
   `packaging/` with `/usr/bin/python3` (without it they fail, unless
   `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them), and `cargo

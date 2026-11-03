@@ -20,9 +20,17 @@ one path per line, as cargo-deb prints those it wrote. Each is unpacked with
 `dpkg-deb -x` into a temporary directory inside DIRECTORY (which must allow
 running programs), and every entry named rusthorse-broker in it must be a
 regular file that passes the check above; the packages must hold at least
-one. If one is refused, cannot be unpacked or is not there, or if no package
-is named, every package named that is a regular file called *.deb or *.ddeb
-is deleted, so that none is left to install.
+one. If one is refused, cannot be unpacked or is not there, if no package is
+named, or if anything else stops the check, every package named is deleted,
+whatever its name (cargo-deb's --output can give it any): each path named
+that is a regular file and either begins as a Debian package does, in the
+format cargo-deb writes, or is called *.deb or *.ddeb, in any case. One that
+begins as a package is emptied first, so that no other hard link to it
+keeps the package (if it cannot be written to, it is deleted only when it
+has no other hard link). Nothing else is deleted, and a symbolic link is not
+followed: cargo-deb wrote the package where it leads. The message names
+such a link, and any path that may hold a package but could not be read or
+deleted, to be deleted by hand.
 
 Exits with status 1, saying why, when a program or a package is refused.
 """
@@ -36,6 +44,13 @@ import tempfile
 
 TIMEOUT_SECONDS = 5
 BROKER = "rusthorse-broker"
+# How a Debian package begins in the format cargo-deb writes, dpkg-deb's
+# default: an ar archive whose first member is debian-binary. dpkg installs
+# packages through dpkg-deb, which reads no other format but its old one,
+# 0.939000; cargo-deb never writes that one, and a file in it is deleted only
+# when called by a package's name.
+PACKAGE_START = b"!<arch>\ndebian-binary"
+PACKAGE_NAMES = (".deb", ".ddeb")
 
 
 class Refused(Exception):
@@ -117,16 +132,63 @@ def check_packages(packages, version, directory):
         raise Refused(f"no {BROKER} in {', '.join(packages)}")
 
 
+def open_no_follow(path, flags):
+    """os.open, failing on a symbolic link; also an opener for `open`."""
+    return os.open(path, flags | os.O_NOFOLLOW)
+
+
+def delete_package(path):
+    """Delete `path` if it is a package, as the module's documentation says.
+    Return True if it was deleted, None if it is not a package, or why it is
+    left although it may hold one."""
+    try:
+        found = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if stat.S_ISLNK(found.st_mode):
+        return "a symbolic link, not followed: delete by hand the package it leads to"
+    if not stat.S_ISREG(found.st_mode):
+        return None
+    named = path.lower().endswith(PACKAGE_NAMES)
+    try:
+        with open(path, "rb", opener=open_no_follow) as file:
+            begins = file.read(len(PACKAGE_START)) == PACKAGE_START
+    except OSError:
+        if not named:
+            raise
+        begins = False
+    if begins:
+        # Emptied first, so that no other hard link to it keeps the package;
+        # one that cannot be written to is only unlinked, when it has none.
+        try:
+            os.close(open_no_follow(path, os.O_WRONLY | os.O_TRUNC))
+        except PermissionError as e:
+            if found.st_nlink > 1:
+                return (f"{e.strerror} to empty it, and another hard link would keep it: "
+                        f"delete them by hand")
+    elif not named:
+        return None
+    os.remove(path)
+    return True
+
+
 def delete_packages(packages):
-    """Delete those of `packages` that are regular files called *.deb or
-    *.ddeb; return their paths."""
-    deleted = []
+    """Delete the packages among `packages`; say which, and which are left
+    that may hold one, and why."""
+    deleted, left = [], []
     for package in packages:
-        if (package.endswith((".deb", ".ddeb")) and not os.path.islink(package)
-                and os.path.isfile(package)):
-            os.remove(package)
+        try:
+            done = delete_package(package)
+        except OSError as e:
+            done = f"{e.strerror}: delete it by hand"
+        if done is True:
             deleted.append(package)
-    return deleted
+        elif done:
+            left.append(f"{package} ({done})")
+    said = f"deleted {', '.join(deleted) or 'nothing'}"
+    if left:
+        said += f"; not deleted: {', '.join(left)}"
+    return said
 
 
 def main_packages(version, directory):
@@ -136,14 +198,15 @@ def main_packages(version, directory):
         check_packages(packages, version, directory)
     except BaseException as e:
         # Whatever stopped the check, nothing unchecked is left to install.
-        deleted = delete_packages(packages)
+        deletion = delete_packages(packages)
         if not isinstance(e, Refused):
+            print(f"check-broker.py: the packages could not all be checked; {deletion}",
+                  file=sys.stderr)
             raise
-        sys.exit(f"check-broker.py: {e}: refusing to package it; deleted "
-                 f"{', '.join(deleted) or 'nothing'}. A package must hold the release build "
-                 f"of the broker that packaging/build-deb.sh built and checked: run the "
-                 f"script without options that make cargo-deb take the programs from "
-                 f"elsewhere, and install no package it did not finish")
+        sys.exit(f"check-broker.py: {e}: refusing to package it; {deletion}. A package must "
+                 f"hold the release build of the broker that packaging/build-deb.sh built "
+                 f"and checked: run the script without options that make cargo-deb take "
+                 f"the programs from elsewhere, and install no package it did not finish")
 
 
 def main():

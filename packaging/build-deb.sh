@@ -77,13 +77,14 @@ revision=$(git rev-parse HEAD 2>/dev/null || echo "v$version")
 python3 -I packaging/docs.py "$generated/doc" "$revision"
 
 # cargo-deb prints the path of each package it writes (and of its -dbgsym
-# package, when asked for one).
+# package, when asked for one), whatever name its --output gives them.
 packages=$(cargo deb --no-build --locked -p rusthorse "$@")
 
 # What ships is checked too: options, variants and the environment of
 # cargo-deb can make it take the programs from elsewhere than the file
 # checked above. If a package is refused, every package of this run is
-# deleted.
+# deleted, whatever its name; one that cannot be deleted, or that is a
+# symbolic link, which is not followed, is named instead.
 printf '%s\n' "$packages" |
     python3 -I packaging/check-broker.py --packages "$version" "$generated" || exit 1
 printf '%s\n' "$packages"
