@@ -338,13 +338,12 @@ phase 1 value; changing it changes this ADR.
   its other test hooks and permit loopback. The agent does not run `--check`
   before each grant: its empty environment gives that trusted helper
   production settings. Packaging checks the built broker and every packaged
-  broker. Refusal cleanup removes reported package files regardless of their
-  extension, empties content-recognized packages first, and names symbolic
-  links without following them and any paths it cannot remove. Extension-only
-  candidates are deleted without emptying; a permission failure while emptying
-  permits deletion only without other hard links. The exact rules are in ADR
-  0010, decision 9. Q01 was fixed in `b999e72` and `3953912` (merged in
-  `453e772`; review history).
+  broker. cargo-deb writes the packages into a private staging directory;
+  they are moved to the output directory only if every broker in them passes,
+  and otherwise the staging directory is deleted, so a refused package never
+  reaches the output directory. The exact rules are in ADR 0010, decision 9
+  (R01–R04 in the review history; they replaced the cleanup of refused
+  packages that Q01 had extended).
 
 ### The token and the grant ID
 
@@ -847,7 +846,8 @@ remains a dated observation, not a guarantee about all installed SDK versions.
 The guide uses the library's key variable and leaves a competing
 `ANTHROPIC_AUTH_TOKEN` unset (Q02, `4ff834a`). The package cleanup description
 was updated on the same date for Q01's fixes in `b999e72` and `3953912`,
-merged in `453e772`.
+merged in `453e772`; that cleanup was then replaced by a staging directory
+that only checked packages leave (R01–R04).
 
 | Area amended | Why and implementation evidence |
 |---|---|

@@ -8,7 +8,9 @@
 
 - Amended: 2026-11-03, for credential broker phase 1 (ADR 0013): a fourth
   program, CA recommendation, checks of the built and packaged broker, and the
-  extended licence inventory. See the
+  extended licence inventory; then the packages are checked in a staging
+  directory, which only those that pass leave (R01–R04, replacing the cleanup
+  of refused packages), and `--manifest-path` is refused. See the
   [implementation review history](../threat-model.md#11-review-history).
 
 ## Context
@@ -91,19 +93,38 @@ Build a Debian package with [cargo-deb](https://github.com/kornelski/cargo-deb)
    `ca-certificates`; without a usable root-owned bundle, broker runs fail
    closed while the other features still work. See ADR 0013 for the file
    checks and HTTP scope.
-9. **Check what ships.** `build-deb.sh` checks the built broker, generates
-   assets, runs cargo-deb, then extracts and checks each packaged broker. It
-   refuses test-feature builds, alternate targets and install-before-check
-   options. On refusal, cleanup considers only the paths cargo-deb reported:
-   regular files beginning as Debian packages are emptied, then deleted,
-   whatever their names. If permission prevents emptying one, it is deleted
-   only when no other hard link keeps it; otherwise it is named for manual
-   removal. Regular files not recognized by their contents but called `*.deb`
-   or `*.ddeb` (any case) are deleted without emptying. Nothing else is
-   deleted. Symbolic links are not followed and are named; paths that cannot
-   be read or deleted are reported without stopping other cleanup. Q01 was
-   fixed in `b999e72` and `3953912` (merged in `453e772`); see the review
-   history. No feature for tests belongs in a release.
+9. **Check what ships before it ships.** `build-deb.sh` checks the built
+   broker, generates assets and runs cargo-deb, which never writes where
+   `--output` points: the script takes `--output DIR` itself, in each form
+   cargo-deb reads (default `target/debian`; a DIR given that exists and is
+   not a directory is refused before anything is built), and gives cargo-deb
+   a new staging directory of its own, which only its user can enter. There
+   `check-broker.py` lists what cargo-deb wrote (it does not parse
+   cargo-deb's output, so a name is handled whole whatever it holds): each
+   entry must be a regular file, examined without being followed or opened,
+   and there must be at least one. It extracts each and checks every
+   packaged `rusthorse-broker` (at least one across the run). Only if all
+   pass are the packages moved to DIR, created if missing, under the names
+   cargo-deb gave them: renamed on the same file system, otherwise copied into
+   a new file created in DIR, flushed and renamed. A symbolic or hard link
+   already at such a name is replaced, never followed or written through. If
+   a package is refused, or anything else stops the check, the staging
+   directory is deleted whole (symbolic links in it are not followed) and
+   nothing reaches DIR; a move that fails leaves there only the packages
+   moved before it, which passed. The script also deletes the staging
+   directory when cargo-deb fails or the script is interrupted; a run killed
+   outright leaves it to the next run. Outside `target/release/packaging`,
+   which it makes again on each run, the script removes only what a package
+   that passed replaces at its name in DIR and the new file of a copy that
+   fails; cargo-deb itself, whatever `--output` says, deletes the packages of
+   rusthorse that it finds in `target/debian` before it writes. The script
+   refuses test-feature builds, alternate targets, another manifest
+   (`--manifest-path`: cargo-deb puts the package name of the manifest,
+   unchecked, in each package's file name, so a `/` in it would write the
+   package outside the staging directory) and install-before-check options.
+   This replaced the cleanup of refused packages, which Q01 had extended to
+   any name (R01–R04 in the review history). No feature for tests belongs in
+   a release.
 
 ## Alternatives considered
 
