@@ -404,6 +404,18 @@ impl GrantRow {
     /// The row for `grant`. A [`GrantInfo`] holds no token, so neither does
     /// the row.
     pub(crate) fn new(grant: &GrantInfo) -> Self {
+        Self::of(grant, false)
+    }
+
+    /// The row for a grant the agent listed before and lists no more: it has
+    /// ended. The page keeps it in its place while it is shown, so that no
+    /// other grant's button moves under the pointer, with what was last
+    /// listed. The same facts as [`GrantRow::new`], in the same order.
+    pub(crate) fn ended(grant: &GrantInfo) -> Self {
+        Self::of(grant, true)
+    }
+
+    fn of(grant: &GrantInfo, gone: bool) -> Self {
         let revoked = grant.state == "revoked";
         let used = match grant.max_requests {
             Some(limit) => format!("{} of {limit}", grant.requests),
@@ -411,7 +423,7 @@ impl GrantRow {
         };
         Self {
             id: grant.id.clone(),
-            revocable: !revoked,
+            revocable: !revoked && !gone,
             facts: vec![
                 ("Entry", grant.entry.clone()),
                 (
@@ -423,17 +435,31 @@ impl GrantRow {
                 // agent's dialogs label them.
                 ("Requested by (unverified)", grant.requester.clone()),
                 ("Token variable", grant.var.clone()),
-                ("State", grant_state(&grant.state)),
+                (
+                    "State",
+                    if gone {
+                        "Ended: the agent no longer lists it".to_string()
+                    } else {
+                        grant_state(&grant.state)
+                    },
+                ),
                 ("Started", grant.started.clone()),
                 (
                     "Ends",
-                    if revoked {
+                    if revoked || gone {
                         "It has ended.".to_string()
                     } else {
                         ends_in(grant.ends_in_secs)
                     },
                 ),
-                ("Requests", format!("{used}; {} in flight", grant.in_flight)),
+                (
+                    "Requests",
+                    if gone {
+                        format!("{used} when last listed")
+                    } else {
+                        format!("{used}; {} in flight", grant.in_flight)
+                    },
+                ),
                 (
                     "Automatic locks",
                     match grant.automatic_locks {
@@ -452,9 +478,12 @@ impl GrantRow {
 }
 
 /// A grant's state for people; a state this build does not know is shown
-/// as the agent wrote it.
+/// as the agent wrote it. The agent of phase 1 also lists a grant as
+/// `starting` while the run it belongs to is prepared, before it admits
+/// anything.
 fn grant_state(state: &str) -> String {
     match state {
+        "starting" => "Starting: its run is being prepared; no request is admitted yet".into(),
         "active" => "Active".into(),
         "exhausted" => {
             "Exhausted: its request limit is reached; requests already admitted finish".into()
@@ -1131,10 +1160,49 @@ pub(crate) mod tests {
         assert!(!row.revocable);
         assert_eq!(fact(&row, "Ends"), "It has ended.");
         assert!(fact(&row, "State").starts_with("Revoked: "));
-        // A state of a newer agent is shown as it is, and can be revoked.
+        // A grant whose run is being prepared can be revoked: that ends it
+        // before it admits anything.
         let row = GrantRow::new(&grant("g3", "starting"));
         assert!(row.revocable);
-        assert_eq!(fact(&row, "State"), "starting");
+        assert_eq!(
+            fact(&row, "State"),
+            "Starting: its run is being prepared; no request is admitted yet"
+        );
+        // A state of a newer agent is shown as it is, and can be revoked.
+        let row = GrantRow::new(&grant("g4", "paused"));
+        assert!(row.revocable);
+        assert_eq!(fact(&row, "State"), "paused");
+    }
+
+    #[test]
+    fn a_grant_no_longer_listed_is_shown_as_ended_in_the_same_rows() {
+        let mut listed = grant("g0123456789abcdef", "active");
+        listed.max_requests = Some(10);
+        let keys = |row: &GrantRow| row.facts.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let fact = |row: &GrantRow, key: &str| {
+            row.facts
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        for state in ["active", "exhausted", "revoked", "starting", "paused"] {
+            listed.state = state.into();
+            let (now, ended) = (GrantRow::new(&listed), GrantRow::ended(&listed));
+            // The same rows, in the same order: the page sets their texts
+            // in place.
+            assert_eq!(keys(&ended), keys(&now), "{state}");
+            assert!(!ended.revocable, "{state}");
+            assert_eq!(ended.id, now.id);
+            assert_eq!(fact(&ended, "State"), "Ended: the agent no longer lists it");
+            assert_eq!(fact(&ended, "Ends"), "It has ended.");
+            // Its counts are those last listed; nothing is said of requests
+            // in flight, which the agent no longer reports.
+            assert_eq!(fact(&ended, "Requests"), "3 of 10 when last listed");
+            for key in ["Entry", "Destination", "Command", "Started", "ID"] {
+                assert_eq!(fact(&ended, key), fact(&now, key), "{key}");
+            }
+        }
     }
 
     #[test]

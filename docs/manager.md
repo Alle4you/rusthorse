@@ -313,13 +313,25 @@ the agent's dialogs), the variable that holds its token, its state, when it
 started, when it ends at the latest (its maximum lifetime, in whole minutes
 rounded up), the requests admitted (of the limit, if there is one) and those
 in flight now, and whether the automatic locks end it. Never the token: the
-agent does not send it. The states are *Active*; *Exhausted*, when its
+agent does not send it. The states are *Starting*, while the run it belongs
+to is prepared (no request is admitted yet); *Active*; *Exhausted*, when its
 request limit is reached (requests already admitted finish); and *Revoked*,
 when it has ended — it is listed until its command ends, and its broker
-refuses every request meanwhile. The grants are listed when you open the
-page, after a revocation, and while the page is shown every five seconds
-and after each of your requests to the agent (Lock now ends every grant; a
-change to an entry ends its grants).
+refuses every request meanwhile. A state the manager does not know is shown
+as the agent sends it. The grants are listed when you open the page, after a
+revocation, and while the page is shown every five seconds and after each of
+your requests to the agent (Lock now ends every grant; a change to an entry
+ends its grants).
+
+A refresh keeps each grant where it was, with the same **Revoke** button: a
+new grant comes last, and only the texts that changed are redrawn, so a
+selection and the keyboard focus stay. A grant the agent no longer lists has
+ended; while
+the page is shown it stays where it was, dimmed and marked *Ended*, with
+what was last listed and nothing to revoke, so that the grants below it do
+not move up and put another grant's **Revoke** button under the pointer. It
+goes when you leave the page. The line above the grants counts those that
+ended while the page was shown.
 
 **Revoke** ends one grant, **Revoke all** every grant, at once and without a
 dialog, as **Lock now** does: the token stops working and the open requests
@@ -338,10 +350,9 @@ the idle timeout — keeps working while the vault is locked, until it ends.
 
 When the grants cannot be listed, the page says why in place of the list,
 and **Revoke all** stays available: it may work all the same, and it only
-takes away. The page waits 30 seconds at most for the agent to list the
-grants or to answer a revocation; after that it says that no answer came,
-and the page can be used again. Since a revocation only takes away, trying
-it again is safe.
+takes away. A listing or a revocation takes 30 seconds at most, from
+reaching the agent to its answer; after that the page says so, and can be
+used again. Since a revocation only takes away, trying it again is safe.
 
 ### Show a value
 
@@ -453,7 +464,7 @@ the new password in its own dialogs. The manager never receives them.
 | A master-password dialog you did not expect | The vault locked between two of the manager's requests (for example the idle timer fired just then), and listing needs it open. Answer it, or cancel it. |
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |
 | "Incompatible agent protocol" | The agent and the manager come from different versions. Upgrade both and restart the agent yourself. |
-| A message in red on the Grants page, in place of the list | The agent could not list the grants, or did not answer within 30 seconds ("No complete answer arrived from the agent"); the message says why. **Revoke all** still tries, and **Lock now** ends every grant. |
+| A message in red on the Grants page, in place of the list | The agent could not list the grants, or did not answer within 30 seconds (for example "No complete answer arrived from the agent"); the message says why. **Revoke all** still tries, and **Lock now** ends every grant. |
 | "Restart needed" on the Status page | The agent's program file was replaced after it started (an upgrade). Restart the service before using dialogs. |
 | "The vault was locked while the agent was asking you, so the value was neither shown nor copied" | The manager saw the vault locked while a Show or Copy was waiting — for example, the vault locked itself just before you clicked and the agent asked for the master password first. For safety, a value that arrives after a lock is dropped. Your approval was used up; click Show or Copy again. |
 
@@ -487,4 +498,5 @@ tested against a fake agent in the test process instead, since a test agent
 cannot start a broker: it answers from a script, records every request, and
 can hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
 screenshots of the window in the light and dark styles, of the Show window,
-of the Grants page and of a profile in the details.
+of the Grants page (also with a grant that ended while it was shown) and of
+a profile in the details.

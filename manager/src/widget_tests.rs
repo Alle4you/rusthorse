@@ -1238,6 +1238,10 @@ fn first_start() {
     // No vault yet: the window offers to create it, and says where.
     spin_until(|| s.pill.text() == "No vault");
     assert_eq!(s.lock.label().as_deref(), Some("Create vault…"));
+    // The agent reports a missing vault as locked; the grants page does
+    // not say that a vault is locked when there is none.
+    assert!(s.status.borrow().as_ref().is_some_and(|i| i.locked));
+    assert!(!s.grants_locked.is_visible());
     let (title, description) = first_step(&s).expect("a first step");
     assert_eq!(title, "Create your vault");
     assert!(
@@ -1547,6 +1551,9 @@ struct FakeState {
     locked: bool,
     /// The protocol version its status reports.
     protocol: u32,
+    /// Whether its status reports the broker's program and the number of
+    /// grants, fields an agent may leave out.
+    report_broker: bool,
     entries: Vec<EntryInfo>,
     grants: Vec<GrantInfo>,
     /// Answer `grants` with this refusal.
@@ -1572,6 +1579,7 @@ fn fake_state(locked: bool) -> Arc<Mutex<FakeState>> {
     Arc::new(Mutex::new(FakeState {
         locked,
         protocol: PROTOCOL_VERSION,
+        report_broker: true,
         entries: vec![],
         grants: vec![],
         refuse_grants: None,
@@ -1658,8 +1666,10 @@ fn fake_answer(state: &Mutex<FakeState>, request: &serde_json::Value) -> (Respon
             agent_executable_replaced: None,
             dialogs: None,
             lock_triggers: vec![],
-            broker: Some("/fake/rusthorse-broker".into()),
-            grants: Some(s.grants.iter().filter(|g| g.state != "revoked").count()),
+            broker: s.report_broker.then(|| "/fake/rusthorse-broker".into()),
+            grants: s
+                .report_broker
+                .then(|| s.grants.iter().filter(|g| g.state != "revoked").count()),
         }),
         "list" => Response::Entries {
             entries: s.entries.clone(),
@@ -1755,6 +1765,13 @@ fn show_page(s: &Manager, name: &str) {
         .select_row(Some(&row));
 }
 
+/// The value the Status page shows for `key`: the text that follows it.
+fn status_value(s: &Manager, key: &str) -> Option<String> {
+    let status = texts(&s.status_page);
+    let at = status.iter().position(|t| t == key)?;
+    status.get(at + 1).cloned()
+}
+
 /// Whether a button named `name` is under `root`.
 fn has_button(root: &impl IsA<gtk::Widget>, name: &str) -> bool {
     descendants(root)
@@ -1818,17 +1835,26 @@ fn grants_page() {
     settle(&s);
     assert_eq!(s.pill.text(), "Locked");
     // The Status page reports the broker program and the active grants.
-    let status = texts(&s.status_page);
-    assert!(
-        status.iter().any(|t| t == "/fake/rusthorse-broker"),
-        "{status:#?}"
+    assert_eq!(
+        status_value(&s, "Credential broker").as_deref(),
+        Some("/fake/rusthorse-broker")
     );
-    let at = status
-        .iter()
-        .position(|t| t == "Active grants")
-        .expect("the active grants");
-    // A key's value follows it.
-    assert_eq!(status.get(at + 1).map(String::as_str), Some("2"));
+    assert_eq!(status_value(&s, "Active grants").as_deref(), Some("2"));
+    // An agent may leave them out: the rows say so.
+    state.lock().unwrap().report_broker = false;
+    s.refresh();
+    settle(&s);
+    for key in ["Credential broker", "Active grants"] {
+        assert_eq!(
+            status_value(&s, key).as_deref(),
+            Some("Not reported"),
+            "{key}"
+        );
+    }
+    state.lock().unwrap().report_broker = true;
+    s.refresh();
+    settle(&s);
+    assert_eq!(status_value(&s, "Active grants").as_deref(), Some("2"));
 
     // Listed once the page is shown, not before; nothing to revoke until
     // then.
@@ -1974,6 +2000,19 @@ fn grants_page() {
     // Listed again every few seconds while shown, and not while hidden.
     let before = asked("grants");
     spin_until(|| asked("grants") > before);
+    // And when a request of the human's ends, without waiting for the next
+    // tick, which comes 4.75 seconds at the earliest after the one just
+    // seen (GLib rounds a seconds timer to a whole second).
+    spin_until(|| s.grants_job.borrow().is_none());
+    let ticked = asked("grants");
+    s.refresh();
+    settle(&s);
+    let soon = Instant::now() + Duration::from_secs(3);
+    spin_until(|| asked("grants") > ticked || Instant::now() >= soon);
+    assert!(
+        asked("grants") > ticked,
+        "not listed when a request of the human's ended"
+    );
     show_page(&s, "entries");
     spin_until(|| s.grants_job.borrow().is_none());
     let before = asked("grants");
@@ -2123,26 +2162,45 @@ fn grants_page() {
     });
 
     // An ID not of the form of one is drawn as plain text, never as a
-    // group's title, which is markup.
+    // group's title, which is markup. (The grants that ended while the page
+    // was shown are still there, marked as ended.)
     state.lock().unwrap().grants = vec![crate::model::tests::grant("<b>g</b>&", "active")];
     s.list_grants();
     spin_until(|| {
         s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-<b>g</b>&")
     });
+    let odd = named(&s.grants_list, "revoke-<b>g</b>&")
+        .ancestor(adw::PreferencesGroup::static_type())
+        .and_downcast::<adw::PreferencesGroup>()
+        .expect("its group");
+    assert_eq!(odd.title(), "Grant");
+    assert!(texts(&odd).iter().any(|t| t == "<b>g</b>&"));
     let titles: Vec<String> = descendants(&s.grants_list)
         .into_iter()
         .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
         .map(|g| g.title().to_string())
         .collect();
-    assert_eq!(titles, ["Grant"]);
-    assert!(texts(&s.grants_list).iter().any(|t| t == "<b>g</b>&"));
+    assert!(
+        titles.iter().all(|t| t == "Grant"
+            || t.strip_prefix("Grant ")
+                .is_some_and(rusthorse::broker_protocol::is_well_formed_grant_id)),
+        "{titles:#?}"
+    );
+    assert_eq!(
+        s.grants_summary.text(),
+        "1 grant; 6 more ended while this page was shown."
+    );
 
-    // A refusal is shown on the page, in place of the list. Revoke all
+    // A refusal is shown on the page, in place of the list, through the
+    // dialogs' filter like everything else the agent sends. Revoke all
     // stays: it may work all the same, and only takes away.
-    state.lock().unwrap().refuse_grants = Some("fake: grants are refused".into());
+    state.lock().unwrap().refuse_grants = Some("fake: grants are\u{202e} refused\n".into());
     s.list_grants();
     spin_until(|| s.grants_job.borrow().is_none() && s.grants_summary.has_css_class("error"));
-    assert_eq!(s.grants_summary.text(), "fake: grants are refused");
+    assert_eq!(
+        s.grants_summary.text(),
+        "fake: grants are\\u{202e} refused\\u{a}"
+    );
     assert!(descendants(&s.grants_list).is_empty());
     assert!(s.revoke_all.is_sensitive());
 
@@ -2261,6 +2319,186 @@ fn grants_page() {
         s.message.text()
     );
     assert_eq!(revocations().len(), before);
+    s.window.close();
+}
+
+/// A refresh does not put another grant's Revoke button under the pointer:
+/// when a grant above others ends, it keeps its place, marked as ended,
+/// rather than let the grants below move up. What did not change is not
+/// drawn anew: the keyboard focus and a selection stay.
+#[test]
+fn grants_keep_their_place() {
+    if !on_xvfb("grants_keep_their_place") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let state = fake_state(false);
+    let ids = [
+        "gaaaaaaaaaaaaaaaa",
+        "gbbbbbbbbbbbbbbbb",
+        "gcccccccccccccccc",
+    ];
+    state.lock().unwrap().grants = ids
+        .iter()
+        .map(|id| crate::model::tests::grant(id, "active"))
+        .collect();
+    fake_agent(&socket, &state);
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket);
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    show_page(&s, "grants");
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-gcccccccccccccccc")
+    });
+    let pause = |ms| {
+        let until = Instant::now() + Duration::from_millis(ms);
+        spin_until(|| Instant::now() >= until);
+    };
+    spin_until(|| s.window.width() > 0);
+    let revoke = |id: &str| named(&s.grants_list, &format!("revoke-{id}"));
+    let group_of = |b: &gtk::Button| {
+        b.ancestor(adw::PreferencesGroup::static_type())
+            .and_downcast::<adw::PreferencesGroup>()
+            .expect("its group")
+    };
+    let (a, b, c) = (revoke(ids[0]), revoke(ids[1]), revoke(ids[2]));
+    // The keyboard focus on B's Revoke, and part of B's command selected.
+    assert!(b.grab_focus());
+    let command = descendants(&group_of(&b))
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .find(|l| l.text() == "claude --print hello")
+        .expect("B's command");
+    command.select_region(0, 6);
+    pause(300);
+    let at = |w: &gtk::Button| {
+        let p = w
+            .compute_point(&s.window, &gtk::graphene::Point::new(4.0, 4.0))
+            .expect("in the window");
+        (f64::from(p.x()), f64::from(p.y()))
+    };
+    // The button a click at this point reaches; with INSENSITIVE, the one
+    // drawn there, usable or not.
+    let under_as = |(x, y): (f64, f64), flags: gtk::PickFlags| {
+        s.window
+            .pick(x, y, flags)
+            .and_then(|w| {
+                if w.is::<gtk::Button>() {
+                    Some(w)
+                } else {
+                    w.ancestor(gtk::Button::static_type())
+                }
+            })
+            .and_downcast::<gtk::Button>()
+    };
+    let under = |point| under_as(point, gtk::PickFlags::DEFAULT);
+    let drawn = |point| under_as(point, gtk::PickFlags::INSENSITIVE);
+    // The pointer is on A's Revoke.
+    let (aimed, b_at, c_at) = (at(&a), at(&b), at(&c));
+    assert_eq!(under(aimed).as_ref(), Some(&a));
+
+    // A's command ends: the agent lists B and C only, and B has made a
+    // request more.
+    {
+        let mut st = state.lock().unwrap();
+        st.grants.remove(0);
+        st.grants[0].requests = 4;
+    }
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none()
+            && texts(&s.grants_list)
+                .iter()
+                .any(|t| t == "4 (no limit); 1 in flight")
+    });
+    pause(300);
+    // What is under the pointer is still A's Revoke, which revokes nothing
+    // now: a click there reaches no button. B and C keep their buttons,
+    // where they were.
+    assert_eq!(drawn(aimed).as_ref(), Some(&a));
+    assert_eq!(under(aimed), None);
+    assert!(!a.is_sensitive());
+    assert_eq!(revoke(ids[0]), a);
+    assert_eq!((revoke(ids[1]), at(&b)), (b.clone(), b_at));
+    assert_eq!((revoke(ids[2]), at(&c)), (c.clone(), c_at));
+    assert!(b.is_sensitive() && c.is_sensitive());
+    let ended = texts(&group_of(&a));
+    for shown in [
+        "Ended: the agent no longer lists it",
+        "It has ended.",
+        "3 (no limit) when last listed",
+    ] {
+        assert!(ended.iter().any(|t| t == shown), "{shown:?} in {ended:#?}");
+    }
+    assert!(group_of(&a).has_css_class("dim-label"));
+    assert_eq!(
+        s.grants_summary.text(),
+        "2 grants, oldest first; 1 more ended while this page was shown."
+    );
+    snapshot(&s, "grants-ended.png");
+    // Only what changed was set anew.
+    assert_eq!(
+        gtk::prelude::RootExt::focus(&s.window).as_ref(),
+        Some(b.upcast_ref())
+    );
+    assert_eq!(command.selection_bounds(), Some((0, 6)));
+    // A new grant comes last: nothing above it moves.
+    state
+        .lock()
+        .unwrap()
+        .grants
+        .push(crate::model::tests::grant("gdddddddddddddddd", "active"));
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-gdddddddddddddddd")
+    });
+    pause(300);
+    assert_eq!(drawn(aimed).as_ref(), Some(&a));
+    assert_eq!((at(&b), at(&c)), (b_at, c_at));
+    let order: Vec<String> = descendants(&s.grants_list)
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
+        .map(|g| g.title().to_string())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "Grant gaaaaaaaaaaaaaaaa",
+            "Grant gbbbbbbbbbbbbbbbb",
+            "Grant gcccccccccccccccc",
+            "Grant gdddddddddddddddd"
+        ]
+    );
+
+    // Once the page is left, the ended grant goes; shown again, the page
+    // lists what the agent lists.
+    show_page(&s, "entries");
+    assert!(!has_button(&s.grants_list, "revoke-gaaaaaaaaaaaaaaaa"));
+    assert_eq!(s.grants_summary.text(), "3 grants, oldest first.");
+    show_page(&s, "grants");
+    spin_until(|| s.grants_job.borrow().is_none());
+    assert!(!has_button(&s.grants_list, "revoke-gaaaaaaaaaaaaaaaa"));
+    assert_eq!((revoke(ids[1]), revoke(ids[2])), (b, c));
+    // Every grant ends while the page is shown: they all stay, with nothing
+    // to revoke, and the line above them stays one short line.
+    state.lock().unwrap().grants.clear();
+    s.list_grants();
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && s.grants_summary.text().starts_with("No grants now")
+    });
+    assert_eq!(
+        s.grants_summary.text(),
+        "No grants now; 3 ended while this page was shown."
+    );
+    assert!(!s.revoke_all.is_sensitive());
     s.window.close();
 }
 

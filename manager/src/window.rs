@@ -27,10 +27,11 @@ const POLL_SECONDS: u32 = 5;
 const START_AGENT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const START_AGENT_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long the agent may take to list the grants or to revoke them: it
-/// asks the human nothing, and a revocation waits about a second at most
-/// for its brokers to confirm (ADR 0013). A listing or a revocation without
-/// an answer by then is reported, and the page can be used again.
+/// How long a listing of the grants or a revocation may take in all, from
+/// reaching the agent to its answer ([`Job::with_limit`]): the agent asks the
+/// human nothing for them, and a revocation waits about a second at most
+/// for its brokers to confirm (ADR 0013). One without an answer by then is
+/// reported, and the page can be used again.
 #[cfg(not(test))]
 const GRANTS_LIMIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -114,12 +115,10 @@ pub(crate) struct Manager {
     grants_summary: gtk::Label,
     grants_list: gtk::Box,
     revoke_all: gtk::Button,
-    /// The Revoke button of each grant shown, and whether that grant can
-    /// still be revoked.
-    revoke_buttons: RefCell<Vec<(gtk::Button, bool)>>,
-    /// What the grants page shows: the grants listed, or why they could
-    /// not be.
-    grants_view: RefCell<Option<Result<Vec<GrantRow>, String>>>,
+    /// The grants shown, in the order shown ([`GrantSlot`]).
+    grant_slots: RefCell<Vec<GrantSlot>>,
+    /// The last listing failed: the page says why in place of the list.
+    grants_failed: Cell<bool>,
     /// A listing of the grants, in the background, and `grants_epoch` when
     /// it started.
     grants_job: RefCell<Option<(Job, u64)>>,
@@ -239,13 +238,89 @@ fn key_row(key: &str, content: &impl IsA<gtk::Widget>) -> adw::PreferencesRow {
     row
 }
 
-/// A row showing requester-independent metadata as plain, selectable text.
+/// A row showing metadata as plain, selectable text, through the dialogs'
+/// filter.
 fn fact_row(key: &str, value: &str) -> adw::PreferencesRow {
+    fact_parts(key, value).0
+}
+
+/// A [`fact_row`], and the label that holds its value.
+fn fact_parts(key: &str, value: &str) -> (adw::PreferencesRow, gtk::Label) {
     let v = label(value);
     v.set_selectable(true);
     v.set_hexpand(true);
     v.set_valign(gtk::Align::Center);
-    key_row(key, &v)
+    (key_row(key, &v), v)
+}
+
+/// Set a [`label`]'s text, through the same filter, unless it shows that
+/// text already: a label set anew loses its selection.
+fn set_plain(label: &gtk::Label, text: &str) {
+    let text = rusthorse::ui::dialog_text(text);
+    if label.text() != text {
+        label.set_text(&text);
+    }
+}
+
+/// One grant on the grants page. Its group, its Revoke button and its rows
+/// are kept from one listing to the next, and only the texts that changed
+/// are set again: a refresh does not put another grant's button under the
+/// pointer, and keeps a selection and the keyboard focus.
+struct GrantSlot {
+    id: String,
+    group: adw::PreferencesGroup,
+    revoke: gtk::Button,
+    /// Each fact's key, row and value, in the order shown.
+    rows: Vec<(&'static str, adw::PreferencesRow, gtk::Label)>,
+    /// What the agent listed for it last.
+    last: GrantInfo,
+    /// Whether the last listing named it. A grant the agent no longer lists
+    /// has ended; it keeps its place while the page is shown.
+    listed: bool,
+    /// Whether revoking it would end anything.
+    revocable: bool,
+}
+
+impl GrantSlot {
+    /// Show `row`: in the rows there are, when they hold the same facts.
+    fn show(&mut self, row: &GrantRow) {
+        let same = self
+            .rows
+            .iter()
+            .map(|(key, ..)| *key)
+            .eq(row.facts.iter().map(|(key, _)| *key));
+        if same {
+            for ((_, _, value), (_, text)) in self.rows.iter().zip(&row.facts) {
+                set_plain(value, text);
+            }
+        } else {
+            for (_, r, _) in self.rows.drain(..) {
+                self.group.remove(&r);
+            }
+            for (key, text) in &row.facts {
+                let (r, value) = fact_parts(key, text);
+                self.group.add(&r);
+                self.rows.push((key, r, value));
+            }
+        }
+        self.revocable = row.revocable;
+    }
+
+    /// The agent lists it: show what it says now.
+    fn listed(&mut self, grant: &GrantInfo) {
+        self.show(&GrantRow::new(grant));
+        self.last = grant.clone();
+        self.listed = true;
+        self.group.remove_css_class("dim-label");
+    }
+
+    /// The agent lists it no more: it has ended.
+    fn ended(&mut self) {
+        let row = GrantRow::ended(&self.last);
+        self.show(&row);
+        self.listed = false;
+        self.group.add_css_class("dim-label");
+    }
 }
 
 fn button(text: &str, icon: Option<&str>) -> gtk::Button {
@@ -347,7 +422,7 @@ impl Manager {
         let grants_group = group(
             "Grants of the credential broker",
             Some(
-                "A command started with rusthorse run --broker gets a temporary token for each entry it uses that way, never the entry's value: the broker adds the value to the command's requests, only to the destination of the entry's profile and only for the routes it allows. A grant ends when its command ends or its lifetime passes, or earlier: when you revoke it, on Lock now, when its entry changes, on an automatic lock if its profile says so, and in a few other cases, such as a failed save. Revoking ends it at once and closes its open requests, though one already sent may still take effect; the command keeps running, without that access. Refreshed every five seconds while shown.",
+                "A command started with rusthorse run --broker gets a temporary token for each entry it uses that way, never the entry's value: the broker adds the value to the command's requests, only to the destination of the entry's profile and only for the routes it allows. A grant ends when its command ends or its lifetime passes, or earlier: when you revoke it, on Lock now, when its entry changes, on an automatic lock if its profile says so, and in a few other cases, such as a failed save. Revoking ends it at once and closes its open requests, though one already sent may still take effect; the command keeps running, without that access. Refreshed every five seconds while shown; a grant that ends meanwhile keeps its place, marked as ended, until you leave the page.",
             ),
         );
         let revoke_all = button("Revoke all", None);
@@ -641,8 +716,8 @@ impl Manager {
             grants_summary,
             grants_list,
             revoke_all,
-            revoke_buttons: RefCell::new(vec![]),
-            grants_view: RefCell::new(None),
+            grant_slots: RefCell::new(vec![]),
+            grants_failed: Cell::new(false),
             grants_job: RefCell::new(None),
             revoke_job: RefCell::new(None),
             grants_epoch: Cell::new(0),
@@ -675,13 +750,16 @@ impl Manager {
             }
         });
         // The grants are listed when their page is shown, and every few
-        // seconds while it is (see the timer below).
+        // seconds while it is (see the timer below). Those that ended while
+        // it was shown go when it is left.
         let weak = Rc::downgrade(&manager);
         manager.stack.connect_visible_child_name_notify(move |_| {
-            if let Some(s) = weak.upgrade()
-                && s.showing_grants()
-            {
-                s.list_grants();
+            if let Some(s) = weak.upgrade() {
+                if s.showing_grants() {
+                    s.list_grants();
+                } else {
+                    s.forget_ended_grants();
+                }
             }
         });
         let weak = Rc::downgrade(&manager);
@@ -1021,77 +1099,155 @@ impl Manager {
     fn update_revoke_buttons(&self) {
         let idle = self.revoke_job.borrow().is_none();
         let mut any = false;
-        for (button, revocable) in self.revoke_buttons.borrow().iter() {
-            button.set_sensitive(idle && *revocable);
-            any |= *revocable;
+        for slot in self.grant_slots.borrow().iter() {
+            slot.revoke.set_sensitive(idle && slot.revocable);
+            any |= slot.revocable;
         }
-        let unlisted = matches!(*self.grants_view.borrow(), Some(Err(_)));
-        self.revoke_all.set_sensitive(idle && (any || unlisted));
+        self.revoke_all
+            .set_sensitive(idle && (any || self.grants_failed.get()));
     }
 
-    /// Show the grants listed, or why they could not be listed. A list that
-    /// shows the same as the page does already is not drawn again, so that
-    /// the refresh does not rebuild the buttons under the pointer.
+    /// Show the grants listed, or why they could not be listed (in place of
+    /// the list, which may be out of date then).
+    ///
+    /// Each grant keeps its place: its group and its Revoke button stay
+    /// from one listing to the next, and only the texts that changed are
+    /// set again ([`GrantSlot`]). A new grant comes last. A grant the agent
+    /// no longer lists has ended: while the page is shown it stays where it
+    /// was, marked so — collapsing it would move the grants below it, and
+    /// put another grant's Revoke button under the pointer. It goes when the
+    /// page is left.
     fn paint_grants(self: &Rc<Self>, listed: Result<Vec<GrantInfo>, String>) {
-        let view = listed.map(|grants| grants.iter().map(GrantRow::new).collect::<Vec<_>>());
-        if self.grants_view.borrow().as_ref() == Some(&view) {
-            return;
-        }
-        clear(&self.grants_list);
-        let mut buttons = Vec::new();
-        match &view {
+        let grants = match listed {
+            Ok(grants) => grants,
             Err(why) => {
+                for slot in self.grant_slots.take() {
+                    self.grants_list.remove(&slot.group);
+                }
+                self.grants_failed.set(true);
                 self.grants_summary
-                    .set_text(&rusthorse::ui::dialog_text(why));
+                    .set_text(&rusthorse::ui::dialog_text(&why));
                 self.grants_summary.add_css_class("error");
+                self.update_revoke_buttons();
+                return;
             }
-            Ok(rows) => {
-                self.grants_summary.remove_css_class("error");
-                self.grants_summary.set_text(&match rows.len() {
-                    0 => "No grants. A command started with rusthorse run --broker gets one for each entry it uses through the broker, until it ends.".to_string(),
-                    1 => "1 grant.".to_string(),
-                    n => format!("{n} grants, oldest first."),
-                });
-                for row in rows {
-                    // A group's title is markup: only an ID of the exact
-                    // form of one goes there. Everything else from the agent
-                    // is drawn as plain text, through the dialogs' filter.
-                    let title = if rusthorse::broker_protocol::is_well_formed_grant_id(&row.id) {
-                        format!("Grant {}", row.id)
-                    } else {
-                        "Grant".to_string()
-                    };
-                    let g = group(&title, None);
-                    let revoke = button("Revoke", None);
-                    revoke.set_widget_name(&format!("revoke-{}", row.id));
-                    revoke.add_css_class("destructive-action");
-                    revoke.set_valign(gtk::Align::Center);
-                    revoke.set_tooltip_text(Some(
-                        "End this grant now: its token stops working and its open requests are closed.",
-                    ));
-                    revoke.update_property(&[gtk::accessible::Property::Label(&format!(
-                        "Revoke grant {}",
-                        rusthorse::ui::dialog_text(&row.id)
-                    ))]);
-                    let id = row.id.clone();
-                    let weak = Rc::downgrade(self);
-                    revoke.connect_clicked(move |_| {
-                        if let Some(s) = weak.upgrade() {
-                            s.revoke(Some(id.clone()));
-                        }
-                    });
-                    g.set_header_suffix(Some(&revoke));
-                    for (key, value) in &row.facts {
-                        g.add(&fact_row(key, value));
-                    }
-                    self.grants_list.append(&g);
-                    buttons.push((revoke, row.revocable));
+        };
+        self.grants_failed.set(false);
+        self.grants_summary.remove_css_class("error");
+        let mut slots = self.grant_slots.take();
+        // Which slots this listing names; a slot is matched once, so that
+        // an ID listed twice keeps two places.
+        let mut named = vec![false; slots.len()];
+        for grant in &grants {
+            match (0..slots.len()).find(|&i| !named[i] && slots[i].id == grant.id) {
+                Some(i) => {
+                    slots[i].listed(grant);
+                    named[i] = true;
+                }
+                None => {
+                    let slot = self.grant_slot(grant);
+                    self.grants_list.append(&slot.group);
+                    slots.push(slot);
+                    named.push(true);
                 }
             }
         }
-        *self.revoke_buttons.borrow_mut() = buttons;
-        *self.grants_view.borrow_mut() = Some(view);
+        let shown = self.showing_grants();
+        let mut kept = Vec::with_capacity(slots.len());
+        for (mut slot, named) in slots.into_iter().zip(named) {
+            if !named {
+                if !shown {
+                    self.grants_list.remove(&slot.group);
+                    continue;
+                }
+                slot.ended();
+            }
+            kept.push(slot);
+        }
+        *self.grant_slots.borrow_mut() = kept;
+        self.paint_grants_summary();
         self.update_revoke_buttons();
+    }
+
+    /// The group of a grant the page did not show yet.
+    fn grant_slot(self: &Rc<Self>, grant: &GrantInfo) -> GrantSlot {
+        // A group's title is markup: only an ID of the exact form of one
+        // goes there. Everything else from the agent is drawn as plain
+        // text, through the dialogs' filter.
+        let title = if rusthorse::broker_protocol::is_well_formed_grant_id(&grant.id) {
+            format!("Grant {}", grant.id)
+        } else {
+            "Grant".to_string()
+        };
+        let g = group(&title, None);
+        let revoke = button("Revoke", None);
+        revoke.set_widget_name(&format!("revoke-{}", grant.id));
+        revoke.add_css_class("destructive-action");
+        revoke.set_valign(gtk::Align::Center);
+        revoke.set_tooltip_text(Some(
+            "End this grant now: its token stops working and its open requests are closed.",
+        ));
+        revoke.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Revoke grant {}",
+            rusthorse::ui::dialog_text(&grant.id)
+        ))]);
+        let id = grant.id.clone();
+        let weak = Rc::downgrade(self);
+        revoke.connect_clicked(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.revoke(Some(id.clone()));
+            }
+        });
+        g.set_header_suffix(Some(&revoke));
+        let mut slot = GrantSlot {
+            id: grant.id.clone(),
+            group: g,
+            revoke,
+            rows: vec![],
+            last: grant.clone(),
+            listed: true,
+            revocable: false,
+        };
+        slot.listed(grant);
+        slot
+    }
+
+    /// The line above the grants: how many are listed, and how many of
+    /// those shown have ended since the page was opened. Kept short once
+    /// there is a grant to show, whatever the counts: a line more would move
+    /// the grants below.
+    fn paint_grants_summary(&self) {
+        let slots = self.grant_slots.borrow();
+        let listed = slots.iter().filter(|s| s.listed).count();
+        let ended = slots.len() - listed;
+        self.grants_summary.set_text(&match (listed, ended) {
+            (0, 0) => "No grants. A command started with rusthorse run --broker gets one for each entry it uses through the broker, until it ends.".to_string(),
+            (0, m) => format!("No grants now; {m} ended while this page was shown."),
+            (1, 0) => "1 grant.".to_string(),
+            (n, 0) => format!("{n} grants, oldest first."),
+            (1, m) => format!("1 grant; {m} more ended while this page was shown."),
+            (n, m) => {
+                format!("{n} grants, oldest first; {m} more ended while this page was shown.")
+            }
+        });
+    }
+
+    /// The grants page was left: the grants that ended while it was shown
+    /// go, now that nothing can move under the pointer.
+    fn forget_ended_grants(&self) {
+        let mut slots = self.grant_slots.borrow_mut();
+        let before = slots.len();
+        slots.retain(|slot| {
+            if !slot.listed {
+                self.grants_list.remove(&slot.group);
+            }
+            slot.listed
+        });
+        let changed = slots.len() != before;
+        drop(slots);
+        if changed {
+            self.paint_grants_summary();
+        }
     }
 
     fn submit(self: &Rc<Self>, request: Request, purpose: Pending) {
