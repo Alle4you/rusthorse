@@ -217,11 +217,22 @@ fn requests_without_this_grants_token_are_refused() {
 
 #[test]
 fn check_answers_the_contract_of_check_program() {
-    let (version, protocol) = rusthorse::helper_program::check_program(
+    let checked = rusthorse::helper_program::check_program(
         std::path::Path::new(program()),
         Duration::from_secs(10),
-    )
-    .expect("--check");
+    );
+    let (version, protocol) = if TEST_UPSTREAM {
+        // A build with the test feature is refused by check_program (and
+        // so by rusthorse doctor), whatever its version.
+        let refusal = checked.expect_err("a build for tests is refused");
+        assert!(format!("{refusal:#}").contains("for tests"), "{refusal:#}");
+        (
+            env!("CARGO_PKG_VERSION").to_string(),
+            rusthorse::broker_protocol::VERSION,
+        )
+    } else {
+        checked.expect("--check")
+    };
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
     assert_eq!(protocol, rusthorse::broker_protocol::VERSION);
     // The whole answer: a build with the test feature says so, so that it

@@ -112,11 +112,18 @@ pub fn check_file(path: &Path) -> Located {
 /// Run `program --check` with an empty environment and return the version
 /// and protocol it reports, within `limit` for everything — its output, the
 /// end of that output and its exit — under the same supervision as dialogs.
+///
+/// A program that reports `"test_upstream": true` is a build of
+/// `rusthorse-broker` with its feature for tests (extra certificate
+/// authorities and loopback destinations from its environment): it is
+/// refused, whatever its version.
 pub fn check_program(program: &Path, limit: Duration) -> anyhow::Result<(String, u32)> {
     #[derive(serde::Deserialize)]
     struct Report {
         version: String,
         protocol: u32,
+        #[serde(default)]
+        test_upstream: bool,
     }
     let deadline = Instant::now() + limit;
     let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
@@ -138,6 +145,9 @@ pub fn check_program(program: &Path, limit: Duration) -> anyhow::Result<(String,
         None => bail!("it did not exit within {limit:?}"),
     }
     let report: Report = serde_json::from_slice(&output).context("unexpected answer to --check")?;
+    if report.test_upstream {
+        bail!("it is a build for tests (feature test-upstream), never to be installed");
+    }
     Ok((report.version, report.protocol))
 }
 
@@ -168,6 +178,33 @@ mod tests {
             })
             .expect("ran");
         assert_eq!(checked.expect("report"), ("9.9".to_string(), 1));
+        // A build of the broker for tests is refused; saying false is fine.
+        for (report, refused) in [
+            (
+                r#"{"version":"9.9","protocol":1,"test_upstream":true}"#,
+                true,
+            ),
+            (
+                r#"{"version":"9.9","protocol":1,"test_upstream":false}"#,
+                false,
+            ),
+        ] {
+            write(&format!("#!/bin/sh\necho '{report}'\n"));
+            let result = (0..50)
+                .find_map(|_| match check_program(&program, Duration::from_secs(5)) {
+                    Err(e) if format!("{e:#}").contains("Text file busy") => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    }
+                    other => Some(other),
+                })
+                .expect("ran");
+            match result {
+                Err(e) if refused => assert!(format!("{e:#}").contains("for tests"), "{e:#}"),
+                Ok(checked) if !refused => assert_eq!(checked, ("9.9".to_string(), 1)),
+                other => panic!("{report}: {other:?}"),
+            }
+        }
         // Its output held open by a descendant: no end, a bounded wait.
         write("#!/bin/sh\necho '{\"version\":\"9.9\",\"protocol\":1}'\n/bin/sleep 30 &\n");
         let started = Instant::now();
