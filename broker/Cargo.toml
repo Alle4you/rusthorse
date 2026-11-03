@@ -1,0 +1,52 @@
+[package]
+name = "rusthorse-broker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "The credential broker of the Rusthorse agent: serves one grant on a loopback port (ADR 0013)."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Alle4you/rusthorse"
+readme = "../README.md"
+publish = false
+
+[features]
+# For tests only, never in a release (like the main package's
+# `fake-keyring`): the broker then reads RUSTHORSE_BROKER_TEST_* from its
+# environment (extra trusted roots, fixed addresses, a resolver delay,
+# shorter deadlines, a panic) and may reach a loopback destination. A build
+# without debug assertions refuses the feature, and `--check` reports it.
+# Without it the broker's own code reads no environment variable (tokio
+# and the C library read a few of their own, unset in the empty
+# environment the agent gives it: see src/config.rs).
+test-upstream = []
+
+[dependencies]
+bytes = "1.12.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+# The same nix as the main package: the checks of the listening socket
+# (SO_TYPE, SO_ACCEPTCONN) and the boot-time clock.
+nix = { version = "0.31.3", features = ["socket", "time"] }
+rusthorse = { path = "..", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+# A paused clock for the unit tests of deadlines.
+tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+unwrap_used = "warn"
