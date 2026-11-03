@@ -60,8 +60,11 @@ const _: () = assert!(MIN_CREDENTIAL_CHARS >= crate::redact::MIN_REDACT_LEN);
 const MAX_HOST_CHARS: usize = 253;
 /// Longest label of a host name, as DNS allows.
 const MAX_LABEL_CHARS: usize = 63;
-/// Longest `{id}` segment of a route, and longest query value.
+/// Longest `{id}` segment of a route, and longest pagination cursor
+/// (`before_id`, `after_id`), which is a model ID too.
 const MAX_ID_CHARS: usize = 128;
+/// Most digits of a `limit` query value.
+const MAX_LIMIT_DIGITS: usize = 4;
 
 /// A preset built into the program: the routes a grant allows, how the
 /// client presents the token and how the credential is presented to the
@@ -952,8 +955,9 @@ pub fn is_origin_form(target: &str) -> bool {
 /// non-empty `name=value` pairs joined by `&`, no name twice — its path is
 /// the base path, as whole segments, followed by a route of the preset for
 /// that method, and every query parameter is one the route allows, `beta`
-/// with the value `true` and the others with 1 to 128 letters, digits, `.`,
-/// `_`, `~` and `-`.
+/// with the value `true`, `limit` with 1 to 4 digits, and `before_id` and
+/// `after_id` with a model ID, the form of an `{id}` segment: 1 to 128
+/// letters, digits, `.`, `_`, `:`, `~` and `-`.
 ///
 /// The path the broker checks is the path it sends:
 /// [`MatchedRoute::path_and_query`] is `target` itself.
@@ -975,10 +979,12 @@ pub fn match_route(
         if !route.query.contains(&name) {
             return Err(RouteRefusal::NotAllowed);
         }
-        let allowed = if name == "beta" {
-            value == "true"
-        } else {
-            is_query_value(value)
+        let allowed = match name {
+            "beta" => value == "true",
+            "limit" => is_limit(value),
+            // Pagination cursors are model IDs.
+            "before_id" | "after_id" => is_id(value),
+            _ => false,
         };
         if !allowed {
             return Err(RouteRefusal::NotAllowed);
@@ -1061,10 +1067,9 @@ fn is_id(segment: &str) -> bool {
         && segment.bytes().all(|b| is_unreserved(b) || b == b':')
 }
 
-/// A query value other than `beta`'s: 1 to 128 letters, digits, `.`, `_`,
-/// `~` and `-`.
-fn is_query_value(value: &str) -> bool {
-    (1..=MAX_ID_CHARS).contains(&value.len()) && value.bytes().all(is_unreserved)
+/// A value of `limit`: 1 to [`MAX_LIMIT_DIGITS`] digits.
+fn is_limit(value: &str) -> bool {
+    (1..=MAX_LIMIT_DIGITS).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether the broker forwards the request header `name` to the destination
@@ -1847,7 +1852,14 @@ mod tests {
         anthropic          -        GET      /v1/models?limit=1=2                         404
         anthropic          -        GET      /v1/models?after_id=a/b                      404
         anthropic          -        GET      /v1/models?after_id=a?b                      404
-        anthropic          -        GET      /v1/models?after_id=a:b                      404
+        anthropic          -        GET      /v1/models?after_id=model:release            GET /v1/models
+        anthropic          -        GET      /v1/models?before_id=a:b&limit=1000          GET /v1/models
+        anthropic          -        GET      /v1/models?limit=abc                         404
+        anthropic          -        GET      /v1/models?limit=-1                          404
+        anthropic          -        GET      /v1/models?limit=1.5                         404
+        anthropic          -        GET      /v1/models?after_id=a~b:c.d_e-f              GET /v1/models
+        anthropic          -        GET      /v1/models?after_id=a!b                      404
+        anthropic          -        GET      /v1/models?before_id=                        404
         openai             /v1      GET      /v1/models?limit=10                          404
         openai             /v1      POST     /v1/chat/completions?beta=true               404
         openai-compatible  /v1      GET      /v1/models?x=1                               404
@@ -1899,10 +1911,13 @@ mod tests {
         let anthropic = latest(Preset::Anthropic);
         let id = |n: usize| format!("/v1/models/{}", "a".repeat(n));
         let limit = |n: usize| format!("/v1/models?limit={}", "1".repeat(n));
+        let cursor = |n: usize| format!("/v1/models?after_id={}", "a".repeat(n));
         check_route(anthropic, "", "GET", &id(128), "GET /v1/models/{id}");
         check_route(anthropic, "", "GET", &id(129), "404");
-        check_route(anthropic, "", "GET", &limit(128), "GET /v1/models");
-        check_route(anthropic, "", "GET", &limit(129), "404");
+        check_route(anthropic, "", "GET", &limit(4), "GET /v1/models");
+        check_route(anthropic, "", "GET", &limit(5), "404");
+        check_route(anthropic, "", "GET", &cursor(128), "GET /v1/models");
+        check_route(anthropic, "", "GET", &cursor(129), "404");
         for target in [
             "",
             "/v1/messages ",

@@ -350,8 +350,9 @@ pub struct Install {
     pub max_in_flight: u32,
     /// Most open client connections ([`MAX_CONNECTIONS`] at most).
     pub max_connections: u32,
-    /// Seconds the grant has left. The agent ends it then; the broker stops
-    /// serving then too, should the agent's word not come.
+    /// Seconds the grant has left: at most the profile's maximum lifetime.
+    /// The agent ends it then; the broker stops serving then too, should
+    /// the agent's word not come.
     pub lifetime_secs: u64,
 }
 
@@ -374,8 +375,9 @@ impl Install {
     /// Check what a broker must check before serving: this protocol's
     /// version, the forms of the grant ID and of the token, a credential
     /// that can be sent in a header ([`is_valid_credential`]), a valid
-    /// profile, limits within phase 1's, and a lifetime of at most a day.
-    /// The reason never contains a secret.
+    /// profile, limits within phase 1's, and a lifetime of at most the
+    /// profile's maximum (and so at most a day). The reason never contains a
+    /// secret.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != VERSION {
             return Err("another version of the control protocol");
@@ -402,6 +404,9 @@ impl Install {
         if !(1..=longest).contains(&self.lifetime_secs) {
             return Err("a lifetime out of range");
         }
+        if self.lifetime_secs > u64::from(self.profile.max_lifetime_minutes) * 60 {
+            return Err("a lifetime longer than the profile allows");
+        }
         Ok(())
     }
 }
@@ -418,8 +423,11 @@ pub enum FromBroker {
         /// The grant's ID, as installed.
         grant: String,
     },
-    /// Ask to forward a request that passed the broker's own checks (token,
-    /// route, framing, body). Nothing is forwarded before the answer.
+    /// Ask to forward a request that passed the broker's own checks: its
+    /// framing, its token, its route, and its declared body length, which
+    /// fits [`MAX_REQUEST_BODY_BYTES`] and is already reserved from
+    /// [`REQUEST_BODY_BUDGET_BYTES`]. The body itself is read only after
+    /// [`ToBroker::Admitted`]; nothing is forwarded before it.
     Admit {
         /// A number the broker gives the request, counting from 1; distinct
         /// within the grant.
@@ -1140,6 +1148,13 @@ mod tests {
             ("too many connections", |i| i.max_connections = 65),
             ("no lifetime", |i| i.lifetime_secs = 0),
             ("more than a day", |i| i.lifetime_secs = 24 * 3600 + 1),
+            ("longer than the profile", |i| {
+                i.lifetime_secs = u64::from(i.profile.max_lifetime_minutes) * 60 + 1
+            }),
+            ("a day, with a shorter profile", |i| {
+                i.profile.max_lifetime_minutes = 60;
+                i.lifetime_secs = 24 * 3600;
+            }),
         ];
         for (what, spoil) in cases {
             let mut install = install();

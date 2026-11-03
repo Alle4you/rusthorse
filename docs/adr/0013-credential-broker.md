@@ -344,7 +344,7 @@ A profile is stored in the entry's custom string field
 | `version` | The format: `1`. |
 | `preset`, `revision` | The preset and the revision of it the human approved. A newer Rusthorse keeps old revisions as they were: it never widens a stored profile. |
 | `origin` | `https://` and a host name, with an optional port. No IP address, user information, path, query or fragment in phase 1. |
-| `base_path` | What the client's base URL adds after the origin: empty, or one or more segments, each `/` followed by letters, digits, `.`, `_`, `~` and `-`, never `.` or `..`, with no trailing `/` — the same rules as a request's path. |
+| `base_path` | What the client's base URL adds after the origin: empty, or one or more segments, each `/` followed by letters, digits, `.`, `_`, `~` and `-`, never a segment made only of dots (`.`, `..`, `...`), with no trailing `/` — the same rules as a request's path. |
 | `automatic_locks` | `end` or `continue`: whether screen lock, suspend and the idle timeout end the entry's grants (decision 8). |
 | `max_lifetime_minutes` | 1 to 1440. |
 | `max_requests` | Optional, 1 to 1,000,000: the most requests one grant admits. |
@@ -379,13 +379,14 @@ Rules:
 | `openai` | `https://api.openai.com`, `/v1` | `Authorization: Bearer TOKEN` | `Authorization: Bearer KEY` | `POST /chat/completions`, `POST /responses`, `POST /responses/input_tokens`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
 | `openai-compatible` | none (the profile names it), `/v1` | `Authorization: Bearer TOKEN` | `Authorization: Bearer KEY` | `POST /chat/completions`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
 
-- Routes are exact. `{id}` is one segment of letters, digits, `.`, `_`,
-  `:`, `~` and `-`. Message batches, files, administration, key and
+- Routes are exact. `{id}` is one segment of 1 to 128 letters, digits,
+  `.`, `_`, `:`, `~` and `-`. Message batches, files, administration, key and
   organisation management, fine-tuning, uploads and everything else are
   not routes of any phase 1 preset; they answer `404` from the broker and
   are never forwarded.
 - Query parameters: `beta` (value `true`) on the Anthropic routes, and
-  `limit`, `before_id`, `after_id` on `GET /v1/models`; none elsewhere.
+  `limit` (1 to 4 digits), `before_id` and `after_id` (each a model ID, in
+  the form of an `{id}`) on `GET /v1/models`; none elsewhere.
 - Request headers forwarded (all others are dropped): `content-type`,
   `accept`, `user-agent`, and those starting with `anthropic-`,
   `x-stainless-` or `x-claude-code-` (Anthropic), or `openai-beta` and
@@ -419,7 +420,8 @@ request, in order:
    previous response on it.
 2. **Token**: missing or wrong → `401`.
 3. **Route**: the path must be in the exact form above, without `%`
-   escapes, empty, `.` or `..` segments, `;` or `\`, and match a route of
+   escapes, empty segments or segments made only of dots, `;`, `\` or
+   `#`, and match a route of
    the preset after the base path, with only the allowed query parameters
    (each at most once); otherwise `404`. The path the broker checks is the
    path it sends.
