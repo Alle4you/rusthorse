@@ -268,12 +268,14 @@ page](#grants-of-the-credential-broker). The variables are those the
 preset's libraries read, as `rusthorse guide ai` binds them, whatever the
 entry is called: `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for
 `anthropic`, `OPENAI_API_KEY` and `OPENAI_BASE_URL` for `openai` and
-`openai-compatible`. With the token in `ANTHROPIC_API_KEY`, which the
-Anthropic libraries send as `x-api-key`, `run` replaces any key your
-environment holds in that variable. If your environment also sets
-`ANTHROPIC_AUTH_TOKEN`, unset it (`env -u ANTHROPIC_AUTH_TOKEN`): a library
-that sends it as well presents something other than the token, and the
-broker refuses the request. The card of an `anthropic` entry says so.
+`openai-compatible`. With the token in `ANTHROPIC_API_KEY`, the variable the
+Anthropic libraries take their key from, `run` replaces any key your
+environment holds in that variable; the `anthropic` preset takes the token
+whether a library sends it as `x-api-key` or as `Authorization: Bearer`. If
+your environment also sets `ANTHROPIC_AUTH_TOKEN`, unset it
+(`env -u ANTHROPIC_AUTH_TOKEN`): a library that sends it as well presents
+something other than the token, and the broker refuses the request. The card
+of an `anthropic` entry says so.
 
 Claude Code has a recipe of its own in `rusthorse guide ai`, which that card
 points to too: the token in `ANTHROPIC_AUTH_TOKEN`, with `ANTHROPIC_API_KEY`

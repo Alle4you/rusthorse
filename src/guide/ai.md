@@ -154,11 +154,14 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
-- A program that uses an Anthropic SDK reads `ANTHROPIC_API_KEY` before
-  `ANTHROPIC_AUTH_TOKEN`: give it the token in `ANTHROPIC_API_KEY`, as above.
-  A key that your own environment holds in another variable the program
+- A program that uses an Anthropic SDK takes its key from
+  `ANTHROPIC_API_KEY`: give it the token there, as above.
+- A key that your own environment holds in another variable the program
   reads reaches the command like the rest of your environment: leave it out
-  of the run with `env -u NAME` before `rusthorse run`.
+  of the run with `env -u NAME` before `rusthorse run`. For an Anthropic
+  SDK, that is `ANTHROPIC_AUTH_TOKEN`: an SDK that finds both variables may
+  send both, and the broker refuses a request that presents anything but
+  the token.
 - `rusthorse grants` lists the grants, each with its state, never a token:
   their ID, entry, destination, command, requester, requests and when they
   end. A revoked grant can stay in the list until its command ends.

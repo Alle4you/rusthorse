@@ -335,9 +335,10 @@ pub(crate) fn snippet(entry: &EntryInfo) -> String {
 /// The variables that get the token and the broker's address in a command
 /// given an entry through the broker: those its preset's libraries read, as
 /// the recipes of `rusthorse guide ai` bind them. The Anthropic libraries
-/// send `ANTHROPIC_API_KEY` as `x-api-key`, where the `anthropic` preset
-/// takes the token, so the token goes there and `run` replaces whatever key
-/// that variable held in the environment; they read `ANTHROPIC_BASE_URL`. A
+/// take their key from `ANTHROPIC_API_KEY`, so the token goes there and
+/// `run` replaces whatever key that variable held in the environment (the
+/// `anthropic` preset takes the token as `x-api-key` or as `Authorization:
+/// Bearer`, however a library sends it); they read `ANTHROPIC_BASE_URL`. A
 /// library that also sends `ANTHROPIC_AUTH_TOKEN`, when the environment
 /// sets it, presents something other than the token and is refused, which
 /// the note says ([`broker_snippet_note`]), with Claude Code's own recipe.
@@ -981,8 +982,8 @@ pub(crate) mod tests {
         entry.fields.kind = Some(EntryKind::ApiKey);
         entry.fields.url = Some("https://api.anthropic.com".into());
         entry.broker = Some(usable(Preset::Anthropic));
-        // The token in the variable the Anthropic libraries send as
-        // x-api-key: `run` replaces any key the environment holds there.
+        // The token in the variable the Anthropic libraries take their key
+        // from: `run` replaces any key the environment holds there.
         assert_eq!(
             snippet(&entry),
             "rusthorse run \\\n  \

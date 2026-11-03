@@ -2649,7 +2649,7 @@ fn broker_profiles() {
     spin_until(|| Instant::now() >= settle_frame);
     snapshot(&s, "details-broker.png");
     // Its command goes through the broker, the token in the variable the
-    // Anthropic libraries send as x-api-key, and copies as shown.
+    // Anthropic libraries take their key from, and copies as shown.
     let expected = crate::model::snippet(&usable);
     assert!(
         expected.starts_with(&format!(
