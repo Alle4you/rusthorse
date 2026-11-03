@@ -397,6 +397,9 @@ fn desktop_flow() {
             send_buffer: None,
             session_lock: Default::default(),
             new_vault_kdf: rusthorse::vault::KdfParams::INSECURE_FOR_TESTS,
+            broker_program: None,
+            broker_ready_timeout: None,
+            broker_lifetime: None,
             keyring: Default::default(),
         },
         Box::new(Scripted(
@@ -1220,6 +1223,9 @@ fn first_start() {
             send_buffer: None,
             session_lock: Default::default(),
             new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+            broker_program: None,
+            broker_ready_timeout: None,
+            broker_lifetime: None,
             keyring: Default::default(),
         },
         Box::new(Scripted(
@@ -1328,6 +1334,9 @@ fn import_windows() {
             send_buffer: None,
             session_lock: Default::default(),
             new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+            broker_program: None,
+            broker_ready_timeout: None,
+            broker_lifetime: None,
             keyring: rusthorse::keyring::Settings {
                 address: None,
                 plain: true,
