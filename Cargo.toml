@@ -11,12 +11,16 @@ readme = "README.md"
 keywords = ["secrets", "password-manager", "keepass", "ai-agents", "cli"]
 categories = ["command-line-utilities", "authentication"]
 exclude = ["/.github"]
+# `cargo run` in the source tree runs this program, although the broker is
+# a default member too.
+default-run = "rusthorse"
 
 [workspace]
-# The dialog and manager need GTK 4 and libadwaita to build; plain
-# `cargo build` and `cargo test` here build `rusthorse` only.
+# Plain `cargo build`, `cargo test`, `cargo clippy`, `cargo doc` and `cargo
+# check` here cover `rusthorse` and `rusthorse-broker`; the dialog and the
+# manager need GTK 4 and libadwaita to build and are named with `-p`.
 members = [".", "dialog", "manager", "broker"]
-default-members = ["."]
+default-members = [".", "broker"]
 
 [features]
 default = ["secret-service", "session-lock"]
@@ -51,10 +55,14 @@ tempfile = "3.27.0"
 
 # The Debian package, built by packaging/build-deb.sh with cargo-deb (not
 # by `cargo deb` alone: the script generates the completions, the copyright
-# file and the documentation first): the three programs, the agent's
-# systemd user service (enabled for every user by packaging/deb/postinst),
-# the manager's menu entry and icon, shell completions and the
-# documentation. See docs/installation.md and ADR 0010.
+# file and the documentation first, and refuses a broker built for tests):
+# the four programs, the agent's systemd user service (enabled for every
+# user by packaging/deb/postinst), the manager's menu entry and icon, shell
+# completions and the documentation. See docs/installation.md and ADR 0010.
+# The credential broker reads the system's certificate authorities, which
+# ca-certificates installs (/etc/ssl/certs/ca-certificates.crt); without
+# them no grant can be served and nothing else changes, hence a
+# recommendation rather than a dependency.
 [package.metadata.deb]
 maintainer = "Alle4you <56454046+Alle4you@users.noreply.github.com>"
 copyright = "2026 The Rusthorse contributors"
@@ -62,19 +70,25 @@ changelog = "packaging/deb/changelog"
 section = "utils"
 priority = "optional"
 depends = "$auto"
+recommends = "ca-certificates"
 suggests = "keepassxc"
 extended-description = """\
 Rusthorse keeps secrets in a KeePass (KDBX4) file and runs an agent, a \
 systemd user service, through which programs — AI coding agents above all — \
 use a secret without seeing it: the agent asks you in a dialog before each \
 use, runs the approved command with the secret in its environment and hides \
-the value in its output. It locks the vault when the screen locks or the \
-computer suspends. The package contains the command-line program and the \
-agent, the agent's dialogs and the visual manager."""
+the value in its output. For an API key whose entry has a broker profile \
+(the Anthropic, OpenAI and OpenAI-compatible HTTP APIs), the approved \
+command can get a temporary token instead of the key: a credential broker, \
+which the agent starts for the run, adds the key to the requests the \
+profile allows. It locks the vault when the screen locks or the computer \
+suspends. The package contains the command-line program and the agent, the \
+agent's dialogs, the credential broker and the visual manager."""
 maintainer-scripts = "packaging/deb/"
 assets = [
     ["target/release/rusthorse", "usr/bin/", "755"],
     ["target/release/rusthorse-dialog", "usr/bin/", "755"],
+    ["target/release/rusthorse-broker", "usr/bin/", "755"],
     ["target/release/rusthorse-manager", "usr/bin/", "755"],
     ["packaging/deb/rusthorse-agent.service", "usr/lib/systemd/user/", "644"],
     ["data/io.github.alle4you.Rusthorse.desktop", "usr/share/applications/", "644"],

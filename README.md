@@ -99,14 +99,17 @@ and keeps the value out of the agent's reach in the common case.
 
 Requirements: Linux with a graphical session (X11 or Wayland) and systemd
 user services; to build, Rust 1.92 or newer and the GTK 4 and libadwaita
-development packages. On Ubuntu 24.04, Linux Mint 22, Debian 13 or later,
-build and install the Debian package; elsewhere, install from source. Full
-instructions, including uninstalling, are in
-[docs/installation.md](docs/installation.md).
+development packages; for the credential broker (`run --broker`), the
+system's certificate authorities (`ca-certificates`). On Ubuntu 24.04,
+Linux Mint 22, Debian 13 or later, build and install the Debian package;
+elsewhere, install from source. Full instructions, including uninstalling,
+are in [docs/installation.md](docs/installation.md).
 
 ```sh
 # 1. Build the Debian package (no release is published yet) and install it:
-#    the programs, the agent's service (enabled for every user), the manager
+#    the four programs (the command-line program and agent, its dialogs, the
+#    credential broker, the manager) and the agent's service (enabled for
+#    every user)
 sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
 cargo install --locked cargo-deb
 git clone https://github.com/Alle4you/rusthorse && cd rusthorse
