@@ -1429,14 +1429,105 @@ fn the_copyright_file_covers_every_crate_the_programs_are_built_from() {
         .iter()
         .position(|line| *line == "   At the top of its source files:")
         .expect("the notices of ring's source files");
+    let in_sources: BTreeSet<&str> = entry[sources + 1..]
+        .iter()
+        .map(|line| line.strip_prefix("     ").expect("a notice"))
+        .collect();
+    let in_license_files: BTreeSet<&str> =
+        entry[..sources].iter().map(|line| line.trim()).collect();
+    // Every notice of ring's sources, found here by other rules than
+    // copyright.py's, is listed; and nothing else is listed as one.
+    let expected = ring_notices(&crate_directory("ring", ring));
+    assert!(expected.len() > 50, "{expected:#?}");
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|notice| {
+            !in_sources.contains(notice.as_str()) && !in_license_files.contains(notice.as_str())
+        })
+        .collect();
+    assert!(missing.is_empty(), "not listed: {missing:#?}");
+    let unexpected: Vec<&&str> = in_sources
+        .iter()
+        .filter(|notice| !expected.contains(**notice))
+        .collect();
+    assert!(unexpected.is_empty(), "not notices: {unexpected:#?}");
+    // A file with code of two authors: src/aead/chacha.rs, compiled on every
+    // target.
     assert!(
-        entry[sources + 1..]
-            .iter()
-            .filter(|line| line.starts_with("     Copyright"))
-            .count()
-            > 10,
-        "{entry:#?}"
+        in_sources.contains("Portions Copyright (c) 2016, Google Inc."),
+        "{in_sources:#?}"
     );
+}
+
+/// The directory of the crate `name` `version` in Cargo's registry.
+fn crate_directory(name: &str, version: &str) -> PathBuf {
+    let meta: Value =
+        serde_json::from_str(&cargo(&["metadata", "--format-version", "1", "--locked"]))
+            .expect("JSON");
+    let manifest = meta["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|p| p["name"] == name && p["version"] == version)
+        .and_then(|p| p["manifest_path"].as_str())
+        .unwrap_or_else(|| panic!("no {name} {version}"));
+    Path::new(manifest)
+        .parent()
+        .expect("its directory")
+        .to_path_buf()
+}
+
+/// The copyright notices in ring's sources, found without copyright.py: the
+/// lines of the text files below its top directory (but in tests/, which is
+/// not compiled in) that start, after the marks of a comment, with
+/// "Copyright", "Portions Copyright", "(c)" or "©", and name a year. The
+/// license files at its top are read as such, and the sentences of license
+/// texts that start with "copyright" name no year.
+fn ring_notices(directory: &Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for top in fs::read_dir(directory).expect("read_dir").flatten() {
+        let top = top.path();
+        if !top.is_dir() || top.file_name().is_some_and(|name| name == "tests") {
+            continue;
+        }
+        for file in walk(&top) {
+            if !file.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&file).expect("read");
+            if bytes.contains(&0) {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                let mut text = line
+                    .trim_start_matches(|c: char| c.is_whitespace() || "/*#;@!%-".contains(c))
+                    .trim_end();
+                if let Some(open) = text.strip_suffix("*/") {
+                    text = open.trim_end_matches('*').trim_end();
+                }
+                let lower = text.to_lowercase();
+                if ["copyright", "portions copyright", "(c)", "©"]
+                    .iter()
+                    .any(|start| lower.starts_with(start))
+                    && names_a_year(text)
+                {
+                    found.insert(text.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether `text` has four digits, alone, that make a year from 1900 to 2099.
+fn names_a_year(text: &str) -> bool {
+    let b = text.as_bytes();
+    (0..b.len().saturating_sub(3)).any(|i| {
+        b[i..i + 4].iter().all(u8::is_ascii_digit)
+            && matches!(&b[i..i + 2], b"19" | b"20")
+            && (i == 0 || !b[i - 1].is_ascii_digit())
+            && b.get(i + 4).is_none_or(|c| !c.is_ascii_digit())
+    })
 }
 
 /// What copyright.py's own functions find for a stand-in crate, version
@@ -1511,10 +1602,15 @@ fn copyright_stops_at_a_license_file_below_a_crate_that_nobody_checked() {
         fs::write(path, text).expect("write");
     };
     file("Cargo.toml", b"");
-    // A license written as a comment: its notice is found all the same.
+    // A license written as a comment: its notice is found all the same, and
+    // the sentences of license texts about notices are not notices.
     file(
         "LICENSE",
-        b"// Copyright 2020 A Stand-In\n//\n// Permission to use, copy, modify...\n",
+        b"// Copyright 2020 A Stand-In\n//\n// Permission to use, copy, modify... provided that the above\n\
+          // copyright notice and this permission notice appear in all copies.\n\
+          // Copyright [yyyy] [name of copyright owner]\n\
+          // COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n\
+          // portions of the Software.\n",
     );
     file(
         "vendored/LICENSE-BSD",
@@ -1604,16 +1700,25 @@ fn copyright_stops_at_a_license_file_below_a_crate_that_nobody_checked() {
         "src/a.c",
         b"/* Copyright (c) 2014, Someone Inc.\n *\n * Permission to use...\n */\n",
     );
+    // The notice of a second author ("Portions Copyright"), and one in ARM
+    // assembly, whose comments start with `@`.
     file(
         "src/deep/b.rs",
-        b"// Copyright 2016 Another Author.\n// Copyright (c) 2014, Someone Inc.\n",
+        b"// Copyright 2016 Another Author.\n// Portions Copyright (c) 2014, Someone Inc.\n\
+          // Copyright (c) 2014, Someone Inc.\n",
+    );
+    file(
+        "src/deep/d.S",
+        b"@ Copyright 2012-2016 An Assembler. All Rights Reserved.\n@\n@ Licensed...\n",
     );
     file("src/c.o", b"\x7fELF\0\0\nCopyright 1999 Not Text\n");
     assert_eq!(
         probe(dir.path(), "sources", "{}", "[]").expect("notices"),
         serde_json::json!([
             "Copyright (c) 2014, Someone Inc.",
-            "Copyright 2016 Another Author."
+            "Copyright 2012-2016 An Assembler. All Rights Reserved.",
+            "Copyright 2016 Another Author.",
+            "Portions Copyright (c) 2014, Someone Inc."
         ])
     );
     // A crate whose source files were checked by hand, replaced by another

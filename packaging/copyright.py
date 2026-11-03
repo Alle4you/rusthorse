@@ -104,8 +104,13 @@ NOTICES_IN_SOURCES = {
 LICENSE_FILE = re.compile(r"(?i)^(licen[sc]e|copying|copyright|notice|unlicense)")
 
 # What may stand before a notice: the markers of a comment, in source files
-# and in license files written as one ("// Copyright 2015 ...").
-COMMENT_MARKER = re.compile(r"^(//+|/\*+|\*+|#+|;+|--)\s*")
+# (`@` in ARM assembly) and in license files written as one ("// Copyright
+# 2015 ...").
+COMMENT_MARKER = re.compile(r"^(//+|/\*+|\*+|#+|;+|--|@+)\s*")
+
+# A notice: "Copyright ...", "(c) 2014 ..." or "© 2014 ...", and the
+# "Portions Copyright ..." of a file that also has code of another author.
+NOTICE = re.compile(r"(?i)^(portions\s+)?(copyright\b|(\(c\)|©)\s*\d{4})")
 
 
 def host_triple():
@@ -249,7 +254,7 @@ def notices(texts):
             stripped = re.sub(r"\s*\*+/$", "", stripped).strip()
             # Notices, not the sentences of license texts about them ("the
             # copyright notice", "copyright owner", "[yyyy]").
-            if re.match(r"(?i)^(copyright\b|(\(c\)|©)\s*\d{4})", stripped) and not re.search(
+            if NOTICE.match(stripped) and not re.search(
                 r"(?i)\[|notice|license|owner|holder|permission", stripped
             ):
                 if stripped not in found:
