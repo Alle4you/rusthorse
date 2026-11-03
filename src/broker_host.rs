@@ -39,6 +39,10 @@
 //! confirmation. No thread that writes records waits for a broker's
 //! confirmation (only, at most [`ANSWER_TIMEOUT`], for it to take an
 //! answer), and a grant's end record is best effort.
+//!
+//! Lifetimes are checked by a timer thread ([`Registry::start_timer`]).
+//! Should it not start, nothing would end a grant when its lifetime passes:
+//! the registry then refuses to enter any grant.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -517,7 +521,10 @@ pub(crate) struct Registry {
     /// Notified when a grant confirms a revocation or ends.
     changed: Condvar,
     audit: Arc<dyn Recorder>,
+    /// The timer was started, or its start tried ([`Registry::start_timer`]).
     timer: AtomicBool,
+    /// The timer could not start: no grant is entered.
+    no_timer: AtomicBool,
 }
 
 impl Registry {
@@ -532,11 +539,25 @@ impl Registry {
             changed: Condvar::new(),
             audit,
             timer: AtomicBool::new(false),
+            no_timer: AtomicBool::new(false),
         })
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Refused when the timer that ends grants could not start: a grant
+    /// whose lifetime nothing would end is not served (fail closed).
+    fn timer_running(&self) -> Result<(), String> {
+        if self.no_timer.load(Ordering::SeqCst) {
+            return Err(
+                "the agent could not start the timer that ends grants when their lifetime \
+                 passes, so it serves no grant; restart the agent"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// The grants that have not ended, revoked ones whose broker still runs
@@ -560,7 +581,9 @@ impl Registry {
     /// Whether `asked` more grants fit within [`MAX_GRANTS`], which counts
     /// every grant that has not ended: a revoked one too holds a broker and
     /// a port until its command ends. The refusal says how many are revoked.
+    /// None fits when the timer could not start.
     pub(crate) fn room_for(&self, asked: usize) -> Result<(), String> {
+        self.timer_running()?;
         room(&self.inner(), asked)
     }
 
@@ -605,8 +628,9 @@ impl Registry {
     /// same lock that checks the vault's generation and reads the
     /// credentials, so that a lock comes either before (nothing was read)
     /// or after (it ends them). Refused when more than [`MAX_GRANTS`] grants
-    /// would then not have ended.
+    /// would then not have ended, and when the timer could not start.
     pub(crate) fn enter(self: &Arc<Self>, grants: Vec<NewGrant>) -> Result<RunGrants, String> {
+        self.timer_running()?;
         let mut inner = self.inner();
         room(&inner, grants.len())?;
         let mut ids: Vec<&str> = grants.iter().map(|g| g.id.as_str()).collect();
@@ -728,23 +752,38 @@ impl Registry {
     }
 
     /// Check the grants' lifetimes every second, on a thread of its own
-    /// (once; later calls do nothing).
-    pub(crate) fn start_timer(self: &Arc<Self>) {
+    /// (once; later calls do nothing). Should that thread not start, the
+    /// error is returned and no grant is entered from then on
+    /// ([`Registry::enter`] and [`Registry::room_for`] refuse): nothing would
+    /// end one when its lifetime passes.
+    pub(crate) fn start_timer(self: &Arc<Self>) -> io::Result<()> {
+        self.start_timer_with(|timer| {
+            thread::Builder::new()
+                .name("rusthorse-grants".into())
+                .spawn(timer)
+                .map(drop)
+        })
+    }
+
+    /// [`Registry::start_timer`], with the thread started by `spawn`.
+    fn start_timer_with(
+        self: &Arc<Self>,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.timer.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         let weak = Arc::downgrade(self);
-        let _ = thread::Builder::new()
-            .name("rusthorse-grants".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(EXPIRY_CHECK);
-                    let Some(registry) = weak.upgrade() else {
-                        return;
-                    };
-                    registry.expire();
-                }
-            });
+        let timer = Box::new(move || {
+            loop {
+                thread::sleep(EXPIRY_CHECK);
+                let Some(registry) = weak.upgrade() else {
+                    return;
+                };
+                registry.expire();
+            }
+        });
+        spawn(timer).inspect_err(|_| self.no_timer.store(true, Ordering::SeqCst))
     }
 
     /// End every grant for `reason`, then end the conversation with every
@@ -3055,9 +3094,9 @@ mod tests {
             0,
         );
         let started = Instant::now();
-        s.registry.start_timer();
+        s.registry.start_timer().expect("the timer");
         // Once: a second call starts no other timer.
-        s.registry.start_timer();
+        s.registry.start_timer().expect("the timer");
         assert!(matches!(
             s.broker.next(),
             ToBroker::Revoke {
@@ -3068,6 +3107,38 @@ mod tests {
         assert!(took < Duration::from_secs(3), "{took:?}");
         assert_eq!(info(&s.registry, &s.id).state, "revoked");
         assert_eq!(s.log.end_of(&s.id).reason.as_deref(), Some("expired"));
+        // Grants are still served.
+        assert_eq!(s.registry.room_for(1), Ok(()));
+    }
+
+    /// Without the timer, nothing would end a grant when its lifetime
+    /// passes: when its thread cannot start, no grant is served from then
+    /// on (fail closed) — `room_for`, which a run checks before its dialog,
+    /// and `enter` refuse, saying why.
+    #[test]
+    fn no_grant_is_served_when_the_timer_cannot_start() {
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(log as Arc<dyn Recorder>);
+        let err = registry
+            .start_timer_with(|_| Err(io::Error::other("no thread for the test")))
+            .expect_err("the timer did not start");
+        assert_eq!(err.to_string(), "no thread for the test");
+        let refused = registry.room_for(1).expect_err("room without a timer");
+        assert!(
+            refused.contains("could not start the timer that ends grants"),
+            "{refused}"
+        );
+        let entered = registry.enter(vec![new_grant(
+            &broker_protocol::new_grant_id(),
+            "KEY",
+            anthropic(),
+            Duration::from_secs(60),
+        )]);
+        assert_eq!(entered.err(), Some(refused));
+        assert_eq!(registry.count(), 0);
+        // A later call starts nothing, and changes nothing.
+        assert!(registry.start_timer().is_ok());
+        assert!(registry.room_for(1).is_err());
     }
 
     #[test]

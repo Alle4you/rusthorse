@@ -353,7 +353,14 @@ impl Agent {
     pub fn serve(self: &Arc<Self>, listener: UnixListener) -> anyhow::Result<()> {
         let _grants = StopGrants(Arc::clone(&self.registry));
         self.start_idle_timer();
-        self.registry.start_timer();
+        // Without the timer that ends grants when their lifetime passes, the
+        // registry serves no grant (fail closed); everything else still works.
+        if let Err(e) = self.registry.start_timer() {
+            eprintln!(
+                "rusthorse agent: cannot start the timer of the credential broker's grants \
+                 ({e}); runs through the broker are refused"
+            );
+        }
         *self
             .session_watchers
             .lock()
