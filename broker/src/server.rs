@@ -8,15 +8,16 @@
 //! arrive within the header deadline of the connection's opening or of the
 //! previous response, and of at most `MAX_REQUEST_HEADER_BYTES` (`431`); a
 //! connection with no request in progress is closed after the idle
-//! deadline; every connection open when the grant is revoked is closed at
-//! once. HTTP/1.1 only, without upgrades.
+//! deadline; every connection open when the grant closes — revoked, or past
+//! its lifetime, which a task of its own watches — is closed at once.
+//! HTTP/1.1 only, without upgrades.
 //!
 //! Requests, in order: the framing (`400`, `505`), the token (`401`), the
 //! route (`404`), room for the body (`413`, `503`), the admission (`403`,
 //! `429`, `503`, or the agent's answer). A request that hyper cannot parse
 //! it answers itself (`400`, or `431` for a head too large) and closes the
 //! connection. Every request refused before its admission was asked,
-//! those included, is counted, for `revoked`; once the grant is revoked,
+//! those included, is counted, for `revoked`; once the grant is closed,
 //! every request that passes the token and the route gets `403`.
 
 use std::convert::Infallible;
@@ -129,6 +130,9 @@ pub async fn run(prepared: Prepared, config: Config) -> u8 {
         #[cfg(feature = "test-upstream")]
         panic_on_request: config.panic_on_request,
     });
+    // The grant closes when its lifetime ends, whether or not the agent
+    // says `revoke` by then.
+    tokio::spawn(Arc::clone(&server.grant).watch_lifetime(config.lifetime_lag));
     tokio::spawn(accept(listener, Arc::clone(&server)));
     tokio::select! {
         code = control::read(from_agent, &server.grant) => code,
@@ -156,11 +160,11 @@ async fn accept(listener: TcpListener, server: Arc<Server>) {
 }
 
 /// Serve one client connection until it ends, it idles too long, or the
-/// grant is revoked (if it was open then).
+/// grant closes (if it was open then).
 async fn connection(stream: TcpStream, server: Arc<Server>, _slot: OwnedSemaphorePermit) {
     let activity = Activity::new();
-    let open_at_revocation = !server.grant.is_revoked();
-    let mut revoked = server.grant.subscribe();
+    let open_at_closing = !server.grant.is_closed();
+    let mut closed = server.grant.subscribe();
     let service = {
         let server = Arc::clone(&server);
         let activity = Arc::clone(&activity);
@@ -184,7 +188,7 @@ async fn connection(stream: TcpStream, server: Arc<Server>, _slot: OwnedSemaphor
                 server.grant.count_refusal();
             }
         }
-        _ = revoked.wait_for(|revoked| *revoked), if open_at_revocation => {}
+        _ = closed.wait_for(|closed| *closed), if open_at_closing => {}
         _ = activity.idle(server.limits.idle_connection) => {}
     }
 }

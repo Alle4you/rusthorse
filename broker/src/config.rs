@@ -32,6 +32,10 @@
 //! - `RUSTHORSE_BROKER_TEST_TIMEOUTS`: shorter deadlines, as `name=ms` pairs
 //!   separated by commas (`ready`, `header`, `idle`, `body`, `connect`,
 //!   `tls`, `response`, `pause`);
+//! - `RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS`: how long after the grant's
+//!   lifetime passes the task that watches it closes the grant, as that task
+//!   may see it late after a resume (requests stop at the lifetime's end by
+//!   themselves meanwhile);
 //! - `RUSTHORSE_BROKER_TEST_PANIC`: `request` makes handling a request
 //!   panic, as an internal error would (for the test of the panic hook);
 //!
@@ -98,6 +102,9 @@ pub struct Config {
     pub addresses: Option<Vec<IpAddr>>,
     /// How long each resolution blocks before it starts.
     pub resolve_delay: Duration,
+    /// How long after the grant's lifetime passes the task that watches it
+    /// closes the grant: zero, but in tests.
+    pub lifetime_lag: Duration,
     /// Whether handling a request panics (for the test of the panic hook).
     #[cfg(feature = "test-upstream")]
     pub panic_on_request: bool,
@@ -112,6 +119,7 @@ impl Config {
             extra_roots: None,
             addresses: None,
             resolve_delay: Duration::ZERO,
+            lifetime_lag: Duration::ZERO,
             #[cfg(feature = "test-upstream")]
             panic_on_request: false,
         }
@@ -165,6 +173,9 @@ impl Config {
         }
         if let Some(pairs) = text("RUSTHORSE_BROKER_TEST_TIMEOUTS")? {
             apply_timeouts(&mut config.limits, &pairs)?;
+        }
+        if let Some(ms) = text("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS")? {
+            config.lifetime_lag = parse_ms(&ms)?;
         }
         if let Some(when) = text("RUSTHORSE_BROKER_TEST_PANIC")? {
             if when != "request" {
@@ -242,6 +253,7 @@ mod tests {
         assert_eq!(config.extra_roots, None);
         assert_eq!(config.addresses, None);
         assert_eq!(config.resolve_delay, Duration::ZERO);
+        assert_eq!(config.lifetime_lag, Duration::ZERO);
         #[cfg(feature = "test-upstream")]
         assert!(!config.panic_on_request);
     }
@@ -275,6 +287,7 @@ mod tests {
         let unparsable = [
             ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon"),
             ("RUSTHORSE_BROKER_TEST_TIMEOUTS", "nap=1"),
+            ("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "later"),
             ("RUSTHORSE_BROKER_TEST_ADDRESSES", "localhost"),
             ("RUSTHORSE_BROKER_TEST_PANIC", "later"),
         ];
@@ -282,6 +295,7 @@ mod tests {
             ("RUSTHORSE_BROKER_TEST_ADDRESSES", "127.0.0.1"),
             ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "5"),
             ("RUSTHORSE_BROKER_TEST_TIMEOUTS", "body=500"),
+            ("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "60000"),
             ("RUSTHORSE_BROKER_TEST_PANIC", "request"),
         ];
         assert_eq!(with(&unparsable), Ok(Config::release()));
@@ -305,6 +319,7 @@ mod tests {
         );
         assert_eq!(config.resolve_delay, Duration::from_millis(5));
         assert_eq!(config.limits.request_body, Duration::from_millis(500));
+        assert_eq!(config.lifetime_lag, Duration::from_secs(60));
         assert!(config.panic_on_request);
         for (name, value) in unparsable {
             assert!(with(&[ROOTS, (name, value)]).is_err(), "{name}");

@@ -1,6 +1,7 @@
 //! The one grant a broker serves: its token and credential, the requests it
 //! asked the agent to admit, those it admitted and has not finished, the
-//! requests it refused itself, the body budget, and its revocation.
+//! requests it refused itself, the body budget, its revocation and its
+//! lifetime.
 //!
 //! The agent is the authority on the grant's state and limits; this side
 //! keeps the conversation of the control channel exact (ADR 0013, "The
@@ -17,9 +18,24 @@
 //! should answer every waiting `admit` at once (`refused`, `revoked`) when
 //! it revokes.
 //!
+//! The grant also closes on its own when its lifetime passes, should the
+//! agent's `revoke` not come first. The lifetime counts from the receipt of
+//! the install, on the boot-time clock (so time spent suspended counts).
+//! Whoever sees it passed first closes the grant ([`Grant::expire`]): the
+//! task that watches it ([`Grant::watch_lifetime`]), or a request about to
+//! be admitted, forwarded or passed on ([`Grant::is_closed`]). It closes as
+//! a revocation does: nothing more is admitted or sent, every open request
+//! and connection is closed, and the credential is dropped. The control
+//! channel says nothing of it, since only a `revoke` of the agent may be
+//! confirmed (the agent ends the grant on its own clock and says `revoke`):
+//! each admitted request still gets its `finished`, the agent's answers to
+//! waiting `admit`s are still taken (an `admitted` among them ends
+//! `revoked`, unsent), and the agent's `revoke`, when it comes, is
+//! confirmed as usual.
+//!
 //! It also refuses by itself, as a backstop to the agent: a grant being
-//! revoked, a grant past its lifetime (on the boot-time clock, so time spent
-//! suspended counts), and more requests in flight than the install allows.
+//! revoked, a grant past its lifetime, and more requests in flight than the
+//! install allows.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -31,6 +47,13 @@ use rusthorse::protocol::SecretString;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::answer::Refusal;
+
+/// The longest the task that watches a grant's lifetime waits before it
+/// reads the boot-time clock again. tokio's timers count on the monotonic
+/// clock, which stops while the computer is suspended: a lifetime that ends
+/// during a suspend is seen by that task within this time of the resume
+/// (and by any request that comes first at once).
+pub const LIFETIME_CHECK: Duration = Duration::from_secs(1);
 
 /// The agent's answer to an `admit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +105,10 @@ pub struct Ended {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Serving,
+    /// The lifetime passed before the agent said `revoke`: closed as a
+    /// revocation closes it, with nothing sent for it; `revoked` waits for
+    /// the agent's `revoke`.
+    Expired,
     /// Told to revoke; `revoked` not sent yet.
     Revoking,
     /// `revoked` sent: nothing more goes to the agent.
@@ -103,7 +130,8 @@ struct State {
 /// The grant, shared by every connection and request of the broker.
 pub struct Grant {
     token: SecretString,
-    /// Dropped, and so wiped, when the grant is revoked.
+    /// Dropped, and so wiped, when the grant closes: revoked, or past its
+    /// lifetime.
     credential: Mutex<Option<SecretString>>,
     profile: BrokerProfile,
     spec: &'static PresetSpec,
@@ -112,7 +140,8 @@ pub struct Grant {
     /// could not be read, which counts as expired.
     expires: Option<Duration>,
     state: Mutex<State>,
-    revoked: watch::Sender<bool>,
+    /// Set once the grant closes: revoked, or past its lifetime.
+    closed: watch::Sender<bool>,
     to_agent: mpsc::UnboundedSender<FromBroker>,
 }
 
@@ -168,7 +197,7 @@ impl Grant {
                 refused: 0,
                 phase: Phase::Serving,
             }),
-            revoked: watch::Sender::new(false),
+            closed: watch::Sender::new(false),
             to_agent,
         })
     }
@@ -188,27 +217,98 @@ impl Grant {
         self.spec
     }
 
-    /// A copy of the credential (wiped when dropped), unless the grant was
-    /// revoked.
+    /// A copy of the credential (wiped when dropped), unless the grant is
+    /// closed ([`Grant::is_closed`]).
     pub fn credential(&self) -> Option<SecretString> {
+        if self.is_closed() {
+            return None;
+        }
         lock(&self.credential).clone()
     }
 
-    /// Whether the agent said `revoke`.
-    pub fn is_revoked(&self) -> bool {
-        *self.revoked.borrow()
+    /// Whether the grant is closed: the agent said `revoke`, or the
+    /// lifetime has passed. Finding the lifetime passed closes the grant
+    /// ([`Grant::expire`]), whether or not the task that watches it has
+    /// seen it yet: so a request checked here at each step stops at the
+    /// lifetime's end, even when that task sees it late.
+    pub fn is_closed(&self) -> bool {
+        if *self.closed.borrow() {
+            return true;
+        }
+        if self.expired() {
+            self.expire();
+            return true;
+        }
+        false
     }
 
-    /// A receiver that sees the revocation.
+    /// A receiver that sees the grant close.
     pub fn subscribe(&self) -> watch::Receiver<bool> {
-        self.revoked.subscribe()
+        self.closed.subscribe()
+    }
+
+    /// What is left of the lifetime; `None` once it has passed, or if the
+    /// boot-time clock cannot be read.
+    fn time_left(&self) -> Option<Duration> {
+        self.time_left_at(boot_time())
+    }
+
+    /// What is left of the lifetime at `now` on the boot-time clock; `None`
+    /// once it has passed, or if the clock could not be read (`now` is
+    /// `None`).
+    fn time_left_at(&self, now: Option<Duration>) -> Option<Duration> {
+        let left = self.expires?.checked_sub(now?)?;
+        Some(left).filter(|left| !left.is_zero())
     }
 
     fn expired(&self) -> bool {
-        match (self.expires, boot_time()) {
-            (Some(expires), Some(now)) => now >= expires,
-            _ => true,
+        self.time_left().is_none()
+    }
+
+    /// The lifetime has passed: unless the grant is closed already, close it
+    /// as a revocation does — admit nothing more, drop the credential, and
+    /// tell every open request and connection to close — and say nothing to
+    /// the agent, whose own `revoke` is then confirmed as usual.
+    pub fn expire(&self) {
+        let mut state = lock(&self.state);
+        self.expire_locked(&mut state);
+    }
+
+    fn expire_locked(&self, state: &mut State) {
+        if state.phase == Phase::Serving {
+            state.phase = Phase::Expired;
+            self.close();
         }
+    }
+
+    /// Drop the credential, and tell every open request and connection to
+    /// close.
+    fn close(&self) {
+        drop(lock(&self.credential).take());
+        self.closed.send_replace(true);
+    }
+
+    /// Close the grant when its lifetime passes ([`Grant::expire`]); run as
+    /// a task of its own. It waits at most [`LIFETIME_CHECK`] at a time,
+    /// then reads the boot-time clock again. `lag` delays it beyond that:
+    /// zero, but in tests of what requests do while this task has not seen
+    /// the end yet, as after a resume.
+    pub async fn watch_lifetime(self: Arc<Self>, lag: Duration) {
+        self.watch_lifetime_on(boot_time, lag).await;
+    }
+
+    /// [`Grant::watch_lifetime`], reading the boot-time clock from `now`
+    /// (a test's clock, which can jump as a suspend makes the real one).
+    async fn watch_lifetime_on(self: Arc<Self>, now: impl Fn() -> Option<Duration>, lag: Duration) {
+        // tokio's timers count on the monotonic clock, which stops during a
+        // suspend: never one long wait, which would end that much late.
+        while let Some(left) = self.time_left_at(now()) {
+            tokio::time::sleep(left.min(LIFETIME_CHECK)).await;
+        }
+        if !lag.is_zero() {
+            tokio::time::sleep(lag).await;
+        }
+        self.expire();
     }
 
     fn send(&self, state: &State, message: FromBroker) {
@@ -232,10 +332,13 @@ impl Grant {
         route: &str,
     ) -> Result<(u64, oneshot::Receiver<Answer>), Held> {
         let mut state = lock(&self.state);
-        if state.phase != Phase::Serving {
-            return Err(Held::Revoked);
+        match state.phase {
+            Phase::Serving => {}
+            Phase::Expired => return Err(Held::Expired),
+            Phase::Revoking | Phase::Revoked => return Err(Held::Revoked),
         }
         if self.expired() {
+            self.expire_locked(&mut state);
             return Err(Held::Expired);
         }
         if state.waiting.len() + state.admitted.len() >= self.max_in_flight {
@@ -266,8 +369,8 @@ impl Grant {
             state.admitted.insert(request);
         }
         if let Err(Answer::Admitted) = waiter.send(answer) {
-            // Nobody waits for it any more (its client went away, or a
-            // revocation closed it): it ends here, unsent.
+            // Nobody waits for it any more (its client went away, or the
+            // grant closed): it ends here, unsent.
             let outcome = if state.phase == Phase::Serving {
                 RequestOutcome::NotForwarded
             } else {
@@ -311,18 +414,21 @@ impl Grant {
     }
 
     /// The agent said `revoke`: admit nothing more, drop the credential, and
-    /// tell every open request and connection to close. `revoked` goes at
-    /// once if no `admit` waits for its answer and no admitted request is
-    /// open; otherwise after the last answer ([`Grant::on_answer`]) and the
-    /// last `finished` ([`Grant::finish`]).
+    /// tell every open request and connection to close (a grant past its
+    /// lifetime has done so already). `revoked` goes at once if no `admit`
+    /// waits for its answer and no admitted request is open; otherwise after
+    /// the last answer ([`Grant::on_answer`]) and the last `finished`
+    /// ([`Grant::finish`]).
     pub fn on_revoke(&self) -> Result<(), Violation> {
         let mut state = lock(&self.state);
-        if state.phase != Phase::Serving {
-            return Err(Violation("a second revoke"));
+        match state.phase {
+            Phase::Serving => self.close(),
+            // Closed at the end of its lifetime: this is the agent's first
+            // revoke, confirmed as any.
+            Phase::Expired => {}
+            Phase::Revoking | Phase::Revoked => return Err(Violation("a second revoke")),
         }
         state.phase = Phase::Revoking;
-        drop(lock(&self.credential).take());
-        self.revoked.send_replace(true);
         self.confirm_if_done(&mut state);
         Ok(())
     }
@@ -537,10 +643,10 @@ mod tests {
         grant.count_refusal();
         grant.count_refusal();
         let watcher = grant.subscribe();
-        assert!(!grant.is_revoked());
+        assert!(!grant.is_closed());
         assert!(grant.credential().is_some());
         assert_eq!(grant.on_revoke(), Ok(()));
-        assert!(grant.is_revoked());
+        assert!(grant.is_closed());
         assert!(watcher.has_changed().expect("watch"));
         assert!(grant.credential().is_none(), "the credential is dropped");
         assert_eq!(grant.on_revoke(), Err(Violation("a second revoke")));
@@ -677,6 +783,237 @@ mod tests {
         let (grant, _rx) = self::grant(4);
         assert!(grant.ask_admission("POST", "POST /v1/messages").is_ok());
         assert!(boot_time().is_some());
+    }
+
+    /// Whether the grant's own copy of the credential is gone.
+    fn dropped(grant: &Grant) -> bool {
+        lock(&grant.credential).is_none()
+    }
+
+    #[test]
+    fn the_end_of_the_lifetime_closes_the_grant_as_a_revocation_does_and_says_nothing() {
+        let (grant, mut rx) = grant(8);
+        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
+        let (two, mut answer_two) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        grant.on_answer(one, Answer::Admitted).expect("answer");
+        grant.count_refusal();
+        let watcher = grant.subscribe();
+        assert_eq!(sent(&mut rx), vec![admit(1), admit(2)]);
+
+        grant.expire();
+        // Closed: every open request and connection is told, the credential
+        // is dropped, nothing more is asked.
+        assert!(grant.is_closed());
+        assert!(watcher.has_changed().expect("watch"));
+        assert!(dropped(&grant), "the credential is dropped");
+        assert!(grant.credential().is_none());
+        assert_eq!(
+            grant
+                .ask_admission("POST", "POST /v1/messages")
+                .map(|(n, _)| n),
+            Err(Held::Expired)
+        );
+        grant.count_refusal();
+        // And nothing is said: only the agent's revoke may be confirmed.
+        assert_eq!(sent(&mut rx), vec![]);
+        // The open request still finishes, and the waiting admission is still
+        // answered (an admitted one then ends unsent); still nothing more.
+        grant.finish(one, ended(RequestOutcome::Unknown));
+        grant.on_answer(two, Answer::Admitted).expect("answer");
+        assert_eq!(answer_two.try_recv(), Ok(Answer::Admitted));
+        grant.finish(two, ended(RequestOutcome::Revoked));
+        grant.expire();
+        assert_eq!(
+            sent(&mut rx),
+            vec![
+                finished(1, RequestOutcome::Unknown),
+                finished(2, RequestOutcome::Revoked)
+            ]
+        );
+        // The agent's revoke, which its own clock sends, is no second revoke:
+        // it is confirmed, with the refusals before and after the end.
+        assert_eq!(grant.on_revoke(), Ok(()));
+        assert_eq!(sent(&mut rx), vec![FromBroker::Revoked { refused: 2 }]);
+        assert_eq!(grant.on_revoke(), Err(Violation("a second revoke")));
+        grant.expire();
+        assert_eq!(sent(&mut rx), vec![]);
+    }
+
+    #[test]
+    fn a_revoke_after_the_end_of_the_lifetime_waits_for_the_answers_and_the_ends() {
+        let (grant, mut rx) = grant(8);
+        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
+        let (two, _b) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        grant.on_answer(one, Answer::Admitted).expect("answer");
+        grant.expire();
+        grant.on_revoke().expect("revoke");
+        // Request 2 waits for its answer and request 1 has not finished.
+        assert_eq!(sent(&mut rx), vec![admit(1), admit(2)]);
+        grant
+            .on_answer(two, Answer::Refused(AdmissionRefusal::Revoked))
+            .expect("answer");
+        assert_eq!(sent(&mut rx), vec![]);
+        grant.finish(one, ended(RequestOutcome::Unknown));
+        assert_eq!(
+            sent(&mut rx),
+            vec![
+                finished(1, RequestOutcome::Unknown),
+                FromBroker::Revoked { refused: 0 }
+            ]
+        );
+        // An admission nobody waits for any more, answered after the end of
+        // the lifetime, ends unsent and `revoked`.
+        let (grant, mut rx) = self::grant(8);
+        let (one, answer) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
+        grant.expire();
+        drop(answer);
+        grant.on_answer(one, Answer::Admitted).expect("answer");
+        assert_eq!(
+            sent(&mut rx),
+            vec![admit(1), unsent(1, RequestOutcome::Revoked)]
+        );
+    }
+
+    #[test]
+    fn whoever_sees_the_lifetime_passed_first_closes_the_grant() {
+        let past = || {
+            boot_time()
+                .expect("clock")
+                .saturating_sub(Duration::from_millis(1))
+        };
+        // A request at one of its steps, before the task that watches the
+        // lifetime has seen it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let grant = Grant::with_expiry(install(4), tx, Some(past()));
+        let watcher = grant.subscribe();
+        assert!(!dropped(&grant) && !*watcher.borrow());
+        assert!(grant.credential().is_none());
+        assert!(dropped(&grant), "the credential is dropped");
+        assert!(*watcher.borrow(), "every request and connection is told");
+        // The agent is told nothing.
+        assert_eq!(sent(&mut rx), vec![]);
+        // A request asking for its admission.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let grant = Grant::with_expiry(install(4), tx, Some(past()));
+        assert_eq!(
+            grant
+                .ask_admission("POST", "POST /v1/messages")
+                .map(|(n, _)| n),
+            Err(Held::Expired)
+        );
+        assert!(dropped(&grant) && *grant.subscribe().borrow());
+        // A clock that cannot be read counts as a lifetime passed.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let grant = Grant::with_expiry(install(4), tx, None);
+        assert!(grant.is_closed());
+        assert!(dropped(&grant));
+        // A grant within its lifetime is not closed by looking.
+        let (grant, _rx) = self::grant(4);
+        assert!(!grant.is_closed());
+        assert!(grant.credential().is_some());
+        assert!(!dropped(&grant) && !*grant.subscribe().borrow());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_task_that_watches_the_lifetime_closes_the_grant_when_it_ends() {
+        let lifetime = Duration::from_millis(400);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let start = boot_time().expect("clock");
+        let grant = Grant::with_expiry(install(4), tx, Some(start + lifetime));
+        let mut watcher = grant.subscribe();
+        let started = std::time::Instant::now();
+        tokio::spawn(Arc::clone(&grant).watch_lifetime(Duration::ZERO));
+        tokio::time::timeout(Duration::from_secs(10), watcher.wait_for(|closed| *closed))
+            .await
+            .expect("closed in time")
+            .expect("watch");
+        // Not before its end, on the real clocks; that it is at the end, not
+        // at the next LIFETIME_CHECK, the paused test below shows exactly.
+        let took = started.elapsed();
+        assert!(
+            took >= lifetime - Duration::from_millis(50)
+                && took < lifetime + Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert!(boot_time().expect("clock") >= start + lifetime);
+        assert!(dropped(&grant));
+        assert_eq!(
+            grant
+                .ask_admission("POST", "POST /v1/messages")
+                .map(|(n, _)| n),
+            Err(Held::Expired)
+        );
+        assert_eq!(sent(&mut rx), vec![]);
+        // A lifetime longer than LIFETIME_CHECK is read again on the clock
+        // until it ends; one that has passed already ends at once.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let grant = Grant::with_expiry(install(4), tx, None);
+        let mut watcher = grant.subscribe();
+        tokio::spawn(Arc::clone(&grant).watch_lifetime(Duration::ZERO));
+        tokio::time::timeout(Duration::from_secs(5), watcher.wait_for(|closed| *closed))
+            .await
+            .expect("closed at once")
+            .expect("watch");
+        let (grant, _rx) = self::grant(4);
+        tokio::spawn(Arc::clone(&grant).watch_lifetime(Duration::ZERO));
+        tokio::time::sleep(LIFETIME_CHECK + Duration::from_millis(200)).await;
+        assert!(!grant.is_closed(), "a lifetime of 60 s");
+    }
+
+    /// On tokio's clock, paused here, with a boot-time clock that follows it:
+    /// the grant closes at the end of its lifetime, not at the next
+    /// LIFETIME_CHECK.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_task_that_watches_the_lifetime_closes_the_grant_at_its_end() {
+        let lifetime = Duration::from_millis(400);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let base = boot_time().expect("clock");
+        let grant = Grant::with_expiry(install(4), tx, Some(base + lifetime));
+        let start = tokio::time::Instant::now();
+        let clock = move || Some(base + start.elapsed());
+        let mut watcher = grant.subscribe();
+        tokio::spawn(Arc::clone(&grant).watch_lifetime_on(clock, Duration::ZERO));
+        watcher.wait_for(|closed| *closed).await.expect("watch");
+        let took = start.elapsed();
+        assert!(
+            took >= lifetime && took < lifetime + Duration::from_millis(10),
+            "{took:?}"
+        );
+        assert!(dropped(&grant), "the credential is dropped");
+        assert_eq!(sent(&mut rx), vec![]);
+    }
+
+    /// tokio's timers, paused here, count on the monotonic clock, which
+    /// stops while the computer is suspended; the boot-time clock does not.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_lifetime_that_ends_during_a_suspend_is_seen_soon_after_the_resume() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let base = boot_time().expect("clock");
+        let grant = Grant::with_expiry(install(4), tx, Some(base + Duration::from_secs(600)));
+        // The boot-time clock of this test: tokio's time, and the time spent
+        // suspended, which tokio's time does not count.
+        let start = tokio::time::Instant::now();
+        let suspended = Arc::new(Mutex::new(Duration::ZERO));
+        let clock = {
+            let suspended = Arc::clone(&suspended);
+            move || Some(base + start.elapsed() + *lock(&suspended))
+        };
+        let mut watcher = grant.subscribe();
+        tokio::spawn(Arc::clone(&grant).watch_lifetime_on(clock, Duration::ZERO));
+        // Awake for a minute and a half: the lifetime goes on.
+        tokio::time::sleep(Duration::from_millis(90_500)).await;
+        assert!(!*watcher.borrow());
+        assert!(!dropped(&grant));
+        // Suspended for an hour, past the end of the lifetime; once resumed,
+        // the task that watches it sees the end within LIFETIME_CHECK, not
+        // when the 600 s its timers count would have passed.
+        *lock(&suspended) = Duration::from_secs(3600);
+        tokio::time::timeout(LIFETIME_CHECK, watcher.wait_for(|closed| *closed))
+            .await
+            .expect("seen within LIFETIME_CHECK of the resume")
+            .expect("watch");
+        assert!(dropped(&grant), "the credential is dropped");
+        assert_eq!(sent(&mut rx), vec![]);
     }
 
     #[test]

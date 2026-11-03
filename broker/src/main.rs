@@ -29,6 +29,9 @@
 //! authority (`RUSTHORSE_BROKER_TEST_ROOTS`), which the agent's empty
 //! environment never does.
 //!
+//! The grant ends in the broker too when its lifetime passes, on the
+//! boot-time clock, even if the agent's `revoke` never comes ([`grant`]).
+//!
 //! `rusthorse-broker --check` prints its version and the control channel's
 //! protocol version as JSON, for `rusthorse doctor`, and exits. A build with
 //! the test feature adds `"test_upstream":true`, so that it cannot pass for
