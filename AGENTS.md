@@ -96,19 +96,27 @@ example `AtomicUsize::fetch_update`; use a `Mutex`).
 
 Breaking one of these is a security bug, whatever the tests say.
 
-1. **Only the agent handles secrets taken from the vault.** A client — the
-   CLI or the manager — holds a secret only when the user supplies one —
-   `init` without an agent (the new master password), `add --stdin` — or
-   asked for one: `reveal`, after approval (the manager's Show and Copy are
-   reveals). Imports are read by the agent (`import_from`, ADR 0012): the
-   CLI and the manager send names, never values; the `import` request, which
-   carries values, is left for other clients. The manager's forms carry
-   metadata only: they never ask for a master password or a value.
-2. **Never** log, audit or put in an error message a secret value, the master
-   password or notes. A value leaves a client only where the human asked for
-   it: printed by `reveal`, shown in the manager's Show window, or put on the
-   clipboard by its Copy ([ADR 0007](docs/adr/0007-visual-manager.md)). Keep
-   secrets in `Zeroizing` types; never `Debug` a structure that contains one.
+1. **Only the agent, and the broker it starts for each grant, handle secrets
+   taken from the vault.** The agent gives a `rusthorse-broker` process the
+   credential of its one grant, with the grant's token, profile and limits,
+   over the control channel, and nothing else from the vault (ADR 0013). The
+   broker puts the credential only in the authentication header it builds for
+   the profile's destination. A command run with `--broker` gets a token for
+   that binding, never the credential (ordinary `run` bindings give their
+   values to the approved command, as before). A client — the CLI or the
+   manager — holds a secret only when the user supplies one — `init` without
+   an agent (the new master password), `add --stdin` — or asked for one:
+   `reveal`, after approval (the manager's Show and Copy are reveals). Imports
+   are read by the agent (`import_from`, ADR 0012): the CLI and the manager
+   send names, never values; the `import` request, which carries values, is
+   left for other clients. The manager's forms carry metadata only: they never
+   ask for a master password or a value.
+2. **Never** log, audit or put in an error message a secret value, a broker
+   token or credential, the master password or notes. A value leaves a client
+   only where the human asked for it: printed by `reveal`, shown in the
+   manager's Show window, or put on the clipboard by its Copy
+   ([ADR 0007](docs/adr/0007-visual-manager.md)). Keep secrets in `Zeroizing`
+   types; never `Debug` a structure that contains one.
 3. **Approval-gated actions record an audit event before acting and fail
    closed** if they cannot.
 4. **Approval and secret-entry dialogs are shown by the agent**, never by
@@ -196,23 +204,31 @@ not guaranteed.
   file before their last answer: a child forked by another test keeps a copy
   of the listener until its exec.
 - **The broker's tests** (`broker/tests/`) run the real `rusthorse-broker`,
-  played by a fake agent, in front of a fake HTTPS destination in the test
-  process, with a certificate authority made for the test and fake keys;
-  nothing leaves the loopback interface. Those that need the broker to
-  reach that destination need its `test-upstream` feature (`--all-features`);
-  a few that check what a build without it ignores and refuses run only
-  without it (`--no-default-features`); the others run in both builds.
+  driven by a fake agent (`broker.rs`) or the real agent (`system.rs`), in
+  front of a fake HTTPS destination in the test process, with a certificate
+  authority made for the test and fake keys; nothing leaves the loopback
+  interface. Those that need the broker to reach that destination need its
+  `test-upstream` feature (`--all-features`); a few that check what a build
+  without it ignores and refuses run only without it
+  (`--no-default-features`); the others run in both builds.
+- **System tests** need the Linux tools, `/proc` facilities, CA file and short
+  `TMPDIR` listed in `broker/tests/system.rs`'s module documentation. Run them
+  through Cargo with `--all-features`. Both feature sets share
+  `target/debug/rusthorse-broker`: do not run the test binary directly after
+  building without features, or test different feature sets concurrently in
+  the same target directory.
 - **`test-upstream` is for tests only, never in a release**: with it the
-  broker trusts certificate authorities and addresses named in its
-  environment and may reach loopback destinations. A build without debug
-  assertions refuses it (`compile_error!`; the CI checks a release build),
-  the broker's `--check` reports it, `rusthorse doctor` fails on such a
-  build, and `packaging/build-deb.sh` refuses to package one
+  broker enables its hooks and permits loopback only when its environment sets
+  `RUSTHORSE_BROKER_TEST_ROOTS`. With the agent's empty environment it uses
+  the production configuration. A build without debug assertions refuses it
+  (`compile_error!`; the CI checks a release build), the broker's `--check`
+  reports it, `rusthorse doctor` fails on such a build, and
+  `packaging/build-deb.sh` refuses to package one
   (`packaging/check-broker.py`): it checks the broker it built and every
   broker in the packages cargo-deb wrote, and if one is refused it deletes
-  those packages, whatever their names, and names any it cannot delete,
-  such as one behind a symbolic link, which it does not follow. Never turn
-  it on outside tests.
+  those packages, whatever their names, and names any it cannot delete, such
+  as one behind a symbolic link, which it does not follow. Never turn it on
+  outside tests.
 - **The packaging tests** (`tests/packaging.rs`) run the scripts of
   `packaging/` with `/usr/bin/python3` (without it they fail, unless
   `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them), and `cargo

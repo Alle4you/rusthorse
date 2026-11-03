@@ -14,11 +14,12 @@ sequenceDiagram
     participant A as Rusthorse agent
     participant You as You
     AI->>R: rusthorse run GH_TOKEN=github -- gh pr create --fill
-    R->>A: request (+ the shell's stdio)
+    R->>A: request (bindings, command, directory, environment)
     A->>You: Allow "gh pr create --fill" with github → GH_TOKEN?
     You-->>A: Allow once
     A->>A: start gh with GH_TOKEN, filter its output
-    A-->>AI: PR URL (any token in the output shows as [REDACTED:github])
+    A-->>R: redacted stdout/stderr as data frames
+    R-->>AI: PR URL (any token in the output shows as [REDACTED:github])
 ```
 
 The AI composes the command; you decide whether it runs; the secret goes
@@ -50,11 +51,11 @@ from the vault straight into the approved program.
      dialog in time, stop and ask the human.
    ```
 
-   `rusthorse guide ai` prints the guide built into the installed
-   `rusthorse`: the rules above and why, how to find entries
-   (`list --kind`, `show NAME --json` for the host and username), how to
-   use `run` (`VAR=NAME`, `--url`, quoting, input, redaction), what each exit
-   status means and what to do about it, and how to store secrets without
+   `rusthorse guide ai` prints the guide built into the installed `rusthorse`:
+   the rules above and why, how to find entries (`list --kind`,
+   `show NAME --json` for the host and username), how to use `run`
+   (`VAR=NAME`, `--broker`, `--url`, quoting, input, redaction), what each
+   exit status means and what to do about it, and how to store secrets without
    seeing them (`add`, `--generate`, `import dotenv`). A test checks that
    every command and option it names exists, so it changes with the CLI and
    the instructions file does not have to. Its source is
@@ -70,6 +71,59 @@ from the vault straight into the approved program.
    [installation.md](installation.md#from-source)) and reaches the
    agent.
 
+## HTTP APIs through the credential broker
+
+Prefer `run --broker` when the entry has a usable profile and the operation
+fits its routes. You set the profile in an edit the agent asks you to approve:
+
+```sh
+rusthorse edit ANTHROPIC_API_KEY --broker anthropic
+rusthorse edit OPENAI_API_KEY --broker openai
+rusthorse edit DEEPSEEK_API_KEY --broker openai-compatible --broker-origin https://api.deepseek.com
+```
+
+The program must use the token and the broker's base URL together:
+
+```sh
+env -u ANTHROPIC_AUTH_TOKEN rusthorse run \
+  --broker ANTHROPIC_API_KEY --url ANTHROPIC_BASE_URL=ANTHROPIC_API_KEY -- python app.py
+rusthorse run --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
+rusthorse run --broker OPENAI_API_KEY=DEEPSEEK_API_KEY --url OPENAI_BASE_URL=DEEPSEEK_API_KEY -- python app.py
+```
+
+These are recipes for programs that read those variables, not a claim that
+every SDK does. The Anthropic preset accepts either `x-api-key` or
+`Authorization: Bearer`; if both appear they must both hold the grant's token.
+Leave competing key variables out, and check SDK configuration that may
+override the environment. Use the same entry spelling for `--broker` and
+`--url`. Never send the token to the provider's own URL or fall back to an
+ordinary value binding after a broker refusal.
+
+Claude Code is interactive and uses the terminal through `--no-redact`; the
+[built-in guide](../src/guide/ai.md#claude-code-through-the-broker) gives its
+separate recipe and settings checks. The recipe and real SDKs still await
+manual compatibility validation with a real key before a client version is
+called supported (ADR 0013, answer 9). You approve each use; the automated
+tests use fake destinations and keys only.
+
+A grant is approved once, with no `--remember`. Each admitted request,
+including a retry, consumes one use; a stream holds a slot until it ends.
+Disable SDK retries where practical, and impose spending limits at the
+provider: a request count cannot bound the cost of one request.
+
+Inspect `rusthorse grants` or the manager's Grants page, and end one with
+`rusthorse grants revoke ID` or all with `rusthorse grants revoke --all`.
+Explicit `rusthorse lock` also ends them all. AI profiles default to
+`automatic_locks: continue` and 12 hours, so screen lock, suspend or idle lock
+can leave active grants running. Choose `end` or a shorter lifetime for
+profiles that should stop sooner. Entry changes, failed saves, command end,
+broker failure and expiry also end grants. Already-sent requests may still
+take effect even after revocation has been confirmed.
+
+With zenity, two or more grants in one approval may exceed its estimated
+height and be refused. `rusthorse-dialog` scrolls; both retain character
+limits and never truncate what is approved.
+
 ## Approving requests
 
 The dialog is where your security comes from. Before clicking **Allow**, read
@@ -80,6 +134,7 @@ these lines:
 | **Command** | Is this what I expected the agent to do right now? Does it send data anywhere (`curl`, `nc`, `ssh`, `git push`)? |
 | **Program** | Is this the real tool (`/usr/bin/gh`), or something in a project or temporary directory? |
 | **Directory** | Is the agent working where I think it is? |
+| **Broker grants** | Is the destination correct, is every route needed, and are the lifetime, automatic-lock policy, request count and concurrency acceptable? The dialog warns that bodies are opaque and calls can spend credit. Mixed runs still deliver real values for ordinary bindings. |
 | **Secrets** | Does this command need *these* secrets? An API key for a model has no business in `git push`. |
 | **Requested by (unverified)** | Is it the AI's shell, or something unexpected? These are process names, which any program can choose, so they inform but do not prove who asked. |
 | **Destinations (environment)** | Is every host one you expect — the provider's real API, your own database? An AI agent can set `OPENAI_BASE_URL` or `DATABASE_URL` to a server of its own, and the approved program would send the secret there. |
@@ -95,21 +150,22 @@ before you allow it.
 Be especially careful with:
 
 - **Shell one-liners** (`sh -c '…'`, `bash -c '…'`). Everything inside runs
-  with the secret. Read the whole string.
+  with the ordinary values or broker capabilities you grant. Read the whole
+  string.
 - **Scripts in the project** (`python deploy.py`, `./run.sh`, `npm run x`).
   You are approving whatever the file contains *now*, and the AI can edit
   files. If it just changed the script, look at the change first.
 - **Interpreters with an inline program** (`python -c`, `node -e`).
-- **`--no-redact`**. The output will contain the secret if the program
-  prints it.
+- **`--no-redact`**. The output will contain the secret if the program prints
+  it (a token for a broker binding).
 
 **Remembered approvals** ("Allow for N") are off by default. If you enable
 them (`rusthorse agent --remember 5m`), they skip the dialog for *identical*
 requests — same command line, program, directory, secrets, environment and
 vault state — but not for what the command reads: an agent can change a
 script, a config file or the command's input between runs. Enable them only
-for commands whose inputs you control, and use `rusthorse lock` when you
-step away.
+for commands whose inputs you control, and use `rusthorse lock` when you step
+away. Remembering never applies to `broker_run`.
 
 **Sandboxed agents.** If the AI agent runs in a sandbox (restricted network,
 read-only file system, container), remember that the command you approve is
@@ -130,14 +186,32 @@ cooperative-but-fallible agents:
 - output that happens to contain the secret is redacted;
 - there is a record of every use.
 
+For ordinary bindings, default redaction catches literal copies on
+stdout/stderr; encodings, files and network writes can bypass it (L5). For
+each broker binding the command instead receives a token, never the source
+credential. The broker fixes the credential's destination and routes, and
+redacts literal copies returned in response bodies. A grant is a capability
+you approve once: allowed calls can spend credit or access data without
+another dialog. Each admission is recorded before forwarding; completion
+records are best effort and abrupt process death can leave an unfinished audit
+trail.
+
 It cannot make a malicious agent harmless when the agent runs as you in your
-desktop session. An agent that is actively trying to steal a secret can get
-it — by encoding it in an approved command's output, by having a script send
-it somewhere, by reading `/proc/<pid>/environ` of a running command, or on
-X11 by clicking "Allow" itself. Rusthorse makes such attempts visible and
-leaves a trail; it does not detect them for you. To resist a hostile agent,
-run it isolated from your session (separate user, no access to your display
-or processes) — see [threat model §8](threat-model.md#8-running-ai-agents-in-isolation).
+desktop session. An agent that is actively trying to steal a secret can get it
+— by encoding it in an approved command's output, by having a script send it
+somewhere, by reading `/proc/<pid>/environ` of a running command (a value for
+an ordinary binding, a token for a broker binding), or on X11 by clicking
+"Allow" itself. Rusthorse makes such attempts visible and leaves a trail; it
+does not detect them for you. To resist a hostile agent, run it isolated from
+your session (separate user, no access to your display or processes) — see
+[threat model §8](threat-model.md#8-running-ai-agents-in-isolation).
+
+A stolen broker token works through its listener within the grant's routes and
+limits until it ends. The loopback hop is clear text HTTP; request bodies are
+not inspected, and transformed copies of a credential returned by the
+destination escape literal redaction. `--no-redact` exposes anything the
+command prints, including tokens. See L21–L24 of the
+[threat model](threat-model.md) for these broker-specific limits.
 
 ## Tips
 

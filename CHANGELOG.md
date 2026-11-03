@@ -11,6 +11,41 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
+- **HTTP credential broker, phase 1**
+  ([ADR 0013](docs/adr/0013-credential-broker.md)):
+  `run --broker VAR=ENTRY --url URLVAR=ENTRY` gives the approved command a
+  temporary token and local base URL. One broker per grant authenticates to
+  the profile's fixed HTTPS destination and exact routes, supports SSE,
+  redacts literal copies of the credential in response bodies, drops headers
+  containing it, and records each admission durably before forwarding.
+  Presets: Anthropic, OpenAI and OpenAI-compatible. Grants have a maximum
+  lifetime, an optional request limit and a policy for automatic locks; the
+  explicit lock and command end always end them. No automatic fallback to the
+  real key; no remembered broker approvals.
+- **Profiles and grants**: `edit --broker PRESET` and its `--broker-*`
+  settings, `edit --clear broker`, `grants [--json]` and
+  `grants revoke ID|--all`. `show` displays profiles; `status` reports the
+  broker and live grant count; `doctor` checks the broker and the CA file;
+  `audit` shows grant and request records. `rusthorse guide ai` includes SDK
+  recipes and a Claude Code recipe awaiting a manual compatibility test.
+- **Manager broker controls**: a Grants page lists and revokes one or all
+  grants, also while locked. Ended rows retain their place while the page is
+  shown. Entry details show profiles read-only and offer broker command
+  snippets; edit and import notes explain grant revocation and profile removal
+  on replacement.
+- **Broker distribution**: the package installs `/usr/bin/rusthorse-broker` as
+  its fourth program and recommends `ca-certificates`. The build script checks
+  both the built broker and every broker in the packages it produces, refuses
+  test builds and cleans up the paths reported by cargo-deb on refusal:
+  regular files beginning as Debian packages are emptied, then deleted. If
+  permission prevents emptying one, it is deleted only when no other hard link
+  keeps it; otherwise it is named for manual removal. Regular files recognized
+  only by a `.deb`/`.ddeb` extension (any case) are deleted without emptying;
+  nothing else is deleted. Symbolic links are not followed and are named, as
+  are paths that cannot be deleted. Its copyright file covers all four
+  programs, including ring's nested license texts and source notices. Default
+  Cargo commands now cover the main package and the broker; `cargo run` still
+  runs `rusthorse`.
 - **Move an entry to another group**: `rusthorse edit NAME --group PATH`
   (`/` for the top level) and the **Group** of the manager's **Edit** form,
   which used to be locked. In the manager's forms the group is chosen from a
@@ -56,20 +91,20 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - `rusthorse init` uses `create_vault` when the agent serves that vault, so
   the new master password never enters the `rusthorse` process; it creates
   the file itself only without such an agent.
-- A **Debian package** ([ADR 0010](docs/adr/0010-debian-package.md)),
-  built with `packaging/build-deb.sh` (cargo-deb) for Ubuntu 24.04, Linux
-  Mint 22, Debian 13 or later: the three programs in `/usr/bin`, the agent's
-  user service enabled for every user, the manager in the applications menu,
-  shell completions and the documentation, and a copyright file with the
-  license of every crate compiled in. `apt remove` stops the agents of
-  logged-in users (and says which it could not stop) and removes everything
-  but users' vaults and audit logs; upgrades do not restart running agents.
-- The agent **locks the vault when the screen locks or the computer
-  suspends** ([ADR 0009](docs/adr/0009-lock-on-screen-lock-and-suspend.md)):
-  it watches logind — holding a delay inhibitor so that the lock happens
-  before the computer sleeps — and the Cinnamon, GNOME, MATE and
-  freedesktop screensavers over D-Bus. No signal ever unlocks. `status`,
-  `doctor` and the manager's Status page say what is watched;
+- A **Debian package** ([ADR 0010](docs/adr/0010-debian-package.md)), built
+  with `packaging/build-deb.sh` (cargo-deb) for Ubuntu 24.04, Linux Mint 22,
+  Debian 13 or later: the four programs in `/usr/bin`, the agent's user
+  service enabled for every user, the manager in the applications menu, shell
+  completions and the documentation, and a copyright file with the license of
+  every crate compiled in. `apt remove` stops the agents of logged-in users
+  (and says which it could not stop) and removes everything but users' vaults
+  and audit logs; upgrades do not restart running agents.
+- The agent **locks the vault when the screen locks or the computer suspends**
+  ([ADR 0009](docs/adr/0009-lock-on-screen-lock-and-suspend.md)): it watches
+  logind — holding a delay inhibitor to allow locking before sleep, subject to
+  the signal and disk delays in threat model L20 — and the Cinnamon, GNOME,
+  MATE and freedesktop screensavers over D-Bus. No signal ever unlocks.
+  `status`, `doctor` and the manager's Status page say what is watched;
   `--no-lock-on-suspend` and `--no-lock-on-screen-lock` turn it off. Builds
   without the new default feature `session-lock` have no D-Bus watchers.
 - Entry **kinds** ([ADR 0008](docs/adr/0008-entry-kinds.md)): `api-key`,
@@ -145,6 +180,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- **Protocol 8**: separate `broker_run` and `broker_edit` requests prevent an
+  older agent from silently ignoring broker bindings or profile edits. Added
+  `grants`, `revoke_grant` and optional profile/status fields.
+- Human-readable `audit` output escapes control and invisible characters
+  throughout each record. JSON output remains machine-readable.
 - The manager's entry form shows how the value is made as one row per
   choice (keep it, type a new one, generate one), the first one chosen,
   instead of a drop-down.

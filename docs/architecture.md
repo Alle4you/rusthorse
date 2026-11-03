@@ -34,17 +34,18 @@ flowchart LR
     P --> L
 ```
 
-The CLI and agent share a binary; the dialog and manager are optional
-separate programs:
+The CLI and agent share a binary; the dialog, manager and credential broker
+are optional separate programs:
 
 - **The agent** (`rusthorse agent`) runs for the whole desktop session. It is
-  the only component that decrypts the vault, holds the decrypted database, shows approval/secret-entry
-  dialogs and starts approved commands. An approved `reveal` also sends one
-  value to its client.
+  the only component that decrypts the vault, holds the decrypted database,
+  shows approval/secret-entry dialogs and starts approved commands. An
+  approved `reveal` also sends one value to its client.
 - **The CLI** (every other subcommand) is a thin client. It turns command-line
   arguments into one request, sends it over the socket, prints the response
-  and exits. It never handles the master password, and for `run` it never
-  handles secret values.
+  and exits. For `run` it receives no values from the vault. It holds a value
+  only when supplied by the user or requested through `reveal`; `init` without
+  an agent handles the new master password locally.
 - **`rusthorse-manager`** (GTK 4 and libadwaita, built separately) is a
   window to manage entries: a client of the agent like the CLI, which shows
   or copies a value only through an approved `reveal`. It never opens the
@@ -52,12 +53,18 @@ separate programs:
 - **`rusthorse-dialog`** (GTK 4 and libadwaita, built separately) shows one
   dialog for the agent and exits. Without it, the agent uses zenity.
 
+- **`rusthorse-broker`** is one process per HTTP grant. It receives only that
+  grant's credential, token, profile and limits, not the vault or master
+  password. It authenticates requests to the profile's HTTPS destination and
+  relays responses; the agent owns approval, accounting and revocation.
+
 ## Process model
 
 ```mermaid
 flowchart TB
     systemd["systemd --user"] --> agent["rusthorse agent<br/>(non-dumpable)"]
     agent --> dialog["rusthorse-dialog, or zenity<br/>(one process per dialog)"]
+    agent --> broker["rusthorse-broker<br/>(one process per grant, non-dumpable)"]
     agent --> cmd["approved command<br/>(own process group)"]
     terminal["terminal / AI agent"] --> shell["shell"] --> cli["rusthorse run …"]
     cli -. "socket + fds" .-> agent
@@ -154,6 +161,150 @@ the agent from reading the connection. If the caller's stdout is closed
 needs no lock) and exits with status 141, like a process killed by
 `SIGPIPE` — within about half a second, even if its other output is stuck.
 
+## Lifecycle of a `broker_run`
+
+The CLI sends a distinct protocol-8 request with entry names and variable
+names, never a token, source key or requester-selected profile. It pairs a
+`--url` with the broker binding by the same entry spelling; an alias that
+would instead expose the entry's provider URL is refused. The agent resolves
+UUIDs and the stored profiles and rejects duplicate brokered entries, mixed
+use of the same entry, invalid variables, unusable profiles and credentials
+outside 8–4096 visible ASCII characters. The helper's availability and room
+for the grants are checked even before unlocking; no grant is served if the
+agent's expiry thread could not start.
+
+The approval shows each destination, every allowed route, termination policy,
+maximum lifetime, request count (or no limit), concurrency, bindings by value
+in a mixed run, command, program, directory and requester. It warns about
+spending credit, opaque request bodies and unredacted output when requested.
+Broker approvals are never remembered. All dialog parts pass `dialog_text` and
+the size checks; no part is truncated. A single ordinary AI grant fits the
+tested zenity height estimate, but two or more may exceed it and be refused;
+`rusthorse-dialog` scrolls, subject to the text limits.
+
+Preparation is one transaction:
+
+1. Record approval, then under the agent's state lock check the generation,
+   read the credentials and enter all grants as `starting`. Lock order is
+   state then registry; admission never acquires the vault-state lock.
+2. Record each grant's creation durably, bind its loopback port and start its
+   broker. As soon as the process exists, register its control channel and
+   process handle. Under that same registry lock, check `starting` and send
+   `Install` non-blockingly. A revocation before this sends no credential; a
+   revocation after it contains the registered broker even before `Ready`. A
+   send that cannot complete fails preparation closed.
+3. Wait at most 10 seconds for installation and readiness. The broker hardens
+   itself before reading, validates the install and listening fd, parses the
+   CA bundle, initializes TLS and registers sockets before answering `Ready`.
+4. Under the registry lock require every grant to remain `starting`, then
+   activate them together and start the command. Failure ends all grants,
+   stops their brokers and releases the ports before a did-not-run answer.
+   Cleanup also precedes a best-effort `aborted` audit record.
+
+The command gets one token per broker binding (`rh_` plus 64 lowercase hex
+characters), and `http://127.0.0.1:PORT` plus the stored base path in its URL
+variable. The agent replaces requester values for those variables and adds
+`127.0.0.1` to `NO_PROXY` and `no_proxy`. This helps clients that honor those
+variables; it does not force a client to use them. Other entries may still be
+given by value. Default output redaction covers both values and tokens;
+`--no-redact` passes the requester's three input/output descriptors through
+and can expose a printed token.
+
+### HTTP, admission and accounting
+
+One broker owns one listener, one credential and one grant. The agent keeps a
+duplicate listener until the command ends, preventing port reuse after broker
+failure while that command might still use it. The broker runs with an empty
+environment, cwd `/`, its own process group and a socket pair as stdin/stdout;
+stderr is discarded. It is not an OS sandbox.
+
+HTTP/1.1 is used on both hops; TLS 1.2/1.3, SNI from the profile and the fixed
+ALPN offer `http/1.1` on the upstream hop. Each request uses a new TLS
+connection. The broker rebuilds Host, length, identity encoding and the
+credential header. Header allowlists, exact routes and query rules reject
+requests outside the stored preset. Redirects and encoded responses are
+refused; literal credentials in relayed bodies and headers are removed. SSE is
+streamed through the redactor, which retains a small suffix needed to match a
+credential split across chunks. Opaque request bodies are not inspected. See
+the
+[normative HTTP rules](adr/0013-credential-broker.md#requests-and-responses).
+
+Declared bodies are limited to 16 MiB, with a 64 MiB per-broker reservation
+budget before admission. The reservation is held by both the exchange until a
+response head and the body bytes, including bytes Hyper retains for writing.
+It returns only after both release it; kernel socket buffers are outside this
+budget. At most 16 requests are in flight and 64 client connections open per
+grant. DNS uses `getaddrinfo` on bounded blocking work: a lookup retains its
+semaphore slot until it actually returns, even after its request timed out.
+Public addresses are tried in order within one 10-second resolution/connect
+deadline, without a second resolution. There is no Happy Eyeballs; a stalled
+first address may consume the deadline.
+
+The broker numbers admissions from 1. The agent's reader validates numbers and
+routes, refuses invalid state/limits immediately, or reserves a use and slot
+under the registry lock. A bounded per-grant queue (256 jobs) feeds an audit
+thread, which durably records the admission, rechecks state and lifetime, then
+answers exactly once. Only then is the body read and the request forwarded. An
+admitted attempt spends its use regardless of its outcome; each SDK retry is
+another attempt. `finished` frees its slot and queues its completion record. A
+failed completion record revokes the grant.
+
+### Ending grants and the unlock barrier
+
+The registry distinguishes `starting`, `active`, `exhausted` and `revoked`.
+Exhaustion stops new admissions and lets admitted requests finish. A normally
+revoked broker stays alive until its command ends; its registry entry remains
+listed and consumes the 16-slot cap. If the broker exits, the entry is removed
+sooner, but the run keeps its copy of the listener until cleanup.
+`status.grants` counts only starting, active and exhausted grants. Listing and
+revocation work while locked, without a dialog.
+
+Every grant ends on explicit lock, failed save, agent exit or its command's
+end; entry changes, manual revocation, broker failure and expiry end the
+grants they concern. Every automatic lock ends every starting grant. For
+active/exhausted grants it follows `automatic_locks`: `end` or `continue`
+(default for AI presets, with a 12-hour maximum). Broker traffic never
+postpones the vault's idle lock.
+
+Revocation is decided under the registry lock: no later admission succeeds.
+The agent tells the brokers and immediately refuses admissions waiting for
+audit, without waiting for the log. It allows 250 ms to send and one second
+for confirmation, then kills and reaps an unresponsive broker. Concurrent
+revocations wait for the same completed containment, not merely a requested
+kill. A lock/edit/revocation is reported done only after every concerned
+broker confirms or is gone. Requests already sent may still take effect; there
+is a window between decision and containment. Suspend locking retains the
+timing limitations of
+[L20](threat-model.md#l20--locking-with-the-screen-depends-on-the-desktops-signals).
+
+When the agent sees the command's leader exit or the requester disconnect, it
+revokes before terminating the remaining process group or draining output.
+Descendants outside that group may survive, but their token loses its grant.
+Ports are released after the run's cleanup.
+
+An agent timer checks expiry every second on `CLOCK_BOOTTIME`. The broker
+independently watches its installed remaining lifetime on that clock,
+rereading at intervals of at most one second while scheduled so suspension
+counts, and checking again before forwarding and relaying response data.
+Expiry closes existing work and drops the credential. The broker reports
+`finished` but no unsolicited `revoked`; it confirms a later agent revoke. EOF
+on the control channel exits immediately without waiting for DNS work. SIGTERM
+of the agent normally causes this EOF (systemd also kills its cgroup), but
+does not run the serve-loop `StopGrants` guard, so it does not produce
+`agent_stopped` grant-end records.
+
+For grants surviving automatic locks, the agent keeps a keyed fingerprint of
+the encrypted file bytes last read or written, across locks. At unlock, under
+the state lock it checks the generation, compares fingerprints and decides
+`vault_changed` for all surviving grants when different or missing. It
+releases the state lock, contains the brokers, writes the unlock record
+outside that lock, then rechecks the generation before publishing the unlocked
+vault and new fingerprint. A lock before the comparison cancels the attempt
+and keeps the previous fingerprint; a subsequent valid unlock finds the
+change. Once comparison decided revocation, a later lock cannot cancel it.
+Failed unlocks retain the previous fingerprint; an agent save of another entry
+updates it without revoking unrelated grants.
+
 ## Policy
 
 | Request | Unlock needed | Human interaction | Remembered |
@@ -172,11 +323,14 @@ needs no lock) and exits with status 141, like a process killed by
 | `remove` | yes | approval | no |
 | `reveal` | yes | approval with a warning; the dialog names the client's stated purpose (print, show, copy) | no |
 | `run` | yes | approval | opt-in (`--remember`), exact match |
+| `broker_run` | yes | approval of the whole grant scope | no |
+| `broker_edit` | yes | approval of the resolved profile and other edits | no |
+| `grants`, `revoke_grant` | no | none | — |
 
-"Metadata" is the entry name, group, username, URL, host, port, tags, whether
-a value and notes exist, the *names* of other fields and the modification
-time. Values, notes and the values of other fields are never sent without
-approval.
+"Metadata" includes the usable broker profile, and is the entry name, group,
+username, URL, host, port, tags, whether a value and notes exist, the *names*
+of other fields and the modification time. Values, notes and the values of
+other fields are never sent without approval.
 
 Fields that the KDBX file marks as *protected* (KeePassXC lets you protect
 any field) are withheld from metadata as well; `protected_fields` lists their
@@ -207,36 +361,35 @@ display in full are refused outright.
 ### Locking
 
 The decrypted vault is dropped after `--idle-timeout` (default 15 minutes)
-without an *approved* use (`status`, `list`, `show` and denied requests do
-not count), on `rusthorse lock`, when a save fails, when the agent stops, and
-when the session is locked or the computer is about to sleep. A command that
-is already running keeps the secrets it was given.
+without an *approved* use (`status`, `list`, `show` and denied requests do not
+count), on `rusthorse lock`, when a save fails, when the agent stops, and when
+the session is locked or the computer is about to sleep. A command that is
+already running keeps values it was given by ordinary bindings. Broker grants
+instead obey the rules above; automatic locks can keep them alive.
 
 The last two come from `session_lock`
 ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)): three threads
 (`zbus`, blocking API) watch logind's `PrepareForSleep` on the system bus —
-holding a *delay* inhibitor, taken at start and after each resume and
-released once the vault is locked, so that logind waits for the lock, up to
-its `InhibitDelayMaxSec` —, logind's session `Lock` signal and `LockedHint`
-for sessions of the agent's user, and the screensavers' `ActiveChanged` on
-the session bus. Each reads signals on one connection and asks its
-questions (the owner of logind's name, a session's user, the inhibitor —
-the last on a helper thread) on a second one with a 2-second limit, so that
-a reply never waits behind queued signals; the inhibitor never delays a
-lock, the other questions by at most that limit. logind's signals count only
-from the current owner of its name; malformed ones are ignored. A lock from them is the same as
-`rusthorse lock` and changes the generation even when the vault is already
-locked, so an unlock under way does nothing. Signals only lock; no signal
-unlocks. A watcher whose bus goes away reports itself inactive in `status`
-and connects again every five seconds; on connecting — and when a
-screensaver appears — it locks if a session is locked or a screensaver on
-already, or if it gets no answer in time. The inhibitor is let go only once
-the lock is done — never because logind left or restarted (systemd keeps
-inhibitors across restarts); that only changes `status`. The agent's handle on the watchers closes their
-connections and waits up to 3 seconds for their threads when the agent is
-dropped.
-The watchers exist only with the `session-lock` Cargo feature (on by
-default).
+holding a *delay* inhibitor, taken at start and after each resume and released
+once the vault is locked, so that logind waits for the lock, up to its
+`InhibitDelayMaxSec` —, logind's session `Lock` signal and `LockedHint` for
+sessions of the agent's user, and the screensavers' `ActiveChanged` on the
+session bus. Each reads signals on one connection and asks its questions (the
+owner of logind's name, a session's user, the inhibitor — the last on a helper
+thread) on a second one with a 2-second limit, so that a reply never waits
+behind queued signals; the inhibitor never delays a lock, the other questions
+by at most that limit. logind's signals count only from the current owner of
+its name; malformed ones are ignored. A lock from them drops the vault and
+changes the generation even when it is already locked, so an unlock under way
+does nothing. Signals only lock; no signal unlocks. A watcher whose bus goes
+away reports itself inactive in `status` and connects again every five
+seconds; on connecting — and when a screensaver appears — it locks if a
+session is locked or a screensaver on already, or if it gets no answer in
+time. The inhibitor is let go only once the lock is done — never because
+logind left or restarted (systemd keeps inhibitors across restarts); that only
+changes `status`. The agent's handle on the watchers closes their connections
+and waits up to 3 seconds for their threads when the agent is dropped. The
+watchers exist only with the `session-lock` Cargo feature (on by default).
 
 ## Storage format
 
@@ -260,6 +413,7 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 | port | `Port` (custom) | no | yes |
 | kind | `Kind` (custom): `api-key`, `login`, `server` or `device` | no | yes |
 | notes | `Notes` | yes | **no** |
+| broker profile | `Rusthorse.Broker` (custom, versioned JSON) | no | yes, when valid and unprotected |
 | tags | `Tags` | — | yes |
 | group | entry's group path | — | yes |
 | other fields | custom fields | as stored | names only |
@@ -275,6 +429,12 @@ another client) is reported as one of the other fields, by name only, and
 the entry has no kind. A metadata field that the file marks as protected —
 `Kind` included — is withheld like a value. The kind only labels fields
 ([ADR 0008](adr/0008-entry-kinds.md)); no policy reads it.
+
+The broker profile is parsed strictly: unknown fields, format/preset
+revisions, invalid origins/paths/limits and oversized JSON make it unusable. A
+protected profile is withheld. `broker_edit` sets a complete resolved profile
+with a frozen preset revision; replacement by add/import removes it. A real
+KeePassXC CLI round trip is covered by an opt-in compatibility test.
 
 ### Saving
 
@@ -415,9 +575,20 @@ names take at most 24 lines (`import::batch_sizes`).
 Each decision appends one JSON object to `audit.jsonl`: time, action, outcome,
 entry names, requester chain and, for `run`, the command line and directory.
 The time is taken from the system clock when the record is written, so an
-approval is dated after the human answered (usually within a moment), not
-when the request arrived. Values are never logged. If a record cannot be written, approval-gated
-requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
+approval is dated after the human answered (usually within a moment), not when
+the request arrived. Values are never logged. If a record cannot be written,
+approval-gated requests are refused ("fail closed"). Broker runs add public
+grant IDs, entries and destinations. Each grant has a fail-closed `created`
+record and a best-effort `ended` record with its reason and admitted,
+finished, unknown and refused counts. Each admission has a durable
+`broker_request` record and a completion record with route template, outcome,
+status and byte counts; never raw paths, query strings, headers, bodies,
+tokens or credentials. Refusals are counted through revocation confirmation
+rather than logged individually. An admission revoked while its record is
+written gets a `not_forwarded` follow-up and counts as refused. Last
+request/end records may arrive after the run's reply; a grant's end record is
+its last record. See [cli.md](cli.md#rusthorse-audit) and
+[protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-1).
 
 ## Code map
 
@@ -425,6 +596,10 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 |---|---|
 | [`src/main.rs`](../src/main.rs) | Command-line parsing and output formatting. |
 | [`src/guide/ai.md`](../src/guide/ai.md) | The guide for AI agents that `rusthorse guide ai` prints. |
+| [`broker/`](../broker) | Per-grant HTTP/TLS process and broker/system tests. |
+| [`src/broker_profile.rs`](../src/broker_profile.rs) | Strict profiles, presets, route/header/token rules. |
+| [`src/broker_protocol.rs`](../src/broker_protocol.rs) | Control frames, grant/token types, limits and CA-file validation. |
+| [`src/broker_host.rs`](../src/broker_host.rs) | Agent registry, preparation, admission, audit jobs, expiry and containment. |
 | [`src/agent.rs`](../src/agent.rs) | The agent: socket server, policy, unlock, approvals, `run`. |
 | [`src/vault.rs`](../src/vault.rs) | KDBX4 access, field mapping, atomic saves. |
 | [`src/session_lock.rs`](../src/session_lock.rs) | Locking on suspend and screen lock: the D-Bus watchers. |
@@ -473,11 +648,11 @@ its own dialog.
   dialogs. With nothing listening on the socket, it offers **Start agent**,
   which runs `systemctl --user start rusthorse-agent.service` — systemd, not
   the manager, starts the agent ([ADR 0011](adr/0011-first-start-from-the-manager.md)).
-- **Requests.** It uses the protocol-7 requests and targets entries by UUID.
+- **Requests.** It uses the protocol-8 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
-  started by the human runs at a time, on a worker thread, with bounded
-  waits; closing the window shuts the connection down. A lost answer to a
-  request with effects is reported as an unknown outcome, never retried.
+  started by the human runs at a time, on a worker thread, with bounded waits;
+  closing the window shuts the connection down. A lost answer to a request
+  with effects is reported as an unknown outcome, never retried.
 - **Status.** A background `status` every five seconds, also while a
   request waits for the human; it never blocks the controls and does not
   postpone the idle lock. A result that predates a request of the human's is
@@ -500,6 +675,48 @@ its own dialog.
   clipboard histories may keep it. See
   [ADR 0007, section 2](adr/0007-visual-manager.md#copy) and
   [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client).
+- **Grants.** The page lists on entry, every five seconds while shown, and
+  after human requests or revocations. Revocation runs beside a pending human
+  request, without a dialog; listing and revocation each have a 30-second job
+  deadline. Rows are keyed by grant ID, updated in place and retained as Ended
+  until the page is left, to keep another Revoke button from moving into a
+  removed row's place. No token reaches this page.
+- **Profiles.** Entry details show usable profiles read-only and distinguish
+  protected/unusable ones. Snippets use broker token and URL bindings;
+  Anthropic SDK and Claude Code recipes keep competing key variables out.
+  Profile editing remains in the CLI; the manager never sends `broker_edit`.
 - **Memory.** Values live in zeroizing buffers in Rust; GTK's own copies
   are emptied when no longer needed but cannot be wiped reliably, and a
   copied value is out of reach. The process is non-dumpable.
+
+## Native package
+
+The Debian package installs four programs: `rusthorse`, `rusthorse-dialog`,
+`rusthorse-manager` and `rusthorse-broker`. It recommends `ca-certificates`.
+The broker parses the first existing candidate from
+`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` and
+`/etc/ssl/ca-bundle.pem`, after `open_ca_file` verifies the resolved regular
+file and every parent directory are root-owned and not group/other-writable. A
+bad first candidate fails closed; it is not skipped. `doctor` checks the file
+properties but leaves certificate parsing to broker startup.
+
+`packaging/build-deb.sh` refuses install-before-check and cross-target
+options, builds the workspace in release mode without test features, checks
+the built broker, generates completions/licenses/docs, and runs `cargo deb`.
+It then extracts the reported packages, checks every entry named
+`rusthorse-broker` (at least one across the run), and only then reports the
+package paths. On refusal, cleanup considers only the reported paths. Regular
+files beginning as Debian packages are emptied before deletion, whatever their
+names, so another hard link cannot retain the package. If permission prevents
+emptying one, it is deleted only when no other hard link keeps it; otherwise
+it is named for manual removal. Regular files recognized only by a
+`.deb`/`.ddeb` extension (any case) are deleted without emptying. Nothing else
+is deleted. Symbolic links are not followed and are named; unreadable or
+undeletable candidates are reported without stopping the cleanup of other
+paths. See `packaging/check-broker.py` and Q01 in the review history
+(`b999e72` and `3953912`, merged in `453e772`). `--check` reports
+`test_upstream`; doctor and packaging refuse such a build. Without debug
+assertions the feature does not compile. With the feature but no
+`RUSTHORSE_BROKER_TEST_ROOTS`, the broker still uses production configuration;
+the agent clears its environment. This does not replace trust in the helper
+program itself.

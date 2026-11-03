@@ -10,8 +10,11 @@ port, username) in a standard KeePass KDBX4 file. A small background agent
 holds the unlocked vault. When a program — or an AI coding agent such as
 Claude Code or Codex — needs a secret, it asks the agent; **you approve the
 exact request in a dialog**, and the agent runs the command with the secret in
-its environment and scrubs the value from the output. The caller gets the
-result, never the secret.
+its environment and redacts literal copies from the output by default. For
+HTTP API entries with a broker profile, `run --broker` instead gives the
+command a temporary token: a separate broker adds the real key only to the
+profile's destination and routes. The caller gets the result, never the
+secret. Neither mode sandboxes the command.
 
 ```console
 $ rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
@@ -71,7 +74,8 @@ and keeps the value out of the agent's reach in the common case.
   port, tags, notes and history.
 - **Approval for every use.** Running a command with a secret, revealing a
   value, editing or deleting an entry all require your approval in a dialog
-  shown by the agent — not in the terminal, where a program could answer.
+  shown by the agent — not in the terminal, where a program could answer. A
+  broker grant permits repeated API calls within its routes and limits.
 - **The command you approve is the command that starts.** The agent itself
   resolves the program to an absolute path, removes dynamic-loader variables
   (`LD_PRELOAD`, …), warns about variables that can inject code
@@ -81,17 +85,25 @@ and keeps the value out of the agent's reach in the common case.
   and directory were not swapped, and starts the command as its own child.
   (What the program then reads — scripts, config files — is up to you to
   trust; see the threat model.)
-- **Output redaction.** Secret values printed by the command are replaced with
-  `[REDACTED:<entry>]` before they reach the caller; the command only ever
-  sees pipes owned by the agent, reads `/dev/null` unless you pass `--stdin`,
-  and anything it leaves running in the background is stopped when it exits.
+- **Output redaction.** With redaction on (the default), secret values printed
+  by the command are replaced with `[REDACTED:<entry>]` before they reach the
+  caller; the command sees pipes owned by the agent and reads `/dev/null`
+  unless you pass `--stdin`. Broker tokens are filtered too. `--no-redact`
+  passes the caller's input/output descriptors directly, with unfiltered
+  output (the terminal in an interactive shell). On exit, remaining members of
+  the command's process group are stopped; detached descendants may survive,
+  but its broker grants end. Exact-match limits are in threat model L5.
 - **The master password never touches the client.** The agent asks for it in
   its own dialog (only `rusthorse init` reads the password of a new vault
-  itself) and locks itself after 15 minutes without an approved use, when
-  the screen locks, and before the computer sleeps.
+  itself) and locks itself after 15 minutes without an approved use, when the
+  screen locks, and before the computer sleeps. Locking before sleep depends
+  on the desktop's signals and inhibitor deadline; a slow save can delay it
+  (threat model L20).
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
   (without values). If the log cannot be written, the vault stays locked and
-  approval-gated requests are refused.
+  approval-gated requests are refused. Broker admissions are also recorded
+  durably before forwarding. Completion records are best effort: a failed
+  command-exit or grant-end record cannot undo what already happened.
 - **Migration.** Import from `.env` files and from GNOME Keyring / KWallet,
   in the manager or the CLI; the agent reads the values itself.
 
@@ -147,9 +159,10 @@ clone, without installing anything:
 cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4+
 ```
 
-This first milestone ([ADR 0007](docs/adr/0007-visual-manager.md)) awaits
-independent review. The [manager guide](docs/manager.md) explains every
-action, where a shown or copied value can end up, and what comes later.
+This first milestone ([ADR 0007](docs/adr/0007-visual-manager.md)) is
+implemented and reviewed, with the broker Grants page added in phase 1. The
+[manager guide](docs/manager.md) explains every action, where a shown or
+copied value can end up, and what comes later.
 
 ## Using it with AI agents
 
@@ -203,19 +216,41 @@ requester is an AI.
 
 See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
 
+## HTTP APIs through the broker
+
+After the human sets a profile with
+`rusthorse edit OPENAI_API_KEY --broker openai`, an SDK can use it without
+receiving the source key:
+
+```sh
+rusthorse run --broker OPENAI_API_KEY=OPENAI_API_KEY \
+  --url OPENAI_BASE_URL=OPENAI_API_KEY -- python summarize.py
+```
+
+The approval shows the destination, routes and limits. `rusthorse grants` and
+the manager's **Grants** page list and revoke grants; `rusthorse lock` ends
+all of them. Always pair the broker token with its local base URL. See
+[the CLI reference](docs/cli.md#through-the-credential-broker---broker) and
+`rusthorse guide ai` for client-specific recipes and limitations.
+
 ## Security in one paragraph
 
-Rusthorse prevents **accidental** exposure: against a cooperative but
-fallible requester — the common case with AI agents — values do not appear in
-the caller's process, output, logs or the AI's context, and every use is a
-decision you make with the exact command in front of you. It does **not**
-resist a requester that deliberately attacks it from your own user account
-and desktop session: on X11 such a program can click "Allow" for you, and it
-can read the environment of a running approved command. For that, the AI
-agent must run isolated from your session. Approving a command means trusting
-everything that command does, and it runs outside any sandbox the requester
-is in. The [threat model](docs/threat-model.md) lists every assumption and
-limitation.
+Rusthorse prevents **accidental** exposure: against a cooperative but fallible
+requester — the common case with AI agents — values do not appear in the
+caller's process, output, logs or the AI's context, and every use is a
+decision you make with the exact command in front of you. For a broker
+binding, the command gets a token instead of the credential: the approval
+creates a grant, and its token permits calls within that grant's routes and
+limits while it lasts. Those calls can spend credit without another dialog.
+Ordinary bindings still give their values to the approved command; default
+redaction filters literal copies on stdout/stderr. It does **not** resist a
+requester that deliberately attacks it from your own user account and desktop
+session: on X11 such a program can click "Allow" for you, and it can read the
+environment of a running approved command — a value, or a broker token. For
+that, the AI agent must run isolated from your session. Approving a command
+means trusting everything that command does, and it runs outside any sandbox
+the requester is in. The [threat model](docs/threat-model.md) lists every
+assumption and limitation.
 
 ## Documentation
 
@@ -231,12 +266,13 @@ limitation.
 
 ## Roadmap
 
-The main direction is a **credential broker**: instead of the secret, an
-approved command receives a short-lived token that only works through
-Rusthorse, and the agent uses the real credential on its behalf — an HTTP
-proxy for APIs, an `ssh-agent` for SSH keys, then database connectors. The
-key never enters the client process at all. Also planned: locking on screen
-lock and suspend, packaged releases. Details, status and reasons are in [docs/roadmap.md](docs/roadmap.md).
+The HTTP **credential broker's phase 1 is implemented and reviewed READY**
+(unreleased): Anthropic, OpenAI and OpenAI-compatible presets, streaming,
+profiles and grant revocation in the CLI and manager. A manual check with
+Claude Code and real credentials remains pending. Screen-lock and suspend
+locking are implemented too. Next are private-device HTTP profiles and pinned
+TLS, then `ssh-agent` and database connectors; published packages remain
+planned. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
 

@@ -316,23 +316,23 @@ show nothing about it.
 
 ### Grants of the credential broker
 
-The **Grants** page lists the grants in use: one for each entry that a
-command started with `rusthorse run --broker` uses through the broker. For
-each, under its ID: the entry, the destination and preset, the command, who
-asked for it (process names, which any program chooses: unverified, as in
-the agent's dialogs), the variable that holds its token, its state, when it
-started, when it ends at the latest (its maximum lifetime, in whole minutes
-rounded up), the requests admitted (of the limit, if there is one) and those
-in flight now, and whether the automatic locks end it. Never the token: the
-agent does not send it. The states are *Starting*, while the run it belongs
-to is prepared (no request is admitted yet); *Active*; *Exhausted*, when its
-request limit is reached (requests already admitted finish); and *Revoked*,
-when it has ended — it is listed until its command ends, and its broker
-refuses every request meanwhile. A state the manager does not know is shown
-as the agent sends it. The grants are listed when you open the page, after a
-revocation, and while the page is shown every five seconds and after each of
-your requests to the agent (Lock now ends every grant; a change to an entry
-ends its grants).
+The **Grants** page lists the grants in use: one for each entry that a command
+started with `rusthorse run --broker` uses through the broker. For each, under
+its ID: the entry, the destination and preset, the command, who asked for it
+(process names, which any program chooses: unverified, as in the agent's
+dialogs), the variable that holds its token, its state, when it started, when
+it ends at the latest (its maximum lifetime, in whole minutes rounded up), the
+requests admitted (of the limit, if there is one) and those in flight now, and
+whether the automatic locks end it. Never the token: the agent does not send
+it. The states are *Starting*, while the run it belongs to is prepared (no
+request is admitted yet); *Active*; *Exhausted*, when its request limit is
+reached (requests already admitted finish); and *Revoked*, when it has ended —
+normally it stays listed until its command ends, and its broker refuses every
+request meanwhile. If that broker exits sooner, the grant disappears from the
+agent's list. A state the manager does not know is shown as the agent sends
+it. The grants are listed when you open the page, after a revocation, and
+while the page is shown every five seconds and after each of your requests to
+the agent (Lock now ends every grant; a change to an entry ends its grants).
 
 A refresh keeps each grant where it was, with the same **Revoke** button: a
 new grant comes last, and only the texts that changed are redrawn, so a

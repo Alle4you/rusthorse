@@ -127,10 +127,11 @@ lock itself, how many approvals are remembered, which program shows its
 dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why), what
 else locks the vault, and the program file the agent runs (with a note if it
 was replaced since the agent started). From an agent that reports them, it
-also shows the credential broker's program (the path of `rusthorse-broker`,
-or `none:` and why it cannot be used) and the number of grants the agent
-reports (see [`run --broker`](#through-the-credential-broker---broker)),
-which can include a revoked grant whose command still runs:
+also shows the credential broker's program (the path of `rusthorse-broker`, or
+`none:` and why it cannot be used) and the number of grants the agent reports
+(see [`run --broker`](#through-the-credential-broker---broker)), which
+includes starting, active and exhausted grants, but excludes revoked ones. The
+list can still retain a revoked grant whose command runs:
 [`rusthorse grants`](#rusthorse-grants) lists each one with its state. For
 example:
 
@@ -335,7 +336,7 @@ included, ends its grants.
 | Option | Default | Meaning |
 |---|---|---|
 | `--broker-origin URL` | the preset's | `https://` and a lowercase host name, with an optional port: no IP address, user, path, query or fragment |
-| `--broker-base-path PATH` | the preset's | What the client's base URL adds after the origin: `/` and segments of letters, digits, `.`, `_`, `~` and `-`, none of them `.` or `..`, without a trailing `/`; `''` for nothing |
+| `--broker-base-path PATH` | the preset's | What the client's base URL adds after the origin: `/` and segments of letters, digits, `.`, `_`, `~` and `-`, none made only of dots (`.`, `..`, `...`), without a trailing `/`; `''` for nothing |
 | `--broker-locks end\|continue` | `continue` | Whether the screen locking, a suspend and the idle timeout end the entry's grants (`rusthorse lock` always does) |
 | `--broker-lifetime MINUTES` | `720` (12 hours) | The longest a grant lasts: 1 to 1440 |
 | `--broker-requests N` | no limit | The most requests one grant admits: 1 to 1000000 |
@@ -576,15 +577,21 @@ of an older protocol refuses whole, instead of running the command without
 its grants.
 
 The agent checks, before its dialog, that each brokered entry has a usable
-profile and a value the broker can send (8 to 4096 visible ASCII
-characters), that it would then serve no more than 16 grants at once, and
-that the broker's program is usable; and it adds `127.0.0.1` to `NO_PROXY` and
-`no_proxy` in the command's environment. The dialog says what each grant
-allows — the entry, the destination, every route, how and when the grant
-ends, its request limit and the requests at a time — that the command gets a
-temporary token and not the key, which variables get real values in a mixed
-run, and that the command can spend credit, that a request count is not a
-spending limit and that request bodies are not inspected.
+profile and a value the broker can send (8 to 4096 visible ASCII characters),
+that it would then serve no more than 16 grants at once, and that the broker's
+program is usable; and it adds `127.0.0.1` to `NO_PROXY` and `no_proxy` in the
+command's environment. The dialog says what each grant allows — the entry, the
+destination, every route, how and when the grant ends, its request limit and
+the requests at a time — that the command gets a temporary token and not the
+key, which variables get real values in a mixed run, and that the command can
+spend credit, that a request count is not a spending limit and that request
+bodies are not inspected. With zenity, a run asking for two or more grants may
+exceed the estimated dialog height and be refused before a dialog is shown.
+`rusthorse-dialog` scrolls long approvals; the character limits still apply
+and nothing is truncated. A revoked grant can still occupy one of the 16
+available places while its command runs. Revoking it may therefore not make
+room for a new run: check `rusthorse grants` and wait for those commands to
+finish.
 
 There is no fallback: if a grant cannot be served before the command
 starts, the run fails with 125 and nothing ran; the command never gets the
@@ -634,18 +641,18 @@ rusthorse grants revoke --all
 
 Lists the grants of the credential broker
 ([`run --broker`](#through-the-credential-broker---broker)), never a token:
-one line each, with its ID (`g` and 16 hexadecimal digits, also in the
-audit log), entry, destination, state, when it started and how long its
-lifetime has left, the requests admitted of those allowed, the requests in
-flight, whether the automatic locks end it, the requester and the command.
-The state is `starting` (its run is being prepared: nothing is admitted
-yet); `active`; `exhausted` (its request limit is reached: no new request is
-admitted, those admitted finish); or `revoked` (it has ended; its broker
-answers `403` until the command ends, and it stays in the list until then).
-What the agent reports is shown
-with control and invisible characters escaped (`\u{…}`), so that a command
-line or a process name cannot rewrite the terminal. `--json` prints the
-agent's list as it is ([protocol](protocol.md)).
+one line each, with its ID (`g` and 16 hexadecimal digits, also in the audit
+log), entry, destination, state, when it started and how long its lifetime has
+left, the requests admitted of those allowed, the requests in flight, whether
+the automatic locks end it, the requester and the command. The state is
+`starting` (its run is being prepared: nothing is admitted yet); `active`;
+`exhausted` (its request limit is reached: no new request is admitted, those
+admitted finish); or `revoked` (it has ended; its broker normally answers
+`403` until the command ends, and it stays in the list until then unless its
+broker exits sooner). What the agent reports is shown with control and
+invisible characters escaped (`\u{…}`), so that a command line or a process
+name cannot rewrite the terminal. `--json` prints the agent's list as it is
+([protocol](protocol.md)).
 
 ```
 ID                 ENTRY                    DESTINATION                STATE   STARTED                    ENDS IN  REQUESTS      IN FLIGHT  AUTOMATIC LOCKS  REQUESTER                     COMMAND

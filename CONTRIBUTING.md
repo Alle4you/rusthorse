@@ -48,10 +48,22 @@ All of these must pass; CI runs them on every pull request:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test --all-features
 cargo test --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo +1.89 check --all-targets
+cargo +1.89 check --all-targets --all-features
 ```
+
+The default members are `rusthorse` and `rusthorse-broker`; these commands
+cover both, and `cargo run` still runs `rusthorse`. The broker's system tests
+need the tools, CA file and short temporary paths listed in
+[`broker/tests/system.rs`](broker/tests/system.rs). Run feature sets
+sequentially through Cargo: both use `target/debug/rusthorse-broker`.
+`test-upstream` is for tests only; never install a broker built with it. The
+graphical programs' checks and the complete test requirements are in
+[AGENTS.md](AGENTS.md#checks).
 
 And check the following by hand:
 
@@ -66,17 +78,23 @@ And check the following by hand:
 
 ## Rules for security-sensitive code
 
-- Secrets taken from the vault are only ever handled by the agent. A client
-  — the CLI or the manager — holds a secret only when the user supplies one
-  — `init` without an agent (the new master password), `add --stdin` — or
-  asked for one: `reveal`, after approval (the manager's Show and Copy are
-  reveals). Imports are read by the agent (`import_from`): the CLI and the
-  manager send names, never values.
-  The manager's forms carry metadata only and approve nothing.
-- Never log, include in error messages or put in the audit log a secret
-  value, a master password or notes. A value leaves a client only where the
-  human asked for it: printed by `reveal`, shown in the manager's Show
-  window, or put on the clipboard by its Copy.
+- Only the agent, and the broker it starts for each grant, handle secrets
+  taken from the vault. The agent gives a `rusthorse-broker` process the
+  credential of its one grant, with the grant's token, profile and limits,
+  over the control channel, and nothing else from the vault (ADR 0013). The
+  broker puts the credential only in the authentication header it builds for
+  the profile's destination. A command run with `--broker` gets a token for
+  that binding, never the credential (ordinary `run` bindings give their
+  values to the approved command, as before). A client — the CLI or the
+  manager — holds a secret only when the user supplies one — `init` without an
+  agent (the new master password), `add --stdin` — or asked for one: `reveal`,
+  after approval (the manager's Show and Copy are reveals). Imports are read
+  by the agent (`import_from`): the CLI and the manager send names, never
+  values. The manager's forms carry metadata only and approve nothing.
+- Never log, include in error messages or put in the audit log a secret value,
+  a broker token or credential, a master password or notes. A value leaves a
+  client only where the human asked for it: printed by `reveal`, shown in the
+  manager's Show window, or put on the clipboard by its Copy.
 - Keep secret material in `Zeroizing` types where practical, and do not
   `Debug`-print structures that contain it.
 - Anything a requester controls that appears in a dialog must go through

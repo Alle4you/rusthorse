@@ -14,79 +14,88 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 [guide](manager.md)). M1 (done, reviewed): metadata browsing, search and
 groups, agent-approved edits, generated values, Show and Copy, command
 snippets, status, locking and verified backup; since then, first start,
-changing the value and moving entries between groups.
-M2: persistent agent configuration, grant revocation, bounded history, and
-screen/suspend locking (done in the agent, [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)).
-M3: import UI (done, [ADR 0012](adr/0012-import-read-by-the-agent.md)), safe
-restoration and exclusive KeePassXC handoff. The [reference prototype](design/manager/index.html) uses
-fake data and simulates features not yet implemented.
+changing the value and moving entries between groups. M2: persistent agent
+configuration, bounded history, remembered-approval revocation, and
+screen/suspend locking (done in the agent,
+[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). M3: import UI (done,
+[ADR 0012](adr/0012-import-read-by-the-agent.md)), safe restoration and
+exclusive KeePassXC handoff. The
+[reference prototype](design/manager/index.html) uses fake data and simulates
+features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
 
-**Status: Planned — [ADR 0013](adr/0013-credential-broker.md) proposed
-(2026-11-02).** The most important direction; the maintainer moved it before
-the first publication. The ADR refines the sketch below — phases, a
-separate `rusthorse-broker` process, profiles that fix the destination, no
-fallback to the real key — and is the reference where the two differ.
+**Phase 1 implemented, tested and reviewed READY (2026-11-03), unreleased.**
+[ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker
+and the later phases. The manual check with Claude Code and the Python SDKs
+using the maintainer's credentials is still pending; no client version is
+claimed supported by that check yet.
 
 ### Why
 
-Today `rusthorse run` puts the secret in the approved command's environment.
-The command — and every program it starts — can read it, print it in a way
-redaction does not recognise (encoded, split, transformed), write it to a file
-or send it anywhere (threat model [L3, L4 and L5](threat-model.md)). Redaction
-only catches the literal value in the output, and approval only helps if the
-human reads the command.
+Ordinary `rusthorse run` puts the secret in the approved command's
+environment. The command — and every program it starts — can read it, print it
+in a way redaction does not recognise (encoded, split, transformed), write it
+to a file or send it anywhere (threat model [L3, L4 and L5](threat-model.md)).
+Redaction only catches the literal value in the output, and approval only
+helps if the human reads the command.
 
-A broker removes the secret from the client entirely: the client receives a
-**temporary token** that no provider accepts — it works only through the
-Rusthorse broker, within its scope and while it is valid (a stolen token
-still works there until then) — and the agent uses the real credential on
-the client's behalf.
+For a broker binding, phase 1 removes the secret from the approved command:
+the command receives a **temporary token** that no provider accepts — it works
+only through the Rusthorse broker, within its scope and while it is valid (a
+stolen token still works there until then) — and the broker uses the real
+credential on the command's behalf.
 
 ### Design
 
-1. **Approval mints a capability token.** Instead of the value, the approved
-   command receives a random token (`rh_…`, 256 bits) in the variable where
-   the secret would have gone, and the broker's address. The token is bound
-   to:
-   - one entry;
-   - a destination (host and port, or a database or SSH target);
-   - optionally methods and paths (`GET` only, `/v1/models` only);
-   - an expiry (minutes) and a maximum number of uses;
-   - the approved command: it is revoked when the command ends, unless the
-     human approved a longer lifetime; while it runs, the broker can also
-     refuse new connections on its Unix socket from processes outside the
-     command (peer credentials). That does not stop a process of the command
-     from handing a connected socket to another one, and a loopback TCP
-     connection carries no peer credentials: questions for the ADR.
-2. **The broker checks the token on every use** and refuses anything outside
-   its scope. `rusthorse lock` revokes every token at once.
-3. **The broker listens on a private Unix socket** (mode `0600`, same-user
-   peer check, as the agent's socket does today). A loopback TCP port is
-   offered only to clients that cannot use a Unix socket, and still requires
-   the token.
-4. **Every use is audited** under the grant's public identifier — never the
-   token itself, which is a bearer credential — with the entry and what was
-   done (`POST api.openai.com/v1/chat/completions`), not only "a command
-   ran".
-5. **The dialog says what the token allows**: "This command may call
-   **api.openai.com** for 10 minutes", instead of "this command receives the
-   key".
+1. **Approval mints a capability token.** In phase 1,
+   `rusthorse run --broker VAR=ENTRY --url URLVAR=ENTRY -- command` gives the
+   approved command a random token (`rh_…`, 256 bits) in the variable where
+   the secret would have gone, and the broker's address. The token is bound to
+   one entry, a snapshot of its stored profile (HTTPS origin, base path and
+   exact preset routes), a maximum lifetime and an optional request count. One
+   `rusthorse-broker` process serves each grant. Command end always revokes
+   its grants; no grant outlives that run.
+2. **The broker checks the token on every request** and refuses anything
+   outside its scope. `rusthorse lock` revokes every grant at once. Automatic
+   locks follow the profile (`continue`, 12 hours by default for AI presets),
+   except that every lock ends grants still being prepared. Revocation ends
+   open streams as well as new admissions; requests already sent can still
+   take effect at the destination.
+3. **The broker listens on loopback TCP (`127.0.0.1`)**, requiring the token.
+   The supported clients can select a base URL but not a Unix socket from
+   their environment. TCP carries no peer credentials; a same-user process can
+   steal a command's token and use it while valid. A Unix socket is a later
+   option, not phase 1's listener.
+4. **Every admitted request is audited** under the grant's public ID, before
+   forwarding — never the token itself. The record contains the method and
+   route template, not a raw path, query or body. The agent serializes
+   admission so concurrent requests cannot exceed the request limit; exhausted
+   grants let admitted requests finish. Phase 1 allows 16 requests in flight
+   per grant and at most 16 grants in the registry. Refusals are counted;
+   completion/end records are best effort.
+5. **The dialog says what the token allows**: destination, every route,
+   lifetime, automatic-lock policy, request count and concurrency, with the
+   exact command. It warns that allowed calls can spend credit and bodies are
+   not inspected. The CLI and manager list and revoke grants even while the
+   vault is locked. Profiles are edited through an approved CLI request; there
+   is no fallback to the real key when a grant cannot start.
 
 ### Connectors
 
 Authentication usually happens at the start of a connection: the broker
-performs that part with the real credential, then only relays bytes. HTTP is
-the exception — the credential travels with every request — so the broker must
-see each request.
+performs that part with the real credential, then relays bytes. HTTP carries a
+credential with each request, so its connector checks every request. The later
+connectors remain planned; phase 1 implements HTTP only.
 
-| Connector | How it works | Phase |
+| Connector | How it works | Phase/status |
 |---|---|---|
-| **HTTP APIs** | The client's base URL points to the broker (`OPENAI_BASE_URL=http://127.0.0.1:…/openai`, or a Unix socket), and its API key is the token. The broker validates the token, replaces it with the real key in the header (`Authorization`, `x-api-key`, …), and connects to the upstream **over TLS only**, checking the destination against the token's scope rather than trusting the request's `Host` header. Presets for common providers (OpenAI, Anthropic, Google, GitHub, Hugging Face) and a generic header rule. The real value is still redacted from responses, as a second line of defence. | 1 |
-| **SSH agent** | Rusthorse speaks the `ssh-agent` protocol (`SSH_AUTH_SOCK`). Private keys stay in the vault; the agent signs, each signature or session approved; the key never leaves. Compatible with how KeePassXC stores SSH keys, if practical. | 2 |
-| **PostgreSQL, MySQL** | A local listener speaks the database's wire protocol. The client connects with the token as its password (over the private local socket); the broker verifies it, authenticates to the real server with the real password (SCRAM for PostgreSQL) over TLS, then relays the session. The token becomes the password of the local hop only. | 3 |
-| **Signed requests (AWS SigV4 and similar)** | The secret signs each request instead of travelling in it, so the broker re-signs requests with the real key. | Idea |
+| **HTTP APIs** | The client's base URL points to the loopback broker and its API key is the token. The broker constructs authentication, Host and SNI for the profile's fixed origin, connects over verified TLS, follows no redirects and permits only the preset's exact routes. Literal copies of the credential in response bodies are redacted; credential-bearing response header values are dropped. Anthropic, OpenAI and OpenAI-compatible presets, with SSE. | 1 — implemented, reviewed; manual SDK validation pending |
+| **Device and generic HTTP profiles** | Pinned TLS for private devices such as FortiGate; Basic authentication, custom routes, Gemini and Hugging Face presets, narrow administrative operations for Palo Alto/Panorama. Profile editing in the manager. | 2 — planned |
+| **SSH agent** | Rusthorse speaks the `ssh-agent` protocol (`SSH_AUTH_SOCK`). Private keys stay in the vault; each signature or session is approved, with OpenSSH destination constraints. KeePassXC SSH-key storage compatibility where practical. | 3 — planned |
+| **PostgreSQL, then MySQL** | A local listener verifies the grant token, authenticates to the real server (SCRAM for PostgreSQL) over TLS and relays the session, with the database fixed. The token is the password of the local hop only. | 4 — planned |
+| **Signed requests (AWS SigV4 and similar)** | The secret signs each request instead of travelling in it; the broker signs with the real key. Provider-issued short-lived credentials (STS) can complement it. | Later, on concrete demand |
+| **WebSocket, Unix socket listener, sandboxed clients** | Streaming protocols and transports beyond phase 1; grants usable by clients that stay in their own sandbox. | Later, on concrete demand |
 
 ### Prior art: Secretless Broker
 
@@ -108,57 +117,52 @@ the approved command.
 ### Limits
 
 - **A token is usable while it is valid.** Whoever holds it can call the
-  allowed destination within its scope and lifetime. The broker prevents the
-  credential from *leaving* and being reused later; it does not prevent misuse
-  during the window — keep scopes narrow and lifetimes short.
-- **The client must be redirectable**: a configurable base URL, a proxy
-  setting, an `SSH_AUTH_SOCK`, a database host. Intercepting TLS with a local
-  certificate authority is out of scope: it is fragile and invasive.
+  allowed destination within its scope and lifetime. The broker removes direct
+  delivery of the credential and fixes its destination; it does not prevent
+  misuse of permitted operations during the window. Keep scopes narrow,
+  lifetimes short and provider-side spending limits in place: a request count
+  is not a spending limit.
+- **The client must be redirectable**: a configurable base URL, an
+  `SSH_AUTH_SOCK` or a database host, depending on the connector. Phase 1 is a
+  reverse HTTP proxy, not a generic forward proxy. Intercepting TLS with a
+  local certificate authority stays out of scope: fragile and invasive.
 - **Secrets used locally** — decrypting a file, a password typed into a
-  program, a signing key used offline — still need `run`, which stays as the
-  general fallback.
+  program, a signing key used offline — still need ordinary `run`, with its
+  existing limits. It remains available; it is never an automatic fallback
+  after a broker refusal.
 - **SSH with a password cannot be brokered**: the password is what `ssh`
-  sends, so whoever runs `ssh` must have it. Devices reached by SSH should
-  use keys, which the `ssh-agent` connector keeps in the vault; until then,
-  password SSH goes through `run` with its limits (L3–L5).
+  sends, so whoever runs `ssh` must have it. Devices reached by SSH should use
+  keys, which the planned `ssh-agent` connector keeps in the vault; until
+  then, password SSH goes through `run` with its limits (L3–L5).
+- **A broker is not a sandbox.** Commands and brokers run as the user, outside
+  the requester's sandbox. One process per grant limits which vault credential
+  is in that process's memory, not arbitrary code execution there. Bodies are
+  opaque, the local HTTP hop is clear text, and response redaction cannot
+  catch transformed credentials returned by a destination. See the
+  [threat model](threat-model.md).
 
-### Questions the ADR must answer
+### Decisions and next steps
 
-- **Revocation of open sessions**: does revoking or expiring a token end
-  database sessions and HTTP streams already open, or only refuse new ones?
-- **Counting uses atomically**, so that concurrent requests cannot exceed the
-  limit.
-- **HTTP routing**: redirects (never followed with the credential unless the
-  new destination is in scope, checked at every hop), path normalisation,
-  duplicate headers, the destination resolved and pinned by the broker.
-- **Binding to the command**: whether to require peer credentials from the
-  command's process group, and what happens with programs that hand
-  connections to helpers.
-- **SSH**: binding signatures to a destination (OpenSSH's session binding and
-  destination constraints), since the basic agent protocol does not say what a
-  signature is for.
-
-### Steps
-
-1. ADR and threat-model update (token format, grant identifier, scope,
-   lifetime, revocation, audit, dialog wording, the questions above).
-2. HTTP connector with provider presets; `rusthorse run --broker` (name to be
-   decided) chooses the broker over environment injection.
-3. `ssh-agent`.
-4. PostgreSQL, then MySQL.
+ADR 0013 answers phase 1's original questions: revocation cuts open streams;
+the agent serializes counted admissions; routing and DNS are constrained; and
+the local hop authenticates a token, not a process identity. Phase 1 is
+implemented and reviewed; its manual SDK check remains pending. Next are phase
+2's device/generic HTTP profiles, phase 3's SSH agent and phase 4's database
+connectors. Each needs its own design, review and tests, including its
+session-revocation and destination-binding rules before implementation.
 
 ## Desktop and usability
 
 | Item | Status | Notes |
 |---|---|---|
-| **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | Done — [ADR 0006](adr/0006-own-dialog-program.md) | `rusthorse-dialog`, a separate process started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until the end of a long request has been reached (no height limit), a distinct password dialog. Next: a grants panel to inspect and revoke remembered approvals and broker tokens. |
+| **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | Done — [ADR 0006](adr/0006-own-dialog-program.md) | `rusthorse-dialog`, a separate process started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until the end of a long request has been reached (no height limit), a distinct password dialog. The manager now has a broker Grants page; a page for remembered approvals remains planned. |
 | **Lock on screen lock and suspend** | Done — [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md) | The agent watches logind (with a delay inhibitor before a suspend) and the Cinnamon, GNOME, MATE and freedesktop screensavers over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Entry kinds** | Done — [ADR 0008](adr/0008-entry-kinds.md) | `api-key`, `login`, `server`, `device`: labels and form fields, never policy. `run --url` passes an API key's endpoint. More kinds (database, SSH key) can follow. |
 | **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
 | **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Designed with the credential broker, whose tokens would point to a field. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; manager stays an agent client. |
+| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; broker Grants page done (ADR 0013); manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |
@@ -182,7 +186,7 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | Item | Status | Notes |
 |---|---|---|
 | Publish on GitHub, CI on every pull request | Planned | After the clean reinstall and the owner's approval. |
-| Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); built from a clone with `packaging/build-deb.sh` until releases are published. |
+| Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); four programs including the broker; built from a clone with `packaging/build-deb.sh` until releases are published. |
 | Published releases: the `.deb`, static binaries, signed checksums; `.rpm` | Planned | Static binaries with `install.sh` / `uninstall.sh` (or `rusthorse setup`) for other distributions. |
 | First start from the manager: start the agent, create the vault | Done (unreleased) | [ADR 0011](adr/0011-first-start-from-the-manager.md); the agent asks for the master password (`create_vault`). |
 | Import from the manager (GNOME Keyring, `.env`), read by the agent | Done (unreleased) | [ADR 0012](adr/0012-import-read-by-the-agent.md). |

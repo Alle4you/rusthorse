@@ -6,14 +6,15 @@ document and the code, that is a bug; please report it
 ([SECURITY.md](../SECURITY.md)).
 
 - Applies to: Rusthorse 0.1.x
-- Last reviewed: 2026-11-02 (ADR 0013 design; see [review history](#11-review-history))
+- Last reviewed: 2026-11-03 (broker phase 1 implementation and documentation;
+  see [review history](#11-review-history))
 
 ## 1. Scope and the exact guarantee
 
 Rusthorse is a local, single-user secrets vault for Linux desktops. A
-long-running agent holds the decrypted KeePass database; clients (the CLI, the visual manager,
-scripts, AI coding agents) ask it to *use* secrets. Two different guarantees
-are easy to confuse, so they are stated separately:
+long-running agent holds the decrypted KeePass database; clients (the CLI, the
+visual manager, scripts, AI coding agents) ask it to *use* secrets. Two
+different guarantees are easy to confuse, so they are stated separately:
 
 1. **Preventing accidental exposure — provided.** A requester that is
    cooperative but fallible (an AI agent that makes mistakes, over-shares or
@@ -21,6 +22,15 @@ are easy to confuse, so they are stated separately:
    purpose you approved without the value entering its memory, output, logs
    or context, and without being able to use it for something you did not
    see.
+
+   Ordinary `run` gives the approved command the value and redacts literal
+   copies of it by default. For each `run --broker` binding, the command gets
+   a token, never the source credential; the broker puts that credential only
+   in the authentication header it builds for the profile's destination and
+   routes, over verified TLS. A grant approves a capability, not each API
+   call: allowed requests can spend credit or access data without another
+   dialog. Mixed runs still deliver values for their ordinary bindings.
+   Neither mode makes a hostile approved command harmless (L3–L5, L16).
 2. **Resisting a hostile requester that runs code as your user — not
    provided on a normal desktop.** A requester that deliberately attacks
    Rusthorse from a shell running as your user, in your graphical session,
@@ -47,6 +57,9 @@ this setup. It is outside what Rusthorse can enforce on its own.
 | Approval decisions | The human's control over *what* a secret is used for. |
 | Metadata (names, usernames, URLs, hosts, ports, tags) | Reveals what you have access to; useful for targeting. Treated as low sensitivity unless the file marks a field protected. |
 | The vault file and its backups | Encrypted at rest; exposed to offline guessing if copied. |
+| Broker tokens | Bearer capabilities usable through the local listener until the grant ends, within its routes and limits. |
+| A grant's credential in broker memory | Each broker holds only its own grant's credential; memory disclosure there must not expose the whole vault. |
+| Broker profiles and HTTP traffic | Profiles determine authority; prompts, responses and opaque bodies may contain sensitive data. The broker does not interpret them. |
 | The audit log | Lets you notice misuse after the fact. |
 
 ## 3. Adversaries
@@ -64,15 +77,35 @@ this setup. It is outside what Rusthorse can enforce on its own.
 
 Rusthorse's guarantees hold only if all of the following are trustworthy:
 
-- the `rusthorse` binary, the systemd unit and the session that starts it;
+- the `rusthorse` and `rusthorse-broker` binaries, the systemd unit and the
+  session that starts them;
 - the libraries it links (notably the `keepass` crate, which implements the
   file format and its cryptography) and the Rust toolchain that built it;
-- `zenity` and the GTK stack it uses, the X server or Wayland compositor that
-  displays dialogs and delivers your keystrokes;
+- the broker's HTTP/TLS dependencies (`hyper`, `tokio`, `rustls` with `ring`,
+  `tokio-rustls`, `rustls-pki-types`) and the system CA file: the first
+  existing of the three paths in `broker_protocol::open_ca_file`, a regular
+  root-owned file with root-owned parent directories, none writable by group
+  or others; the broker parses its certificates;
+- `rusthorse-dialog`, `zenity` and the GTK stack they use, the X server or
+  Wayland compositor that displays dialogs and delivers your keystrokes;
+- the packaging checks used to distribute the programs: `build-deb.sh` checks
+  the built broker and every broker in the reported packages before reporting
+  success. On refusal, `check-broker.py` considers only reported paths:
+  regular files beginning as Debian packages are emptied, then deleted,
+  regardless of name. If permission prevents emptying one, it is deleted only
+  without other hard links; otherwise it is named for manual removal. Regular
+  files recognized only by a `.deb`/`.ddeb` extension (any case) are deleted
+  without emptying. Nothing else is deleted. Symbolic links are not followed
+  and are named; unreadable or undeletable candidates are reported while
+  cleanup continues. This checks trusted build artifacts; it does not
+  authenticate a malicious replacement binary;
 - the kernel (Yama `ptrace_scope ≥ 1`, which is the default on Ubuntu, Mint,
   Debian and Fedora) and the file system holding the vault;
 - **every program you approve**, for the secrets you approve it for, and
-  everything that program loads or executes (L4).
+  everything that program loads or executes (L4). With a broker binding, this
+  trust concerns the granted API operations, not direct receipt of the
+  credential. The broker is trusted with that credential and runs as the same
+  user; it is not a code-execution sandbox (L16).
 
 ## 5. Trust boundaries
 
@@ -84,7 +117,8 @@ flowchart LR
         end
         subgraph trusted["Trusted computing base"]
             AG["rusthorse agent<br/>(started by systemd, non-dumpable)"]
-            DLG["zenity dialogs"]
+            DLG["rusthorse-dialog / zenity"]
+            BR["rusthorse-broker<br/>one process per grant"]
             BIN["binary, unit file, session"]
         end
         CMD["approved command<br/>(trusted by your approval)"]
@@ -93,11 +127,19 @@ flowchart LR
     FILE[("vault.kdbx")]
     AI -- "socket requests" --> AG
     AG -- "asks (socket pair)" --> DLG -- "shown to" --> HUMAN
-    AG -- "spawns with secrets" --> CMD
+    AG -- "spawns with values and/or broker tokens" --> CMD
+    AG -- "private socketpair: grant and admission" --> BR
+    CMD -- "HTTP on 127.0.0.1 + token" --> BR
+    BR -- "verified TLS + credential header" --> API["profile destination"]
     AG <--> FILE
 ```
 
-The boundary that matters is between **requesters** and the **agent**.
+The requester–agent boundary gates approval. The agent–broker socketpair
+carries one grant and mediates every admission; it never carries the vault.
+The command–broker hop is clear text HTTP with token authentication, and the
+broker–destination hop is TLS to an address the broker resolved and checked.
+The agent retains the listening socket to prevent port reuse while the run
+still holds the grant, including after revocation.
 
 ## 6. Security properties and mechanisms
 
@@ -105,18 +147,30 @@ The boundary that matters is between **requesters** and the **agent**.
 |---|---|---|---|
 | P1 | A requester never receives a secret value, notes or a protected field without an approval for that specific request. | Only `reveal` returns a value, after a non-rememberable approval. `list`/`show` return metadata only, and withhold any field the KDBX file marks as protected — including a protected title, which is shown as `[protected title]` and matched only by UUID — reporting only the field's name. | A1, A2 |
 | P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap in the instant between that check and the start of the program, and changes to file *contents*, are not prevented (L4). | A1, A2 |
-| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. Reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. | A1, A2 |
+| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. For ordinary `run`, reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. For `broker_run`, the same state lock also registers grants as `starting`; any lock ends starting grants, and all grants must still be starting before the command starts. Automatic locks can preserve already active grants by profile (L22). | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
-| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). | A1 |
+| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). Broker tokens are filtered from command output too. Independently, the broker redacts literal copies of its credential from response bodies and drops relayed headers whose values contain it. With `--no-redact`, the command instead gets the requester's input/output descriptors directly and its output is unfiltered; HTTP response redaction stays on. | A1 |
 | P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
 | P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and the start of their UUID, so two entries with the same title in different groups do not look alike (unless a file written by another program gave them UUIDs that start alike, L9); requests whose dialog text would exceed 4000 characters (or 1000 for the command line, program path or directory of a `run`) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
-| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. | A4 |
-| P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. | A1, A2, A6 (window) |
-| P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. | A1, A2 |
+| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token, checks its exact form and compares it in constant time; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
+| P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a profile can keep its grant credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
+| P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
-| P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. | A1 (detection; L13) |
+| P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
+
+Broker-specific bounds are in [ADR 0013](adr/0013-credential-broker.md): 16
+entries in the grant registry per agent (normally revoked brokers stay listed
+and count until run cleanup; broker exit removes the entry sooner), 16
+admitted/reserved requests and 64 connections per broker, 16 MiB per request
+body, 64 MiB of retained request bodies and 64 MiB of upstream body per
+response, before redaction. Only exact preset routes pass; the broker drops
+other headers, refuses redirects and encoded responses, and builds Host, SNI
+and authentication itself. Its own lifetime task and forwarding checks use
+`CLOCK_BOOTTIME`; the agent also expires grants and serves none if its expiry
+timer cannot start. These are bounded resources and scheduled checks, not a
+guarantee of availability under arbitrary same-user denial of service.
 
 ### The guide for AI agents is advice
 
@@ -148,6 +202,8 @@ on.
 | **Deny**, closing the dialog, timeout | Nothing. The command does not run. |
 
 Locking, unlocking and any saved change invalidate remembered approvals.
+`broker_run` never uses them. Its approval creates a grant whose individual
+requests need admission and an audit record, but no new human dialog.
 
 ## 7. Known limitations and residual risks
 
@@ -182,10 +238,13 @@ program of [ADR 0006](adr/0006-own-dialog-program.md).
 ### L3 — The environment of a running approved command is readable
 
 While an approved command runs, any process of the same user can read
-`/proc/<pid>/environ`, which contains the secret. Marking the process
-non-dumpable would prevent that, but `execve` resets the flag. *Mitigation:*
-short-lived commands; the planned SSH agent and HTTP broker keep secrets out
-of the environment altogether.
+`/proc/<pid>/environ`. Ordinary bindings contain the secret; broker bindings
+contain a token. Marking the command non-dumpable would prevent that, but
+`execve` resets the flag. A stolen broker token still works through its
+listener while the grant lives, within its routes and limits. *Mitigation:*
+short-lived commands, narrow grants and isolation (§8). Broker phase 1 keeps
+the source credential out of that binding's environment; it does not hide the
+token.
 
 ### L4 — Approving a command trusts everything it executes
 
@@ -202,8 +261,8 @@ with inline code. The agent removes `LD_*` variables and warns about a list
 of variables that change what programs execute (`NODE_OPTIONS`,
 `PYTHONPATH`, `GIT_SSH_COMMAND`, …), but such a list cannot be complete.
 
-A well-known program can also be pointed elsewhere. Libraries read the
-address they send a key to from the environment (`OPENAI_BASE_URL`,
+A well-known program can also be pointed elsewhere. Libraries read the address
+they send a key to from the environment (`OPENAI_BASE_URL`,
 `ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, …), and the requester's environment is
 passed to the command: a requester can make an approved `python app.py` send
 the key to a server of its choosing. The dialog therefore lists, under
@@ -211,29 +270,29 @@ the key to a server of its choosing. The dialog therefore lists, under
 (`*_URL`, `*_BASE_URL`, `*_HOST`, …), and warns about proxies, certificate
 authorities, switches that disable certificate checks, and name resolution
 ([cli.md](cli.md#rusthorse-run)); the audit record names them too. A value
-that programs could read differently — a backslash, two `@`, an unusual
-host, a numeric host other than `a.b.c.d`, a query naming another server
-(libpq's `hostaddr`), a `#`, anything outside printable ASCII — is not
-shown but warned about. The aim is that the dialog never names a host other
-than the one the program uses. It has been checked against the readings of
-common URL parsers and libpq that four rounds of review found to differ,
-each pinned down by a test; it is not a guarantee for every program, and
-each round found narrower cases. Limits: the lists go
-by name and cannot be complete (`MY_SERVICE=https://…`, a configuration file
-or an argument escape them); a URL is shown by scheme, host and port only,
-so a different path on the same host is not visible; the forms judged
-unambiguous are those known for common URL parsers and libpq, not a proof
-about every program, which may take its destination from elsewhere; and
-`run --url`, which
-takes the address from the entry's metadata, looks the same as a variable
-the requester set ([ADR 0008](adr/0008-entry-kinds.md)).
-*Mitigation:* read the dialog — check the host of every destination; prefer
-well-known binaries with explicit arguments; review recent changes to scripts
-before approving them. The planned credential broker
-([ADR 0013](adr/0013-credential-broker.md)) would, for HTTP APIs, remove the
-direct delivery of the key and fix its destination: the real key would only
-travel to its own provider. The operations a grant allows would still be
-trusted.
+that programs could read differently — a backslash, two `@`, an unusual host,
+a numeric host other than `a.b.c.d`, a query naming another server (libpq's
+`hostaddr`), a `#`, anything outside printable ASCII — is not shown but warned
+about. The aim is that the dialog never names a host other than the one the
+program uses. It has been checked against the readings of common URL parsers
+and libpq that four rounds of review found to differ, each pinned down by a
+test; it is not a guarantee for every program, and each round found narrower
+cases. Limits: the lists go by name and cannot be complete
+(`MY_SERVICE=https://…`, a configuration file or an argument escape them); a
+URL is shown by scheme, host and port only, so a different path on the same
+host is not visible; the forms judged unambiguous are those known for common
+URL parsers and libpq, not a proof about every program, which may take its
+destination from elsewhere; and `run --url`, which takes the address from the
+entry's metadata, looks the same as a variable the requester set
+([ADR 0008](adr/0008-entry-kinds.md)). *Mitigation:* read the dialog — check
+the host of every destination; prefer well-known binaries with explicit
+arguments; review recent changes to scripts before approving them. For a
+broker binding, the stored profile fixes the credential's destination and
+routes. Requester proxy/CA settings do not configure the broker, which starts
+with an empty environment. The command can still misuse allowed operations,
+send the token or other data in an opaque body, or send its token elsewhere
+without using the broker. `NO_PROXY` helps cooperative clients reach loopback;
+it is not enforcement.
 
 ### L5 — Redaction only catches exact copies in the command's output
 
@@ -243,6 +302,14 @@ never are. A command can also send the secret over the network, write it to a
 file, or put it in its own logs — none of which pass through the redactor.
 Redaction prevents *accidental* disclosure on stdout/stderr; it is not a
 defense against exfiltration by a command written to leak.
+
+For a broker binding the command does not receive the source credential. The
+broker's response redactor matches its literal bytes across chunks, using a
+bounded look-behind buffer; compressed responses are refused and headers with
+credential-bearing values are dropped. Encoded or transformed copies returned
+by the destination are not caught. Output redaction filters the token by
+default; `--no-redact` exposes anything the command prints, including that
+token. HTTP response redaction stays on in either mode.
 
 ### L6 — Metadata is visible without approval
 
@@ -257,8 +324,11 @@ is a label: nothing grants or restricts access by it
 
 Rusthorse wipes the buffers it controls (`Zeroizing`), but copies made by JSON
 parsing, the KeePass library, zenity/GTK and the standard library's process
-spawning are not all wiped. Memory is not locked, so secrets can reach swap or
-a hibernation image. *Mitigation:* full-disk encryption (which covers swap).
+spawning are not all wiped. The broker uses zeroizing token/credential and
+control-frame buffers, but HTTP header, TLS and allocator copies are not all
+wiped, and immediate process exit does not run every destructor. Memory is not
+locked, so secrets can reach swap or a hibernation image. *Mitigation:*
+full-disk encryption (which covers swap).
 
 ### L8 — Remembered approvals are a capability, not a decision per use
 
@@ -266,7 +336,11 @@ When enabled, "Allow for N" approves identical requests without asking, even
 when they read different input. For example, `curl --config -` with a
 remembered approval sends the token wherever the next request's standard input
 says. This is why remembering is **off by default** and should only be enabled
-for commands whose inputs you control. See [ADR 0005](adr/0005-remembered-approvals-opt-in.md).
+for commands whose inputs you control. See
+[ADR 0005](adr/0005-remembered-approvals-opt-in.md). Broker grants are a
+separate capability: no `--remember`, but each grant permits multiple API
+calls until its limit or end. A request count is not a spending limit, and the
+broker does not inspect prompts or other bodies.
 
 ### L9 — Dialog information can mislead
 
@@ -297,11 +371,11 @@ process names any program can choose — the dialog labels it "unverified".
 Anyone with a copy of the file or one of its backups can try passwords at a
 cost set by Argon2id. A weak master password will fall. Old values remain in
 entry history, in `vault.kdbx.bak` and in any copies you made. *Mitigation:* a
-long, unique passphrase (`rusthorse passwd` changes it and deletes the
-`.bak` file encrypted with the old one — but not copies made elsewhere);
-rotate credentials at the provider when they may have leaked — deleting an
-entry does not revoke anything (`rusthorse edit NAME --generate` makes the
-new value).
+long, unique passphrase (`rusthorse passwd` changes it and deletes the `.bak`
+file encrypted with the old one — but not copies made elsewhere); rotate
+credentials at the provider when they may have leaked — deleting an entry does
+not revoke the source credential at its provider
+(`rusthorse edit NAME --generate` makes the new value).
 
 ### L11 — Command lines are not secret
 
@@ -375,21 +449,28 @@ change. Only one program should write the vault at a time — lock the agent
 
 ### L16 — Approved commands run outside the requester's sandbox
 
-The command is started by the agent, as you, with the agent's privileges —
-not inside whatever sandbox (container, seccomp policy, network restrictions)
-the requester runs in. Approving a command from a sandboxed AI agent grants
-that command your full access. The dialog states this.
+The command is started by the agent, as you, with the agent's privileges — not
+inside whatever sandbox (container, seccomp policy, network restrictions) the
+requester runs in. Approving a command from a sandboxed AI agent grants that
+command your full access. The dialog states this. A broker also runs as your
+user. One process per grant limits the credential present in its memory; it
+does not contain arbitrary code execution there or prevent the process from
+attacking other user resources.
 
 ### L17 — Descendants that leave the process group outlive the command
 
 When the command exits — or the requester disconnects first — every remaining
 process in its process group is terminated (SIGTERM, then SIGKILL after 3
-seconds), so background jobs started by the command do not keep the secret.
-A process counts as alive while any of its threads is (its main thread may
-already have exited).
-A descendant that started a new session or group (`setsid`, `setpgid`)
-escapes this and keeps the secret in its environment; stopping the agent's
-systemd service kills all of them (cgroup). *Planned:* one cgroup per command.
+seconds), so background jobs started by the command do not keep the secret. A
+process counts as alive while any of its threads is (its main thread may
+already have exited). A descendant that started a new session or group
+(`setsid`, `setpgid`) escapes this and keeps ordinary values in its
+environment; stopping the agent's systemd service kills all of them (cgroup).
+For broker bindings, once the agent sees the leader exit or the requester
+disconnect, it revokes all of the run's grants before terminating the group
+and before draining output. After confirmation or broker death, escaped
+descendants hold dead tokens. Requests already sent may still take effect at
+the destination. *Planned:* one cgroup per command.
 
 ### L19 — A connected client that does not read holds the request open
 
@@ -445,6 +526,72 @@ screensaver's — can only lock: nothing unlocks but the master password.
 locker that emits no signal, run `rusthorse lock` from its hook, and keep
 `--idle-timeout` short.
 
+### L21 — A loopback token is a bearer capability
+
+Any local user can connect to a broker's TCP listener; knowing its port is not
+enough, but possession of the token is. There are no peer credentials on that
+HTTP hop and it is not encrypted. The fixed Host check and rejection of Origin
+limit browser/DNS-rebinding uses; they do not isolate a hostile process with
+the token. The agent holds the port until the run releases it, so a
+replacement process cannot claim that port while the grant is retained. A
+client can put its token in an opaque request body, which is forwarded; the
+broker only excludes it from the headers it builds or relays upstream.
+
+### L22 — Automatic locks can leave grant credentials in brokers
+
+AI profiles default to `automatic_locks: continue`, with a 12-hour maximum
+lifetime. Screen lock, suspend and idle lock drop the decrypted vault but
+leave already active/exhausted grants running. All starting grants end on any
+lock; explicit `rusthorse lock`, entry changes, failed saves, manual
+revocation, command end and expiry end grants regardless of this policy. Use
+`end` for profiles that must stop with the desktop. L20's signal and inhibitor
+limits still apply; revocation cannot promise to beat suspend.
+
+Across locks the agent retains a keyed fingerprint of the encrypted vault
+content. A valid unlock compares it before publishing the unlocked state: a
+difference (or no previous fingerprint) revokes all surviving grants, even if
+another entry changed. It decides under the state lock, contains the brokers,
+writes the unlock record outside that lock, then checks the generation again
+before publishing. A lock before comparison cancels the attempt and keeps the
+previous fingerprint; a subsequent valid attempt still detects the change. A
+lock after the revocation decision cannot undo it. Failed unlocks do not
+replace the fingerprint. Successful saves made by the agent update it;
+changing an unrelated entry does not revoke a grant.
+
+The fingerprint uses one randomly keyed `RandomState` created on its own
+thread when possible (otherwise on the caller's), with two domain-separated
+64-bit outputs. This is an in-memory change detector, not authenticated
+storage or a proof of 128-bit cryptographic collision resistance. It sees
+external edits only on unlock (or a conflicting save); unchanged encrypted
+content leaves grants alive.
+
+### L23 — Abrupt shutdown cannot guarantee grant-end audit records
+
+Control-channel EOF makes each broker exit immediately; the systemd unit also
+kills the service cgroup. An ordinary SIGTERM terminates the agent without
+unwinding Rust stack guards, so it writes no `agent_stopped` end records for
+those grants. The `StopGrants` guard covers a return/unwind from `serve`, not
+signals. Its removal survived mutation V20: no test forces that return path
+with live grants. Direct `stop_all` tests and broker EOF and service-cgroup
+containment cover related mechanisms, not that guard. This remains an
+acknowledged coverage gap; it is not proof the guard is unnecessary. Grant-end
+records are best effort.
+
+### L24 — Parser and client compatibility have explicit limits
+
+Hyper drops a request target's `#` fragment before the broker sees it; the
+broker cannot reject that spelling, but never forwards the fragment and still
+checks the resulting path. Hyper-generated malformed/framing errors can also
+precede the broker's JSON errors and retry hints.
+
+The fake HTTPS tests cover the protocol, not every SDK's behaviour. The Claude
+Code recipe has not yet been tried by hand with a real key. SDK configuration
+can override environment variables or send both Anthropic token headers; both
+must match. With zenity, a run requesting two or more grants may exceed the
+dialog height estimate and be refused before asking. `rusthorse-dialog`
+scrolls long approvals; character limits still apply, and no approval is
+truncated.
+
 ## 8. Running AI agents in isolation
 
 To make Rusthorse resist a hostile requester (A2), deny the AI everything that
@@ -473,20 +620,28 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - Read every dialog; be suspicious of `sh -c`, scripts the agent just edited,
   unexpected programs or directories, and risky-variable warnings.
 - Edit the vault in other programs only while the agent is locked.
+- Prefer broker bindings for the supported HTTP routes. Set provider-side
+  spending limits, narrow the profile's lifetime/request count, and disable
+  SDK retries where practical: every admitted attempt spends a use.
+- Use `rusthorse grants` to inspect grants, `rusthorse grants revoke ID` for
+  one, and explicit `rusthorse lock` to end all grants. Screen lock alone
+  preserves `continue` grants.
 - Look at `rusthorse audit` from time to time.
 
 ## 10. Planned improvements
 
-- **SSH agent and local HTTP broker**: secrets used *by the agent* for a
-  typed operation (destination, method) instead of being placed in a
-  command's environment — addresses L3, L5 and most of L4 for those cases.
+- **Broker phase 2**: pinned TLS and private devices, Basic authentication,
+  generic profiles, narrow administrative operations and more presets. Phase
+  1's Anthropic/OpenAI-compatible HTTP broker is implemented.
+- **SSH agent**, then database connectors: see
+  [ADR 0013](adr/0013-credential-broker.md) for their scope.
 - **Isolation support** (§8): uid allow-list on the socket and documentation
   for running agents as a separate user.
 - **One cgroup per approved command** (L17), with resource limits.
 - **Bounded KDF parameters** before unlocking (L12).
 - **Per-entry policies**: restrict an entry to listed programs or hosts.
-- **A grants panel** in `rusthorse-dialog`, to inspect and revoke remembered
-  approvals (and, later, broker tokens).
+- **Remembered-approval management**: the manager already lists and revokes
+  broker grants; remembered approvals remain separate.
 - **A "waiting for your answer" hint** in the terminal while a dialog is
   open, driven by an explicit event from the agent.
 - Signed release artifacts.
@@ -505,6 +660,14 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-01 | Seventh review: verification and readiness for a first real use (AI-assisted, Codex). | See the seventh table. |
 | 2026-11-01 | Eighth review: verification of the new features (AI-assisted, Codex). | See the eighth table. |
 | 2026-11-01 | Ninth review: verification of the eighth round (AI-assisted, Codex). | See the ninth table. |
+| 2026-11-02 | Broker foundation: independent verification V01–V07, then Codex B01/S1–S3 (AI-assisted). | Fixed; foundation ready. See the phase 1 entries below. |
+| 2026-11-02 | Broker shared helpers: implementer's checks (AI-assisted). | Reviewed with the whole; mutation limits recorded below. |
+| 2026-11-02–03 | Phase 1 pieces B–E: implementation checks, independent verification and fixes (AI-assisted). | Fixed or explicitly documented; whole review still required. |
+| 2026-11-03 | Whole phase 1 at `0d71da0` (Codex, AI-assisted). | Not ready: P01–P06; fixes below. |
+| 2026-11-03 | Pieces F and G: system tests and packaging, independent verification and fixes (AI-assisted). | Coverage and packaging fixes, accepted test gaps and incident below. |
+| 2026-11-03 | Re-review at `9f7599b` (Codex, AI-assisted). | Ready: no medium or higher finding left; Q01/Q02 low, dispositions below. |
+| 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remains pending. |
+| 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -1640,3 +1803,448 @@ Final disposition: **READY as the design basis for phase 1**, with R03
 corrected in the ADR after the fourth review. Implementation, its tests
 and the corresponding changes to the security invariants and protection
 claims still require their own review.
+
+
+**2026-11-02–03 — Credential broker phase 1: implementation reviews.**
+
+At the maintainer's request, the foundation and each parallel piece were
+checked before integration, then the whole was reviewed against ADR 0013. This
+history was consolidated by Codex (AI-assisted) on 2026-11-03 from the
+implementers' notes, independent Claude verifier reports, Codex reviews and
+commits, initially checked against code at `4ff834a`. Q01's follow-up and this
+documentation revision use `453e772`, which includes its two fixes. It records
+historical results, not a fresh rerun of every reported mutation.
+Finding/mutation names below are scoped by piece to avoid collisions. Severity
+is the reviewer's; notes without one remain observations rather than invented
+security findings. Earlier design-review entries above remain historical.
+
+**2026-11-02 — Foundation (`e9f0b46`, then `a7e26b5`).**
+
+Review (Claude independent verifier, AI-assisted, 2026-11-02; verdict: needs
+fixes), requested before the broker, agent, CLI and manager depended on the
+shared types and wire shapes. The original implementation had 16 mutation
+checks, all caught; the seven fixes had 27, all caught.
+
+| Finding | Disposition |
+|---|---|
+| High — V01: optional fields on plain run/edit let a protocol-7 agent silently drop broker authority after a restart between connections. | **Fixed in `a7e26b5`:** separate `broker_run` and `broker_edit`; plain run/edit refuse broker fields; protocol-7 decoding and real old-agent probes refuse the new requests whole. |
+| Medium — V02: credentials of 1–8192 bytes were accepted, including values below the redactor's minimum. | **Fixed in `a7e26b5`:** 8–4096 visible ASCII characters; compile-time relation to the redactor minimum and boundary tests. |
+| Medium — V03: request-body limit was 32 MiB and the aggregate budget was missing. | **Fixed in `a7e26b5`:** 16 MiB per body, 64 MiB budget constants. |
+| Medium — V04: the control channel could not express `vault_changed`. | **Fixed in `a7e26b5`:** the end reason and its serialization tests. |
+| Low — V05: malformed/disallowed routes returned 400 rather than the specified 404. | **Fixed in `a7e26b5`:** route/query failures are 404; non-origin-form targets remain a framing 400. |
+| Low — V06: header, Ready, resolver and control-EOF deadlines lacked shared constants. | **Fixed in `a7e26b5`:** phase 1 constants in `broker_protocol.rs`. |
+| Low — V07: the temporary agent refusals and plain-edit clear guard had no policy tests. | **Fixed in `a7e26b5`:** end-to-end refusal tests, later replaced/extended as the real handlers arrived. |
+
+Review (Codex, AI-assisted, 2026-11-02; verdict: ready), requested on the
+fixed foundation against ADR 0013, before the parallel pieces used it.
+
+| Finding or suggestion | Disposition |
+|---|---|
+| Low — B01: cursor syntax, ID length and all-dot segments differed from the ADR. | **Fixed in `f600896`:** cursors accept the same colon-bearing ID syntax; 128-character IDs/cursors, 1–4-digit limit and rejection of all-dot segments are explicit in the ADR. Five mutations for this commit, including S3 below, all caught. |
+| Suggestion — S1: Admit's documentation implied the body was already read. | **Fixed in `f600896`:** declared length and budget are checked before admission; body reading follows it. |
+| Suggestion — S2: prove preservation through KeePassXC itself, not only a compatible fixture. | **Deferred, then tested in `beaf9af`:** an ignored round-trip test was run with KeePassXC 2.7.6; it is not required in CI where that program may be absent. |
+| Suggestion — S3: cap Install's lifetime by the stored profile too. | **Fixed in `f600896`:** validation rejects an excessive lifetime, with a mutation check. Independent enforcement at runtime was still incomplete until P02. |
+
+**2026-11-02 — Shared helpers (`625df43`).**
+
+Implementation checks (Claude, AI-assisted, 2026-11-02), requested to settle
+helper lookup, CA trust and optional audit fields before parallel work. There
+was no separate independent verdict for this commit: the whole reviews below
+include it. `helper_program` generalized the dialog's lookup; `open_ca_file`
+validates the opened regular root-owned file and its parent directories, using
+O_NONBLOCK so a FIFO cannot hang the check; new audit fields are omitted when
+absent.
+
+Mutation checks: 29 (20 CA, 4 helper, 5 audit), 25 caught. The four survivors
+are named here by operation because the commit supplies no IDs:
+
+| Surviving mutation | Disposition |
+|---|---|
+| SH-CLOEXEC: remove explicit O_CLOEXEC. | **Accepted:** Rust's file opening sets it already. |
+| SH-ANCESTOR-TYPE: remove the ancestor-is-directory check. | **Accepted under the root-owned-path assumption:** replacing such an ancestor requires root; a symlink also fails the mode check. |
+| SH-FD-RACE: check by path instead of the open descriptor. | **Documented coverage gap:** the unit tests do not force a replacement race; this is not evidence that path checking is equivalent. The implementation still checks the descriptor. |
+| SH-OPTION-DEFAULT: remove serde(default) from an Option field. | **Accepted:** an absent optional field already deserializes to None. |
+
+**2026-11-03 — Piece B: the broker program.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-03) in `a28b83b` and
+`18689b4`, requested for the HTTP process and fake HTTPS tests. The WIP checks
+corrected pending-admission outcomes, revocation/counting races, lifetime
+starting at Install, Ready after runtime setup, bounded buffers and panic/exit
+handling. They reported 60 mutations, 57 caught. Three independent deletions
+survived behind other checks: B-F2 (Transfer-Encoding alone: Hyper's unknown
+body length is still refused), B-E1 (pre-forward revocation check: the
+connection is closed and credential dropped), and B-E11 (relay revocation
+branch: the client connection is closed). Removing each together with its
+backup was caught. The notes also name B-M60 as an earlier survivor without
+describing it; it cannot be independently classified from the supplied reports
+and is not counted as an extra proof. The missing-system-CA startup case was
+not mutated end-to-end (the system file cannot be removed by a test); the
+shared CA unit tests cover its validation. The panic-hook gap was closed in
+the following verification.
+
+Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: needs
+fixes), requested before integration. Fixes are in `256f805` unless another
+commit is named.
+
+| Finding | Disposition |
+|---|---|
+| Medium — B-V1: the body budget was released while Hyper still retained unwritten bytes. | **Fixed in `256f805`:** the reservation is shared by forwarding until the response head and by the owned Bytes until Hyper releases them; writev avoids an unaccounted copy. Tests cover a stalled reader, no response and an early response. |
+| Low — B-V2: no test proved an active stream survives the connection idle timeout. | **Fixed in `256f805`:** a stream four times longer than the idle limit completes; dropping its busy guard fails the test. |
+| Low — B-V3: TLS/client-pause deadlines, resolver wiring, panic exit and several revocation races lacked tests. | **Fixed in `256f805`:** targeted tests, biased revocation branches and a test-only panic trigger. |
+| Low — B-V4: “never reads the environment” was stronger than the dependencies permit. | **Fixed in `256f805`, documented here:** the broker's own production code reads none; loader/resolver/runtime variables are unset by the agent. An explicit resolver-thread stack size avoids RUST_MIN_STACK. |
+| Low — B-V5: Revoked's ordering did not state that all admission answers must arrive first. | **Fixed in `256f805` and `d0c4acb`:** broker waits for every answer/Finished; agent refuses pending admissions immediately on revoke. Early-ack tolerance is documented in `6ed1ad7`. |
+| Low — B-V6: a test-upstream build could look like a production helper. | **Fixed in `256f805` and `095414b`:** compile-time release guard, check marker, doctor refusal. Runtime use with an empty environment was revisited and fixed as P05. |
+
+The fix report enumerates checks rather than a unique aggregate: B-MB1–MB4 all
+caught, each budget holder by its applicable test; B-M48 (busy), B-M1 (TLS),
+B-M3 (client pause), B-M2 (resolver wiring, unit test), B-MR1–MR6
+(revocation), B-M61/M61b (panic) and B-M6/M6r (check reports) caught. B-M6u is
+the same mutation as B-M6 run against a unit test, not another variant.
+Removing each of six `biased` directives was caught 20, 20, 19, 20, 19 and 20
+times in 20 runs: probabilistic race coverage, not a proof that every run
+detects it. B-M2b (remove the blocking-pool limit) survived behind the
+resolver's four retained slots. B-MB2/B-MB4 surviving the other budget
+scenarios is expected; each fails its own scenario. Release-feature
+compilation was refused, and a getenv probe logged names only.
+
+**2026-11-03 — Piece C: agent integration and the unlock fingerprint.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-03), requested for the
+registry, preparation transaction and every grant-ending event (`ac0bfc7`,
+`d29ec09`). WIP findings and their subsequent status:
+
+| Finding | Disposition |
+|---|---|
+| High — C-W1: a grant revoked while starting could attach an unrevoked broker and hang cleanup. | **Fixed in `d29ec09`, strengthened by P03 in `d8c8fe3`:** reject attachment after starting ends; register before credential delivery. |
+| Medium — C-W2: a stuck broker writer could delay revocation under the writer lock. | **Fixed in `d29ec09`:** bounded/non-blocking writer acquisition and forced cleanup. |
+| Medium — C-W3: one realistic broker grant did not fit zenity's approval estimate. | **Fixed in `d29ec09`:** shorter factual dialog text and a height test; multiple grants can still be too tall. |
+| Low — C-W4: late admission refusals could be missing from end counts. | **Fixed in `d29ec09` and refined in `d0c4acb`:** registry accounting and answer ordering. |
+| Low — C-W5: the unlock barrier waited on the unlock audit record. | **Initially reported fixed in `d29ec09`; reopened as P01:** deciding revocation alone did not contain the broker. Actual containment before audit is fixed in `c1249d5`. |
+| Low — C-W6: control work needed a bounded queue. | **Fixed in `d29ec09`:** JOB_QUEUE 256 and violation/cleanup tests. |
+
+Initial checks reported 56 mutations, 53 caught. Survivors were the serialized
+request-limit recheck, an unused broker remembering key (the non-rememberable
+approval guard was caught), and a missing fingerprint branch unreachable after
+the vault has opened. The later admission refactor made the
+pending-reservation mutation C-B9a detectable; the old “survives by design”
+disposition no longer applies. The boot-time versus monotonic-clock mutation
+was caught on a machine that had suspended; those clocks coincide before its
+first suspend.
+
+Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: needs
+fixes), requested before integrating the agent with the broker.
+
+| Finding | Disposition |
+|---|---|
+| Medium — C-F1: no test proved a failed grant-created record prevents the credential handoff. | **Fixed in `d0c4acb`:** unit test rejects the run, starts no broker and leaves no grant; C-M1 catches ignoring that write error. |
+| Low — C-F2: audit work could delay pending admission answers needed for Revoked. | **Fixed in `d0c4acb`:** the reader reserves admissions, revoke answers them at once, and containment work does not block the audit worker. |
+| Low — C-F3: retained-listener protection against port reuse was untested. | **Fixed in `d0c4acb`:** binding the port fails until the run releases it. |
+| Low — C-F4: activation's starting-state guard was untested. | **Fixed in `d0c4acb`:** a revoked preparation never becomes active. |
+| Low — C-F5: expiry timer and StopGrants were not exercised. | **Partly fixed in `d0c4acb`:** timer tests added; timer-start failure later fixed by P02. **Accepted coverage gap:** C-V20/C-M8 removes StopGrants and survives; direct stop_all is tested, but serve returning/unwinding with grants needs a test seam. SIGTERM does not run that guard (L23). |
+| Low — C-F6: starting state and status/capacity counts were unclear. | **Fixed in `d0c4acb`, documented here:** status counts starting/active/exhausted; listing and capacity also retain revoked grants. |
+| Low — C-F7: automatic locks preserved starting continue grants contrary to the ADR. | **Fixed in `d0c4acb`:** every lock ends all starting grants. |
+| Low — C-F8: fingerprint keys and collision claims exceeded what RandomState promises. | **Fixed in `e729ebd`, documented in L22:** one key drawn on its own thread (fallback to the caller if spawning fails), domain-separated outputs; no unconditional cryptographic 128-bit claim. |
+| Low — C-F9: the manager's AgentConfig literals would not compile after integration. | **Fixed in `0d71da0`:** new test configuration fields supplied at the merge. |
+| Low — C-F10: failures after approval could lack an aborted record. | **Fixed in `d0c4acb`:** shared best-effort aborted recording, including plain runs; P01 subsequently ensured cleanup precedes that audit. |
+| Low — C-F11: missing Python silently skipped policy tests. | **Fixed in `d0c4acb`:** fail unless the explicit RUSTHORSE_TEST_WITHOUT_PYTHON opt-out is set. |
+| Low — C-F12: multi-broker preparation failure and a lock during startup lacked end-to-end tests. | **Fixed in `d0c4acb`:** stand-in brokers force both failure paths and verify complete cleanup. |
+
+The fix report says “31 mutations and one control”, but its detailed list
+contains 30 distinct variants: 27 caught, three surviving; C-M3r/C-M11r are
+reruns of C-M3/C-M11 after selecting the wrong tests. This history does not
+turn that inconsistent aggregate into 31 distinct successful checks. C-M13b is
+the explicit-Python-skip control. Surviving variants:
+
+| Surviving mutation | Disposition |
+|---|---|
+| C-M8 (the verifier's V20), remove StopGrants. | **Accepted coverage gap:** as C-F5 and L23, not declared redundant. |
+| C-M11b, draw the fingerprint key on the caller's thread. | **Accepted:** related HashMap seed alone exposes no key or hash outputs through the agent's API; separate-thread creation remains best effort. |
+| C-B12b, omit the early admission-state check. | **Accepted:** the post-record check still refuses forwarding; a redundant admitted/not_forwarded audit pair can result. |
+
+Checks caught only at the appropriate unit boundary include the fail-closed
+creation record, profile lifetime clamps and fingerprint domain separation;
+they are not presented as full-system proofs.
+
+**2026-11-02–03 — Piece D: CLI and guide.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-02), requested for the
+commands clients would use (`d13f237`, `948234a`, `a54cb22`). Audit output was
+escaped because same-user editable records could forge terminal lines (one
+mutation caught); the CLI's 29 mutations were all caught. A later independent
+review found these six low findings (Claude, AI-assisted, 2026-11-03; verdict:
+ready):
+
+| Finding | Disposition |
+|---|---|
+| Low — D-V1: grant-table escaping tests missed most agent-controlled cells. | **Fixed in `cad9d14`:** hostile values in every cell and order are tested. |
+| Low — D-V2: duplicate ordinary bindings could reach the agent unnecessarily. | **Fixed in `cad9d14`:** early CLI refusal, no request sent. |
+| Low — D-V3: status called every retained grant active. | **Fixed in `cad9d14`/`d0c4acb`, documented here:** label/count semantics distinguish starting/exhausted from revoked listings. |
+| Low — D-V4: the Claude Code recipe and compatible-origin wording promised unverified support. | **Fixed in `cad9d14`, documented here:** explicit origin and pending manual validation; no claim of testing with a real key. |
+| Low — D-V5: version checks and doctor-without-agent tests missed paths. | **Fixed in `cad9d14`:** checks before edit/grants effects and targeted fake-agent/doctor tests. |
+| Low — D-V6: doctor wording implied it parsed and validated the CA certificates. | **Fixed in `cad9d14` and installation docs in `7dc27dc`:** doctor checks the file; the broker parses certificates at grant startup. |
+
+The fixes had 15 mutations, all caught; prose is supported by code review, not
+counted as mutation-tested behaviour. CLI broker operations refuse old agents
+and never fall back to a value binding. Q02 later clarified SDK
+variable/header wording further.
+
+**2026-11-02–03 — Piece E: manager.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-02) completed the WIP in
+`af6f830`, at the maintainer's request for a metadata-only grants page and
+profile display. All 24 implementation mutations were caught.
+
+| Finding or observation | Disposition |
+|---|---|
+| Low — E-F1: maximum lifetime rounded down despite “at the latest”. | **Fixed in `af6f830`:** round up, with boundary tests. |
+| Low — E-F2: “unverified” was appended to requester-controlled text. | **Fixed in `af6f830`:** put it in the fixed field label. |
+| Low — E-F3: listing/revocation could leave controls waiting ten minutes. | **Fixed in `af6f830`:** 30-second limit; whole-job enforcement refined below. |
+| Low — E-F4: lifetime display arithmetic could overflow. | **Fixed in `af6f830`:** saturating arithmetic and u64 boundary test. |
+| Info — E-F5: listing epochs changed redundantly at request start and end. | **Changed in `af6f830`:** invalidate at completion; both remaining invalidations tested. |
+| Low — E-F6: manager docs attributed agent enforcement to the manager. | **Fixed in `af6f830`:** describe the client's behaviour and the agent's authority separately. |
+| Low — E-F7: a partial list of end reasons looked exhaustive. | **Fixed in `af6f830`:** qualified wording and warning about already-sent requests. |
+| Info — E-F8: replacing an imported entry removed its profile without a manager note. | **Fixed in `af6f830`:** import warning. |
+| Test-gap observation — E-F9: missing refused/unanswered requests, empty/no-agent and stale-listing cases. | **Fixed in `af6f830`:** fake-agent widget scenarios, never real credentials. |
+
+Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: ready),
+requested before integration; six low findings:
+
+| Finding | Disposition |
+|---|---|
+| Low — E-V1: refreshed rows could move a different grant under a Revoke click. | **Fixed in `a22687f`:** stable keyed rows, disappeared grants shown ended in place, tests bind the clicked ID. |
+| Low — E-V2: error-text filtering lacked a widget test. | **Fixed in `a22687f`:** hostile listing/revocation messages tested through dialog_text. |
+| Low — E-V3: missing-vault note, unreported status and refresh-after-request paths were untested. | **Fixed in `a22687f`:** fake-agent and first-start coverage. |
+| Low — E-V4: the stated 30-second bound actually allowed about 50 seconds across job stages. | **Fixed in `a22687f`:** one deadline from the start of the whole job, also for human requests. |
+| Low — E-V5: starting grants lacked their intended description and count semantics. | **Fixed in `a22687f` and `d0c4acb`:** starting label and status count aligned. |
+| Low — E-V6: shared architecture/changelog/invariant docs lagged the feature. | **Documented in this 2026-11-03 consolidation:** protocol 8, grants page, profiles and ownership of secrets. |
+
+All 11 verification-fix mutations were caught; parallel load checks and
+private-Xvfb light/dark inspection used fake data. Grants carries no token;
+profile forms stay read-only and the manager never sends broker_edit.
+
+**2026-11-03 — Whole phase 1 at `0d71da0`.**
+
+Review (Codex, AI-assisted, 2026-11-03; verdict: not ready), requested by the
+maintainer to examine the seams after pieces B–E were integrated, before
+system tests and packaging were finished.
+
+| Finding | Disposition |
+|---|---|
+| Medium — P01: unlock decided revocation but waited for audit before containing brokers. | **Fixed in `c1249d5`:** contain first, record outside the state lock, recheck generation before publishing; aborted-run cleanup also precedes its audit. |
+| Medium — P02: expiry depended on an agent timer that could fail to start, and the broker did not independently end open work. | **Fixed in `c14c4f9` and `24bea7e`:** refuse grants without the agent timer; broker boot-time task and per-step deadline checks drop credentials/work without an unsolicited Revoked. |
+| Medium — P03: Install could deliver the credential before the process was registered for revocation. | **Fixed in `d8c8fe3`:** register Link and non-blocking Install under one registry lock, only while starting; failures kill/reap. |
+| Medium — P04: another revoker could treat a requested kill as completed containment. | **Fixed in `d8c8fe3`:** Running/Ending/Gone; publish Gone only after kill/reap; waiters share confirmed/dead state. |
+| Medium — P05: a test build started by the production agent could reach loopback. | **Fixed in `4c2c5d4`:** absent RUSTHORSE_BROKER_TEST_ROOTS selects production settings before other hooks are read; agent env_clear is the runtime boundary. |
+| Low — P06: the manager's Anthropic snippet bound the wrong variable for the library recipe. | **Fixed in `37e97c6`:** ANTHROPIC_API_KEY and BASE_URL, note to leave AUTH_TOKEN out, separate Claude Code recipe. |
+| Suggestion — document early Revoked tolerance. | **Fixed in `6ed1ad7`:** the agent's tolerance is explicit; the real broker still orders its acknowledgement after all answers/Finished. |
+| Suggestion — test P01–P05 with both real components. | **Partly covered and accepted:** F tests P01, expiry and production settings with real components. Deterministic registry/stand-in tests force P03/P04 interleavings; doing so in a full-system test would require new agent test hooks. |
+
+Fix verification (Claude, AI-assisted, 2026-11-03), requested for these
+findings: the agent branch tip is `6ed1ad7`, not the superseded `36db9c3`; 11
+mutations all caught. Install/check atomicity is by one critical section, not
+by a test interrupting inside it. A non-blocking Install relies on room for
+the <=64 KiB frame in the Unix socket send buffer; an incomplete write or
+WouldBlock fails closed (a short sendmsg may be completed by the remaining
+write_all). Broker/manager fixes end at `37e97c6`: 16 mutations all caught,
+with 36 loaded lifetime-test runs. A long-sleep mutation first survived; a
+paused-clock suspend test then caught removal of periodic CLOCK_BOOTTIME
+rereads. No claim of a real-time scheduling bound follows from these tests.
+
+**2026-11-03 — Piece F: full-system tests.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-03), requested to prove
+ADR 0013 with the real library agent and broker, fake HTTPS and scripted UI
+(`1117cb8`, `beaf9af`). WIP checks corrected false-positive stream-cut
+assertions, reading records before the final grant record, an idle test with
+no actual requests, a vacuous SSL_CERT_FILE check, a Finished branch that
+never ran and named-pipe interference. The supplied implementation notes do
+not give a complete unique mutation total; none is inferred. The request-limit
+extra-reservation mutation is named **F-M15-limit** here; the report's other
+use of M15 is **F-M15-other** (its operation is not given in the consolidated
+inputs). F-M15-limit survives the system test because the serialized admission
+recheck refuses it before recording/forwarding; C's
+`a_request_beyond_the_limit_is_refused_while_earlier_ones_are_recorded` unit
+test catches that reservation error. This is not a second full-system proof.
+The real KeePassXC round trip is a separately run ignored test.
+
+Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: needs
+fixes), requested before merging the system suite.
+
+| Finding | Disposition |
+|---|---|
+| Medium — F-V1: failed unlock coverage never reached a cancelled unlock that had already read a new fingerprint. | **Fixed in `170ea78`:** automatic-lock password hook, surviving stream, cancelled attempt preserving the old fingerprint, then a valid unlock revoking it; F-N27 caught. |
+| Low — F-V2: Lock and RevokeAll tested only one grant. | **Fixed in `170ea78`:** two concurrent runs/streams for all-grant ends and a one-grant-only control; F-N29/N30/N31 caught. |
+| Low — F-V3: failing tests could leave late-writing agents/brokers and temporary files. | **Fixed in `170ea78`:** System Drop locks, releases gates, signals command loops and waits for runs/registry/end records before TempDir destruction; F-N32/N33/N36 caught. F-N34 remains a gap below. |
+| Low — F-V4: one route could not prove completion records belonged to the right request number. | **Fixed in `170ea78`:** alternate two routes and compare each numbered admission/finish; F-N28 caught. |
+| Low — F-V5: environment requirements were incomplete and pipe synchronization depended on kernel wchan names. | **Fixed in `170ea78`:** module requirements, full pipes and owned-descriptor observation; nix mkfifo replaces the external command, no wchan; F-N38 caught. |
+| Low — F-V6: default workspace/CI checks omitted the broker. | **Fixed in `7dc27dc`:** broker is a default member; feature/no-feature checks and CA preflight cover it. |
+| Low — F-V7: report claims overstated moved-entry streaming, profile ALPN, branch tip and mutation names. | **Corrected here:** the moved entry gets its own stream only in `170ea78`; ALPN http/1.1 is fixed by the broker, not its profile; agent-fix tip is `6ed1ad7`; F-M15-limit and F-M15-other are distinct, with the latter's missing description explicit. |
+| Low — F-V8: a failing mutation assertion printed the development session's environment, including a real development-tool session token, into that agent's log. | **Code fixed in `170ea78`:** assertions check variable names before any fixed test-value comparison. **Maintainer notified:** deleting the log does not undo transcript exposure; review/rotation of that token is the maintainer's action and is not claimed complete here. No value is reproduced. |
+
+The verification summary reports 11 checks, 10 caught; its detailed list names
+only ten variants (F-N27/N28/N29/N30/N31/N32/N33/N36/N34/N38), nine caught and
+one survivor. The missing eleventh variant is not inferred. **F-N34
+survives:** removing the cleanup wait for grant-end records leaves a narrow
+race after a run has answered and the registry emptied but the audit worker
+has not written its last record. No outside test widens it without an agent
+hook; no product behaviour changes, but a failed test could rarely leave its
+directory. This is an accepted harness-coverage gap, not an assertion that
+files cannot ever be left. `9f7599b` enabled the previously ignored P01/P05
+tests after their fixes merged; the system suite then had 35 passing tests.
+
+**2026-11-03 — Piece G: packaging and release checks.**
+
+Implementation checks (Claude, AI-assisted, 2026-11-03), requested for the
+fourth program, feature-safe builds and licence completeness (`7dc27dc`,
+`e418949`). The report records 25 mutation checks; the negative-protocol check
+mutation survived because the runtime protocol is unsigned and the runtime
+would reject that value anyway. It is a defensive packaging check, not a
+release-feature bypass; the strict check remains. The supplied summary does
+not give a trustworthy caught total, so none is invented. The original
+three-program/173-crate packaging entry above describes its 2026-11-02 state:
+this extension covers four programs and 195 crates, including ring's nested
+licences and source notices. tracing-core's vendored spin licence is excluded
+because that code is compiled only without std, while this build enables std.
+
+Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: ready),
+requested before integration. Five low findings and one additional fixer's
+test-safety finding:
+
+| Finding | Disposition |
+|---|---|
+| Low — G-V1: text-only tests could miss a disabled build-deb refusal. | **Fixed in `7f113fb`:** run the whole script against stand-in cargo/dpkg, prove no packaging after refusal; explicit `|| exit 1` guards. |
+| Low — G-V2: the checked release binary could differ from the one cargo-deb packaged via --profile/--target. | **Fixed in `7f113fb`:** unpack and check every packaged broker; reject pre-check install and alternate-target paths; refuse and delete the packages of that run on failure. The remaining output-name cleanup gap was found as Q01. |
+| Low — G-V3: ring's Portions Copyright notices were omitted. | **Fixed in `5fdcb19`:** recognize the prefix and include the four notices, including the ARM line. |
+| Low — G-V4: a notice-count test did not detect missing ring source directories. | **Fixed in `5fdcb19`:** independent expected-notice oracle, not just a count. |
+| Low — G-V5: test docs implied feature-only execution covered every broker test. | **Fixed in `8946ec5`:** some production-configuration tests run only without features; run both configurations. |
+| Low — G-V6 (fixer): stand-in executables could hit ETXTBSY under load and dash could fall through to real system tools. | **Fixed in `ca393fb`:** child-created file and rename before execution. Real loginctl was observed in 2/96 pre-fix runs; a real systemctl stop was a possible consequence, not an observed one. Post-fix: 0/96. |
+
+Fix mutations: 30, 27 caught. **G-M06** (append `|| true` after `|| exit 1`)
+survives because the failing command still exits first. **G-M28/G-M29** (omit
+ring's pregenerated/third_party notice scans) survive because their notices
+duplicate others in the pinned ring version; the output is identical. Both
+scans remain and need review on dependency updates. The old script was also
+shown packaging a test build with cargo-deb 3.8.0 and --profile dev; the fixed
+script refused and removed it. No package was installed. Hosted CI and a
+manual installed-broker check remain separate from these local checks.
+
+**2026-11-03 — Codex re-review at `9f7599b`; Q02 at `4ff834a`.**
+
+Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
+maintainer after the four merges and P01–P06 fixes, with F and G included.
+P01–P06 were confirmed resolved; early-Revoked documentation resolved;
+real-component coverage of P03/P04 partly resolved and accepted for the
+reasons above. No medium or higher finding remained.
+
+| Finding | Disposition |
+|---|---|
+| Low — Q01: a refused package whose filename did not end in .deb/.ddeb survived cleanup (release.pkg reproduced it). | **Fixed in `b999e72` and `3953912` (merged in `453e772`):** cleanup recognizes reported regular files by their Debian-package prefix or case-insensitive .deb/.ddeb suffix. Content-recognized packages are emptied, then unlinked; a permission failure permits unlinking only without another hard link. Extension-only candidates are unlinked without emptying. Nothing else is deleted. Symbolic links are named, not followed; unreadable or undeletable candidates are reported and do not stop other cleanup. |
+| Low — Q02: the manager docs universally attributed one Anthropic header to SDKs, contradicting the dated ADR survey. | **Fixed in `4ff834a`:** describe ANTHROPIC_API_KEY and the preset's two accepted headers; leave competing AUTH_TOKEN unset; no universal SDK precedence/header claim. |
+
+Q01 follow-up (2026-11-03): the two fix commit messages report 24 mutation
+checks, all caught (22 in `b999e72`, two in `3953912`). These are attributed
+results, not a new mutation run by this documentation task. The separate
+Claude subagent verification was interrupted by a usage limit and did not
+complete; the final review of the whole implementation is still to come.
+
+Two explicit decisions were accepted. For P05 the agent need not execute
+`--check` on every start: a trusted helper with an empty environment selects
+production settings even when built for tests; doctor, compile-error and
+packaging checks are independent defences, not a sandbox for a tampered
+binary. For unlock, cancellation **before** fingerprint comparison keeps the
+old fingerprint and grants under their continue policy; once comparison has
+decided revocation, a later lock cannot undo it. Revoking at every
+authenticated read would be stricter, but was not required for readiness.
+
+Optional follow-ups: synchronization hooks for real-component P03/P04
+interleavings and retaining the empty-environment regressions in both feature
+sets (already exercised separately). Neither changes the verdict.
+
+Codex ran 182 passing test executions on an isolated git-archive export: 34
+registry unit tests, two agent units, 34 broker units, 71 feature-enabled and
+26 feature-disabled broker integration tests, 14 packaging tests (excluding
+maintainer-script tests), and the KeePassXC round trip; diff whitespace check
+passed. It did not run system.rs/full agent tests, GTK, MSRV, clippy, docs or
+a full package build in that review: it had interpreted the earlier /proc
+restriction as excluding product ancestry reads. The maintainer's agent
+separately reported all AGENTS.md checks passing at `9f7599b`; that report is
+attributed, not presented as Codex's execution. The current documentation task
+explicitly permits the normal test suites. The phase remains unreleased; live
+Claude Code/SDK validation is pending.
+
+
+**2026-11-03 — Documentation checkpoint at `4ff834a` (uncommitted).**
+
+Review (Codex subagents, AI-assisted, 2026-11-03), requested as AGENTS.md's
+independent checkpoint for this documentation update. Read-only checks against
+code and the supplied reports found documentation inaccuracies; the following
+are corrected in this patch, with no runtime changes.
+
+| Finding | Disposition |
+|---|---|
+| Documentation — revoke_grant was included among requests whose lost replies imply outcome_unknown. | **Fixed (docs):** protocol.md follows Request::has_effects: revocation is repeatable, a lost reply is a regular error, not proof of completion. |
+| Documentation — package cleanup was described as complete before Q01 merged. | **Fixed (docs):** the initial draft qualified the remaining output-name gap. After Q01 merged, architecture, changelog and ADRs were updated to the exact cleanup rules in `b999e72` and `3953912` (merged in `453e772`), as was the Q01 disposition above. |
+| Documentation — ADR audit fields named a separate method field. | **Fixed (docs):** the method is part of the route template, as AuditEvent stores it. |
+| Documentation — response limit could be read as bounding the expanded redacted body. | **Fixed (docs):** 64 MiB bounds upstream bytes before replacement. |
+| Documentation — fingerprint thread creation omitted its fallback. | **Fixed (docs):** caller-thread fallback is stated; no stronger hash guarantee added. |
+| Documentation — registry retention was conflated with listener retention. | **Fixed (docs):** broker exit can remove the registry entry before run cleanup, while the run still holds its listener. |
+| Documentation — unredacted execution always “gave the terminal”. | **Fixed (docs):** it passes the requester's descriptors, which may instead be pipes or files. |
+| Documentation — any short sendmsg was said to fail Install. | **Fixed (docs):** write_all can finish a short send; incomplete/non-blocking failure is what fails closed. |
+| Documentation — a heading anchor did not match its title. | **Fixed (docs):** the dated implementation-amendments heading and link agree. |
+| Documentation — README promised universal redaction, descendant termination and exit auditing. | **Fixed (docs):** default-only literal filtering, process-group limitation, best-effort completion records and suspend timing limits. |
+| Low — guide said bodies were not read. | **Fixed (docs):** bodies are read/buffered but not semantically inspected. |
+| Low — roadmap said one broker per entry. | **Fixed (docs):** one per grant; concurrent runs of one entry have separate grants. |
+| Low — README still called manager M1 unreviewed. | **Fixed (docs):** status matches the recorded reviews and roadmap. |
+| Low — deleting an entry was said not to revoke anything. | **Fixed (docs):** it does revoke its grants, but not the provider's source credential. |
+| Low — B01's five mutations appeared to exclude the S3 lifetime check. | **Fixed (history):** five for the whole f600896 commit, including S3. |
+| Documentation — piece F's aggregate did not match its detailed mutation list. | **Documented:** summary 11/10 versus ten named variants/nine caught; no extra result inferred. Piece C's analogous discrepancy is also explicit above. |
+
+Checks for this documentation task: `cargo fmt --all --check`,
+`cargo test --all-features` (551 passed, two opt-in tests ignored),
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, manager clippy with warnings
+denied and `cargo test -p rusthorse-manager` (38 passed, private virtual
+display). After the final prose changes, the four CLI guide tests, the
+manager's guide/snippet test and all 18 packaging tests passed again;
+`git diff --check` passed. No dependencies or services were installed or
+changed. Live SDK checks, hosted CI, full packaging and the optional
+KeePassXC/KDF runs were not repeated for this documentation-only change.
+
+
+**2026-11-03 — Documentation revision at `453e772` (uncommitted).**
+
+Review (the maintainer's agent, AI-assisted, 2026-11-03), requested to check
+that the phase 1 draft retained true, reviewed guarantees as well as adding
+its limits. Codex made these corrections at the maintainer's request; Q01's
+merged code and commit messages supplied its final disposition. This is a
+documentation revision, not the pending final implementation review.
+
+| Finding | Disposition |
+|---|---|
+| Documentation — item 1: scope replaced the accidental-exposure guarantee with caveats. | **Fixed (docs):** restore the reviewed guarantee in §1, then distinguish ordinary, broker and mixed bindings and hostile approved commands. |
+| Documentation — item 2: P3/P5/P8/P9/P10/P12 lost existing guarantees. | **Fixed (docs):** restore their reviewed mechanisms, adding grant preparation, token filtering, HTTP authentication, automatic-lock policy, broker hardening and admission auditing beside them. P3 distinguishes ordinary value delivery from broker preparation. |
+| Documentation — item 3: README weakened the security, approval and audit statements. | **Fixed (docs):** restore the positive guarantees and isolation/trust explanation; add capability, literal-redaction, process-group, completion-record and suspend limits where they apply. |
+| Documentation — item 4: the AI guide addressed the maintainer and lost its protection list. | **Fixed (docs):** address the human reader, restore the protection list and hostile-agent explanation, keep mode-specific caveats, and show request and output directions separately. |
+| Documentation — item 5: roadmap removed still-planned connectors, reasons and prior art. | **Fixed (docs):** restore Why, Design, Connectors, Secretless Broker and Limits; distinguish completed HTTP phase 1 from later device, SSH, database and signed-request work. |
+| Documentation — item 6: invariant 1 narrowed ownership to broker credentials. | **Fixed (docs):** AGENTS.md and CONTRIBUTING.md cover all vault secrets, with the one-grant handoff, ordinary-run delivery and unchanged client exceptions. |
+| Documentation — item 7: new prose had overlong and uneven lines. | **Fixed (docs):** reflow changed prose across the 14-file draft, preserving code spans, links, tables and examples. |
+| Documentation — item 8: Q01's integration was still pending in the draft. | **Fixed (docs):** record `b999e72` and `3953912` (merged in `453e772`), exact content-versus-extension cleanup and all 24 reported mutation checks caught. The interrupted independent verification and pending final review remain explicit. |
+| Documentation — item 9: CLI grant capacity was explained in registry/listener terms. | **Fixed (docs):** explain that revocation may not free a place while its command runs; list grants and wait for commands to finish. Broker exit can remove a revoked grant sooner. |
+| Documentation — item 10: CHANGELOG's approval, auditing and redaction claims needed checking. | **Confirmed and clarified:** broker approvals have no remembering key and cannot be remembered; the agent durably records admission before authorizing forwarding; response bodies lose literal copies of the credential and credential-bearing headers are dropped. |
+| Documentation — reread: protocol.md still said any short Install send failed. | **Fixed (docs):** a partial sendmsg can be completed by write_all; failure to complete the non-blocking send fails preparation closed. |
+| Documentation — reread: two true component/caller statements were omitted. | **Fixed (docs):** architecture again says only the agent decrypts the vault and that helpers are optional; README again states that the caller receives the result, never the secret, beside the mode-specific limits. |
+
+Checks for this revision at `453e772`: `cargo fmt --all --check`,
+`cargo test --all-features` (553 passed; two opt-in tests ignored),
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, and
+`cargo test -p rusthorse-manager` (38 passed; private virtual displays).
+The all-feature run was repeated with a temporary log because the tool had
+truncated its first output; the complete second output was read. Cargo used
+four build jobs and offline mode; the tests inherited no session environment
+beyond HOME and PATH. All 42 actual commit references in this history resolve
+with `git show --stat`; example UUID fragments and numeric IPv4 spellings
+are not commit references. Changed prose fits 78 columns except indivisible
+links, tables and examples; `git diff --check` passed. No runtime code,
+dependency, installed package or service was changed, and nothing was
+committed. Live SDK validation and the final implementation review remain
+separate pending work.

@@ -1,6 +1,8 @@
 # 0013. A credential broker: approved programs get a grant, not the secret
 
 - Status: Proposed
+- Implementation: phase 1 implemented and reviewed ready, unreleased; later
+  phases planned
 - Date: 2026-11-02
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).
 - Preceded by: an independent design analysis (Codex, AI-assisted,
@@ -15,6 +17,12 @@
   ([Answers](#answers-to-the-open-questions)). The findings and what was
   done about each are recorded in the
   [threat model's review history](../threat-model.md#11-review-history).
+
+- Amended: 2026-11-03, to match the reviewed phase 1 implementation at
+  `4ff834a`. The dated
+  [implementation amendments](#implementation-amendments-2026-11-03) below
+  explain each change; the review history records the findings, fixes and
+  coverage gaps. Manual SDK validation with the maintainer is still pending.
 
 ## Context
 
@@ -209,42 +217,44 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
 
 7. **The dialog says what the grant allows**, from the profile and the
    request: the entry, the destination, every route, how and when the grant
-   ends, the request limit (or that there is none) and the number of
-   requests at a time, that the command receives a temporary token and not
-   the key, which other variables receive real values in a mixed run, that
-   the command can spend credit, that a request count is not a spending
-   limit and that request bodies are not inspected — with the command, the
-   program, the directory and the requester as today.
+   ends, the request limit (or that there is none) and the number of requests
+   at a time, that the command receives a temporary token and not the key,
+   which other variables receive real values in a mixed run, that the command
+   can spend credit, that a request count is not a spending limit and that
+   request bodies are not inspected — with the command, the program, the
+   directory and the requester as today. With zenity, two or more grants may
+   exceed the estimated height and be refused before the dialog;
+   `rusthorse-dialog` scrolls, still subject to character limits.
 
-8. **A grant ends** on any of these, whatever the profile says: the
-   command ends (its leader exits, or the requester disconnects); `rusthorse
-   lock` (the explicit lock, which stays the way to stop everything at
-   once); revocation by hand (`rusthorse grants revoke`, the manager's
-   grants panel); any change to its entry; any change to the vault file
-   made by another program while the vault was locked, found when it is
-   unlocked again;
-   a failed save; its broker process failing; the agent stopping; its
-   maximum lifetime passing. Each profile also says whether the
-   **automatic locks** — screen lock, suspend, idle timeout — end its
-   grants (`end`) or not (`continue`). The built-in AI presets default to
-   `continue` and 12 hours: a long session of an AI agent survives the
-   screen locking. Device profiles (phase 2) will default to `end` and 15
-   minutes. Reaching the request limit stops new requests and lets those
-   already admitted finish. Ending a grant refuses new requests at once
-   **and closes the open ones** (a stream in progress ends); a request
-   already sent to the destination may still take effect, and its outcome
-   is recorded as unknown. The command's end, the explicit lock and the
-   agent stopping end all of a run's grants together; the other events end
-   the grants they concern (an entry's, one revoked by hand, those whose
-   profile says `end`).
+8. **A grant ends** on any of these, whatever the profile says: the command
+   ends (its leader exits, or the requester disconnects); `rusthorse lock`
+   (the explicit lock, which stays the way to stop everything at once);
+   revocation by hand (`rusthorse grants revoke`, the manager's grants panel);
+   any change to its entry; any change to the vault file made by another
+   program while the vault was locked, found when it is unlocked again; a
+   failed save; its broker process failing; the agent stopping; its maximum
+   lifetime passing. Each profile also says whether the **automatic locks** —
+   screen lock, suspend, idle timeout — end its grants (`end`) or not
+   (`continue`). The built-in AI presets default to `continue` and 12 hours: a
+   long session of an AI agent survives the screen locking. Device profiles
+   (phase 2) will default to `end` and 15 minutes. Reaching the request limit
+   stops new requests and lets those already admitted finish. Ending a grant
+   refuses new requests at once **and closes the open ones** (a stream in
+   progress ends); a request already sent to the destination may still take
+   effect, and its outcome is recorded as unknown. The command's end, the
+   explicit lock and the agent stopping end all of a run's grants together;
+   the other events end the grants they concern (an entry's, one revoked by
+   hand, those whose profile says `end`). Every automatic lock also ends
+   grants still being prepared (`starting`), even with `continue`.
 
 9. **Audit.** The grant's creation is recorded before the command starts;
-   every request is recorded under the grant ID — method and route, never
-   the raw path — before it is forwarded (fail closed: no record, no
-   request), and again when it ends, with its status, size and outcome; the
-   grant's end is recorded with its reason. Never the token, a credential,
-   a header value, a query or a body. The agent writes every record: the
-   broker asks it, and waits for the answer.
+   every request is recorded under the grant ID — method and route, never the
+   raw path — before it is forwarded (fail closed: no record, no request), and
+   again when it ends, with its status, size and outcome; the grant's end is
+   recorded best effort with its reason (an abrupt agent SIGTERM does not
+   write `agent_stopped` records). Never the token, a credential, a header
+   value, a query or a body. The agent writes every record: the broker asks
+   it, and waits for the answer.
 
 10. **Phases.** Each phase gets its own review and tests:
 
@@ -279,14 +289,14 @@ phase 1 value; changing it changes this ADR.
 
 ### Components and processes
 
-- **`rusthorse-broker`**, a new member of the workspace (`broker/`), built
-  for Rust 1.89 like the main package. It depends on the `rusthorse`
-  library (without default features) for the agent–broker protocol, the
-  profile types and the redactor, and on `hyper` 1 (HTTP/1.1 server and
-  client), `tokio` (current-thread runtime), `rustls` 0.23 with the `ring`
-  provider, `tokio-rustls` and `rustls-native-certs` (to read one fixed
-  file). Their default features are off where those would add another
-  cryptography library, proxy support or connection pools.
+- **`rusthorse-broker`**, a new member of the workspace (`broker/`), built for
+  Rust 1.89 like the main package. It depends on the `rusthorse` library
+  (without default features) for the agent–broker protocol, the profile types
+  and the redactor, and on `hyper` 1 (HTTP/1.1 server and client), `tokio`
+  (current-thread runtime), `rustls` 0.23 with the `ring` provider,
+  `tokio-rustls` and `rustls-pki-types` (to parse the fixed CA file; no
+  `rustls-native-certs`). Their default features are off where those would add
+  another cryptography library, proxy support or connection pools.
 - **Where it is found.** Next to the agent's executable, with the checks
   `rusthorse-dialog` gets (a regular executable owned by the user or root,
   not writable by group or others, refused when the agent's own executable
@@ -309,15 +319,32 @@ phase 1 value; changing it changes this ADR.
   address another program listens on.
 - **Trust.** The broker reads its certificate authorities from the first
   existing file of a fixed list (`/etc/ssl/certs/ca-certificates.crt`,
-  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`), which must
-  be owned by root and not writable by group or others. No environment
-  variable changes it: the broker has an empty environment and does not
-  read one. Without such a file no grant can be served, and `rusthorse
-  doctor` says so.
-- **Tests only:** a feature of the broker package that is never enabled in
-  a release (like `fake-keyring`) lets end-to-end tests add a test
-  certificate authority and reach a loopback destination. The release
-  build, `packaging/build-deb.sh`, enables no feature.
+  `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`), which must be
+  a regular root-owned file in root-owned directories, none writable by group
+  or others. The first existing file decides; an unsafe file is not skipped.
+  `open_ca_file` checks the opened descriptor; the broker parses its PEM
+  certificates and requires usable trust before Ready. `doctor` checks file
+  availability and ownership/mode, not PEM contents. The broker's own
+  production code reads no environment variables; its dependencies may read
+  theirs, unset because the agent uses an empty environment. No requester
+  proxy, CA or resolver variables reach it.
+- **Tests only:** a feature of the broker package that is never enabled in a
+  release (like `fake-keyring`) lets end-to-end tests add a test certificate
+  authority and reach a loopback destination. The release build,
+  `packaging/build-deb.sh`, enables no feature. `test-upstream` is a compile
+  error without debug assertions and is reported by `--check`; `doctor`
+  refuses that marker. Even a test build uses production settings unless
+  `RUSTHORSE_BROKER_TEST_ROOTS` is set before startup; only then does it read
+  its other test hooks and permit loopback. The agent does not run `--check`
+  before each grant: its empty environment gives that trusted helper
+  production settings. Packaging checks the built broker and every packaged
+  broker. Refusal cleanup removes reported package files regardless of their
+  extension, empties content-recognized packages first, and names symbolic
+  links without following them and any paths it cannot remove. Extension-only
+  candidates are deleted without emptying; a permission failure while emptying
+  permits deletion only without other hard links. The exact rules are in ADR
+  0010, decision 9. Q01 was fixed in `b999e72` and `3953912` (merged in
+  `453e772`; review history).
 
 ### The token and the grant ID
 
@@ -411,20 +438,21 @@ request, in order:
    ambiguity. The broker then refuses (`400`) any request with a
    `Transfer-Encoding` header (a request body must be sent with
    `Content-Length`, as the supported clients do), an `Upgrade` header, a
-   `Connection` header naming anything but `close` or `keep-alive`, a
-   request target that is not in origin form, a `Host` other than
-   `127.0.0.1:PORT`, an `Origin` header (browsers have no business here), a
-   method `CONNECT`, `TRACE` or `OPTIONS`, or a body on a route without one;
-   headers larger than 32 KiB get `431`. The whole header block must
-   arrive within 30 seconds of the connection being opened or of the
-   previous response on it.
+   `Connection` header naming anything but `close` or `keep-alive`, a request
+   target that is not in origin form, a `Host` other than `127.0.0.1:PORT`, an
+   `Origin` header (browsers have no business here), a method `CONNECT`,
+   `TRACE` or `OPTIONS`, or a body on a route without one; HTTP versions other
+   than 1.1 get `505`; headers larger than 32 KiB or more than 100 headers get
+   `431`. The whole header block must arrive within 30 seconds of the
+   connection being opened or of the previous response on it.
 2. **Token**: missing or wrong → `401`.
-3. **Route**: the path must be in the exact form above, without `%`
-   escapes, empty segments or segments made only of dots, `;`, `\` or
-   `#`, and match a route of
-   the preset after the base path, with only the allowed query parameters
-   (each at most once); otherwise `404`. The path the broker checks is the
-   path it sends.
+3. **Route**: the path must be in the exact form above, without `%` escapes,
+   empty segments or segments made only of dots, `;`, `\` or `#` in the target
+   seen by the broker, and match a route of the preset after the base path,
+   with only the allowed query parameters (each at most once); otherwise
+   `404`. The path the broker checks is the path it sends. Hyper strips a `#`
+   fragment before this check, so its original presence cannot be refused; the
+   fragment is not forwarded.
 4. **Room for the body**: a body may be at most 16 MiB (`413`). A broker
    holds at most 64 MiB of request bodies at once: it reserves the
    declared length before it asks for admission, and a request that does
@@ -435,101 +463,136 @@ request, in order:
    its body is received.
 6. **Body**: read whole into memory before anything is sent, within 60
    seconds; a body that does not arrive in full is not forwarded (outcome
-   `not_forwarded`; the use is spent).
-7. **Forwarding**: the broker resolves the origin's host, keeps only
-   public addresses (no loopback, private, link-local, unique-local,
-   shared, multicast, unspecified or IPv4-mapped forms of them) and
-   connects to one of those it checked, never resolving again. Resolving
-   and connecting must end within 10 seconds, and a broker resolves at most
-   4 names at a time. TLS 1.2 or 1.3 with the host as SNI, ALPN `http/1.1`
-   only, no early data, no key log. The request line, `Host`,
+   `not_forwarded`; the use is spent). A body timeout returns `408`.
+7. **Forwarding**: the broker resolves the origin's host, keeps only public
+   addresses (no loopback, private, link-local, unique-local, shared,
+   multicast, unspecified or IPv4-mapped forms of them) and connects to one of
+   those it checked, without re-resolving for the connection. It resolves once
+   per admitted request, tries retained addresses in order within a shared
+   10-second resolution/connect deadline, and keeps at most 4 resolver calls
+   running. A blocked system resolver may outlive the cancelled request, but
+   retains its slot until it returns; it does not delay broker exit.
+   IPv4-mapped/compatible IPv6 is refused outright. IPv6 allows global
+   `2000::/3`, except `2001::/23`, `2001:db8::/32`, `2002::/16` and
+   `3fff::/20`; the well-known NAT64 `64:ff9b::/96` prefix is allowed only for
+   an embedded public IPv4 address. The IPv4 exclusions are in
+   `broker/src/destination.rs`. TLS 1.2 or 1.3 with the host as SNI, ALPN
+   `http/1.1` only, no early data, no key log. The request line, `Host`,
    `Content-Length` and the credential header are its own;
-   `Accept-Encoding: identity` replaces the client's. Only the headers
-   listed for the preset pass, so hop-by-hop headers (`Connection`,
-   `Keep-Alive`, `TE`, `Trailer`, `Upgrade`, `Proxy-*`) never do; a listed
-   header whose name or value contains the token is dropped too, so the
-   broker never sends the token in a header; trailers are dropped in both
-   directions. One connection per request; nothing is shared between
-   grants.
-8. **Response**: refused with a local `502`, before anything is passed to
-   the client, when it is a `3xx` (no `Location` reaches the client), has a
-   `Content-Encoding` other than `identity` (in any of its occurrences), or
-   a `Transfer-Encoding` other than exactly `chunked` (a compressed
-   transfer coding would hide the credential from the redactor). Otherwise
-   the status and the relayed headers are passed on and the body is
-   streamed chunked, without buffering, through a redactor that replaces
-   literal copies of the credential with `[REDACTED:credential]`, a fixed
-   text that is safe inside JSON. A header whose value contains the
-   credential is dropped. At most 64 MiB of body per response.
+   `Accept-Encoding: identity` replaces the client's. Only the headers listed
+   for the preset pass, so hop-by-hop headers (`Connection`, `Keep-Alive`,
+   `TE`, `Trailer`, `Upgrade`, `Proxy-*`) never do; a listed header whose name
+   or value contains the token is dropped too, so the broker never sends the
+   token in a header; trailers are dropped in both directions. One connection
+   per request; nothing is shared between grants.
+8. **Response**: refused with a local `502`, before anything is passed to the
+   client, when it is a `3xx` (no `Location` reaches the client), has a
+   `Content-Encoding` other than `identity` (in any of its occurrences), or a
+   `Transfer-Encoding` other than exactly `chunked` (a compressed transfer
+   coding would hide the credential from the redactor). Otherwise the status
+   and the relayed headers are passed on and the body is streamed with chunked
+   framing where HTTP permits a body, through a bounded look-behind redactor
+   that replaces literal copies of the credential with
+   `[REDACTED:credential]`, a fixed text that is safe inside JSON. A header
+   whose value contains the credential is dropped. At most 64 MiB of upstream
+   body per response, before redaction.
 
-A credential must be at least 8 and at most 4096 characters, all visible
-ASCII without spaces, or the entry cannot be used with the broker: shorter
-ones would escape the redactor, and the credential travels in a header.
+A credential must be at least 8 and at most 4096 characters, all visible ASCII
+without spaces, or the entry cannot be used with the broker. This minimum
+exceeds the output redactor's minimum, and the credential must be
+representable in an HTTP header.
 
-Local answers carry a short JSON error and, except `429` and `503`,
-`x-should-retry: false`, so that the clients' own retries do not repeat
-what cannot succeed. A failure to resolve, connect or complete TLS,
-before anything was sent, is a `502` without that header: nothing reached
-the destination, so the client may retry (as a new request, which counts).
+Local answers produced by the broker carry a short JSON error and, except
+`429` and `503`, `x-should-retry: false`, so that the clients' own retries do
+not repeat what cannot succeed. A failure to resolve, connect or complete TLS,
+before anything was sent, is a `502` without that header: nothing reached the
+destination, so the client may retry (as a new request, which counts). A
+response-head timeout returns `504`; a failure after sending can return `502`
+with outcome `unknown` and `x-should-retry: false`. Once response headers have
+gone to the client, a body failure cuts the stream. Hyper's own parse/framing
+errors precede this logic: they can have an empty body and no retry hint
+(including its `400`, `431` and possible `414`).
 
 ### Admission, revocation and the agent's registry
 
-- The **agent** keeps a registry of grants and is the one authority for
-  their state and limits. Every request the broker accepts goes through it
-  over the control channel: `admit` (request number, method and route) →
-  the agent checks that the grant is active and within its limits,
-  reserves a use and a slot, writes the admission record (durably), checks
-  again that the grant is still active, and answers `admitted` or
-  `refused` with the same request number. The broker reads the body and
-  forwards only after `admitted`, and only if it has not been told to
-  revoke meanwhile; it reports `finished` with the number and the outcome,
-  which frees the slot and is recorded. A `refused` admission releases its
-  reservation; an admitted request spends its use whatever its outcome.
+- The **agent** keeps a registry of grants and is the one authority for their
+  state and limits. Every request the broker accepts goes through it over the
+  control channel: `admit` (request number, method and route) → the agent
+  checks that the grant is active and within its limits, reserves a use and a
+  slot, writes the admission record (durably), checks again that the grant is
+  still active, and answers `admitted` or `refused` with the same request
+  number. On revocation, the agent answers pending admissions immediately;
+  their audit work may finish later. The broker reads the body and forwards
+  only after `admitted`, and only if it has not been told to revoke meanwhile;
+  it reports `finished` with the number and the outcome, which frees the slot
+  and is recorded. A `refused` admission releases its reservation; an admitted
+  request spends its use whatever its outcome.
 - **Request numbers** are chosen by the broker, increasing from 1 within a
   grant. The agent accepts each number once in `admit` and once in
   `finished`, after `admitted`; anything else — a number reused, a
   `finished` for a number not admitted or already finished, an unknown
   message — is a broken broker: the agent ends the grant (`broker_failed`)
   and kills the broker, and changes no counter for the offending message.
-- **States**: `starting` (the broker is being prepared; no request
-  admitted), `active`, `exhausted` (no new admission; admitted requests
-  finish), `revoked` (nothing new; open requests closed) and `ended` (the
-  broker has exited). A grant never becomes active again.
-- **Preparing a run's grants** is one transaction. The grants are entered
-  in the registry as `starting` under the same lock that checks the vault
-  generation and reads the credentials, so a lock is either before (the
-  run fails, nothing was read) or after (it ends the `starting` grants).
-  Then, for each grant, the agent binds the port, starts the broker, sends
-  `install` and waits for `ready`, at most 10 seconds. Last, under the
-  registry's lock, it checks that every grant of the run is still
-  `starting` and makes them all `active`; only then does it start the
-  command. If anything fails — a broker that does not start or answer, a
-  grant ended meanwhile, the command that cannot be started — every grant
-  of the run is ended, its broker stopped and its port released, and only
-  then does `run` fail (125, nothing ran).
-- **Revocation** is decided in the registry, so no request is admitted
-  after that moment. The agent then tells the broker to revoke: it closes
-  every open request and stream, drops the credential, confirms, and from
-  then on answers `403` until the command ends. A broker that does not
-  confirm within one second is killed. Every revocation waits for that
-  confirmation or kill — at most about a second once it has started, the
-  brokers of a lock being told at once — before the lock, the edit or the
-  revocation is reported done. A lock before suspend keeps the limits of
-  L20: it can start late (a save in progress holds the agent's state), and
-  logind waits only so long. Between the decision and the confirmation, a
-  request admitted just before the decision may still be sent; after it,
-  nothing more is. Revocation never waits for the audit log.
-- **The unlock barrier**: a grant can outlive a lock (`continue`), and
-  another program may change the vault file while it is locked — move an
-  entry, change its value — without touching the times KeePass records.
-  The agent therefore keeps, in memory only, a fingerprint of the vault
-  file's encrypted content as it last read or wrote it (a hash keyed with a
-  random key the agent chooses at start), and keeps it across a lock. When
-  the vault is unlocked again, before the unlock completes, it compares the
-  fingerprint of the file it just read: if they differ, or the agent has
-  none, every grant that survived the lock ends (`vault_changed`). An
-  unchanged file leaves them running; a changed file ends them even if the
-  change concerned other entries.
+- **States**: `starting` (the broker is being prepared; no request admitted),
+  `active`, `exhausted` (no new admission; admitted requests finish),
+  `revoked` (nothing new; open requests closed) and `ended` (the broker has
+  exited). A grant never becomes active again. The public list includes
+  `starting` and retained `revoked` grants; `ended` is not a `GrantState` on
+  the client wire. Status counts starting, active and exhausted grants; the
+  16-grant capacity also includes retained revoked ones while their brokers
+  remain registered. Broker exit removes the registry entry sooner; the run
+  still holds its listener until cleanup.
+- **Preparing a run's grants** is one transaction. The grants are entered in
+  the registry as `starting` under the same lock that checks the vault
+  generation and reads the credentials, so a lock is either before (the run
+  fails, nothing was read) or after (it ends the `starting` grants). Then, for
+  each grant, the agent binds the port and starts the broker. Under the
+  registry lock, and only while still starting, it registers the control Link
+  and sends `install` non-blockingly; there is no credential handoff before
+  the Link is subject to revocation. A failed or incomplete send kills and
+  reaps the child. It waits for `ready`, at most 10 seconds. Last, under the
+  registry's lock, it checks that every grant of the run is still `starting`
+  and makes them all `active`; only then does it start the command. If
+  anything fails — a broker that does not start or answer, a grant ended
+  meanwhile, the command that cannot be started — every grant of the run is
+  ended, its broker stopped and its port released, and only then does `run`
+  fail (125, nothing ran).
+- **Revocation** is decided in the registry, so no request is admitted after
+  that moment. The agent then tells the broker to revoke: it closes every open
+  request and stream, drops the credential, confirms, and from then on answers
+  `403` until the command ends. A broker that does not confirm within one
+  second is killed. Every revocation waits for that confirmation or confirmed
+  process death — a requested kill alone does not count. Concurrent revokers
+  wait for the same Link to be confirmed or Gone; Gone is published only after
+  kill/reap. Control writes have their own short deadline (250 ms);
+  confirmation has a one-second deadline, then process cleanup. Brokers of a
+  lock are told together. These are scheduling-dependent bounds, not a
+  real-time deadline. Only then is the lock, the edit or the revocation
+  reported done. A lock before suspend keeps the limits of L20: it can start
+  late (a save in progress holds the agent's state), and logind waits only so
+  long. Between the decision and the confirmation, a request admitted just
+  before the decision may still be sent; after it, nothing more is. Revocation
+  never waits for the audit log.
+- **The unlock barrier**: a grant can outlive a lock (`continue`), and another
+  program may change the vault file while it is locked — move an entry, change
+  its value — without touching the times KeePass records. The agent therefore
+  keeps, in memory only, a fingerprint of the vault file's encrypted content
+  as it last read or wrote it (a hash keyed with a random key the agent
+  chooses at start), and keeps it across a lock. The implementation uses one
+  `RandomState` created on its own thread when that thread can be started
+  (otherwise on the caller's), with two domain-separated outputs, not a claim
+  of cryptographic 128-bit collision resistance. After an authenticated read
+  and a generation check under the state lock, it compares the file
+  fingerprint: if they differ, or the agent has none, every grant that
+  survived the lock ends (`vault_changed`). An unchanged file leaves them
+  running; a changed file ends them even if the change concerned other
+  entries. The agent decides under the state lock, contains the brokers,
+  writes the unlock record outside that lock, then checks the generation again
+  before publishing the unlocked state. A lock before comparison cancels the
+  attempt and preserves the old fingerprint; the next valid attempt detects
+  the change. Once comparison decides revocation, a later lock does not undo
+  it. Failed unlocks keep the previous fingerprint; successful saves by the
+  agent update it.
 - **The end of the command** is noticed when its leader exits (or the
   requester disconnects): the run's grants are revoked then — before the
   command's other processes are terminated and before its output is
@@ -538,12 +601,16 @@ the destination, so the client may retry (as a new request, which counts).
   (L17) keeps only a token that no longer works.
 - **Limits** in phase 1: at most 16 grants at once per agent; per grant, 16
   requests in flight (more get `429` with `retry-after: 1`) and 64 open
-  connections; idle connections are closed after 60 seconds; the
-  destination must be resolved and connected within 10 seconds, complete
-  TLS within 10 seconds and answer with its headers within 10 minutes, and
-  the response body may not pause for more than 5 minutes. The maximum
-  lifetime is measured on the boot-time clock, so time spent suspended
-  counts.
+  connections; idle connections are closed after 60 seconds; the destination
+  must be resolved and connected within 10 seconds, complete TLS within 10
+  seconds and answer with its headers within 10 minutes, and the response body
+  may not pause for more than 5 minutes. The maximum lifetime is measured on
+  the boot-time clock, so time spent suspended counts. The agent refuses
+  grants if its expiry timer could not start. The broker also expires
+  independently: a scheduled task drops its credential and work, and
+  forwarding/body checks enforce the deadline even before that task runs. It
+  sends no unrequested `revoked` at expiry; it still answers a later agent
+  `revoke`.
 - **Leaving**: a broker exits at once when its control channel ends,
   without waiting for work in progress (a name resolution that hangs
   included); the agent kills its process group if it is still there a
@@ -555,15 +622,19 @@ the destination, so the client may retry (as a new request, which counts).
 ### The control channel
 
 Framed like the dialog protocol (a 4-byte big-endian length, then JSON,
-unknown fields refused), with its own version number, frames of at most
-64 KiB and the listening socket passed as file-descriptor data. Agent to
-broker: `install` (version, grant ID, token, credential, profile snapshot,
-limits), `admitted` and `refused` (request number), `revoke`. Broker to
-agent: `ready`, `admit` (request number, method, route), `finished`
-(request number, outcome, status, sizes), `revoked`, with a count of the
-requests it refused before admission. The credential and the token are
-kept in zeroizing buffers and never printed. Nothing else crosses: no
-vault, no master password, no requester environment.
+unknown fields refused), with its own version number, frames of at most 64 KiB
+and the listening socket passed as file-descriptor data. Agent to broker:
+`install` (version, grant ID, token, credential, profile snapshot, limits),
+`admitted` and `refused` (request number), `revoke`. Broker to agent: `ready`,
+`admit` (request number, method, route), `finished` (request number, outcome,
+status, sizes), `revoked`, with a count of the requests it refused before
+admission (its own refusals, not the agent's). The normal broker sends
+`revoked` after every admission answer and every admitted request's
+`finished`. The agent tolerates an early acknowledgement and finishes
+outstanding admitted requests as unknown rather than hanging; see
+[the control-channel contract](../protocol.md#agentbroker-control-channel-broker-protocol-1).
+The credential and the token are kept in zeroizing buffers and never printed.
+Nothing else crosses: no vault, no master password, no requester environment.
 
 ### Audit records
 
@@ -571,7 +642,7 @@ vault, no master password, no requester environment.
 |---|---|---|
 | `run` | the approval, as today | the grants it creates, by ID, entry and destination |
 | `grant` | created (before the command starts; fail closed), ended (best effort) | grant ID; at the end: the reason (`command_ended`, `locked`, `screen_locked`, `suspend`, `idle_timeout`, `revoked`, `entry_changed`, `vault_changed`, `expired`, `broker_failed`, `save_failed`, `agent_stopped`, `audit_failed`), requests admitted, finished and unknown, requests refused before admission |
-| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, method, route (`POST /v1/messages`) |
+| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, route template including the method (`POST /v1/messages`) |
 | `broker_request` | finished (best effort) | grant ID, request number, outcome (`completed`, `not_forwarded`, `client_closed`, `revoked`, `unknown`), status, bytes each way |
 
 Refused requests are counted, not recorded one by one, so a client cannot
@@ -580,15 +651,14 @@ nothing more (it is revoked with reason `audit_failed`).
 
 ### `run`, `grants` and the protocol
 
-- `rusthorse run --broker VAR=ENTRY` (repeatable) and `--url URLVAR=ENTRY`
-  as in decision 6. The agent checks that the variables are valid and
-  distinct, that no entry is both brokered and given by value (by UUID),
-  that each brokered entry has a usable profile and a value the broker can
-  carry (8 to 4096 visible ASCII characters), that no more than 16 grants
-  would then be active, and that the broker program is usable — all before
-  the dialog — and adds `127.0.0.1` to `NO_PROXY` and `no_proxy` in the
-  command's environment. The token and URL variables the requester sent
-  are dropped.
+- `rusthorse run --broker VAR=ENTRY` (repeatable) and `--url URLVAR=ENTRY` as
+  in decision 6. The agent checks that the variables are valid and distinct,
+  that no entry is both brokered and given by value (by UUID), that each
+  brokered entry has a usable profile and a value the broker can carry (8 to
+  4096 visible ASCII characters), that no more than 16 grants would then be
+  retained, and that the broker program is usable — all before the dialog —
+  and adds `127.0.0.1` to `NO_PROXY` and `no_proxy` in the command's
+  environment. The token and URL variables the requester sent are dropped.
 - `--remember` is not offered for a run with `--broker`: each approval
   creates its grants once.
 - `--no-redact` is allowed with `--broker`, with a warning in the dialog:
@@ -596,13 +666,13 @@ nothing more (it is revoked with reason `audit_failed`).
   can use the grant until it ends. It is what an interactive program such
   as Claude Code needs, since `run` gives it the terminal only without
   redaction.
-- `rusthorse grants [--json]` lists active grants (ID, entry, destination,
-  command, requester, start, end, requests used and allowed, policy) —
-  never a token — and `rusthorse grants revoke ID|--all` ends them.
-  Neither needs an approval, like `lock`.
+- `rusthorse grants [--json]` lists retained grants (ID, entry, destination,
+  command, requester, start, end, requests used and allowed, policy) — never a
+  token — and `rusthorse grants revoke ID|--all` ends them. Neither needs an
+  approval, like `lock`.
 - `rusthorse status` reports the broker program and the number of active
-  grants; `rusthorse doctor` checks the broker program and the certificate
-  file.
+  grants (starting and exhausted included, revoked excluded);
+  `rusthorse doctor` checks the broker program and the certificate file.
 - **Protocol 8.** A run with broker bindings is a new request,
   `broker_run`: the run request's fields plus the list of broker bindings
   (variable, entry, URL variable). An agent of protocol 7 does not know
@@ -621,11 +691,11 @@ nothing more (it is revoked with reason `audit_failed`).
 
 ### The manager
 
-The manager's grants page lists the active grants with their entry,
-destination, command, start, end and requests, and revokes one or all —
-also while the vault is locked, which the page says, since grants can
-outlive a lock. It shows an entry's profile, read-only. Editing a profile
-stays in the CLI until phase 2.
+The manager's grants page lists the retained grants with their entry,
+destination, command, start, end and requests, and revokes one or all — also
+while the vault is locked, which the page says, since grants can outlive a
+lock. It shows an entry's profile, read-only. Editing a profile stays in the
+CLI until phase 2.
 
 ### Tests before real credentials
 
@@ -637,7 +707,7 @@ keys, showing the allowed and the refused path of each:
 | The key | Never in the command's environment, output, files it can write from what it receives, error bodies, response headers, the audit log, `grants` or `status`; the destination receives exactly one credential header, built by the broker, and the broker never sends the token in a header it builds or passes on (a `User-Agent` carrying it, or an `x-stainless-` header named after it, is dropped). |
 | Tokens | Missing, malformed, wrong, another grant's, or conflicting token headers → `401`, nothing forwarded. |
 | Routes and framing | `/v1/messages/batches`, unknown methods, `%2e%2e`, `//`, `;`, `\`, absolute-form targets, a foreign `Host`, `Origin`, `CONNECT`, `TRACE`, upgrades, any `Transfer-Encoding` on a request (alone and with `Content-Length`), conflicting lengths, `Connection` naming a forwarded header, a query parameter twice, oversized headers and bodies, headers that trickle in → refused, nothing forwarded. |
-| Destination | `Host` and SNI from the profile; the requester's proxy and certificate variables, and the agent's, have no effect on the broker; private addresses refused; a `3xx` with `Location` reaches the client as `502` without it; a response with a compressed `Content-Encoding` or `Transfer-Encoding` refused before anything reaches the client; a name resolution that hangs ends within its deadline. |
+| Destination | `Host` and SNI from the profile; the requester's proxy and certificate variables, and the agent's, have no effect on the broker; private addresses refused; a `3xx` with `Location` reaches the client as `502` without it; a response with a compressed `Content-Encoding` or `Transfer-Encoding` refused before anything reaches the client; a stalled resolution does not hold the HTTP request beyond its deadline (the system resolver call may finish later). |
 | Redaction | The credential echoed in a response body, split across chunks, and in headers, is removed; `Content-Length` is not passed on; a credential shorter than 8 characters is refused before the dialog. |
 | Limits | With a request limit of N, at most N requests reach the destination however many arrive at once; the N-th finishes; the limit of requests in flight and the 64 MiB of bodies hold under load; refused admissions free their slots; requests finishing in another order than they started are counted right. |
 | Revocation | `rusthorse lock`, `grants revoke`, the automatic locks with `end` (and not with `continue`), an entry edit, expiry: open streams end; once the revocation is reported done nothing new is forwarded; an admission waiting for its audit record is refused if the grant was revoked meanwhile; a vault file changed by another program while locked — an entry moved, a value changed, its modification time kept — ends the grants that survived the lock at the next unlock, and an unchanged file keeps them; a failed unlock keeps the previous fingerprint, so the change is still found at the next attempt; the agent's own successful save of another entry updates the fingerprint and ends no grant. |
@@ -767,3 +837,26 @@ second review's corrections are folded in):
 - **What it does not change**: an approval still trusts the program it
   approves for the operations it allows; a careless approval of a broad
   grant is still a careless approval.
+
+## Implementation amendments (2026-11-03)
+
+These amendments record what was implemented and reviewed at `4ff834a`, at the
+maintainer's request, after the phase 1 implementation reviews (AI-assisted).
+They correct the normative specification above; the 2026-11-02 client survey
+remains a dated observation, not a guarantee about all installed SDK versions.
+The guide uses the library's key variable and leaves a competing
+`ANTHROPIC_AUTH_TOKEN` unset (Q02, `4ff834a`). The package cleanup description
+was updated on the same date for Q01's fixes in `b999e72` and `3953912`,
+merged in `453e772`.
+
+| Area amended | Why and implementation evidence |
+|---|---|
+| Components, CA file and test feature | `broker/src/config.rs`, `destination.rs`, `broker_protocol::open_ca_file`: PEM parsing through `rustls-pki-types`, descriptor/ancestor checks, and production settings unless the test roots variable is present. P05 fixed in `4c2c5d4`; package and doctor checks are separate controls. |
+| HTTP handling and bounds | `broker/src/framing.rs`, `exchange.rs`, `destination.rs`: OPTIONS refused, Hyper's fragment normalization and parser errors, 408/504/505 and unknown outcomes after sending, bounded redaction, ordered resolution with retained resolver slots, explicit IPv6 exclusions. No promise to cancel a blocking libc resolver or to inspect opaque bodies. |
+| Registry and Install | P03/P04, `d8c8fe3`: register and send under one lock; confirmation or actual death before reporting containment. `broker_host.rs` counts all retained grants for capacity, including revoked ones, and every lock ends starting grants (`d0c4acb`). |
+| Unlock barrier | P01, `c1249d5`: contain before audit, audit outside the state lock, then generation recheck. Cancellation before comparison preserves the old fingerprint; cancellation after the decision never undoes revocation. Fingerprint implementation clarified in `e729ebd`. |
+| Lifetime and control contract | P02, `c14c4f9` and `24bea7e`: no serving without the agent timer, independent broker expiry. `6ed1ad7` documents early-Revoked tolerance; the broker sends no unsolicited acknowledgement on expiry. |
+| User-visible state, audit and approvals | `grants` includes retained revoked entries; status excludes them. End records are best effort and SIGTERM does not unwind `StopGrants`. The zenity height estimate can refuse multi-grant runs. Manual SDK support validation is pending, as answer 9 requires. |
+
+The review history records remaining coverage gaps and accepted limitations; a
+passing fake-destination test is not evidence of live SDK compatibility.

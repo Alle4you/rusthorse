@@ -138,16 +138,22 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
   profile's destination, and forwards only the requests the profile's
   routes allow: everything else is refused.
 - The grant ends when the command ends, or before: for example on
-  `rusthorse lock`, when the human revokes it, when the entry changes or
-  when its lifetime is over. Requests after that fail.
+  `rusthorse lock`, when the human revokes it, when the entry changes or when
+  its lifetime is over. Requests after that fail. AI profiles default to
+  continuing through screen lock, suspend and idle lock for up to 12 hours;
+  explicit `rusthorse lock` ends all grants. A profile can instead choose
+  `automatic_locks: end`.
 - The token is a secret too. Do not print, log or store it, and send it only
   to the broker's address. Output is redacted as with `run`, the token
   included. With `--no-redact` it is not, and whoever reads the token can use
   the grant until it ends.
-- The dialog says what the grant allows: the destination, every route, when
-  it ends and how many requests it admits. A request limit is not a spending
-  limit, and the broker does not read request bodies: within those routes,
+- The dialog says what the grant allows: the destination, every route, when it
+  ends and how many requests it admits. A request limit is not a spending
+  limit, and the broker does not inspect request bodies: within those routes,
   the command can still spend credit and send what it wants.
+- With zenity, two or more grants in one run may make the approval too tall,
+  so the agent refuses it. `rusthorse-dialog` scrolls; character limits still
+  apply. Never work around a refusal by passing the real key.
 - There is no fallback. When a grant cannot be served (no broker program, no
   profile, a value the broker cannot send), `rusthorse run` exits with `125`
   and nothing ran. Never retry with the key by value: tell the human.
