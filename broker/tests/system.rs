@@ -19,25 +19,43 @@
 //! Every key is fake (`sk-…-test-…`), nothing leaves the loopback interface
 //! and no dialog is shown. The whole file needs the broker's `test-upstream`
 //! feature (`cargo test -p rusthorse-broker --all-features`): without it, it
-//! compiles to nothing. The agent's socket lives in each test's temporary
-//! directory, so `TMPDIR`, when set, must be short enough for a Unix
-//! socket's path (about 80 characters). Tests marked `#[ignore]` show
-//! findings fixed on other branches: run them with `--ignored` once those
-//! are merged.
+//! compiles to nothing. Tests marked `#[ignore]` show findings fixed on
+//! other branches: run them with `--ignored` once those are merged.
+//!
+//! What the tests need of the machine, besides Linux:
+//!
+//! - `/bin/sh`, and `env`, `mv`, `cp`, `chmod`, `cat`, `touch`, `head`,
+//!   `tr`, `sleep`, `mkdir` and `setsid` (util-linux) in `/usr/bin` or
+//!   `/bin`;
+//! - `/proc`, with `/proc/PID/stat`, `/proc/PID/task`,
+//!   `/proc/PID/task/PID/children` (a kernel built with
+//!   `CONFIG_PROC_CHILDREN`, as distributions' are) and `/proc/self/fd`,
+//!   where the tests that hold the audit log in a full pipe see the agent's
+//!   writer that waits on it ([`AuditPipe::writer_waits`]);
+//! - the file of certificate authorities that the broker requires before it
+//!   serves anything, even with the test's authority added: the first of
+//!   `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`
+//!   and `/etc/ssl/ca-bundle.pem` that exists, links resolved, a regular
+//!   file owned by root in directories owned by root, none of them writable
+//!   by group or others;
+//! - a `TMPDIR`, when one is set, short enough for a Unix socket's path
+//!   (about 80 characters): the agent's socket lives in each test's
+//!   temporary directory.
 
 #![cfg(feature = "test-upstream")]
 
 mod support;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::File;
 use std::io::{BufRead, Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -83,11 +101,17 @@ struct ScriptedUi {
     approvals: Mutex<Vec<ApprovalRequest>>,
     /// How many times the master password was asked.
     unlocks: AtomicUsize,
+    /// Runs (once) while the "human" types the next master password.
+    on_password: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Ui for ScriptedUi {
     fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
         self.unlocks.fetch_add(1, Ordering::SeqCst);
+        let hook = self.on_password.lock().expect("lock").take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let next = self.passwords.lock().expect("lock").pop_front();
         Ok(Typed::Value(SecretString::new(
             next.unwrap_or_else(|| PASSWORD.to_string()),
@@ -148,7 +172,9 @@ impl Default for Settings {
 /// An agent of the library in the test process, serving a vault of its own
 /// in a temporary directory, with scripted dialogs; its broker program is
 /// the wrapper that [`System::install_broker`] writes. The directory also
-/// holds what the commands write.
+/// holds what the commands write. Dropping it ends what the test left
+/// going, and waits for it, before the directory is removed (see its
+/// `Drop`).
 struct System {
     dir: tempfile::TempDir,
     socket: PathBuf,
@@ -156,6 +182,51 @@ struct System {
     ui: Arc<ScriptedUi>,
     agent: Arc<Agent>,
     ca: TestCa,
+    /// Runs sent and not answered yet.
+    runs: Arc<AtomicUsize>,
+    /// The lines that the pipes put in place of the audit log took instead
+    /// of it ([`AuditPipe`]).
+    tapped: Arc<Mutex<Vec<String>>>,
+    /// The gates of the outputs held for the test ([`System::start_held`]).
+    held: Mutex<Vec<Gate>>,
+}
+
+/// The file whose creation ends every command of a test that still waits
+/// for its `go` ([`waits`]): [`System`]'s drop creates it.
+const STOP: &str = "stop-all";
+
+impl Drop for System {
+    /// A test that fails may leave its runs going, their brokers serving,
+    /// and the agent with records still to write — which, written after the
+    /// directory is removed, would create it again. So, before the
+    /// directory goes: the vault is locked, which ends every grant at once
+    /// and keeps the idle timer from writing anything later; every command
+    /// still waiting is told to end, and every held output let go; and the
+    /// drop waits until every run has its answer, no grant is left (their
+    /// brokers have exited) and every grant whose creation was recorded has
+    /// its end recorded, in the log or in a pipe in its place: a grant's end
+    /// is the last record of it that the agent writes, possibly after its
+    /// run's answer. It never panics (it may run while a test fails) and
+    /// gives up after [`PATIENCE`].
+    fn drop(&mut self) {
+        let _ = self.call_within(&Request::Lock);
+        for gate in self.held.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            gate.open("drain");
+        }
+        let _ = std::fs::write(self.path(STOP), "");
+        let until = Instant::now() + PATIENCE;
+        while !self.settled() {
+            if Instant::now() >= until {
+                eprintln!(
+                    "the agent still had work {PATIENCE:?} after the test: something may be left \
+                     in {}",
+                    self.dir.path().display()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl System {
@@ -207,7 +278,32 @@ impl System {
             ui,
             agent,
             ca: TestCa::new(),
+            runs: Arc::default(),
+            tapped: Arc::default(),
+            held: Mutex::default(),
         }
+    }
+
+    /// Whether the agent has nothing left to do for the test: no run waits
+    /// for its answer, no grant is left, and every grant whose creation was
+    /// recorded has its end recorded (see the drop).
+    fn settled(&self) -> bool {
+        self.runs.load(Ordering::SeqCst) == 0
+            && matches!(
+                self.call_within(&Request::Grants),
+                Some(Response::Grants { grants }) if grants.is_empty()
+            )
+            && self.unfinished_grants().is_empty()
+    }
+
+    /// A request for the drop, which must neither fail nor wait for good:
+    /// `None` when the agent cannot be reached or does not answer within
+    /// [`PATIENCE`].
+    fn call_within(&self, request: &Request) -> Option<Response> {
+        let stream = UnixStream::connect(&self.socket).ok()?;
+        stream.set_read_timeout(Some(PATIENCE)).ok()?;
+        protocol::send_frame(&stream, request, &[]).ok()?;
+        protocol::read_message(&stream).ok()
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -380,6 +476,10 @@ impl System {
     /// grants the agent no credit for it, so the agent keeps what the
     /// command printed beyond its window, and the run cannot end.
     fn start_held(&self, request: BrokerRunRequest, gate: Gate) -> Running {
+        self.held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(gate.clone());
         let output = Captured::default();
         let held = HeldOutput {
             gate,
@@ -401,11 +501,15 @@ impl System {
             stderr: Box::new(output.clone()),
         };
         let (tx, answer) = mpsc::channel();
+        let runs = Arc::clone(&self.runs);
+        runs.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             let result = client
                 .broker_run_with(request, io)
                 .map_err(|e| format!("{e:#}"));
+            // Answered first: a run counted done has its answer there.
             let _ = tx.send(result);
+            runs.fetch_sub(1, Ordering::SeqCst);
         });
         Running { answer, output }
     }
@@ -437,9 +541,12 @@ impl System {
             }
         });
         let (tx, answer) = mpsc::channel();
+        let runs = Arc::clone(&self.runs);
+        runs.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
             let result = protocol::read_message::<Response>(&stream).map_err(|e| e.to_string());
             let _ = tx.send(result);
+            runs.fetch_sub(1, Ordering::SeqCst);
         });
         Running { answer, output }
     }
@@ -605,6 +712,21 @@ impl System {
             .collect()
     }
 
+    /// The outcomes recorded for the requests of the grant `id`, by request
+    /// number, each request's in the order they were recorded.
+    fn outcomes_by_request(&self, id: &str) -> BTreeMap<u64, Vec<String>> {
+        let mut outcomes: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for record in self.requests_of(id) {
+            let number = record["request"].as_u64().expect("a request number");
+            let outcome = record["outcome"].as_str().expect("an outcome");
+            outcomes
+                .entry(number)
+                .or_default()
+                .push(outcome.to_string());
+        }
+        outcomes
+    }
+
     /// The record of the end of the grant `id`, once it is written.
     fn end_of(&self, id: &str) -> Value {
         eventually("the grant's end record", || {
@@ -614,32 +736,231 @@ impl System {
         })
     }
 
-    /// Make the audit log unwritable until the guard is dropped: a directory
-    /// in its place, the log itself kept aside (works as root too).
-    fn break_audit(&self) -> BrokenAudit {
-        let aside = self.audit.with_extension("aside");
-        let kept = std::fs::rename(&self.audit, &aside).is_ok();
-        std::fs::create_dir(&self.audit).expect("a directory where the log was");
-        BrokenAudit {
-            path: self.audit.clone(),
-            aside: kept.then_some(aside),
-        }
+    /// The records that the agent tried to write while a pipe was in place
+    /// of the log, and that failed ([`AuditPipe`]), in order.
+    fn tapped_records(&self) -> Vec<Value> {
+        self.tapped
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// The end records of grants, by grant ID: those written, and those the
+    /// agent tried to write while a pipe was in place of the log.
+    fn end_records(&self) -> BTreeMap<String, Value> {
+        self.records()
+            .into_iter()
+            .chain(self.tapped_records())
+            .filter(|r| r["action"] == "grant" && r["outcome"] == "ended")
+            .filter_map(|r| Some((r["grant"].as_str()?.to_string(), r)))
+            .collect()
+    }
+
+    /// The record of the end of the grant `id`, once the agent has written
+    /// it, or tried to while a pipe was in place of the log.
+    fn end_anywhere(&self, id: &str) -> Value {
+        eventually("the grant's end record", || self.end_records().remove(id))
+    }
+
+    /// The grants whose creation was recorded and whose end is not, in the
+    /// log or a pipe in its place, yet. (A creation is recorded only in the
+    /// log: one that cannot be written fails the run, and that grant's end
+    /// is not recorded.)
+    fn unfinished_grants(&self) -> Vec<String> {
+        let ended = self.end_records();
+        self.records()
+            .into_iter()
+            .filter(|r| r["action"] == "grant" && r["outcome"] == "created")
+            .filter_map(|r| r["grant"].as_str().map(str::to_string))
+            .filter(|id| !ended.contains_key(id))
+            .collect()
+    }
+
+    /// Make the audit log unwritable until the guard is dropped: a pipe in
+    /// its place, read at once ([`AuditPipe`]): every record fails, and
+    /// nobody waits.
+    fn break_audit(&self) -> AuditPipe {
+        let mut pipe = AuditPipe::install(&self.audit, Arc::clone(&self.tapped), false);
+        pipe.open();
+        pipe
+    }
+
+    /// Hold the audit log until the test opens the guard: a full pipe in its
+    /// place, which nobody reads yet ([`AuditPipe`]). A record waits until
+    /// [`AuditPipe::open`] — and every other record of the agent, behind it
+    /// — and then fails.
+    fn hold_audit(&self) -> AuditPipe {
+        AuditPipe::install(&self.audit, Arc::clone(&self.tapped), true)
     }
 }
 
-/// The audit log made unwritable ([`System::break_audit`]); put back when
-/// dropped.
-struct BrokenAudit {
+/// A named pipe put in place of the audit log ([`System::break_audit`],
+/// [`System::hold_audit`]). A record written to it fails — a pipe cannot be
+/// synced — though its text goes through: once the pipe is opened
+/// ([`AuditPipe::open`]), a thread reads it, and its lines go to the test
+/// and to the system's `tapped`. The test holds the pipe open itself, for
+/// reading and writing, from before the pipe is in place: nobody ever waits
+/// in opening it, so a writer is always seen ([`AuditPipe::writer_waits`]).
+/// Dropping it puts the log back.
+struct AuditPipe {
+    /// The audit log's path, where the pipe is.
     path: PathBuf,
+    /// The log meanwhile: a second name of its file.
     aside: Option<PathBuf>,
+    /// The pipe, open for reading and writing, never blocking.
+    holder: Option<File>,
+    /// The end that the reading thread reads, until it starts.
+    reader: Option<File>,
+    /// The descriptors of the two.
+    own: [RawFd; 2],
+    /// The pipe's device and inode.
+    file: (u64, u64),
+    tapped: Arc<Mutex<Vec<String>>>,
+    reading: Option<JoinHandle<()>>,
 }
 
-impl Drop for BrokenAudit {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
-        if let Some(aside) = &self.aside {
-            let _ = std::fs::rename(aside, &self.path);
+impl AuditPipe {
+    /// Put a pipe in place of the log at `path`, filled when `full` says so:
+    /// a writer then waits until the pipe is read. The log keeps what it
+    /// has, and what a writer that had opened it before writes to it.
+    fn install(path: &Path, tapped: Arc<Mutex<Vec<String>>>, full: bool) -> AuditPipe {
+        use nix::sys::stat::Mode;
+        let fifo = path.with_extension("fifo");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("mkfifo");
+        let holder = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&fifo)
+            .expect("open the pipe");
+        // A writer is there (the holder): this does not wait either.
+        let reader = File::open(&fifo).expect("open the pipe for reading");
+        if full {
+            fill(&holder);
         }
+        let aside = path.with_extension("aside");
+        let aside = match std::fs::hard_link(path, &aside) {
+            Ok(()) => Some(aside),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("cannot keep the log aside: {e}"),
+        };
+        std::fs::rename(&fifo, path).expect("put the pipe in place of the log");
+        let meta = holder.metadata().expect("the pipe's metadata");
+        AuditPipe {
+            path: path.to_path_buf(),
+            aside,
+            own: [holder.as_raw_fd(), reader.as_raw_fd()],
+            file: (meta.dev(), meta.ino()),
+            holder: Some(holder),
+            reader: Some(reader),
+            tapped,
+            reading: None,
+        }
+    }
+
+    /// Read the pipe from now on: the record that waits is written, and
+    /// fails; its line, and every later one, arrive on the channel. (Once
+    /// only: a later call returns a channel that gets nothing.)
+    fn open(&mut self) -> mpsc::Receiver<String> {
+        let (tx, lines) = mpsc::channel();
+        let Some(reader) = self.reader.take() else {
+            return lines;
+        };
+        let tapped = Arc::clone(&self.tapped);
+        self.reading = Some(std::thread::spawn(move || {
+            for line in std::io::BufReader::new(reader).lines() {
+                let Ok(line) = line else { return };
+                if line == "stop" {
+                    return;
+                }
+                // What filled the pipe.
+                if line.starts_with('#') {
+                    continue;
+                }
+                tapped
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(line.clone());
+                let _ = tx.send(line);
+            }
+        }));
+        lines
+    }
+
+    /// Whether a writer other than the test has the pipe open: a record is
+    /// being written to it — and, the pipe full, waits until it is read.
+    /// (It looks for the pipe among this process's open files.)
+    fn writer_waits(&self) -> bool {
+        let Ok(fds) = std::fs::read_dir("/proc/self/fd") else {
+            return false;
+        };
+        fds.flatten().any(|fd| {
+            let number = fd
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<RawFd>().ok());
+            let theirs = number.is_some_and(|n| !self.own.contains(&n));
+            theirs && std::fs::metadata(fd.path()).is_ok_and(|m| (m.dev(), m.ino()) == self.file)
+        })
+    }
+}
+
+/// Fill a pipe until a write would wait, with lines of `#` whose length
+/// divides a page's: every page of the pipe is then full, so that a record
+/// can be added to none and waits for one to be read.
+fn fill(mut pipe: &File) {
+    let mut junk = [b'#'; 64];
+    junk[63] = b'\n';
+    // Far more than any pipe's capacity (1 MiB at most by default).
+    for _ in 0..(16 << 20) / junk.len() {
+        match pipe.write(&junk) {
+            Ok(n) => assert_eq!(n, junk.len(), "a pipe took part of a short line"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) => panic!("cannot fill the pipe: {e}"),
+        }
+    }
+    panic!("the pipe never filled");
+}
+
+impl Drop for AuditPipe {
+    /// Let a waiting record go; put the log back, which every record from
+    /// then on goes to; and stop reading once no other writer has the pipe
+    /// open (one that opened it before the log was back may still write).
+    /// The test's own end stays open for good, so that a writer that found
+    /// the pipe just before the log was back never waits in opening it.
+    fn drop(&mut self) {
+        let _ = self.open();
+        match &self.aside {
+            Some(aside) => {
+                let _ = std::fs::rename(aside, &self.path);
+            }
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        let until = Instant::now() + PATIENCE;
+        while self.writer_waits() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(holder) = self.holder.take() else {
+            return;
+        };
+        let mut stopped = false;
+        while !stopped && Instant::now() < until {
+            match (&holder).write(b"stop\n") {
+                Ok(_) => stopped = true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        if stopped && let Some(reading) = self.reading.take() {
+            let _ = reading.join();
+        }
+        std::mem::forget(holder);
     }
 }
 
@@ -723,11 +1044,13 @@ impl Write for HeldOutput {
 }
 
 /// A command that writes its environment to `env-TAG.txt`, all at once,
-/// then waits until the test creates `go-TAG` (about a minute at most).
+/// then waits until the test creates `go-TAG`, or the drop of the test's
+/// [`System`] creates [`STOP`] (about a minute at most).
 fn waits(tag: &str) -> String {
     format!(
         "env > env-{tag}.new && mv env-{tag}.new env-{tag}.txt; i=0; \
-         while [ ! -e go-{tag} ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done"
+         while [ ! -e go-{tag} ] && [ ! -e {STOP} ] && [ $i -lt 1200 ]; do \
+         sleep 0.05; i=$((i+1)); done"
     )
 }
 
@@ -776,6 +1099,11 @@ fn anthropic_ending(destination: &Destination) -> ProfileRequest {
         automatic_locks: Some(AutomaticLocks::End),
         ..anthropic(destination)
     }
+}
+
+/// Owned copies of `list`.
+fn strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
 }
 
 /// A response as a test message describes it (never a value).
@@ -891,20 +1219,6 @@ fn threads(pid: u32) -> usize {
     std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |tasks| tasks.count())
 }
 
-/// Whether a thread of this test process waits in the opening of a named
-/// pipe that nobody reads (the kernel's `wait_for_partner`): the agent's
-/// thread that writes the audit log, once the log is such a pipe
-/// ([`PipedAudit`], which one test at a time has).
-fn a_thread_waits_for_a_pipe() -> bool {
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-        return false;
-    };
-    tasks.flatten().any(|task| {
-        std::fs::read_to_string(task.path().join("wchan"))
-            .is_ok_and(|wchan| wchan.trim() == "wait_for_partner")
-    })
-}
-
 /// Fail if any of `secrets` is in `text`, saying where (never the secret).
 fn assert_free_of(what: &str, text: &str, secrets: &[&str]) {
     for (n, secret) in secrets.iter().enumerate() {
@@ -1016,15 +1330,15 @@ fn event_numbers(text: &str) -> Vec<usize> {
 }
 
 /// Holds each request until the test opens the gate named by its target's
-/// last segment, then answers `200` with that name as the body.
+/// last segment — or, for `GET /v1/models?after_id=NAME`, by its query —
+/// then answers `200` with that name as the body.
 fn held(gate: Gate) -> Handler {
     Arc::new(move |request, peer| {
-        let name = request
-            .target
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let name = match request.target.split_once("?after_id=") {
+            Some((_, name)) => name,
+            None => request.target.rsplit('/').next().unwrap_or_default(),
+        }
+        .to_string();
         if !gate.wait(&name) {
             return;
         }
@@ -1604,16 +1918,18 @@ fn requests_off_the_routes_or_badly_framed_are_refused_and_reach_nothing() {
 // ===== Destination =====
 
 /// The broker reaches the profile's destination and no other, whatever the
-/// environments say: `Host` and SNI are the profile's. The requester's
-/// proxy and certificate variables reach the command and not the broker,
-/// which the agent starts with nothing of its own either — no variable,
-/// `/` as its working directory — and the same variables in the broker's
-/// own environment (as if the agent passed them on) change nothing: no
-/// proxy is used, the test's authority is still trusted, and a destination
-/// whose certificate only the authority they name vouches for is not
-/// reached. A redirect reaches the client as `502` without its `Location`,
-/// and a compressed response is refused before anything of it reaches the
-/// client; both are recorded as sent, with an unknown outcome.
+/// environments say: `Host` and SNI are the profile's, and ALPN is
+/// `http/1.1`, the one protocol the broker offers (the destination would
+/// rather have `h2`). The requester's proxy and certificate variables reach
+/// the command and not the broker, which the agent starts with nothing of
+/// its own either — no variable, `/` as its working directory — and the
+/// same variables in the broker's own environment (as if the agent passed
+/// them on) change nothing: no proxy is used, the test's authority is still
+/// trusted, and a destination whose certificate only the authority they
+/// name vouches for is not reached. A redirect reaches the client as `502`
+/// without its `Location`, and a compressed response is refused before
+/// anything of it reaches the client; both are recorded as sent, with an
+/// unknown outcome.
 #[test]
 fn the_broker_reaches_the_profiles_destination_whatever_the_environment_says() {
     let sys = System::new();
@@ -1976,7 +2292,7 @@ fn a_request_limit_of_n_lets_n_through_however_many_arrive_at_once() {
 /// twenty refused for want of an audit record leave all sixteen — and a
 /// request that ends frees its slot. Requests that end in another order
 /// than they started are counted by their numbers: the listing and the
-/// audit log agree.
+/// audit log agree, and each request's end is recorded with its own route.
 #[test]
 fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_in() {
     let sys = System::new();
@@ -1996,11 +2312,27 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         }
     }
     // Sixteen held at the destination (requests 21 to 36), numbered in the
-    // order they arrive.
+    // order they arrive, of two routes in turn: so that a request's end is
+    // recorded with its own route only if the agent frees it by its own
+    // number.
+    let target = |n: usize| {
+        if n % 2 == 1 {
+            format!("/v1/models/r{n}")
+        } else {
+            format!("/v1/models?after_id=r{n}")
+        }
+    };
+    let route = |n: usize| {
+        if n % 2 == 1 {
+            "GET /v1/models/{id}"
+        } else {
+            "GET /v1/models"
+        }
+    };
     let mut clients = Vec::new();
     for n in 1..=16 {
         let mut client = ep.connect();
-        client.write(&ep.request("GET", &format!("/v1/models/r{n}"), &[], b""));
+        client.write(&ep.request("GET", &target(n), &[], b""));
         destination.wait_for(n);
         clients.push(client);
     }
@@ -2019,7 +2351,7 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         (sys.grant(&a.id).expect("listed").in_flight == 15).then_some(())
     });
     let mut client = ep.connect();
-    client.write(&ep.request("GET", "/v1/models/r17", &[], b""));
+    client.write(&ep.request("GET", &target(17), &[], b""));
     destination.wait_for(17);
     clients.push(client);
     // The others end last first.
@@ -2040,25 +2372,32 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         sys.end_of(&a.id)["requests"],
         serde_json::json!({"admitted": 17, "finished": 17, "unknown": 0, "refused": 21})
     );
-    let numbers = |outcome: &str| -> Vec<u64> {
+    // Each request by its number and route, as admitted and as ended.
+    let records = |outcome: &str| -> Vec<(u64, String)> {
         sys.requests_of(&a.id)
             .into_iter()
             .filter(|r| r["outcome"] == outcome)
             .map(|r| {
-                assert_eq!(r["route"], "GET /v1/models/{id}");
-                r["request"].as_u64().expect("a number")
+                let number = r["request"].as_u64().expect("a number");
+                (number, r["route"].as_str().expect("a route").to_string())
             })
             .collect()
     };
-    assert_eq!(numbers("admitted"), (21..=37).collect::<Vec<u64>>());
-    let mut ended = vec![21];
-    ended.extend((22..=37).rev());
-    assert_eq!(numbers("completed"), ended);
+    let admitted: Vec<(u64, String)> = (1..=17)
+        .map(|n| (20 + n as u64, route(n).to_string()))
+        .collect();
+    assert_eq!(records("admitted"), admitted);
+    let ended: Vec<(u64, String)> = [1]
+        .into_iter()
+        .chain((2..=17).rev())
+        .map(|n| (20 + n as u64, route(n).to_string()))
+        .collect();
+    assert_eq!(records("completed"), ended);
 }
 
 // ===== Revocation =====
 
-/// How a test ends a grant.
+/// How a test ends grants.
 #[derive(Debug, Clone, Copy)]
 enum Ending {
     Lock,
@@ -2070,27 +2409,49 @@ enum Ending {
     EntryEdit,
 }
 
-/// End a grant with a stream open through it as `ending` says, and check,
-/// once the ending is reported done: the stream is cut at the client — no
-/// event the destination began after that reaches it — and at the
-/// destination, the token is refused, nothing more reaches the
-/// destination; the stream's end is unknown (it may have reached the
-/// destination), and the grant's end says `reason`.
+impl Ending {
+    /// Whether it ends every grant of every run: the explicit lock and
+    /// revoking every grant do, and so do the automatic locks for grants
+    /// whose profile says `end` (both profiles of these tests do then).
+    /// Revoking one grant, or changing one entry, ends only that grant, or
+    /// that entry's.
+    fn ends_every_grant(self) -> bool {
+        matches!(
+            self,
+            Ending::Lock | Ending::RevokeAll | Ending::ScreenLock | Ending::Suspend
+        )
+    }
+}
+
+/// Two runs, each with a grant of an entry of its own and a stream open
+/// through it: end grants as `ending` says — for an ending of one grant,
+/// the first run's, or its entry's — and check, once the ending is reported
+/// done, for each grant it ends: the stream is cut at the client — no event
+/// the destination began after that reaches it — and at the destination,
+/// the token is refused, nothing more reaches the destination, the stream's
+/// end is unknown (it may have reached the destination), and the grant's
+/// end says `reason`. The other grant, when the ending is not for it, goes
+/// on, its stream too, until its command ends.
 fn assert_ending_cuts_streams(ending: Ending, reason: &str) {
     let sys = System::new();
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
-    sys.seed(&[("KEY", CREDENTIAL)]);
-    let profile = match ending {
-        Ending::ScreenLock | Ending::Suspend => anthropic_ending(&destination),
-        _ => anthropic(&destination),
-    };
-    sys.set_profile("KEY", profile);
+    sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
+    for entry in ["KEY", "OTHER"] {
+        let profile = match ending {
+            Ending::ScreenLock | Ending::Suspend => anthropic_ending(&destination),
+            _ => anthropic(&destination),
+        };
+        sys.set_profile(entry, profile);
+    }
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
+    let b = sys.start_grant("OTHER", "b");
     assert_works(&a.endpoint);
+    assert_works(&b.endpoint);
     let mut stream = open_stream(&a.endpoint);
-    assert_eq!(destination.connections(), 2);
+    let mut other = open_stream(&b.endpoint);
+    assert_eq!(destination.connections(), 4);
     match ending {
         Ending::Lock => {
             let response = sys.call(&Request::Lock);
@@ -2129,65 +2490,92 @@ fn assert_ending_cuts_streams(ending: Ending, reason: &str) {
             },
         ),
     }
-    // Reported done: the grant has ended, its stream is cut, both ways.
+    // Reported done: the grants it ends have ended, their streams are cut,
+    // both ways.
     let before = streams.sent();
+    let every = ending.ends_every_grant();
     assert_eq!(sys.state(&a.id).as_deref(), Some("revoked"), "{ending:?}");
     assert_cut(&mut stream, before);
-    streams.wait_closed(1);
+    if every {
+        assert_eq!(sys.state(&b.id).as_deref(), Some("revoked"), "{ending:?}");
+        assert_cut(&mut other, before);
+    }
+    streams.wait_closed(if every { 2 } else { 1 });
     assert_nothing_more_forwarded(&a.endpoint, &destination);
-    sys.go("a");
-    assert_eq!(a.running.exit_code(), Some(0));
-    let end = sys.end_of(&a.id);
-    assert_eq!(end["reason"], reason, "{ending:?}: {end}");
-    assert_eq!(
-        end["requests"],
-        serde_json::json!({"admitted": 2, "finished": 2, "unknown": 0, "refused": 0}),
-        "{ending:?}"
-    );
-    let outcomes: Vec<Value> = sys
-        .requests_of(&a.id)
-        .into_iter()
-        .map(|r| r["outcome"].clone())
-        .collect();
-    assert_eq!(
-        outcomes,
-        ["admitted", "completed", "admitted", "unknown"],
-        "{ending:?}"
-    );
+    if every {
+        assert_nothing_more_forwarded(&b.endpoint, &destination);
+    } else {
+        assert_eq!(sys.state(&b.id).as_deref(), Some("active"), "{ending:?}");
+        assert_goes_on(&mut other);
+        assert_works(&b.endpoint);
+    }
+    for (started, tag) in [(&a, "a"), (&b, "b")] {
+        sys.go(tag);
+        assert_eq!(started.running.exit_code(), Some(0), "{tag}");
+    }
+    // The other's stream ends with its command.
+    if !every {
+        assert_cut(&mut other, streams.sent());
+    }
+    let ended = |id: &str, reason: &str, plain: u64| {
+        let end = sys.end_of(id);
+        assert_eq!(end["reason"], reason, "{ending:?}: {end}");
+        let admitted = plain + 1;
+        assert_eq!(
+            end["requests"],
+            serde_json::json!({
+                "admitted": admitted, "finished": admitted, "unknown": 0, "refused": 0
+            }),
+            "{ending:?}: {end}"
+        );
+        // The plain requests completed, and the stream (request 2) ended
+        // unknown.
+        let mut expected: BTreeMap<u64, Vec<String>> = (1..=admitted)
+            .map(|n| (n, strings(&["admitted", "completed"])))
+            .collect();
+        expected.insert(2, strings(&["admitted", "unknown"]));
+        assert_eq!(sys.outcomes_by_request(id), expected, "{ending:?}");
+    };
+    ended(&a.id, reason, 1);
+    if every {
+        ended(&b.id, reason, 1);
+    } else {
+        ended(&b.id, "command_ended", 2);
+    }
 }
 
 #[test]
-fn rusthorse_lock_cuts_open_streams_and_nothing_is_forwarded_after_it() {
+fn rusthorse_lock_cuts_the_streams_of_every_run_and_nothing_is_forwarded_after_it() {
     assert_ending_cuts_streams(Ending::Lock, "locked");
 }
 
 #[test]
-fn revoking_one_grant_by_hand_cuts_its_streams_and_nothing_is_forwarded_after_it() {
+fn revoking_one_grant_by_hand_cuts_its_streams_only_and_nothing_is_forwarded_for_it() {
     assert_ending_cuts_streams(Ending::RevokeOne, "revoked");
 }
 
 #[test]
-fn revoking_every_grant_by_hand_cuts_open_streams_and_nothing_is_forwarded_after_it() {
+fn revoking_every_grant_by_hand_cuts_the_streams_of_every_run_and_nothing_is_forwarded() {
     assert_ending_cuts_streams(Ending::RevokeAll, "revoked");
 }
 
 #[test]
-fn a_screen_lock_cuts_the_streams_of_a_grant_whose_profile_says_end() {
+fn a_screen_lock_cuts_the_streams_of_every_grant_whose_profile_says_end() {
     assert_ending_cuts_streams(Ending::ScreenLock, "screen_locked");
 }
 
 #[test]
-fn a_suspend_cuts_the_streams_of_a_grant_whose_profile_says_end() {
+fn a_suspend_cuts_the_streams_of_every_grant_whose_profile_says_end() {
     assert_ending_cuts_streams(Ending::Suspend, "suspend");
 }
 
 #[test]
-fn a_change_to_the_profile_cuts_its_grants_streams_in_flight() {
+fn a_change_to_the_profile_cuts_its_grants_streams_in_flight_and_no_others() {
     assert_ending_cuts_streams(Ending::ProfileEdit, "entry_changed");
 }
 
 #[test]
-fn a_change_to_the_entry_cuts_its_grants_streams_in_flight() {
+fn a_change_to_the_entry_cuts_its_grants_streams_in_flight_and_no_others() {
     assert_ending_cuts_streams(Ending::EntryEdit, "entry_changed");
 }
 
@@ -2319,7 +2707,7 @@ fn a_grant_whose_lifetime_passes_cuts_its_streams() {
 
 /// An admission waiting for its audit record when the grant is revoked is
 /// refused: the revocation does not wait for the audit log — the record is
-/// held, the log a named pipe nobody reads yet — and answers the admission
+/// held, the log a full pipe nobody reads yet — and answers the admission
 /// at once; the client gets `403`, nothing reaches the destination, and the
 /// record, once written, does not admit it.
 #[test]
@@ -2331,11 +2719,11 @@ fn an_admission_waiting_for_its_record_is_refused_when_the_grant_is_revoked() {
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
-    let mut piped = PipedAudit::new(&sys.audit);
+    let mut piped = sys.hold_audit();
     let mut waiting = ep.connect();
     waiting.write(&ep.request("POST", "/v1/messages", &[], b"{}"));
     eventually("the admission's record to wait on the pipe", || {
-        a_thread_waits_for_a_pipe().then_some(())
+        piped.writer_waits().then_some(())
     });
     assert_eq!(sys.grant(&a.id).expect("listed").in_flight, 1);
     // Revoked meanwhile: done while the record still waits.
@@ -2355,7 +2743,7 @@ fn an_admission_waiting_for_its_record_is_refused_when_the_grant_is_revoked() {
         describe(&response)
     );
     assert!(
-        a_thread_waits_for_a_pipe(),
+        piped.writer_waits(),
         "the record was written before the revocation was done"
     );
     if !waiting.closed_within(Duration::from_secs(5)) {
@@ -2398,97 +2786,13 @@ fn an_admission_waiting_for_its_record_is_refused_when_the_grant_is_revoked() {
     assert_eq!(a.running.exit_code(), Some(0));
 }
 
-/// The audit log replaced by a named pipe that nobody reads: a record
-/// blocks the thread that writes it — and every other record, behind it —
-/// until [`PipedAudit::open`] opens the pipe, and every record written then
-/// fails (a pipe cannot be synced), though its text goes through. Dropping
-/// it puts the log back.
-///
-/// One test at a time has one ([`PIPES`]), so that a thread of this
-/// process waiting in the opening of a pipe is that test's
-/// ([`a_thread_waits_for_a_pipe`]).
-struct PipedAudit {
-    path: PathBuf,
-    aside: PathBuf,
-    reader: Option<JoinHandle<()>>,
-    /// Dropped last, once the pipe is gone.
-    _turn: MutexGuard<'static, ()>,
-}
-
-/// Held by the [`PipedAudit`] of the test that has one.
-static PIPES: Mutex<()> = Mutex::new(());
-
-impl PipedAudit {
-    fn new(path: &Path) -> PipedAudit {
-        let turn = PIPES.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(
-            !a_thread_waits_for_a_pipe(),
-            "a thread still waits for another test's pipe"
-        );
-        let aside = path.with_extension("aside");
-        std::fs::rename(path, &aside).expect("put the log aside");
-        let made = Command::new("/usr/bin/mkfifo")
-            .args(["-m", "600"])
-            .arg(path)
-            .status()
-            .expect("mkfifo");
-        assert!(made.success(), "mkfifo failed");
-        PipedAudit {
-            path: path.to_path_buf(),
-            aside,
-            reader: None,
-            _turn: turn,
-        }
-    }
-
-    /// Open the pipe (for reading and writing, which never blocks): the
-    /// records waiting for it are written; their lines, and every later
-    /// one's, arrive on the channel.
-    fn open(&mut self) -> mpsc::Receiver<String> {
-        let pipe = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .expect("open the pipe");
-        let (tx, lines) = mpsc::channel();
-        self.reader = Some(std::thread::spawn(move || {
-            for line in std::io::BufReader::new(pipe).lines() {
-                match line {
-                    Ok(line) if line == "stop" => return,
-                    Ok(line) => {
-                        let _ = tx.send(line);
-                    }
-                    Err(_) => return,
-                }
-            }
-        }));
-        lines
-    }
-}
-
-impl Drop for PipedAudit {
-    fn drop(&mut self) {
-        if self.reader.is_none() {
-            let _ = self.open();
-        }
-        if let Ok(mut pipe) = std::fs::File::options().write(true).open(&self.path) {
-            let _ = pipe.write_all(b"stop\n");
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::rename(&self.aside, &self.path);
-    }
-}
-
 /// The unlock barrier: a grant that survived a lock goes on through an
 /// unlock of an unchanged file, through the agent's own save of another
-/// entry, and through a failed unlock after another program changed the
-/// file — which keeps the fingerprint the agent had, so the change is
-/// still found — and ends, its stream cut, at the unlock that finds the
-/// change: another entry's value, or its own entry moved, with the file's
-/// modification time put back each time.
+/// entry, and through an unlock that fails, for wrong passwords, after
+/// another program changed the file; and it ends, its stream cut, at the
+/// unlock that finds the change: another entry's value, or its own entry
+/// moved, with the file's modification time put back each time. (A failed
+/// unlock that has read the changed file: the next test.)
 #[test]
 fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_the_file() {
     let sys = System::new();
@@ -2521,18 +2825,7 @@ fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_th
     // Another program changes another entry's value while the vault is
     // locked.
     sys.agent.lock_for(SCREEN_LOCK, "test");
-    sys.change_elsewhere(|vault| {
-        let other = vault.find("OTHER").expect("find");
-        vault
-            .edit(
-                other,
-                &EntryChanges::default(),
-                Some(&SecretString::new(
-                    "sk-ant-test-2222FAKE2222changed-2222".into(),
-                )),
-            )
-            .expect("change the value");
-    });
+    sys.change_elsewhere(change_the_other_value);
     let mut stream = open_stream(&a.endpoint);
     // A failed unlock finds nothing yet.
     sys.ui.passwords.lock().expect("lock").extend([
@@ -2556,6 +2849,7 @@ fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_th
     // Its own entry moved to another group.
     let b = sys.start_grant("KEY", "b");
     assert_works(&b.endpoint);
+    let mut stream = open_stream(&b.endpoint);
     sys.agent.lock_for(SCREEN_LOCK, "test");
     sys.change_elsewhere(|vault| {
         let key = vault.find("KEY").expect("find");
@@ -2567,7 +2861,10 @@ fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_th
     });
     assert_works(&b.endpoint);
     sys.unlock();
+    let before = streams.sent();
     assert_eq!(sys.state(&b.id).as_deref(), Some("revoked"));
+    assert_cut(&mut stream, before);
+    streams.wait_closed(2);
     assert_nothing_more_forwarded(&b.endpoint, &destination);
     for (started, tag) in [(&a, "a"), (&b, "b")] {
         sys.go(tag);
@@ -2587,11 +2884,97 @@ fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_th
     assert_eq!(unlocked, 2, "{}", sys.audit_text());
 }
 
+/// Another program's change to the entry `OTHER` while the vault is
+/// locked: a new value.
+fn change_the_other_value(vault: &mut Vault) {
+    let other = vault.find("OTHER").expect("find");
+    vault
+        .edit(
+            other,
+            &EntryChanges::default(),
+            Some(&SecretString::new(
+                "sk-ant-test-2222FAKE2222changed-2222".into(),
+            )),
+        )
+        .expect("change the value");
+}
+
+/// The failed unlock that has read the changed file — one that a lock
+/// cancels while the password is typed, as the screen locking again does —
+/// keeps the fingerprint of the last unlock: the grant that survived the
+/// lock goes on through it, its stream too, and the change is still found
+/// at the next unlock, which ends the grant and cuts its stream. (A wrong
+/// password reads nothing: the barrier test above.)
+#[test]
+fn an_unlock_cancelled_by_a_lock_keeps_the_last_fingerprint_and_the_next_one_ends_the_grants() {
+    let sys = System::new();
+    let streams = Streams::default();
+    let destination = Destination::new(&sys.ca, streams.handler());
+    sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
+    sys.set_profile("KEY", anthropic(&destination));
+    sys.install_broker(&[]);
+    let a = sys.start_grant("KEY", "a");
+    let mut stream = open_stream(&a.endpoint);
+    sys.agent.lock_for(SCREEN_LOCK, "test");
+    assert_eq!(sys.state(&a.id).as_deref(), Some("active"));
+    sys.change_elsewhere(change_the_other_value);
+    // The screen locks again while the password is typed: the agent reads
+    // the file, then finds the vault locked meanwhile.
+    let agent = Arc::downgrade(&sys.agent);
+    *sys.ui.on_password.lock().expect("lock") = Some(Box::new(move || {
+        if let Some(agent) = agent.upgrade() {
+            agent.lock_for(SCREEN_LOCK, "test");
+        }
+    }));
+    let asked = sys.ui.unlocks.load(Ordering::SeqCst);
+    let (code, message) = error_of(&sys.call(&Request::Unlock));
+    assert_eq!(code, ErrorCode::Locked, "{message}");
+    assert!(
+        message.contains("locked while the password was being entered"),
+        "{message}"
+    );
+    assert_eq!(sys.ui.unlocks.load(Ordering::SeqCst), asked + 1);
+    assert!(sys.status().locked);
+    assert_eq!(sys.state(&a.id).as_deref(), Some("active"));
+    assert_goes_on(&mut stream);
+    assert_works(&a.endpoint);
+    // The next unlock finds the change, and ends the grant before it is
+    // done.
+    sys.unlock();
+    let before = streams.sent();
+    assert_eq!(sys.state(&a.id).as_deref(), Some("revoked"));
+    assert_cut(&mut stream, before);
+    streams.wait_closed(1);
+    assert_nothing_more_forwarded(&a.endpoint, &destination);
+    sys.go("a");
+    assert_eq!(a.running.exit_code(), Some(0));
+    assert_eq!(sys.end_of(&a.id)["reason"], "vault_changed");
+    let unlocks: Vec<(Value, bool)> = sys
+        .records()
+        .into_iter()
+        .filter(|r| r["action"] == "unlock")
+        .map(|r| {
+            let found = r["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("changed by another program"));
+            (r["outcome"].clone(), found)
+        })
+        .collect();
+    assert_eq!(
+        unlocks,
+        [
+            (serde_json::json!("unlocked"), false),
+            (serde_json::json!("cancelled_by_lock"), false),
+            (serde_json::json!("unlocked"), true),
+        ]
+    );
+}
+
 /// The unlock barrier ends grants without waiting for the audit log (ADR
 /// 0013: "Revocation never waits for the audit log"): at the unlock that
 /// finds the vault file changed by another program, the stream of a grant
 /// that survived the lock is cut while that unlock's own record still
-/// waits — the log is a named pipe nobody reads yet. Once the record
+/// waits — the log is a full pipe nobody reads yet. Once the record
 /// fails, the unlock fails, and the vault stays locked.
 #[test]
 #[ignore = "P01: fixed in broker-p1-fix-agent; run with --ignored once it is merged"]
@@ -2605,19 +2988,8 @@ fn the_unlock_barrier_cuts_streams_before_the_unlock_is_recorded() {
     let a = sys.start_grant("KEY", "a");
     let mut stream = open_stream(&a.endpoint);
     sys.agent.lock_for(SCREEN_LOCK, "test");
-    sys.change_elsewhere(|vault| {
-        let other = vault.find("OTHER").expect("find");
-        vault
-            .edit(
-                other,
-                &EntryChanges::default(),
-                Some(&SecretString::new(
-                    "sk-ant-test-2222FAKE2222changed-2222".into(),
-                )),
-            )
-            .expect("change the value");
-    });
-    let mut piped = PipedAudit::new(&sys.audit);
+    sys.change_elsewhere(change_the_other_value);
+    let mut piped = sys.hold_audit();
     let (tx, unlocked) = mpsc::channel();
     let client = sys.client();
     std::thread::spawn(move || {
@@ -2628,12 +3000,12 @@ fn the_unlock_barrier_cuts_streams_before_the_unlock_is_recorded() {
         (sys.state(&a.id).as_deref() == Some("revoked")).then_some(())
     });
     eventually("the unlock's record to wait on the pipe", || {
-        a_thread_waits_for_a_pipe().then_some(())
+        piped.writer_waits().then_some(())
     });
     // Its broker is told and confirms (or is killed) within about a second
     // of the decision: well within this limit, though the record waits.
     assert_cut_while(&mut stream, Duration::from_secs(10), || {
-        a_thread_waits_for_a_pipe() && matches!(unlocked.try_recv(), Err(mpsc::TryRecvError::Empty))
+        piped.writer_waits() && matches!(unlocked.try_recv(), Err(mpsc::TryRecvError::Empty))
     });
     streams.wait_closed(1);
     assert_nothing_more_forwarded(&a.endpoint, &destination);
@@ -2690,8 +3062,11 @@ fn a_stolen_token_stops_working_once_the_commands_leader_exits() {
     let descendant = sys.path("descendant.sh");
     std::fs::write(
         &descendant,
-        "echo $$ > descendant.pid\ni=0\n\
-         while [ ! -e release ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n",
+        format!(
+            "echo $$ > descendant.pid\ni=0\n\
+             while [ ! -e release ] && [ ! -e {STOP} ] && [ $i -lt 1200 ]; do \
+             sleep 0.05; i=$((i+1)); done\n"
+        ),
     )
     .expect("write");
     sys.decide(&[Decision::AllowOnce]);
@@ -3152,8 +3527,9 @@ fn an_admission_that_cannot_be_recorded_is_not_forwarded() {
 /// A request whose end cannot be recorded ends its grant (`audit_failed`):
 /// the client got its whole answer, but the grant admits nothing more — new
 /// requests get `403` and nothing more reaches the destination. (The log is
-/// a named pipe: the records fail, a pipe cannot be synced, but their text
-/// still comes through, the end record's with its reason.)
+/// a full pipe, read once the client has its answer: the records fail, a
+/// pipe cannot be synced, but their text still comes through, the end
+/// record's with its reason.)
 #[test]
 fn a_finished_record_that_cannot_be_written_ends_the_grant() {
     let sys = System::new();
@@ -3167,7 +3543,7 @@ fn a_finished_record_that_cannot_be_written_ends_the_grant() {
     let mut client = ep.connect();
     client.write(&ep.request("GET", "/v1/models/held", &[], b""));
     destination.wait_for(1);
-    let mut piped = PipedAudit::new(&sys.audit);
+    let mut piped = sys.hold_audit();
     gate.open("held");
     let response = client.response();
     assert_eq!(
@@ -3269,6 +3645,10 @@ fn revocation_works_while_the_audit_log_cannot_be_written() {
     drop(broken);
     sys.go("a");
     assert_eq!(running.exit_code(), Some(0));
+    // Each grant's end says why, whether its record could be written then
+    // or not.
+    assert_eq!(sys.end_anywhere(&ids["A"])["reason"], "revoked");
+    assert_eq!(sys.end_anywhere(&ids["B"])["reason"], "locked");
 }
 
 // ===== Protocol =====
@@ -3381,4 +3761,57 @@ fn replacing_an_entry_removes_its_profile_and_ends_its_grants() {
     sys.go("a");
     assert_eq!(a.running.exit_code(), Some(0));
     assert_eq!(sys.end_of(&a.id)["reason"], "entry_changed");
+}
+
+// ===== The harness =====
+
+/// A test that fails leaves its run going — its command waiting, its broker
+/// serving, a stream open — and its agent unlocked, which its idle timer
+/// would lock, and record, later. Dropping its system ends all of that
+/// before the directory is removed: once the drop returns, the run has its
+/// answer, the stream is cut, the broker has exited and the directory is
+/// gone, and nothing writes it again, the idle lock included.
+#[test]
+fn dropping_a_system_with_its_run_going_ends_the_run_and_leaves_nothing_behind() {
+    const IDLE: Duration = Duration::from_secs(6);
+    let sys = System::with(Settings {
+        idle_timeout: IDLE,
+        ..Settings::default()
+    });
+    let streams = Streams::default();
+    let destination = Destination::new(&sys.ca, streams.handler());
+    sys.seed(&[("KEY", CREDENTIAL)]);
+    sys.set_profile("KEY", anthropic(&destination));
+    sys.install_broker(&[]);
+    let a = sys.start_grant("KEY", "a");
+    assert_works(&a.endpoint);
+    let mut stream = open_stream(&a.endpoint);
+    let brokers = sys.broker_pids();
+    assert_eq!(brokers.len(), 1, "{brokers:?}");
+    let dir = sys.dir.path().to_path_buf();
+    // Unlocked just now: its idle lock is due after the drop.
+    sys.agent.lock_for(SCREEN_LOCK, "test");
+    sys.unlock();
+    let unlocked = Instant::now();
+    drop(sys);
+    assert!(
+        unlocked.elapsed() < IDLE,
+        "the drop took {:?}: too long to tell what the idle lock does",
+        unlocked.elapsed()
+    );
+    match a.running.answer.try_recv() {
+        Ok(Ok(Response::Exited { code: Some(0), .. })) => {}
+        Ok(answer) => panic!("not the command's exit: {}", outcome(&answer)),
+        Err(_) => panic!("the run was still going when the drop returned"),
+    }
+    assert!(!alive(brokers[0]), "the broker was left");
+    assert!(!dir.exists(), "the directory was left");
+    assert_cut(&mut stream, streams.sent());
+    // Past the idle timeout and the next look of its timer, which comes
+    // every second: nothing wrote the directory again.
+    let until = unlocked + IDLE + Duration::from_secs(2);
+    while Instant::now() < until {
+        assert!(!dir.exists(), "something wrote the directory again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
