@@ -253,7 +253,7 @@ the card holds the command that goes through the credential broker
 
 ```sh
 rusthorse run \
-  --broker ANTHROPIC_AUTH_TOKEN=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  --broker ANTHROPIC_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
   --url ANTHROPIC_BASE_URL=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
   -- your-command
 ```
@@ -265,14 +265,23 @@ broker adds the key to the program's requests, only to the profile's
 destination and only for the routes it allows. The token stops working when
 the command ends; meanwhile its grant is on the [Grants
 page](#grants-of-the-credential-broker). The variables are those the
-preset's clients read, whatever the entry is called: `ANTHROPIC_AUTH_TOKEN`
-and `ANTHROPIC_BASE_URL` for `anthropic` (Claude Code and the Anthropic
-libraries), `OPENAI_API_KEY` and `OPENAI_BASE_URL` for `openai` and
-`openai-compatible`. An interactive program such as Claude Code needs
-`--no-redact` as well; the approval dialog then warns that the output is
-not filtered, so the token can reach whoever reads it. `rusthorse guide ai`
-and the [CLI reference](cli.md) say more. An entry whose profile cannot be
-used keeps the command that gives the value, and the card says so.
+preset's libraries read, as `rusthorse guide ai` binds them, whatever the
+entry is called: `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for
+`anthropic`, `OPENAI_API_KEY` and `OPENAI_BASE_URL` for `openai` and
+`openai-compatible`. With the token in `ANTHROPIC_API_KEY`, which the
+Anthropic libraries send as `x-api-key`, `run` replaces any key your
+environment holds in that variable. If your environment also sets
+`ANTHROPIC_AUTH_TOKEN`, unset it (`env -u ANTHROPIC_AUTH_TOKEN`): a library
+that sends it as well presents something other than the token, and the
+broker refuses the request. The card of an `anthropic` entry says so.
+
+Claude Code has a recipe of its own in `rusthorse guide ai`, which that card
+points to too: the token in `ANTHROPIC_AUTH_TOKEN`, with `ANTHROPIC_API_KEY`
+unset (`env -u ANTHROPIC_API_KEY`), and `--no-redact`, which an interactive
+program needs; the approval dialog then warns that the output is not
+filtered, so the token can reach whoever reads it. `rusthorse guide ai` and
+the [CLI reference](cli.md) say more. An entry whose profile cannot be used
+keeps the command that gives the value, and the card says so.
 
 ### The broker profile
 

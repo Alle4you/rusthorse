@@ -6,8 +6,11 @@
 //!
 //! Tests that need the broker to reach the fake destination need its
 //! `test-upstream` feature (`cargo test -p rusthorse-broker
-//! --all-features`); the others run in both builds, and one shows that a
-//! build without the feature refuses a loopback destination.
+//! --all-features`) and an environment that names the test's authority
+//! (`RUSTHORSE_BROKER_TEST_ROOTS`, which `Options` sets); the others run in
+//! both builds. Some show that a build without the feature, and any build
+//! started with an empty environment as the agent starts it, refuse a
+//! loopback destination.
 
 mod support;
 
@@ -1386,6 +1389,78 @@ fn a_build_without_the_test_feature_refuses_a_loopback_destination() {
     );
 }
 
+/// The agent starts every broker with an empty environment: a build with
+/// the test feature then runs as a release one, and its destination may not
+/// be on loopback any more than a release build's.
+#[test]
+fn a_broker_started_with_an_empty_environment_refuses_a_loopback_destination() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    let mut options = Options::anthropic(&destination.origin(), &ca);
+    options.env.clear();
+    let broker = Broker::start(options);
+    // localhost resolves to loopback addresses, on the system's resolver.
+    broker
+        .send(&broker.request("GET", "/v1/models", &[], b""))
+        .assert_unreachable();
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::NotForwarded,
+            status: Some(502),
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    assert_eq!(
+        destination.connections(),
+        0,
+        "a loopback destination was reached"
+    );
+}
+
+/// Without the test's authority in its environment, a build with the test
+/// feature reads none of the other test variables: not those that would
+/// stop it, nor a fixed address, nor a panic.
+#[cfg(feature = "test-upstream")]
+#[test]
+fn without_a_test_authority_a_test_build_reads_no_test_variable() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    // Options fix the address 127.0.0.1, which the system's resolver gives
+    // too: the address does not matter, loopback does.
+    let options = Options::anthropic(&destination.origin(), &ca)
+        .without_env("RUSTHORSE_BROKER_TEST_ROOTS")
+        .timeouts("nap=1")
+        .env("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon")
+        .env("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "later")
+        .env("RUSTHORSE_BROKER_TEST_PANIC", "request");
+    assert!(
+        options
+            .env
+            .iter()
+            .any(|(name, _)| name == "RUSTHORSE_BROKER_TEST_ADDRESSES")
+    );
+    let mut broker = Broker::start(options);
+    broker
+        .send(&broker.request("GET", "/v1/models", &[], b""))
+        .assert_unreachable();
+    assert!(matches!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            outcome: RequestOutcome::NotForwarded,
+            status: Some(502),
+            ..
+        }
+    ));
+    assert_eq!(destination.connections(), 0);
+    assert!(
+        broker.exit_within(Duration::from_millis(200)).is_none(),
+        "the broker stopped"
+    );
+}
+
 #[cfg(not(feature = "test-upstream"))]
 #[test]
 fn a_build_without_the_test_feature_ignores_the_test_variables() {
@@ -1409,6 +1484,7 @@ fn test_variables_that_do_not_parse_stop_a_test_build() {
         ("RUSTHORSE_BROKER_TEST_TIMEOUTS", "nap=1"),
         ("RUSTHORSE_BROKER_TEST_ADDRESSES", "not an address"),
         ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon"),
+        ("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "later"),
         ("RUSTHORSE_BROKER_TEST_ROOTS", "/nonexistent/roots.pem"),
         ("RUSTHORSE_BROKER_TEST_PANIC", "later"),
     ] {
@@ -2184,6 +2260,311 @@ fn requests_that_end_in_another_order_are_reported_by_number() {
         })
         .collect();
     assert_eq!(finished, vec![2, 1]);
+}
+
+// ===== The end of the lifetime =====
+//
+// The broker ends a grant when its lifetime passes, without waiting for the
+// agent's `revoke`: the fake agent here never sends one before the end.
+
+/// The lifetime of the grants in the tests of its end: long enough for
+/// their requests to start before it ends, on a busy computer too.
+#[cfg(feature = "test-upstream")]
+const LIFETIME: Duration = Duration::from_secs(3);
+
+/// `options` for a grant of [`LIFETIME`]. With `late`, the broker's task
+/// that watches the lifetime sees its end a minute late, as it may after a
+/// resume: what then stops at the end is each request, by itself.
+#[cfg(feature = "test-upstream")]
+fn ending(options: Options, late: bool) -> Options {
+    let mut options = if late {
+        options.env("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "60000")
+    } else {
+        options
+    };
+    options.lifetime_secs = LIFETIME.as_secs();
+    options
+}
+
+/// Sleep until `when`.
+#[cfg(feature = "test-upstream")]
+fn sleep_until(when: Instant) {
+    std::thread::sleep(when.saturating_duration_since(Instant::now()));
+}
+
+/// A destination that starts a stream, sends `data: 1`, and `data: 2`
+/// `later` after the request arrived unless the broker closed the
+/// connection first, then holds it open until the broker closes it;
+/// `closed` says that the broker did.
+#[cfg(feature = "test-upstream")]
+fn stream_with_a_late_event(
+    later: Duration,
+) -> (Handler, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let closed = Arc::new(AtomicBool::new(false));
+    let seen = closed.clone();
+    let handler: Handler = Arc::new(move |_, peer| {
+        let _ = peer.send(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        let _ = peer.chunk(b"data: 1\n\n");
+        let closed = peer.closed_within(later) || {
+            let _ = peer.chunk(b"data: 2\n\n");
+            peer.closed_within(PATIENCE)
+        };
+        seen.store(closed, Ordering::SeqCst);
+    });
+    (handler, closed)
+}
+
+/// Once the lifetime has passed: a new request gets `403` without being
+/// asked for, the broker said nothing of its own — `admits` admissions
+/// asked, no `revoked` — and the agent's `revoke`, which its own clock
+/// sends, is confirmed as any, with `refused` requests refused before
+/// admission (that `403` included).
+#[cfg(feature = "test-upstream")]
+fn assert_ended_without_a_word(broker: &Broker, admits: usize, refused: u64) {
+    broker
+        .send(&broker.request("POST", "/v1/messages", &[], b"{}"))
+        .assert_local(403);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(broker.admits(), admits);
+    assert!(
+        !broker
+            .messages()
+            .iter()
+            .any(|m| matches!(m, FromBroker::Revoked { .. })),
+        "{:?}",
+        broker.messages()
+    );
+    broker.revoke(EndReason::Expired);
+    assert_eq!(broker.wait_revoked(), refused);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn the_end_of_the_lifetime_ends_every_request_without_the_agents_word() {
+    use std::sync::atomic::Ordering;
+    let ca = TestCa::new();
+    // The stream's next event would come long after the end.
+    let (handler, closed) = stream_with_a_late_event(LIFETIME + Duration::from_secs(2));
+    let destination = Destination::new(&ca, handler);
+    let broker = Broker::start(ending(
+        Options::anthropic(&destination.origin(), &ca).admit(Admit::Manual),
+        false,
+    ));
+    // Request 1 streams.
+    let mut stream = broker.connect();
+    stream.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    broker.wait_admit(1);
+    broker.admitted(1);
+    assert_eq!(stream.head().0, 200);
+    assert_eq!(stream.chunk().expect("an event"), b"data: 1\n\n");
+    // Request 2 is admitted, and its body is still arriving.
+    let mut uploading = broker.connect();
+    let full = broker.request("POST", "/v1/messages", &[], b"{\"twenty bytes\":1}");
+    uploading.write(&full[..full.len() - 5]);
+    broker.wait_admit(2);
+    broker.admitted(2);
+    // Request 3 waits for its admission, which the agent does not answer.
+    let mut pending = broker.connect();
+    pending.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    broker.wait_admit(3);
+    // And a connection with no request in progress.
+    let mut idle = broker.connect();
+    idle.write(&broker.request("GET", "/v1/files", &[], b""));
+    idle.response().assert_local(404);
+    assert!(broker.started.elapsed() < LIFETIME, "started too late");
+
+    // At the end of the lifetime the stream is cut, and every connection
+    // open then is closed.
+    assert_eq!(stream.chunk(), None, "the stream went on");
+    let ended = broker.started.elapsed();
+    assert!(
+        ended >= LIFETIME - Duration::from_millis(100)
+            && ended < LIFETIME + Duration::from_millis(1500),
+        "{ended:?}"
+    );
+    assert!(idle.closed_within(Duration::from_secs(5)));
+    assert_closed_or_refused(&mut uploading);
+    assert_closed_or_refused(&mut pending);
+    // Each admitted request finished: the stream unknown, the request whose
+    // body was arriving revoked, nothing of it sent.
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::Unknown,
+            status: Some(200),
+            bytes_sent: 2,
+            bytes_received: 9,
+        }
+    );
+    assert_eq!(
+        broker.wait_finished(2),
+        FromBroker::Finished {
+            request: 2,
+            outcome: RequestOutcome::Revoked,
+            status: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    // The destination's connection was closed too.
+    let deadline = Instant::now() + PATIENCE;
+    while !closed.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the destination's connection stayed open"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The agent's late answer is taken: admitted, request 3 ends unsent.
+    broker.admitted(3);
+    assert_eq!(
+        broker.wait_finished(3),
+        FromBroker::Finished {
+            request: 3,
+            outcome: RequestOutcome::Revoked,
+            status: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    // Refused before admission: the 404 and the 403 after the end.
+    assert_ended_without_a_word(&broker, 3, 2);
+    assert_eq!(destination.received().len(), 1);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_lifetime_seen_late_still_keeps_the_next_event_of_a_stream() {
+    let ca = TestCa::new();
+    // The next event comes after the end, before the task sees it.
+    let (handler, _closed) = stream_with_a_late_event(LIFETIME + Duration::from_millis(500));
+    let destination = Destination::new(&ca, handler);
+    let broker = Broker::start(ending(Options::anthropic(&destination.origin(), &ca), true));
+    let mut stream = broker.connect();
+    stream.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    assert_eq!(stream.head().0, 200);
+    assert_eq!(stream.chunk().expect("an event"), b"data: 1\n\n");
+    // That event is not passed on: the stream is cut.
+    assert_eq!(stream.chunk(), None, "the stream went on");
+    let ended = broker.started.elapsed();
+    assert!(
+        ended >= LIFETIME + Duration::from_millis(400) && ended < LIFETIME + Duration::from_secs(5),
+        "{ended:?}"
+    );
+    let finished = broker.wait_finished(1);
+    assert!(
+        matches!(
+            finished,
+            FromBroker::Finished {
+                request: 1,
+                outcome: RequestOutcome::Unknown,
+                status: Some(200),
+                bytes_sent: 2,
+                ..
+            }
+        ),
+        "{finished:?}"
+    );
+    assert_ended_without_a_word(&broker, 1, 1);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_lifetime_seen_late_still_keeps_a_body_that_arrives_after_it_from_being_sent() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    let broker = Broker::start(ending(Options::anthropic(&destination.origin(), &ca), true));
+    let mut uploading = broker.connect();
+    let full = broker.request("POST", "/v1/messages", &[], b"{\"twenty bytes\":1}");
+    uploading.write(&full[..full.len() - 5]);
+    broker.wait_admit(1);
+    // The rest of the body, after the end.
+    sleep_until(broker.started + LIFETIME + Duration::from_millis(500));
+    uploading.write(&full[full.len() - 5..]);
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::Revoked,
+            status: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    assert_closed_or_refused(&mut uploading);
+    assert_eq!(destination.connections(), 0, "the destination was reached");
+    assert_ended_without_a_word(&broker, 1, 1);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_lifetime_seen_late_still_keeps_a_request_reached_after_it_from_being_sent() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    // Resolving the destination ends after the end of the lifetime.
+    let delay = (LIFETIME + Duration::from_millis(500))
+        .as_millis()
+        .to_string();
+    let broker = Broker::start(ending(
+        Options::anthropic(&destination.origin(), &ca)
+            .env("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", &delay),
+        true,
+    ));
+    let mut client = broker.connect();
+    client.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::Revoked,
+            status: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    assert!(broker.started.elapsed() >= LIFETIME);
+    assert_closed_or_refused(&mut client);
+    // Reached, and nothing of the request sent.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(destination.received().is_empty(), "the request was sent");
+    assert_ended_without_a_word(&broker, 1, 1);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_lifetime_seen_late_still_keeps_an_answer_that_comes_after_it_from_the_client() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // The destination answers after the end of the lifetime.
+    let handler: Handler = Arc::new(|_, peer| {
+        std::thread::sleep(LIFETIME + Duration::from_millis(500));
+        let _ = peer.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+    });
+    let destination = Destination::new(&ca, handler);
+    let broker = Broker::start(ending(Options::anthropic(&destination.origin(), &ca), true));
+    let mut client = broker.connect();
+    client.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::Unknown,
+            status: Some(200),
+            bytes_sent: 2,
+            bytes_received: 0,
+        }
+    );
+    assert!(broker.started.elapsed() >= LIFETIME);
+    // Not passed on: the client gets the broker's 403, or its connection
+    // closed.
+    assert_closed_or_refused(&mut client);
+    assert_eq!(destination.received().len(), 1);
+    assert_ended_without_a_word(&broker, 1, 1);
 }
 
 // ===== Deadlines =====

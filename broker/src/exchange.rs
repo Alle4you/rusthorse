@@ -7,29 +7,41 @@
 //! the client its response head over a channel and its body as a stream of
 //! chunks, so that its end is decided in one place whatever stops it: the
 //! end of the response, a deadline, the client going away, or the grant
-//! being revoked. That task reports the end of every admitted request with
-//! `finished` exactly once, after it has dropped what it held of the
-//! credential.
+//! closing — revoked, or past its lifetime (`grant`). That task reports the
+//! end of every admitted request with `finished` exactly once, after it has
+//! dropped what it held of the credential.
 //!
 //! The outcomes (`RequestOutcome`): `not_forwarded` when nothing was sent
 //! (the body did not arrive in time or the client went away first, or
-//! resolving, connecting or TLS failed); `revoked` when a revocation closed
-//! the request before anything was sent (an `admitted` that came after the
-//! revocation included); `client_closed` when the client went away, or
-//! stopped reading, once something was sent; `completed` when the whole
-//! response was passed on; `unknown` for anything else once the request may
-//! have reached the destination, a revocation during it included.
+//! resolving, connecting or TLS failed); `revoked` when the grant closed
+//! the request before anything was sent (an `admitted` that came after it
+//! closed included); `client_closed` when the client went away, or stopped
+//! reading, once something was sent; `completed` when the whole response
+//! was passed on; `unknown` for anything else once the request may have
+//! reached the destination, the grant closing during it included.
 //!
-//! A revocation closes the client's connection too, so a request open then
-//! sees its client go at the same moment. Every wait therefore looks at the
-//! revocation first (`biased` selects): once the grant is revoked, the
-//! request's next step is the revocation's, whatever else became ready. The
-//! runtime has a single thread and the revocation comes from another task,
-//! so it cannot happen while this one runs; each time this one runs again,
-//! the first thing it polls is a wait on the revocation, with tokio's
-//! cooperative budget fresh (a wait polled once that budget is spent may
-//! say "not yet" without looking, but nothing can have changed by then).
-//! So a client found gone anywhere else left before the revocation.
+//! The grant closing closes the client's connection too, so a request open
+//! then sees its client go at the same moment. Every wait therefore looks
+//! at the closing first (`biased` selects): once the grant is closed, the
+//! request's next step is the closing's, whatever else became ready. The
+//! runtime has a single thread and the closing comes from another task, so
+//! it cannot happen while this one runs; each time this one runs again, the
+//! first thing it polls is a wait on the closing, with tokio's cooperative
+//! budget fresh (a wait polled once that budget is spent may say "not yet"
+//! without looking, but nothing can have changed by then). So a client
+//! found gone anywhere else left before the closing.
+//!
+//! The end of the lifetime is a moment on the boot-time clock rather than
+//! an event: the task that watches it may see it late (after a resume, up to
+//! `grant::LIFETIME_CHECK`). So each step that would send anything to the
+//! destination or pass anything on to the client — taking the credential
+//! before connecting, starting to send the request, passing on the response
+//! head, passing on each piece of the body as it arrives — first asks the
+//! grant whether it is closed, which reads the clock and closes the grant if
+//! the lifetime has passed: no request starts to be sent after it, and
+//! nothing of a response that arrives after it is passed on. A request still
+//! being sent then is cut when the grant closes, as at a revocation, and
+//! ends `unknown`.
 //!
 //! The room a request's body reserved in the broker's budget comes back
 //! only once the broker holds none of the body. Two holders share it
@@ -103,7 +115,7 @@ pub struct Admission {
 pub async fn respond(server: Arc<Server>, admission: Admission) -> Response<ResponseBody> {
     let (head, response) = oneshot::channel();
     tokio::spawn(run(server, admission, head));
-    // Without a head the request was closed (by a revocation, whose
+    // Without a head the request was closed (by the grant closing, whose
     // connections are dropped anyway): nothing is relayed.
     response
         .await
@@ -261,13 +273,13 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     use RequestOutcome::*;
     let grant = &server.grant;
     let limits = &server.limits;
-    let mut revoked = grant.subscribe();
+    let mut closed = grant.subscribe();
     // How a request ends when its client went away, `sent` saying whether
-    // anything may have reached the destination. Never after a revocation:
-    // every wait below looks at it first.
+    // anything may have reached the destination. Never after the grant
+    // closed: every wait below looks at that first.
     let left = |sent: bool| if sent { ClientClosed } else { NotForwarded };
-    // An admission answered after the revocation is not forwarded.
-    if grant.is_revoked() {
+    // An admission answered after the grant closed is not forwarded.
+    if grant.is_closed() {
         return Outcome::new(Revoked, None);
     }
     if client.is_gone() {
@@ -277,7 +289,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     // 6. The body, whole, within its deadline.
     let body = tokio::select! {
         biased;
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
+        _ = closed.wait_for(|closed| *closed) => return Outcome::new(Revoked, None),
         body = timeout(limits.request_body, read_body(request.body, request.body_len)) => match body {
             Ok(Some(body)) => body,
             // Cut short: the client went away.
@@ -293,6 +305,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     // the body's bytes for as long as any of them is alive.
     let room = Arc::new(request.reservation);
     let body = held_body(body, Arc::clone(&room));
+    // None once the grant is closed, the lifetime passed included.
     let Some(credential) = grant.credential() else {
         return Outcome::new(Revoked, None);
     };
@@ -304,7 +317,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     };
     let tcp = tokio::select! {
         biased;
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
+        _ = closed.wait_for(|closed| *closed) => return Outcome::new(Revoked, None),
         tcp = server.destination.connect() => match tcp {
             Ok(tcp) => tcp,
             Err(_) => return unreachable(client),
@@ -315,7 +328,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     let handshake = server.tls.connect(server.server_name.clone(), tcp);
     let tls = tokio::select! {
         biased;
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
+        _ = closed.wait_for(|closed| *closed) => return Outcome::new(Revoked, None),
         tls = timeout(limits.tls_handshake, handshake) => match tls {
             Ok(Ok(tls)) => tls,
             _ => return unreachable(client),
@@ -347,11 +360,16 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
         return unreachable(client);
     };
     drop(request.headers);
+    // The last moment before anything is sent: the lifetime may have passed
+    // while the destination was reached.
+    if grant.is_closed() {
+        return Outcome::new(Revoked, None);
+    }
 
     // From here on, the request may reach the destination.
     let response = tokio::select! {
         biased;
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Unknown, None),
+        _ = closed.wait_for(|closed| *closed) => return Outcome::new(Unknown, None),
         response = timeout(limits.response_headers, sender.send_request(outgoing)) => match response {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
@@ -369,9 +387,13 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     // that hyper has not written yet keep its room.
     drop(room);
 
-    // 8. The response: checked before anything is passed on.
+    // 8. The response: checked before anything is passed on, and nothing of
+    // it once the grant is closed.
     let status = response.status();
     let code = Some(status.as_u16());
+    if grant.is_closed() {
+        return Outcome::new(Unknown, code);
+    }
     if let Err(refusal) = headers::check_response(status, response.headers()) {
         client.answer(local(refusal, false));
         return Outcome::new(Unknown, code);
@@ -400,7 +422,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     loop {
         let frame = tokio::select! {
             biased;
-            _ = revoked.wait_for(|revoked| *revoked) => {
+            _ = closed.wait_for(|closed| *closed) => {
                 return Outcome::new(Unknown, code).received(received);
             }
             frame = timeout(pause, body.frame()) => frame,
@@ -418,6 +440,11 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
             Ok(Some(Err(_))) | Err(_) => return Outcome::new(Unknown, code).received(received),
         };
         received = received.saturating_add(data.len() as u64);
+        // Nothing more is passed on once the grant is closed: the stream is
+        // cut, even if the lifetime passed while the destination was quiet.
+        if grant.is_closed() {
+            return Outcome::new(Unknown, code).received(received);
+        }
         if received > MAX_RESPONSE_BODY_BYTES {
             // Too long: the stream is cut.
             return Outcome::new(Unknown, code).received(received);
@@ -434,10 +461,10 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
             pieces.push(Chunk::End);
         }
         for piece in pieces {
-            match deliver(&chunks, piece, pause, &mut revoked).await {
+            match deliver(&chunks, piece, pause, &mut closed).await {
                 Delivery::Delivered => {}
                 Delivery::Gone => return Outcome::new(left(true), code).received(received),
-                Delivery::Revoked => return Outcome::new(Unknown, code).received(received),
+                Delivery::Closed => return Outcome::new(Unknown, code).received(received),
             }
         }
         if end {
@@ -451,18 +478,19 @@ enum Delivery {
     Delivered,
     /// The client went away, or took no chunk for the longest pause allowed.
     Gone,
-    Revoked,
+    /// The grant closed.
+    Closed,
 }
 
 async fn deliver(
     chunks: &mpsc::Sender<Chunk>,
     chunk: Chunk,
     pause: Duration,
-    revoked: &mut watch::Receiver<bool>,
+    closed: &mut watch::Receiver<bool>,
 ) -> Delivery {
     tokio::select! {
         biased;
-        _ = revoked.wait_for(|revoked| *revoked) => Delivery::Revoked,
+        _ = closed.wait_for(|closed| *closed) => Delivery::Closed,
         sent = timeout(pause, chunks.send(chunk)) => match sent {
             Ok(Ok(())) => Delivery::Delivered,
             Ok(Err(_)) | Err(_) => Delivery::Gone,

@@ -1,5 +1,6 @@
 //! What the broker runs with: phase 1's deadlines, and the hooks that only
-//! a build with the `test-upstream` feature has.
+//! a build with the `test-upstream` feature has, and only when its
+//! environment asks for them.
 //!
 //! A release build uses [`Config::release`]: the deadlines of
 //! `rusthorse::broker_protocol`, no extra trust, no loopback destination,
@@ -14,8 +15,12 @@
 //!
 //! A build with `test-upstream` (for tests only, never in a release; a
 //! build without debug assertions refuses it, and `--check` reports it)
-//! reads `RUSTHORSE_BROKER_TEST_*` variables once at startup
-//! ([`Config::load`]):
+//! looks at its environment once at startup ([`Config::load`]) and runs as
+//! a release build unless `RUSTHORSE_BROKER_TEST_ROOTS` is set there. The
+//! agent starts every broker with an empty environment: a build for tests
+//! that a real agent starts trusts nothing more, reaches no loopback
+//! destination and reads no other variable. Only with that variable set,
+//! as the broker's own tests set it, does such a build read:
 //!
 //! - `RUSTHORSE_BROKER_TEST_ROOTS`: a PEM file of certificate authorities
 //!   trusted besides the system's file;
@@ -27,12 +32,16 @@
 //! - `RUSTHORSE_BROKER_TEST_TIMEOUTS`: shorter deadlines, as `name=ms` pairs
 //!   separated by commas (`ready`, `header`, `idle`, `body`, `connect`,
 //!   `tls`, `response`, `pause`);
+//! - `RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS`: how long after the grant's
+//!   lifetime passes the task that watches it closes the grant, as that task
+//!   may see it late after a resume (requests stop at the lifetime's end by
+//!   themselves meanwhile);
 //! - `RUSTHORSE_BROKER_TEST_PANIC`: `request` makes handling a request
-//!   panic, as an internal error would (for the test of the panic hook).
+//!   panic, as an internal error would (for the test of the panic hook);
 //!
-//! With the feature, a destination may also be on loopback (`127.0.0.0/8`
-//! and `::1`, never another private address). A variable that does not
-//! parse stops the broker before it answers.
+//! and a destination may then be on loopback too (`127.0.0.0/8` and `::1`,
+//! never another private address). A variable that does not parse stops
+//! the broker before it answers.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -93,6 +102,9 @@ pub struct Config {
     pub addresses: Option<Vec<IpAddr>>,
     /// How long each resolution blocks before it starts.
     pub resolve_delay: Duration,
+    /// How long after the grant's lifetime passes the task that watches it
+    /// closes the grant: zero, but in tests.
+    pub lifetime_lag: Duration,
     /// Whether handling a request panics (for the test of the panic hook).
     #[cfg(feature = "test-upstream")]
     pub panic_on_request: bool,
@@ -107,6 +119,7 @@ impl Config {
             extra_roots: None,
             addresses: None,
             resolve_delay: Duration::ZERO,
+            lifetime_lag: Duration::ZERO,
             #[cfg(feature = "test-upstream")]
             panic_on_request: false,
         }
@@ -119,11 +132,28 @@ impl Config {
         Ok(Config::release())
     }
 
-    /// The configuration of this build, for tests only: the release one,
-    /// with loopback destinations allowed and the test variables applied.
+    /// The configuration of this build, for tests only: see
+    /// [`Config::from_test_variables`].
     #[cfg(feature = "test-upstream")]
     pub fn load() -> Result<Config, &'static str> {
-        let get = |name: &str| std::env::var_os(name);
+        Config::from_test_variables(|name| std::env::var_os(name))
+    }
+
+    /// The configuration of a build for tests, from the environment
+    /// variables `get` returns: [`Config::release`] unless
+    /// `RUSTHORSE_BROKER_TEST_ROOTS` is set, which asks for test behaviour;
+    /// with it, the release configuration with that authority trusted too,
+    /// loopback destinations allowed and the other test variables applied.
+    #[cfg(feature = "test-upstream")]
+    fn from_test_variables(
+        get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Config, &'static str> {
+        let mut config = Config::release();
+        // Nothing asks for test behaviour (the agent's empty environment):
+        // a release build's configuration, and no other variable read.
+        let Some(roots) = get("RUSTHORSE_BROKER_TEST_ROOTS") else {
+            return Ok(config);
+        };
         let text = |name: &str| -> Result<Option<String>, &'static str> {
             get(name)
                 .map(|value| {
@@ -133,9 +163,8 @@ impl Config {
                 })
                 .transpose()
         };
-        let mut config = Config::release();
         config.allow_loopback = true;
-        config.extra_roots = get("RUSTHORSE_BROKER_TEST_ROOTS").map(PathBuf::from);
+        config.extra_roots = Some(PathBuf::from(roots));
         if let Some(list) = text("RUSTHORSE_BROKER_TEST_ADDRESSES")? {
             config.addresses = Some(parse_addresses(&list)?);
         }
@@ -144,6 +173,9 @@ impl Config {
         }
         if let Some(pairs) = text("RUSTHORSE_BROKER_TEST_TIMEOUTS")? {
             apply_timeouts(&mut config.limits, &pairs)?;
+        }
+        if let Some(ms) = text("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS")? {
+            config.lifetime_lag = parse_ms(&ms)?;
         }
         if let Some(when) = text("RUSTHORSE_BROKER_TEST_PANIC")? {
             if when != "request" {
@@ -221,6 +253,7 @@ mod tests {
         assert_eq!(config.extra_roots, None);
         assert_eq!(config.addresses, None);
         assert_eq!(config.resolve_delay, Duration::ZERO);
+        assert_eq!(config.lifetime_lag, Duration::ZERO);
         #[cfg(feature = "test-upstream")]
         assert!(!config.panic_on_request);
     }
@@ -231,6 +264,66 @@ mod tests {
     #[test]
     fn without_the_test_feature_the_configuration_is_the_release_one() {
         assert_eq!(Config::load(), Ok(Config::release()));
+    }
+
+    /// [`Config::from_test_variables`] with only these variables set.
+    #[cfg(feature = "test-upstream")]
+    fn with(set: &[(&str, &str)]) -> Result<Config, &'static str> {
+        Config::from_test_variables(|name| {
+            set.iter()
+                .find(|(set, _)| *set == name)
+                .map(|(_, value)| value.into())
+        })
+    }
+
+    #[cfg(feature = "test-upstream")]
+    #[test]
+    fn a_test_build_runs_as_a_release_one_unless_its_environment_names_a_test_authority() {
+        const ROOTS: (&str, &str) = ("RUSTHORSE_BROKER_TEST_ROOTS", "/nonexistent/roots.pem");
+        // The agent's empty environment: a release build's configuration.
+        assert_eq!(with(&[]), Ok(Config::release()));
+        // Without the authority no other variable is read, not even one
+        // that does not parse.
+        let unparsable = [
+            ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon"),
+            ("RUSTHORSE_BROKER_TEST_TIMEOUTS", "nap=1"),
+            ("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "later"),
+            ("RUSTHORSE_BROKER_TEST_ADDRESSES", "localhost"),
+            ("RUSTHORSE_BROKER_TEST_PANIC", "later"),
+        ];
+        let valid = [
+            ("RUSTHORSE_BROKER_TEST_ADDRESSES", "127.0.0.1"),
+            ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "5"),
+            ("RUSTHORSE_BROKER_TEST_TIMEOUTS", "body=500"),
+            ("RUSTHORSE_BROKER_TEST_LIFETIME_LAG_MS", "60000"),
+            ("RUSTHORSE_BROKER_TEST_PANIC", "request"),
+        ];
+        assert_eq!(with(&unparsable), Ok(Config::release()));
+        assert_eq!(with(&valid), Ok(Config::release()));
+        // The authority alone: trusted, and loopback destinations allowed.
+        assert_eq!(
+            with(&[ROOTS]),
+            Ok(Config {
+                allow_loopback: true,
+                extra_roots: Some(PathBuf::from(ROOTS.1)),
+                ..Config::release()
+            })
+        );
+        // With it, the other variables are read.
+        let config = with(&[&[ROOTS][..], &valid[..]].concat()).expect("a test configuration");
+        assert!(config.allow_loopback);
+        assert_eq!(config.extra_roots, Some(PathBuf::from(ROOTS.1)));
+        assert_eq!(
+            config.addresses,
+            Some(vec!["127.0.0.1".parse().expect("ip")])
+        );
+        assert_eq!(config.resolve_delay, Duration::from_millis(5));
+        assert_eq!(config.limits.request_body, Duration::from_millis(500));
+        assert_eq!(config.lifetime_lag, Duration::from_secs(60));
+        assert!(config.panic_on_request);
+        for (name, value) in unparsable {
+            assert!(with(&[ROOTS, (name, value)]).is_err(), "{name}");
+        }
     }
 
     #[test]
