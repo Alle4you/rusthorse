@@ -3806,6 +3806,17 @@ fn logged(log: &Path, event: &str) -> serde_json::Value {
     })
 }
 
+/// Whether the process `pid` runs now: it exists and is not a zombie.
+fn process_alive(pid: u64) -> bool {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Err(_) => false,
+        Ok(stat) => {
+            let close = stat.iter().rposition(|&b| b == b')').unwrap_or(0);
+            !matches!(stat.get(close + 2), Some(b'Z' | b'X'))
+        }
+    }
+}
+
 /// Whether the process `pid` is gone (or a zombie nobody waits for any
 /// more), within a few seconds.
 fn process_gone(pid: u64) -> bool {
@@ -4758,8 +4769,9 @@ fn a_run_whose_broker_fails_to_start_keeps_none_of_its_grants() {
 /// A lock while a run's brokers start ends the run's grants, which were
 /// entered as starting — a screen lock too, whatever their profile says
 /// about the automatic locks, since nothing of the run has been used yet —
-/// and the run fails before anything runs: a broker that answers ready
-/// after that is killed, not attached (ADR 0013, preparing a run's grants).
+/// and the run fails before anything runs: a broker that has its install
+/// and has not answered ready is killed, and the lock is done only once it
+/// is gone (ADR 0013, preparing a run's grants and revocation).
 #[test]
 fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
     use rusthorse::protocol::{ErrorCode, Request, Response};
@@ -4797,8 +4809,15 @@ fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
                 other => panic!("unexpected {}", other.kind()),
             }
         }
-        assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"), "{lock}");
-        // Its broker answers ready only now: too late.
+        // Done once its broker, which had not answered, is gone.
+        assert!(!process_alive(pid), "{lock}: done while the broker ran");
+        // Revoked, or ended already: the run, whose broker is gone, fails.
+        let state = grant_state(&h, &id);
+        assert!(
+            matches!(state.as_deref(), Some("revoked") | None),
+            "{lock}: {state:?}"
+        );
+        // An answer now would be too late (nobody is left to give it).
         std::fs::write(&ready, "").expect("ready");
         let (code, message) = error_of(&running.wait());
         assert_eq!(code, ErrorCode::Internal, "{lock}: {message}");

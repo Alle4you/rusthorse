@@ -181,6 +181,13 @@ impl AuditLog {
         &self.path
     }
 
+    /// Hold the log, as a slow disk would: every record waits until the
+    /// guard is dropped, and is then written as usual. For tests.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Append one record, stamped with the current time. An event is often
     /// built when a request arrives and recorded once its outcome is known —
     /// after a dialog that may stay open for minutes — so the time it was

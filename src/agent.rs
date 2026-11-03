@@ -3926,6 +3926,93 @@ mod tests {
         assert!(!marker.exists(), "a broker was started");
     }
 
+    /// A lock that comes while a run records the creation of its grants —
+    /// after the grants were entered, before their brokers start — ends
+    /// them, and no broker ever gets their credential: the run fails, saying
+    /// so, before anything runs (ADR 0013, preparing a run's grants).
+    #[test]
+    fn a_lock_while_a_grants_creation_is_recorded_gives_no_broker_its_credential() {
+        use crate::session_lock::{Locker, SCREEN_LOCK};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let received = dir.path().join("received");
+        // A stand-in that keeps whatever it is sent, and never answers.
+        std::fs::write(
+            &broker,
+            format!("#!/bin/sh\nexec /bin/cat > '{}'\n", received.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        let id = broker_protocol::new_grant_id();
+        let mut run = agent
+            .registry
+            .enter(vec![NewGrant {
+                id: id.clone(),
+                entry_uuid: "uuid-of-key".into(),
+                entry: "KEY (uuid-of-)".into(),
+                var: "K".into(),
+                profile: anthropic_profile(),
+                command: "true".into(),
+                requester: "test".into(),
+                lifetime: Duration::from_secs(60),
+            }])
+            .expect("enter");
+        let grants = vec![Brokered {
+            uuid: "uuid-of-key".into(),
+            name: "KEY".into(),
+            identity: "KEY (uuid-of-)".into(),
+            var: "K".into(),
+            url_var: None,
+            profile: anthropic_profile(),
+        }];
+        let program = std::fs::canonicalize(&broker).expect("canonical");
+        let prepared = std::thread::scope(|scope| {
+            // The audit log is slow: the record of the grant's creation
+            // waits. (Held in here, so that a failed assertion lets it go.)
+            let held = agent.audit.hold();
+            let preparing = scope.spawn(|| {
+                agent.prepare_grants(
+                    &Peer::agent(),
+                    &mut run,
+                    &program,
+                    &grants,
+                    std::slice::from_ref(&id),
+                    vec![SecretString::new("sk-ant-test-0000000000000000".into())],
+                )
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            // The vault was not open: the lock writes no record.
+            agent.lock_for(SCREEN_LOCK, "test");
+            assert_eq!(agent.registry.list()[0].state, "revoked");
+            drop(held);
+            preparing.join().expect("the preparation ends")
+        });
+        let Err((failure, reason)) = prepared else {
+            panic!("the grant was prepared after it ended");
+        };
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(
+            failure
+                .message
+                .contains("the grant ended while its broker was starting"),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("nothing was run"));
+        assert!(!failure.message.contains("sk-ant-test"));
+        // Time for a broker that got an install to write it down.
+        std::thread::sleep(Duration::from_millis(300));
+        let got = std::fs::read(&received).unwrap_or_default();
+        assert!(got.is_empty(), "a broker received {} bytes", got.len());
+        run.finish(reason);
+        assert_eq!(agent.registry.count(), 0, "a grant was left");
+        let records = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("audit");
+        assert!(records.contains(r#""outcome":"created""#), "{records}");
+        assert!(records.contains(r#""reason":"screen_locked""#), "{records}");
+    }
+
     /// The approver of [`a_run_refused_after_its_approval_says_why_on_record`]:
     /// while the human decides, other runs take every grant an agent may
     /// hold.
