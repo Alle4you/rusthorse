@@ -1,9 +1,14 @@
 //! Metadata-only form and search logic. Never stores a revealed value.
 
+use std::time::Duration;
+
+use rusthorse::broker_profile::{AutomaticLocks, BrokerProfile, Preset};
 use rusthorse::generate::Spec;
 use rusthorse::protocol::{
-    EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, Request, ValueChange,
+    EntryChanges, EntryFields, EntryInfo, EntryKind, Field, GrantInfo, NewEntry, Request,
+    ValueChange,
 };
+use rusthorse::vault::FIELD_BROKER;
 
 #[derive(Clone, Default)]
 pub(crate) struct Form {
@@ -291,27 +296,214 @@ pub(crate) fn matches(entry: &EntryInfo, query: &str, group: Option<&str>) -> bo
             .any(|s| s.to_lowercase().contains(&query))
 }
 
-/// The command that gives an entry's value to a program. The entry is named
-/// by its UUID, which no rename or duplicate title can make ambiguous; the
-/// variable is the entry's name when that is a valid variable name.
+/// The command that gives an entry to a program. The entry is named by its
+/// UUID, which no rename or duplicate title can make ambiguous.
 ///
-/// For an API key with an endpoint, the command also gets the endpoint in a
-/// variable of its own ([`url_variable`]): it is not a secret.
+/// An entry with a usable broker profile (ADR 0013) is given through the
+/// credential broker: the command gets a temporary token and the broker's
+/// address, in the variables its preset's clients read
+/// ([`broker_variables`]), never the value. Any other entry is given by
+/// value, in a variable named after the entry when that is a valid variable
+/// name; for an API key with an endpoint, the command also gets the
+/// endpoint in a variable of its own ([`url_variable`]): it is not a secret.
 pub(crate) fn snippet(entry: &EntryInfo) -> String {
+    let quote = rusthorse::util::shell_quote;
+    // One option per line, joined by the shell's line continuation, so that
+    // it reads well and still pastes as one command.
+    if let Some(profile) = &entry.broker {
+        let (token, url) = broker_variables(profile.preset);
+        let token = quote(&format!("{token}={}", entry.id));
+        let url = quote(&format!("{url}={}", entry.id));
+        return format!(
+            "rusthorse run \\\n  --broker {token} \\\n  --url {url} \\\n  -- your-command"
+        );
+    }
     let var = if is_variable_name(&entry.name) {
         entry.name.as_str()
     } else {
         "SECRET"
     };
-    let quote = rusthorse::util::shell_quote;
     let secret = quote(&format!("{var}={}", entry.id));
     if entry.fields.kind == Some(EntryKind::ApiKey) && entry.fields.url.is_some() {
-        // One option per line, joined by the shell's line continuation, so
-        // that it reads well and still pastes as one command.
         let url = quote(&format!("{}={}", url_variable(var), entry.id));
         format!("rusthorse run {secret} \\\n  --url {url} \\\n  -- your-command")
     } else {
         format!("rusthorse run {secret} -- your-command")
+    }
+}
+
+/// The variables that get the token and the broker's address in a command
+/// given an entry through the broker: those its preset's clients read. The
+/// Anthropic libraries and Claude Code send `ANTHROPIC_AUTH_TOKEN` as
+/// `Authorization: Bearer` and read `ANTHROPIC_BASE_URL`; the OpenAI
+/// libraries read `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+pub(crate) fn broker_variables(preset: Preset) -> (&'static str, &'static str) {
+    match preset {
+        Preset::Anthropic => ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"),
+        Preset::Openai | Preset::OpenaiCompatible => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    }
+}
+
+/// An entry's broker profile (ADR 0013) as the agent reports it: a usable
+/// one in [`EntryInfo::broker`], a protected one among the protected
+/// fields, one this Rusthorse cannot read among the other fields.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Profile<'a> {
+    /// Commands can get a grant for the entry.
+    Usable(&'a BrokerProfile),
+    /// The file marks the profile as protected: it is withheld like a
+    /// secret, and cannot be used.
+    Protected,
+    /// The stored profile cannot be read, so it cannot be used.
+    Unusable,
+    /// The entry has no profile.
+    Absent,
+}
+
+/// What the agent reports about `entry`'s broker profile.
+pub(crate) fn profile(entry: &EntryInfo) -> Profile<'_> {
+    let named = |fields: &[String]| fields.iter().any(|f| f == FIELD_BROKER);
+    match &entry.broker {
+        Some(profile) => Profile::Usable(profile),
+        None if named(&entry.protected_fields) => Profile::Protected,
+        None if named(&entry.other_fields) => Profile::Unusable,
+        None => Profile::Absent,
+    }
+}
+
+/// The rows an entry's details show for a usable profile: its preset and
+/// the revision of it the human approved, then what approval dialogs show
+/// ([`BrokerProfile::describe`]).
+pub(crate) fn profile_facts(profile: &BrokerProfile) -> Vec<(String, String)> {
+    let mut facts = vec![(
+        "Preset".to_string(),
+        format!(
+            "{} ({}), revision {}",
+            profile.preset.label(),
+            profile.preset,
+            profile.revision
+        ),
+    )];
+    facts.extend(profile.describe());
+    facts
+}
+
+/// How the grants page shows one grant of the credential broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantRow {
+    /// The grant's ID, which a revocation names.
+    pub id: String,
+    /// Whether revoking it would end anything: a revoked grant is listed
+    /// until its command ends, but has ended already.
+    pub revocable: bool,
+    /// Label and value pairs, in the order shown.
+    pub facts: Vec<(&'static str, String)>,
+}
+
+impl GrantRow {
+    /// The row for `grant`. A [`GrantInfo`] holds no token, so neither does
+    /// the row.
+    pub(crate) fn new(grant: &GrantInfo) -> Self {
+        Self::of(grant, false)
+    }
+
+    /// The row for a grant the agent listed before and lists no more: it has
+    /// ended. The page keeps it in its place while it is shown, so that no
+    /// other grant's button moves under the pointer, with what was last
+    /// listed. The same facts as [`GrantRow::new`], in the same order.
+    pub(crate) fn ended(grant: &GrantInfo) -> Self {
+        Self::of(grant, true)
+    }
+
+    fn of(grant: &GrantInfo, gone: bool) -> Self {
+        let revoked = grant.state == "revoked";
+        let used = match grant.max_requests {
+            Some(limit) => format!("{} of {limit}", grant.requests),
+            None => format!("{} (no limit)", grant.requests),
+        };
+        Self {
+            id: grant.id.clone(),
+            revocable: !revoked && !gone,
+            facts: vec![
+                ("Entry", grant.entry.clone()),
+                (
+                    "Destination",
+                    format!("{} ({})", grant.destination, grant.preset.label()),
+                ),
+                ("Command", grant.command.clone()),
+                // Process names, which any program chooses: labelled as the
+                // agent's dialogs label them.
+                ("Requested by (unverified)", grant.requester.clone()),
+                ("Token variable", grant.var.clone()),
+                (
+                    "State",
+                    if gone {
+                        "Ended: the agent no longer lists it".to_string()
+                    } else {
+                        grant_state(&grant.state)
+                    },
+                ),
+                ("Started", grant.started.clone()),
+                (
+                    "Ends",
+                    if revoked || gone {
+                        "It has ended.".to_string()
+                    } else {
+                        ends_in(grant.ends_in_secs)
+                    },
+                ),
+                (
+                    "Requests",
+                    if gone {
+                        format!("{used} when last listed")
+                    } else {
+                        format!("{used}; {} in flight", grant.in_flight)
+                    },
+                ),
+                (
+                    "Automatic locks",
+                    match grant.automatic_locks {
+                        AutomaticLocks::End => {
+                            "End it: the screen locking, suspend and the idle timeout".to_string()
+                        }
+                        AutomaticLocks::Continue => {
+                            "Do not end it: it keeps working while the screen or the vault is locked".to_string()
+                        }
+                    },
+                ),
+                ("ID", grant.id.clone()),
+            ],
+        }
+    }
+}
+
+/// A grant's state for people; a state this build does not know is shown
+/// as the agent wrote it. The agent of phase 1 also lists a grant as
+/// `starting` while the run it belongs to is prepared, before it admits
+/// anything.
+fn grant_state(state: &str) -> String {
+    match state {
+        "starting" => "Starting: its run is being prepared; no request is admitted yet".into(),
+        "active" => "Active".into(),
+        "exhausted" => {
+            "Exhausted: its request limit is reached; requests already admitted finish".into()
+        }
+        "revoked" => "Revoked: its broker refuses every request until the command ends".into(),
+        other => other.into(),
+    }
+}
+
+/// When a grant ends at the latest: when its maximum lifetime passes, `secs`
+/// from now. In whole minutes, rounded up so that "at the latest" stays
+/// true (and a page refreshed every few seconds does not change all the
+/// time).
+fn ends_in(secs: u64) -> String {
+    match secs.div_ceil(60) {
+        0 => "now".into(),
+        minutes => format!(
+            "in {} at the latest",
+            rusthorse::util::format_duration(Duration::from_secs(minutes.saturating_mul(60)))
+        ),
     }
 }
 
@@ -750,6 +942,281 @@ pub(crate) mod tests {
         ] {
             assert_eq!(url_variable(var), url);
         }
+    }
+
+    /// A usable broker profile of `preset`, with the defaults of its latest
+    /// revision.
+    pub fn usable(preset: Preset) -> BrokerProfile {
+        let mut request = rusthorse::broker_profile::ProfileRequest::new(preset);
+        if preset == Preset::OpenaiCompatible {
+            request.origin = Some("https://api.deepseek.example".into());
+        }
+        request.resolve().expect("a valid profile")
+    }
+
+    #[test]
+    fn an_entry_with_a_usable_profile_is_given_through_the_broker() {
+        let mut entry = entry();
+        entry.name = "ANTHROPIC_API_KEY".into();
+        entry.fields.kind = Some(EntryKind::ApiKey);
+        entry.fields.url = Some("https://api.anthropic.com".into());
+        entry.broker = Some(usable(Preset::Anthropic));
+        assert_eq!(
+            snippet(&entry),
+            "rusthorse run \\\n  \
+             --broker ANTHROPIC_AUTH_TOKEN=11111111-2222-3333-4444-555555555555 \\\n  \
+             --url ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555 \\\n  \
+             -- your-command"
+        );
+        // The shell reads the four lines as one command with these words.
+        let script = snippet(&entry).replacen("rusthorse run", "printf '%s\\n'", 1);
+        let words = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("sh");
+        assert!(words.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&words.stdout),
+            "--broker\nANTHROPIC_AUTH_TOKEN=11111111-2222-3333-4444-555555555555\n--url\n\
+             ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555\n--\nyour-command\n"
+        );
+        // The variables are those the preset's clients read, whatever the
+        // entry is called, and whatever its kind.
+        for (preset, token, url) in [
+            (Preset::Openai, "OPENAI_API_KEY", "OPENAI_BASE_URL"),
+            (
+                Preset::OpenaiCompatible,
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+            ),
+        ] {
+            entry.name = "with space".into();
+            entry.fields.kind = None;
+            entry.broker = Some(usable(preset));
+            let text = snippet(&entry);
+            assert!(
+                text.starts_with(&format!(
+                    "rusthorse run \\\n  --broker {token}={} ",
+                    entry.id
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("--url {url}={} ", entry.id)),
+                "{text}"
+            );
+        }
+        // The entry's UUID is quoted for the shell like any other.
+        entry.id = "a'$(echo fake)".into();
+        let text = snippet(&entry);
+        assert!(
+            text.contains("--broker 'OPENAI_API_KEY=a'\\''$(echo fake)'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--url 'OPENAI_BASE_URL=a'\\''$(echo fake)'"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_usable_profile_keeps_the_snippet_by_value() {
+        let mut entry = entry();
+        entry.name = "OPENAI_API_KEY".into();
+        let by_value = "rusthorse run OPENAI_API_KEY=11111111-2222-3333-4444-555555555555 \
+                        -- your-command";
+        assert_eq!(profile(&entry), Profile::Absent);
+        assert_eq!(snippet(&entry), by_value);
+        // Protected, or unreadable: the agent cannot use it either.
+        entry.protected_fields.push(FIELD_BROKER.into());
+        assert_eq!(profile(&entry), Profile::Protected);
+        assert_eq!(snippet(&entry), by_value);
+        entry.protected_fields.retain(|f| f != FIELD_BROKER);
+        entry.other_fields.push(FIELD_BROKER.into());
+        assert_eq!(profile(&entry), Profile::Unusable);
+        assert_eq!(snippet(&entry), by_value);
+        // Fields of other names say nothing about the profile.
+        entry.other_fields = vec!["Rusthorse.Other".into(), "Broker".into()];
+        entry.protected_fields = vec!["rusthorse.broker".into()];
+        assert_eq!(profile(&entry), Profile::Absent);
+        // The agent reports a usable one in `broker`.
+        let anthropic = usable(Preset::Anthropic);
+        entry.broker = Some(anthropic.clone());
+        assert_eq!(profile(&entry), Profile::Usable(&anthropic));
+        assert!(snippet(&entry).starts_with("rusthorse run \\\n  --broker "));
+    }
+
+    #[test]
+    fn the_details_describe_the_whole_profile() {
+        let anthropic = usable(Preset::Anthropic);
+        let facts = profile_facts(&anthropic);
+        assert_eq!(
+            facts[0],
+            (
+                "Preset".to_string(),
+                "Anthropic (anthropic), revision 1".to_string()
+            )
+        );
+        // Then exactly what an approval dialog shows.
+        assert_eq!(facts[1..], anthropic.describe()[..]);
+        let labels: Vec<&str> = facts.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Preset", "Destination", "Allows", "Ends", "Requests"]
+        );
+        let compatible = profile_facts(&usable(Preset::OpenaiCompatible));
+        assert_eq!(
+            compatible[0].1,
+            "OpenAI-compatible (openai-compatible), revision 1"
+        );
+        assert_eq!(compatible[1].1, "https://api.deepseek.example/v1");
+    }
+
+    /// A grant as an agent of protocol 8 lists it.
+    pub fn grant(id: &str, state: &str) -> GrantInfo {
+        GrantInfo {
+            id: id.into(),
+            entry: "AI/ANTHROPIC_API_KEY (11111111)".into(),
+            var: "ANTHROPIC_AUTH_TOKEN".into(),
+            destination: "https://api.anthropic.com".into(),
+            preset: Preset::Anthropic,
+            command: "claude --print hello".into(),
+            requester: "bash ← claude".into(),
+            state: state.into(),
+            started: "2026-11-02T10:15:00-03:00".into(),
+            ends_in_secs: 11 * 3600 + 42 * 60 + 30,
+            requests: 3,
+            max_requests: None,
+            in_flight: 1,
+            automatic_locks: AutomaticLocks::Continue,
+        }
+    }
+
+    #[test]
+    fn grants_are_described_field_by_field() {
+        let row = GrantRow::new(&grant("g0123456789abcdef", "active"));
+        assert_eq!(row.id, "g0123456789abcdef");
+        assert!(row.revocable);
+        let facts: Vec<(&str, &str)> = row.facts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            facts,
+            [
+                ("Entry", "AI/ANTHROPIC_API_KEY (11111111)"),
+                ("Destination", "https://api.anthropic.com (Anthropic)"),
+                ("Command", "claude --print hello"),
+                ("Requested by (unverified)", "bash ← claude"),
+                ("Token variable", "ANTHROPIC_AUTH_TOKEN"),
+                ("State", "Active"),
+                ("Started", "2026-11-02T10:15:00-03:00"),
+                // 11h42m30s: rounded up, so that it is at the latest.
+                ("Ends", "in 11h43m at the latest"),
+                ("Requests", "3 (no limit); 1 in flight"),
+                (
+                    "Automatic locks",
+                    "Do not end it: it keeps working while the screen or the vault is locked"
+                ),
+                ("ID", "g0123456789abcdef"),
+            ]
+        );
+        // A limit, the automatic locks ending it, the last minutes.
+        let mut limited = grant("g1", "exhausted");
+        limited.max_requests = Some(3);
+        limited.in_flight = 0;
+        limited.automatic_locks = AutomaticLocks::End;
+        limited.ends_in_secs = 59;
+        let row = GrantRow::new(&limited);
+        assert!(row.revocable, "an exhausted grant has not ended");
+        let fact = |row: &GrantRow, key: &str| {
+            row.facts
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        assert_eq!(fact(&row, "Requests"), "3 of 3; 0 in flight");
+        assert_eq!(fact(&row, "Ends"), "in 1m at the latest");
+        assert!(fact(&row, "State").starts_with("Exhausted: "));
+        assert!(fact(&row, "Automatic locks").starts_with("End it: "));
+        // Never earlier than it says: a second past a minute is a minute
+        // more.
+        for (secs, ends) in [
+            (0, "now"),
+            (1, "in 1m at the latest"),
+            (60, "in 1m at the latest"),
+            (61, "in 2m at the latest"),
+            (3600, "in 1h at the latest"),
+            (3601, "in 1h1m at the latest"),
+            (24 * 3600, "in 24h at the latest"),
+        ] {
+            limited.ends_in_secs = secs;
+            assert_eq!(fact(&GrantRow::new(&limited), "Ends"), ends, "{secs}");
+        }
+        // Whatever an agent sends, the page draws it rather than panic.
+        limited.ends_in_secs = u64::MAX;
+        assert!(fact(&GrantRow::new(&limited), "Ends").ends_with("h at the latest"));
+        // A revoked grant is listed until its command ends; there is
+        // nothing left to revoke.
+        let row = GrantRow::new(&grant("g2", "revoked"));
+        assert!(!row.revocable);
+        assert_eq!(fact(&row, "Ends"), "It has ended.");
+        assert!(fact(&row, "State").starts_with("Revoked: "));
+        // A grant whose run is being prepared can be revoked: that ends it
+        // before it admits anything.
+        let row = GrantRow::new(&grant("g3", "starting"));
+        assert!(row.revocable);
+        assert_eq!(
+            fact(&row, "State"),
+            "Starting: its run is being prepared; no request is admitted yet"
+        );
+        // A state of a newer agent is shown as it is, and can be revoked.
+        let row = GrantRow::new(&grant("g4", "paused"));
+        assert!(row.revocable);
+        assert_eq!(fact(&row, "State"), "paused");
+    }
+
+    #[test]
+    fn a_grant_no_longer_listed_is_shown_as_ended_in_the_same_rows() {
+        let mut listed = grant("g0123456789abcdef", "active");
+        listed.max_requests = Some(10);
+        let keys = |row: &GrantRow| row.facts.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let fact = |row: &GrantRow, key: &str| {
+            row.facts
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        for state in ["active", "exhausted", "revoked", "starting", "paused"] {
+            listed.state = state.into();
+            let (now, ended) = (GrantRow::new(&listed), GrantRow::ended(&listed));
+            // The same rows, in the same order: the page sets their texts
+            // in place.
+            assert_eq!(keys(&ended), keys(&now), "{state}");
+            assert!(!ended.revocable, "{state}");
+            assert_eq!(ended.id, now.id);
+            assert_eq!(fact(&ended, "State"), "Ended: the agent no longer lists it");
+            assert_eq!(fact(&ended, "Ends"), "It has ended.");
+            // Its counts are those last listed; nothing is said of requests
+            // in flight, which the agent no longer reports.
+            assert_eq!(fact(&ended, "Requests"), "3 of 10 when last listed");
+            for key in ["Entry", "Destination", "Command", "Started", "ID"] {
+                assert_eq!(fact(&ended, key), fact(&now, key), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn editing_an_entry_with_a_profile_never_touches_the_profile() {
+        let mut entry = entry();
+        entry.broker = Some(usable(Preset::Anthropic));
+        let mut form = Form::from_entry(&entry);
+        form.name = "RENAMED".into();
+        form.tags = String::new();
+        let sent = changes(&form, &entry).expect("edit");
+        // A plain edit: one that sets or clears a profile is a broker_edit,
+        // which this app never sends.
+        assert!(!sent.touches_broker());
+        assert!(sent.broker.is_none() && !sent.clear.contains(&Field::Broker));
     }
 
     #[test]

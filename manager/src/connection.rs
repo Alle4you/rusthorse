@@ -70,19 +70,29 @@ impl Job {
         Self::with_limit(path, request, Duration::from_secs(600))
     }
 
-    fn with_limit(path: PathBuf, request: Request, limit: Duration) -> Result<Self, String> {
+    /// Like [`Job::start`], with `limit` instead of ten minutes: for
+    /// requests that ask the human nothing, so that an agent that does not
+    /// answer is reported sooner. The limit bounds the whole job from the
+    /// moment it starts — reaching the agent, the status check, sending the
+    /// request and its answer — besides each step's own [`STEP_LIMIT`].
+    pub(crate) fn with_limit(
+        path: PathBuf,
+        request: Request,
+        limit: Duration,
+    ) -> Result<Self, String> {
+        let deadline = Instant::now() + limit;
         let cancel = Arc::new(Mutex::new(Cancellation::default()));
         let (tx, result) = mpsc::sync_channel(1);
         let worker_cancel = Arc::clone(&cancel);
         let worker = thread::Builder::new().name("manager-request".into()).spawn(move || {
             let result = (|| {
-                let status = exchange(&path, &Request::Status, &worker_cancel, Duration::from_secs(5))?;
+                let status = exchange(&path, &Request::Status, &worker_cancel, STEP_LIMIT, deadline)?;
                 let Response::Status(info) = status else { return Err(Failure::new("The agent did not return status.", false)); };
                 if info.protocol_version != protocol::PROTOCOL_VERSION {
                     return Err(Failure::new("Incompatible agent protocol. Upgrade matching programs and restart the agent yourself.", false));
                 }
                 if matches!(request, Request::Status) { return Ok(Response::Status(info)); }
-                exchange(&path, &request, &worker_cancel, limit)
+                exchange(&path, &request, &worker_cancel, limit, deadline)
             })();
             let _ = tx.send(result);
             worker_cancel.lock().unwrap_or_else(|p| p.into_inner()).socket.take();
@@ -112,15 +122,30 @@ impl Drop for Job {
     }
 }
 
+/// How long each step of a job may take: reaching the agent, writing a
+/// request, the status check's answer.
+const STEP_LIMIT: Duration = Duration::from_secs(5);
+
+/// Send `request` on a connection of its own and read the answer, which may
+/// take `answer` once the request is sent; nothing goes on past `deadline`,
+/// the whole job's.
 fn exchange(
     path: &Path,
     request: &Request,
     cancel: &Mutex<Cancellation>,
-    limit: Duration,
+    answer: Duration,
+    deadline: Instant,
 ) -> Result<Response, Failure> {
-    let stream = connect_by(path, cancel)?;
+    let stream = connect_by(path, cancel, deadline)?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Failure::new(
+            "Connection cancelled or timed out before sending.",
+            false,
+        ));
+    }
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(left.min(STEP_LIMIT)))
         .map_err(|e| Failure::new(e.to_string(), false))?;
     {
         let mut state = cancel.lock().unwrap_or_else(|p| p.into_inner());
@@ -136,7 +161,8 @@ fn exchange(
     protocol::send_frame(&stream, request, &[])
         .map_err(|e| Failure::new(format!("Cannot send request: {e}"), false))?;
     let effects = request.has_effects();
-    let (body, fds) = protocol::recv_frame_before(&stream, Some(Instant::now() + limit))
+    let before = (Instant::now() + answer).min(deadline);
+    let (body, fds) = protocol::recv_frame_before(&stream, Some(before))
         .map_err(|_| Failure::new("No complete answer arrived from the agent.", effects))?;
     if !fds.is_empty() {
         return Err(Failure::new(
@@ -162,13 +188,18 @@ fn exchange(
 }
 
 // AF_UNIX connect can block when the listener's backlog is full. No GTK
-// thread or unregistered blocking connect may outlive cancellation forever.
-fn connect_by(path: &Path, cancel: &Mutex<Cancellation>) -> Result<UnixStream, Failure> {
+// thread or unregistered blocking connect may outlive cancellation forever,
+// nor the job's deadline.
+fn connect_by(
+    path: &Path,
+    cancel: &Mutex<Cancellation>,
+    deadline: Instant,
+) -> Result<UnixStream, Failure> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
     use std::os::fd::AsRawFd;
     let addr = UnixAddr::new(path).map_err(|e| Failure::new(e.to_string(), false))?;
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = (Instant::now() + STEP_LIMIT).min(deadline);
     loop {
         if cancel.lock().unwrap_or_else(|p| p.into_inner()).closed || Instant::now() >= end {
             return Err(Failure::new(
@@ -340,14 +371,16 @@ mod tests {
             let (s, _) = listener.accept().expect("accept");
             let r: Request = protocol::read_message(&s).expect("request");
             assert!(matches!(r, Request::Remove { .. }));
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(1500));
         });
+        // The limit covers the status check too: wide enough for it on a
+        // loaded machine, well short of the server's wait.
         let job = Job::with_limit(
             socket,
             Request::Remove {
                 name: "fake".into(),
             },
-            Duration::from_millis(50),
+            Duration::from_millis(500),
         )
         .expect("job");
         let failure = job
@@ -357,6 +390,39 @@ mod tests {
             .err()
             .expect("failure");
         assert!(failure.uncertain);
+        drop(job);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_limit_bounds_the_whole_job_from_its_start() {
+        // An agent slower to answer the status check than the whole limit:
+        // the job ends once the limit has passed, not after the status
+        // check's own five seconds and the limit again.
+        let dir = tempfile::tempdir().expect("dir");
+        let socket = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket).expect("listen");
+        let server = thread::spawn(move || {
+            let (s, _) = listener.accept().expect("accept");
+            let _: Request = protocol::read_message(&s).expect("status request");
+            thread::sleep(Duration::from_millis(1500));
+            // The job may be gone by now.
+            let _ = protocol::send_frame(&s, &status(), &[]);
+        });
+        let job =
+            Job::with_limit(socket, Request::Grants, Duration::from_millis(200)).expect("job");
+        let failure = job
+            .result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("an answer once the limit has passed")
+            .err()
+            .expect("failure");
+        // Nothing but the status check was sent.
+        assert!(!failure.uncertain);
+        assert_eq!(
+            failure.message,
+            "No complete answer arrived from the agent."
+        );
         drop(job);
         server.join().expect("server");
     }
@@ -455,7 +521,11 @@ mod tests {
         let other = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            let _ = tx.send(connect_by(&path, &other));
+            let _ = tx.send(connect_by(
+                &path,
+                &other,
+                Instant::now() + Duration::from_secs(60),
+            ));
         });
         // A normal blocking connect cannot see this flag; the timeout fails.
         thread::sleep(Duration::from_millis(100));

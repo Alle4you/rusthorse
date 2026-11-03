@@ -22,8 +22,10 @@ awaiting an independent review: try it with fake entries first.
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
 | The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
-| Import from GNOME Keyring or a `.env` file; the agent reads the values | |
+| Import from GNOME Keyring or a `.env` file; the agent reads the values | Editing broker profiles ([ADR 0013](adr/0013-credential-broker.md), phase 2) |
 | Verified backup of the vault; change of the master password | |
+| An entry's broker profile, read-only, and the command that gives a program a temporary token instead of the value (`rusthorse run --broker`) | |
+| The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
 
 Pages for the later features are in the window already; they say what is
 missing and what to do meanwhile.
@@ -62,7 +64,9 @@ the details, which take any extra width. It fits a screen 1024 pixels wide
   the two ways to change the value: **Change the value…** and **Replace
   with a random value…**), the
   **Details** (login, URL, host, port, tags, the names of other fields, the
-  UUID) and the command to use it. Each row has its name on the left and
+  UUID), the entry's **Credential broker** profile when it has one (see
+  [The broker profile](#the-broker-profile)) and the command to use it.
+  Each row has its name on the left and
   its content on the right (screen readers name the row by it); the details
   can be selected and copied, since none of them is secret. No hyphen is
   added where a long value, URL or command wraps.
@@ -100,11 +104,14 @@ it before the first start ([installation guide](installation.md#using-an-existin
 
 **Unlock** makes the agent ask for the master password in its own dialog.
 **Lock now** makes the agent forget the decrypted vault and every remembered
-approval; commands already running keep the secrets they were given. Closing
+approval, and ends every grant of the credential broker (see
+[Grants](#grants-of-the-credential-broker)); commands already running keep
+the values they were given, but a token stops working. Closing
 the manager does **not** lock the vault. The agent itself also locks it when
 the screen locks or the computer suspends, whether the manager is open or
 not; the Status page shows what it watches ("Also locks on"), see
-[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md).
+[ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md). Those automatic
+locks end only the grants whose profile says so.
 
 If the vault is locked by something else — the agent's idle timer,
 `rusthorse lock` — the manager notices at its next check (every five
@@ -240,6 +247,113 @@ variable name, `SECRET` otherwise. **This is the way to give an AI agent a
 secret**: it never sees the value. The snippet holds no secret; copying it is
 safe.
 
+For an entry with a usable broker profile ([below](#the-broker-profile)),
+the card holds the command that goes through the credential broker
+([ADR 0013](adr/0013-credential-broker.md)) instead:
+
+```sh
+rusthorse run \
+  --broker ANTHROPIC_AUTH_TOKEN=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  --url ANTHROPIC_BASE_URL=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  -- your-command
+```
+
+After your approval the program gets a temporary token in the first
+variable — never the key — and the broker's local address
+(`http://127.0.0.1:PORT` and the profile's base path) in the second; the
+broker adds the key to the program's requests, only to the profile's
+destination and only for the routes it allows. The token stops working when
+the command ends; meanwhile its grant is on the [Grants
+page](#grants-of-the-credential-broker). The variables are those the
+preset's clients read, whatever the entry is called: `ANTHROPIC_AUTH_TOKEN`
+and `ANTHROPIC_BASE_URL` for `anthropic` (Claude Code and the Anthropic
+libraries), `OPENAI_API_KEY` and `OPENAI_BASE_URL` for `openai` and
+`openai-compatible`. An interactive program such as Claude Code needs
+`--no-redact` as well; the approval dialog then warns that the output is
+not filtered, so the token can reach whoever reads it. `rusthorse guide ai`
+and the [CLI reference](cli.md) say more. An entry whose profile cannot be
+used keeps the command that gives the value, and the card says so.
+
+### The broker profile
+
+An entry's broker profile says what a grant of the credential broker allows
+for it: the destination, the routes, when a grant ends and how many requests
+it admits ([ADR 0013](adr/0013-credential-broker.md)). The details show it
+under **Credential broker**, read-only: the preset and the revision of it
+you approved, then the profile as the agent's approval dialogs describe it —
+**Destination**, **Allows** (every route), **Ends** and **Requests**.
+
+Profiles are set, changed and removed in a terminal, never in the manager
+(that comes with phase 2): `rusthorse edit ENTRY --broker PRESET`, with
+`--broker-origin`, `--broker-base-path`, `--broker-locks`,
+`--broker-lifetime` and `--broker-requests` for what differs from the
+preset's defaults, or `rusthorse edit ENTRY --clear broker`; the agent shows
+the whole new profile and asks you. Any change to an entry — its value,
+name, group, fields or profile — ends its grants; the **Edit** form of an
+entry with a usable profile says so.
+
+The details also say when a profile cannot be used:
+
+- **Withheld**: the KeePass file marks it as protected, so it is treated
+  like a secret, and the broker cannot use it.
+- **Unusable**: this version of Rusthorse cannot read it — another program
+  wrote it, or a newer version — and nothing guesses.
+
+In both cases the command card gives the value instead, and says why. An API
+key without a profile shows how to give it one; other entries without one
+show nothing about it.
+
+### Grants of the credential broker
+
+The **Grants** page lists the grants in use: one for each entry that a
+command started with `rusthorse run --broker` uses through the broker. For
+each, under its ID: the entry, the destination and preset, the command, who
+asked for it (process names, which any program chooses: unverified, as in
+the agent's dialogs), the variable that holds its token, its state, when it
+started, when it ends at the latest (its maximum lifetime, in whole minutes
+rounded up), the requests admitted (of the limit, if there is one) and those
+in flight now, and whether the automatic locks end it. Never the token: the
+agent does not send it. The states are *Starting*, while the run it belongs
+to is prepared (no request is admitted yet); *Active*; *Exhausted*, when its
+request limit is reached (requests already admitted finish); and *Revoked*,
+when it has ended — it is listed until its command ends, and its broker
+refuses every request meanwhile. A state the manager does not know is shown
+as the agent sends it. The grants are listed when you open the page, after a
+revocation, and while the page is shown every five seconds and after each of
+your requests to the agent (Lock now ends every grant; a change to an entry
+ends its grants).
+
+A refresh keeps each grant where it was, with the same **Revoke** button: a
+new grant comes last, and only the texts that changed are redrawn, so a
+selection and the keyboard focus stay. A grant the agent no longer lists has
+ended; while
+the page is shown it stays where it was, dimmed and marked *Ended*, with
+what was last listed and nothing to revoke, so that the grants below it do
+not move up and put another grant's **Revoke** button under the pointer. It
+goes when you leave the page. The line above the grants counts those that
+ended while the page was shown.
+
+**Revoke** ends one grant, **Revoke all** every grant, at once and without a
+dialog, as **Lock now** does: the token stops working and the open requests
+and streams are closed; the command keeps running, without that access. A
+request the broker had already sent may still take effect at its
+destination; the audit log records its outcome as unknown. The manager sends
+a revocation at once, even while one of the agent's dialogs is waiting for
+you, and one revocation at a time: the buttons are off until the agent
+answers. The agent's answer appears at the bottom of the window, as for
+other actions, and the page lists the grants again.
+
+The page works while the vault is locked, and then says so: a grant whose
+profile continues after the automatic locks — the screen locking, suspend,
+the idle timeout — keeps working while the vault is locked, until it ends.
+**Lock now** ends every grant.
+
+When the grants cannot be listed, the page says why in place of the list,
+and **Revoke all** stays available: it may work all the same, and it only
+takes away. A listing or a revocation takes 30 seconds at most, from
+reaching the agent to its answer; after that the page says so, and can be
+used again. Since a revocation only takes away, trying it again is safe.
+
 ### Show a value
 
 **Show…** in the Value row (or in the Notes row) asks the agent; its dialog says
@@ -307,7 +421,10 @@ names; the window then lists them, with what each would become:
   tick them. A locked item cannot be ticked: unlock the keyring first.
 - **A .env file**: the variable names, and an optional **Prefix**.
 - For both: a **Tag** for the new entries (`imported` unless you change it),
-  and **Replace entries that already exist** (off: they are skipped). Each
+  and **Replace entries that already exist** (off: they are skipped).
+  Replacing an entry removes its broker profile, which ends its grants (a
+  profile is set only by an edit you approve; see
+  [The broker profile](#the-broker-profile)). Each
   ticked name is marked new, existing, not allowed or repeated; **Import**
   stays off while a ticked one cannot be imported.
 
@@ -347,6 +464,7 @@ the new password in its own dialogs. The manager never receives them.
 | A master-password dialog you did not expect | The vault locked between two of the manager's requests (for example the idle timer fired just then), and listing needs it open. Answer it, or cancel it. |
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |
 | "Incompatible agent protocol" | The agent and the manager come from different versions. Upgrade both and restart the agent yourself. |
+| A message in red on the Grants page, in place of the list | The agent could not list the grants, or did not answer within 30 seconds (for example "No complete answer arrived from the agent"); the message says why. **Revoke all** still tries, and **Lock now** ends every grant. |
 | "Restart needed" on the Status page | The agent's program file was replaced after it started (an upgrade). Restart the service before using dialogs. |
 | "The vault was locked while the agent was asking you, so the value was neither shown nor copied" | The manager saw the vault locked while a Show or Copy was waiting — for example, the vault locked itself just before you clicked and the agent asked for the master password first. For safety, a value that arrives after a lock is dropped. Your approval was used up; click Show or Copy again. |
 
@@ -357,7 +475,12 @@ the new password in its own dialogs. The manager never receives them.
   wiped reliably, and on X11 other programs of your session can capture
   windows. A copied value is out of Rusthorse's hands (see the note above).
 - Show and Copy are for you at the desktop. An AI agent uses
-  `rusthorse run`, which keeps the value inside the approved command.
+  `rusthorse run`, which keeps the value inside the approved command — or,
+  better, `rusthorse run --broker`, which gives the command a token instead.
+- The Grants page and the broker profile hold no secret: the agent sends
+  neither a token nor a value with them. What a requester chose — the
+  command, the process names — is drawn as plain text, through the same
+  character filter as the agent's dialogs.
 - The full analysis is in [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client)
   and [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
 
@@ -370,5 +493,10 @@ real agent in the test process, on a fake vault, socket and audit log, with
 scripted dialogs; it drives the window, reads the clipboard with `xclip` as
 another program would, and focuses windows with `xdotool`. Missing tools
 (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather than
-pass untested. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save screenshots of
-the window in the light and dark styles and of the Show window.
+pass untested. The Grants page and the broker profile in the details are
+tested against a fake agent in the test process instead, since a test agent
+cannot start a broker: it answers from a script, records every request, and
+can hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
+screenshots of the window in the light and dark styles, of the Show window,
+of the Grants page (also with a grant that ended while it was shown) and of
+a profile in the details.
