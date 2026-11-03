@@ -671,6 +671,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Re-review at `9f7599b` (Codex, AI-assisted). | Ready: no medium or higher finding left; Q01/Q02 low, dispositions below. |
 | 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remains pending. |
 | 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
+| 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2142,7 +2143,7 @@ reasons above. No medium or higher finding remained.
 
 | Finding | Disposition |
 |---|---|
-| Low — Q01: a refused package whose filename did not end in .deb/.ddeb survived cleanup (release.pkg reproduced it). | **Fixed in `b999e72` and `3953912` (merged in `453e772`):** cleanup recognizes reported regular files by their Debian-package prefix or case-insensitive .deb/.ddeb suffix. Content-recognized packages are emptied, then unlinked; a permission failure permits unlinking only without another hard link. Extension-only candidates are unlinked without emptying. Nothing else is deleted. Symbolic links are named, not followed; unreadable or undeletable candidates are reported and do not stop other cleanup. |
+| Low — Q01: a refused package whose filename did not end in .deb/.ddeb survived cleanup (release.pkg reproduced it). | **Fixed in `b999e72` and `3953912` (merged in `453e772`); reopened by R01–R04 of the final review and replaced in `17c1965` (merged in `dbf6a4b`), which packages into a private staging directory instead (see the final review below).** As first fixed, cleanup recognized reported regular files by their Debian-package prefix or case-insensitive .deb/.ddeb suffix. Content-recognized packages are emptied, then unlinked; a permission failure permits unlinking only without another hard link. Extension-only candidates are unlinked without emptying. Nothing else is deleted. Symbolic links are named, not followed; unreadable or undeletable candidates are reported and do not stop other cleanup. |
 | Low — Q02: the manager docs universally attributed one Anthropic header to SDKs, contradicting the dated ADR survey. | **Fixed in `4ff834a`:** describe ANTHROPIC_API_KEY and the preset's two accepted headers; leave competing AUTH_TOKEN unset; no universal SDK precedence/header claim. |
 
 Q01 follow-up (2026-11-03): the two fix commit messages report 24 mutation
@@ -2251,3 +2252,47 @@ links, tables and examples; `git diff --check` passed. No runtime code,
 dependency, installed package or service was changed, and nothing was
 committed. Live SDK validation and the final implementation review remain
 separate pending work.
+
+**2026-11-03 — Final phase 1 review at `4b0186d`.**
+
+Review (Codex, AI-assisted, 2026-11-03; verdict: not ready), requested by
+the maintainer to verify Q01's fixes in `b999e72` and `3953912` (merged in
+`453e772`) independently, confirm Q02 in `4ff834a`, and check the
+documentation in `4b0186d` against the code and the review records. The
+reviewed range was `9f7599b..4b0186d`; no repository file was changed.
+
+Q02 is confirmed resolved: the documentation names the Anthropic key
+variable and both accepted token headers without asserting which header
+the SDKs choose or which variable they prefer. Q01's cleanup worked for
+packages with other extensions and for a debug-symbol package, but the
+cases below reopened it. No other material discrepancy was found in the
+changed documentation; the history's 42 commit references resolved.
+
+| Finding | Disposition |
+|---|---|
+| Medium — R01: the cleanup classified, emptied and unlinked a file through separate operations on its name. A package replaced by a hard link to another file after the read open had that file emptied, and an installable alias of the package survived without a warning; a file swapped in before the unlink was deleted; a FIFO swapped in after the lstat blocked the cleanup. | **Fixed in `17c1965` (merged in `dbf6a4b`):** cargo-deb no longer writes where the user asked. `build-deb.sh` takes `--output DIR` itself and has cargo-deb write into a new private staging directory (mode 0700) inside `target/release/packaging`; `check-broker.py --staged` checks every entry there, refusing anything that is not a regular file without opening it, and only when all pass moves the packages into DIR, by a rename or, between file systems, a new `O_EXCL` file renamed over the final name, so that a file or link at that name is replaced, never followed or written through. Whatever stops the check removes the staging directory whole. Nothing outside it is classified, emptied or deleted. |
+| Low — R02: the package prefix also matched an ar archive whose first member is `debian-binary.o`, which was deleted although dpkg-deb refuses it. | **Fixed in `17c1965`:** no file is taken for a package by its first bytes any more; everything in the staging directory belongs to the run, and nothing else is deleted. |
+| Low — R03: a read error on a `.deb`/`.ddeb` took the name-only path, unlinking it without emptying it, so another hard link kept an installable package, unreported. | **Fixed in `17c1965`:** a refused package never leaves the staging directory, and removing that directory leaves nothing in DIR. |
+| Low — R04: the package list was split on newlines, but cargo-deb accepts a newline in its output name: a refused `line\nname.pkg` survived and the cleanup said "deleted nothing". | **Fixed in `17c1965`:** the staging directory is listed with `os.scandir`, never parsed from cargo-deb's output; a name with a newline is moved or removed whole (tested). |
+| Low — found while fixing R01: with `--manifest-path` to another manifest whose package name holds `../`, cargo-deb 3.8.0 wrote the package outside the staging directory, where no check would see it (reproduced). | **Fixed in `17c1965`:** `build-deb.sh` refuses `--manifest-path`, as it refuses `--target`. |
+
+The fix was implemented by a Claude subagent (AI-assisted) and was not
+separately verified by another; Codex's re-review of it follows. Its
+mutation checks: 33 mutations of the guards, each caught by the 24
+packaging tests; two survive, harmless by design: removing the `fsync` of a
+copy between file systems (durability across a crash, which no test can
+observe), and copying on any rename error rather than only `EXDEV` (the copy
+also writes only a new `O_EXCL` file and renames it over the final name, and
+removes it if that fails). Residual assumptions, stated in §4 and ADR 0010:
+no other process of the user changes the private staging directory between
+the check and the move; a `SIGKILL` leaves the staging directory until the
+next run, which removes `target/release/packaging` (and, during a copy
+between file systems, a hidden `.check-broker-*.tmp` in DIR); two runs at
+once on one target directory are not supported.
+
+Checks after the merge (`dbf6a4b`), whole output read: every check of
+AGENTS.md passed — fmt; clippy with all features and as released; `cargo
+test --all-features` and `--no-default-features` (packaging 24, system 35,
+`tests/agent.rs` 158 and 139); rustdoc with warnings denied; MSRV 1.89 both
+ways; the dialog's and the manager's clippy and tests; the KeePassXC round
+trip.
