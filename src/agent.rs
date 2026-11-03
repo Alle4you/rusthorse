@@ -855,33 +855,49 @@ impl Agent {
             tried = true;
             match Vault::open_fingerprinted(&self.config.vault, password, &self.fingerprint_key) {
                 Ok(vault) => {
-                    let mut state = self.state();
-                    if state.generation != started {
-                        // `lock` was requested while the password was typed.
-                        // (The fingerprint stays the one of the last unlock.)
-                        drop(state);
+                    // A lock while the unlock is under way cancels it. (The
+                    // fingerprint stays the one of the last unlock.) Its
+                    // record says that the vault stays locked: one that comes
+                    // after the unlock's own record follows `unlocked`.
+                    let locked_meanwhile = |vault: Vault, when: &str| {
                         drop(vault);
-                        let _ = self
-                            .audit
-                            .record(&AuditEvent::new("unlock", peer).outcome("cancelled_by_lock"));
-                        return Err(Failure::new(
-                            ErrorCode::Locked,
-                            "the vault was locked while the password was being entered",
-                        ));
-                    }
+                        let _ = self.audit.record(
+                            &AuditEvent::new("unlock", peer)
+                                .outcome("cancelled_by_lock")
+                                .detail(format!("the vault was locked {when}; it stays locked")),
+                        );
+                        Failure::new(ErrorCode::Locked, format!("the vault was locked {when}"))
+                    };
                     // The unlock barrier: a file whose bytes are not those
                     // the agent last read or wrote — another program changed
                     // it while the vault was locked — ends every grant that
                     // survived the lock, whichever entries the change
                     // concerned, before the unlock completes. Decided as
-                    // soon as the change is found, before the unlock is
-                    // recorded: ending grants only takes away, and must not
-                    // wait for the audit log.
+                    // soon as the change is found, under the lock that
+                    // checks the generation.
                     let fingerprint = vault.content_fingerprint();
-                    let changed = fingerprint.is_none() || state.content != fingerprint;
-                    let ending =
-                        changed.then(|| self.registry.decide(Which::All, EndReason::VaultChanged));
-                    let ended = ending.as_ref().map_or(0, |e| e.ended());
+                    let ending = {
+                        let state = self.state();
+                        if state.generation != started {
+                            drop(state);
+                            return Err(locked_meanwhile(
+                                vault,
+                                "while the password was being entered",
+                            ));
+                        }
+                        let changed = fingerprint.is_none() || state.content != fingerprint;
+                        changed.then(|| self.registry.decide(Which::All, EndReason::VaultChanged))
+                    };
+                    // Their brokers are told and waited for (confirmed, or
+                    // killed and gone) before anything waits for the audit
+                    // log, and without the state lock: revocation never
+                    // waits for the audit log, and a lock meanwhile is not
+                    // held up either.
+                    let ended = ending.map_or(0, |ending| {
+                        let ended = ending.ended();
+                        ending.complete();
+                        ended
+                    });
                     let mut event = AuditEvent::new("unlock", peer).outcome("unlocked");
                     if ended > 0 {
                         event = event.detail(format!(
@@ -889,22 +905,27 @@ impl Agent {
                              locked: {ended} grant(s) of the credential broker end"
                         ));
                     }
-                    // Record first: if the audit log cannot be written, the
-                    // vault stays locked (and keeps the previous fingerprint,
-                    // so that the change is found again at the next unlock).
-                    if let Err(failure) = self.record(event) {
+                    // Recorded before the vault is unlocked, and outside the
+                    // state lock, so that no lock waits for this record: if
+                    // the audit log cannot be written, the vault stays
+                    // locked, and keeps the previous fingerprint, so that
+                    // the change is found again at the next unlock.
+                    self.record(event)?;
+                    // Only a lock can have come meanwhile: this request
+                    // holds the dialog lock, without which nothing else
+                    // unlocks or creates the vault.
+                    let mut state = self.state();
+                    if state.generation != started {
                         drop(state);
-                        drop(ending);
-                        return Err(failure);
+                        return Err(locked_meanwhile(
+                            vault,
+                            "while it was being unlocked, after its unlock was recorded",
+                        ));
                     }
                     state.vault = Some(vault);
                     state.content = fingerprint;
                     state.last_used = Instant::now();
                     state.generation += 1;
-                    drop(state);
-                    if let Some(ending) = ending {
-                        ending.complete();
-                    }
                     return Ok(());
                 }
                 Err(VaultError::WrongPassword) => {
@@ -2392,6 +2413,16 @@ impl Agent {
             );
             failure
         };
+        // Once the run has grants, such a failure ends them first: their
+        // brokers are stopped and their ports released before anything
+        // waits for the audit log (revocation never does), and only then
+        // does the run fail.
+        let abandon = |run_grants: Option<RunGrants>, reason: EndReason, failure: Failure| {
+            if let Some(run_grants) = run_grants {
+                run_grants.finish(reason);
+            }
+            aborted(failure)
+        };
 
         // The answer may have taken a while: make sure the program and the
         // directory were not replaced meanwhile...
@@ -2486,13 +2517,7 @@ impl Agent {
         };
         let (tokens, ports) = match prepared {
             Ok(prepared) => prepared,
-            Err((failure, reason)) => {
-                let failure = aborted(failure);
-                if let Some(run_grants) = run_grants.take() {
-                    run_grants.finish(reason);
-                }
-                return Err(failure);
-            }
+            Err((failure, reason)) => return Err(abandon(run_grants.take(), reason, failure)),
         };
 
         let mut command = Command::new(&program.canonical);
@@ -2546,24 +2571,27 @@ impl Agent {
         // Everything that can fail is prepared before the command starts: once
         // it has started, the only answer is its exit status (or, if waiting
         // for it fails, "outcome unknown").
-        // (On these failures a run's grants end as it is dropped.)
-        let internal = |e: io::Error| aborted(Failure::new(ErrorCode::Internal, e.to_string()));
-        let writer = Arc::new(Mutex::new(stream.try_clone().map_err(internal)?));
-        let watch_stream = stream.try_clone().map_err(internal)?;
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                let failure = aborted(Failure::new(
-                    ErrorCode::InvalidRequest,
-                    format!("cannot start {}: {e}", program.canonical.display()),
-                ));
-                if let Some(run_grants) = run_grants.take() {
-                    run_grants.finish(EndReason::CommandEnded);
-                }
-                return Err(failure);
+        let started = stream
+            .try_clone()
+            .and_then(|writer| Ok((writer, stream.try_clone()?)))
+            .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))
+            .and_then(|streams| {
+                let child = command.spawn().map_err(|e| {
+                    Failure::new(
+                        ErrorCode::InvalidRequest,
+                        format!("cannot start {}: {e}", program.canonical.display()),
+                    )
+                })?;
+                Ok((streams, child))
+            });
+        let ((writer, watch_stream), mut child) = match started {
+            Ok(started) => started,
+            Err(failure) => {
+                return Err(abandon(run_grants.take(), EndReason::CommandEnded, failure));
             }
         };
         drop(command);
+        let writer = Arc::new(Mutex::new(writer));
         let pid = Pid::from_raw(child.id() as i32);
         // While the leader is not reaped its pid — and so the process group
         // id — cannot be reused, which makes signalling the group safe.
@@ -4150,6 +4178,105 @@ mod tests {
             .finish(EndReason::CommandEnded);
         assert_eq!(agent.registry.count(), 0);
         assert!(!marker.exists(), "a broker was started");
+    }
+
+    /// Types the master password, and says when it is asked for it.
+    struct TypesPassword(Mutex<Option<std::sync::mpsc::Sender<()>>>);
+
+    impl Ui for TypesPassword {
+        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+            if let Some(asked) = self.0.lock().expect("lock").take() {
+                let _ = asked.send(());
+            }
+            Ok(Typed::Value(SecretString::new("correct horse".into())))
+        }
+        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+            unreachable!("no value dialog expected")
+        }
+        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+            unreachable!("no approval expected")
+        }
+    }
+
+    /// An unlock records itself outside the state lock, so that no lock
+    /// waits for its record; a lock that comes meanwhile wins: the unlock,
+    /// recorded, does not take effect, and says so on record.
+    #[test]
+    fn a_lock_while_an_unlock_is_recorded_keeps_the_vault_locked() {
+        use crate::session_lock::{Locker, SCREEN_LOCK};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        drop(
+            Vault::create(
+                &path,
+                SecretString::new("correct horse".into()),
+                KdfParams::INSECURE_FOR_TESTS,
+            )
+            .expect("create"),
+        );
+        let audit = dir.path().join("audit.jsonl");
+        let (asked, typed) = std::sync::mpsc::channel();
+        let agent = Agent::new(
+            AgentConfig {
+                vault: path,
+                socket: dir.path().join("agent.sock"),
+                audit_log: audit.clone(),
+                idle_timeout: Duration::ZERO,
+                request_timeout: Duration::from_secs(10),
+                send_buffer: None,
+                session_lock: Default::default(),
+                new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+                keyring: Default::default(),
+                broker_program: None,
+                broker_ready_timeout: None,
+                broker_lifetime: None,
+            },
+            Box::new(TypesPassword(Mutex::new(Some(asked)))),
+        );
+        let unlocked = std::thread::scope(|scope| {
+            // Held in here, so that a failed assertion lets it go.
+            let held = agent.audit.hold();
+            let unlocking = scope.spawn(|| agent.ensure_unlocked(&Peer::agent()));
+            typed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the password was asked for");
+            // The vault is read; the unlock then waits to record itself.
+            std::thread::sleep(Duration::from_millis(500));
+            // The vault was not open yet: the lock writes no record. It must
+            // not wait for the unlock's record (which the log holds).
+            let (done, locked) = std::sync::mpsc::channel();
+            let locker: &Agent = &agent;
+            scope.spawn(move || {
+                locker.lock_for(SCREEN_LOCK, "test");
+                let _ = done.send(());
+            });
+            let waited = locked.recv_timeout(Duration::from_secs(2)).is_err();
+            drop(held);
+            assert!(!waited, "the lock waited for the unlock's record");
+            unlocking.join().expect("the unlock ends")
+        });
+        let failure = unlocked.expect_err("unlocked after a lock");
+        assert_eq!(failure.code, ErrorCode::Locked);
+        assert!(
+            failure.message.contains("while it was being unlocked"),
+            "{}",
+            failure.message
+        );
+        assert!(agent.state().vault.is_none(), "unlocked after a lock");
+        assert!(agent.state().content.is_none(), "the fingerprint changed");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&audit)
+            .expect("audit")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        let outcomes: Vec<&str> = records
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(outcomes, ["unlocked", "cancelled_by_lock"]);
+        // What follows the record of the unlock says that it did not happen.
+        let cancelled = records[1]["detail"].as_str().unwrap_or_default();
+        assert!(cancelled.contains("it stays locked"), "{cancelled}");
     }
 
     #[test]
