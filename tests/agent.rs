@@ -103,6 +103,9 @@ struct Harness {
     socket: PathBuf,
     audit: PathBuf,
     ui: Arc<ScriptedUi>,
+    /// The agent, for the events that do not come through its socket (a
+    /// screen lock, a suspend).
+    agent: Arc<Agent>,
 }
 
 impl Harness {
@@ -131,6 +134,19 @@ impl Harness {
             send_buffer,
             rusthorse::session_lock::Settings::default(),
             no_keyring(),
+            BROKER_READY_TIMEOUT,
+        )
+    }
+
+    /// An agent that waits at most `ready` for a broker to answer.
+    fn with_broker_ready_timeout(ready: Duration) -> Harness {
+        Harness::build(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            None,
+            rusthorse::session_lock::Settings::default(),
+            no_keyring(),
+            ready,
         )
     }
 
@@ -142,6 +158,7 @@ impl Harness {
             None,
             settings,
             no_keyring(),
+            BROKER_READY_TIMEOUT,
         )
     }
 
@@ -158,6 +175,7 @@ impl Harness {
                 plain: true,
                 ..Default::default()
             },
+            BROKER_READY_TIMEOUT,
         )
     }
 
@@ -167,6 +185,7 @@ impl Harness {
         send_buffer: Option<usize>,
         session_lock: rusthorse::session_lock::Settings,
         keyring: rusthorse::keyring::Settings,
+        broker_ready_timeout: Duration,
     ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
@@ -189,15 +208,21 @@ impl Harness {
             session_lock,
             new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
             keyring,
+            // Nothing there until a test of the credential broker writes a
+            // stand-in (`fake_broker`).
+            broker_program: Some(dir.path().join("rusthorse-broker")),
+            broker_ready_timeout: Some(broker_ready_timeout),
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
-        std::thread::spawn(move || agent.serve(listener));
+        let serving = Arc::clone(&agent);
+        std::thread::spawn(move || serving.serve(listener));
         Harness {
             dir,
             socket,
             audit,
             ui,
+            agent,
         }
     }
 
@@ -287,6 +312,10 @@ fn no_keyring() -> rusthorse::keyring::Settings {
 /// No single rusthorse invocation in these tests should take this long; a
 /// hang is reported as a failure instead of blocking the whole suite.
 const TEST_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long the agents of these tests wait for a broker to answer its
+/// install (ADR 0013): as long as in production, unless a test shortens it.
+const BROKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run `f` on a thread and fail the test if it does not finish in time.
 fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -3504,82 +3533,641 @@ fn descriptors_on_other_requests_are_rejected() {
     ));
 }
 
-/// Whether the agent understood the request and refused it with
-/// `invalid_request` (a request it cannot read gets that code too, with a
-/// message that says so).
-fn is_invalid(response: &rusthorse::protocol::Response) -> bool {
-    matches!(
-        response,
-        rusthorse::protocol::Response::Error {
-            code: rusthorse::protocol::ErrorCode::InvalidRequest,
-            message,
-        } if !message.starts_with("malformed request")
-    )
+// ---------------------------------------------------------------------------
+// The credential broker (ADR 0013). The agent starts `rusthorse-broker` for
+// each grant; here a stand-in written in Python plays it (`fake_broker`): it
+// follows the control channel as far as its mode says and logs what it
+// receives. The real broker is tested with the agent after the merge.
+
+/// A fake key: what the broker would present to the destination.
+const FAKE_KEY: &str = "sk-ant-test-0000000000000000";
+
+/// Whether these tests can run a stand-in broker: it is a Python script.
+fn python3() -> bool {
+    let found = Path::new("/usr/bin/python3").exists();
+    if !found {
+        eprintln!("skipped: /usr/bin/python3 is needed for a stand-in broker");
+    }
+    found
 }
 
-/// A run with broker bindings starts nothing until the agent serves grants
-/// (ADR 0013), and neither does a plain `run` that carries them: no dialog,
-/// no command, no `run` record, and never the values instead.
-#[test]
-fn runs_with_broker_bindings_start_nothing_until_grants_are_served() {
+/// Write an executable file that only its owner can change, from another
+/// process, and put it in place at once: a file that this process held open
+/// for writing could not be run while a process forked meanwhile by another
+/// test still held that descriptor ("Text file busy").
+fn write_program(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cat > \"$1.new\" && chmod 700 \"$1.new\" && mv -f \"$1.new\" \"$1\"",
+            "sh",
+        ])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("sh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(text.as_bytes())
+        .expect("write");
+    assert!(child.wait().expect("wait").success());
+}
+
+/// A stand-in for `rusthorse-broker`. It reads the install (and the
+/// listening socket that comes with it), logs it with what it can see of
+/// its own process, then, by `MODE`:
+///
+/// - `silent`: never answers;
+/// - `wrong_grant`, `old_version`: answers ready for another grant, or in
+///   another version;
+/// - anything else: answers ready; `bad_number` then asks for request 5
+///   first, and `admit` for requests 1 and 2 (finishing 1 between them),
+///   once the command has created `LOG.go`; `ignore_revoke` never confirms
+///   a revocation, the others confirm at once.
+///
+/// It logs every message it receives and exits when its channel ends.
+const FAKE_BROKER: &str = r#"#!/usr/bin/python3 -I
+import json, os, socket, struct, sys, time
+
+MODE = "@MODE@"
+LOG = "@LOG@"
+
+def log(entry):
+    with open(LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+chan = socket.socket(fileno=0)
+
+def recv_exact(n, got=b""):
+    while len(got) < n:
+        part = chan.recv(n - len(got))
+        if not part:
+            log({"event": "eof"})
+            sys.exit(0)
+        got += part
+    return got
+
+def read_frame(want_fds=False):
+    fds = []
+    if want_fds:
+        data, ancillary, _, _ = chan.recvmsg(4, socket.CMSG_SPACE(16 * 4))
+        if not data:
+            log({"event": "eof"})
+            sys.exit(0)
+        for level, kind, payload in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                count = len(payload) // 4
+                fds += struct.unpack("%di" % count, payload[: count * 4])
+        head = recv_exact(4, data)
+    else:
+        head = recv_exact(4)
+    (length,) = struct.unpack(">I", head)
+    return json.loads(recv_exact(length)), list(fds)
+
+def send(message):
+    body = json.dumps(message).encode()
+    chan.sendall(struct.pack(">I", len(body)) + body)
+
+def wait_for(path):
+    for _ in range(600):
+        if os.path.exists(path):
+            return
+        time.sleep(0.05)
+
+install, fds = read_frame(want_fds=True)
+with open("/proc/self/environ", "rb") as f:
+    environ = f.read().decode("latin-1")
+entry = {
+    "event": "install",
+    "pid": os.getpid(),
+    "pgid": os.getpgrp(),
+    "argv": sys.argv[1:],
+    "environ": environ,
+    "cwd": os.getcwd(),
+    "stderr": os.readlink("/proc/self/fd/2"),
+    "fds": len(fds),
+    "install": install,
+}
+if len(fds) == 1:
+    listener = socket.socket(fileno=fds[0])
+    entry["listen"] = list(listener.getsockname())
+    entry["inet"] = listener.family == socket.AF_INET
+    entry["accepting"] = listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+log(entry)
+
+if MODE == "silent":
+    while chan.recv(65536):
+        pass
+    log({"event": "eof"})
+    sys.exit(0)
+grant = install["grant"]
+version = install["version"]
+if MODE == "wrong_grant":
+    grant = "g0000000000000000"
+if MODE == "old_version":
+    version = 99
+send({"type": "ready", "version": version, "grant": grant})
+
+if MODE == "bad_number":
+    wait_for(LOG + ".go")
+    send({"type": "admit", "request": 5, "method": "POST", "route": "POST /v1/messages"})
+if MODE == "admit":
+    wait_for(LOG + ".go")
+    send({"type": "admit", "request": 1, "method": "POST", "route": "POST /v1/messages"})
+    answer, _ = read_frame()
+    log({"event": "answer", "message": answer})
+    send({"type": "finished", "request": 1, "outcome": "completed", "status": 200,
+          "bytes_sent": 10, "bytes_received": 20})
+    send({"type": "admit", "request": 2, "method": "GET", "route": "GET /v1/models"})
+    answer, _ = read_frame()
+    log({"event": "answer", "message": answer})
+    open(LOG + ".done", "w").close()
+
+while True:
+    message, _ = read_frame()
+    log({"event": message["type"], "message": message})
+    if message["type"] == "revoke" and MODE != "ignore_revoke":
+        send({"type": "revoked", "refused": 0})
+"#;
+
+impl Harness {
+    /// Where this harness's agent looks for `rusthorse-broker`.
+    fn broker_program(&self) -> PathBuf {
+        self.dir.path().join("rusthorse-broker")
+    }
+}
+
+/// Put a stand-in broker in `mode` where the agent looks for it; returns
+/// the log it writes.
+fn fake_broker(h: &Harness, mode: &str) -> PathBuf {
+    let log = h.dir.path().join(format!("broker-{mode}.jsonl"));
+    let _ = std::fs::remove_file(&log);
+    let script = FAKE_BROKER
+        .replace("@MODE@", mode)
+        .replace("@LOG@", log.to_str().expect("utf8"));
+    write_program(&h.broker_program(), &script);
+    log
+}
+
+/// What a stand-in broker logged so far.
+fn broker_log(log: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Wait until `f` gives something, within [`TEST_LIMIT`].
+fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let until = Instant::now() + TEST_LIMIT;
+    loop {
+        if let Some(found) = f() {
+            return found;
+        }
+        assert!(Instant::now() < until, "waited too long for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The first entry of a stand-in broker's log with this event, once it is
+/// there.
+fn logged(log: &Path, event: &str) -> serde_json::Value {
+    eventually(event, || {
+        broker_log(log)
+            .into_iter()
+            .find(|entry| entry["event"] == event)
+    })
+}
+
+/// Whether the process `pid` is gone (or a zombie nobody waits for any
+/// more), within a few seconds.
+fn process_gone(pid: u64) -> bool {
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        match std::fs::read(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(stat) => {
+                let close = stat.iter().rposition(|&b| b == b')').unwrap_or(0);
+                if matches!(stat.get(close + 2), Some(b'Z' | b'X')) {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Write entries into the vault file before the agent opens it — name,
+/// value and broker profile — and return their UUIDs by name.
+fn seed(
+    h: &Harness,
+    entries: &[(
+        &str,
+        &str,
+        Option<rusthorse::broker_profile::ProfileRequest>,
+    )],
+) -> std::collections::HashMap<String, String> {
+    use rusthorse::protocol::{EntryChanges, NewEntry};
+    let mut vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
+    let mut uuids = std::collections::HashMap::new();
+    for (name, value, profile) in entries {
+        let entry = NewEntry {
+            name: name.to_string(),
+            ..NewEntry::default()
+        };
+        vault
+            .add(&entry, &SecretString::new(value.to_string()), false)
+            .expect("add");
+        let id = vault.find(name).expect("find");
+        if let Some(profile) = profile {
+            let set = EntryChanges {
+                broker: Some(profile.clone()),
+                ..EntryChanges::default()
+            };
+            vault.edit(id, &set, None).expect("set the profile");
+        }
+        uuids.insert(name.to_string(), vault.info(id).id);
+    }
+    vault.save().expect("save");
+    uuids
+}
+
+/// Set a field of the entry titled `title` as another KeePass client could:
+/// in the file, while the agent does not have it open.
+fn set_field_elsewhere(h: &Harness, title: &str, key: &str, value: &str, protected: bool) {
+    use keepass::{Database, DatabaseKey};
+    let path = h.vault_path();
+    let mut db = Database::open(
+        &mut std::fs::File::open(&path).expect("open"),
+        DatabaseKey::new().with_password(PASSWORD),
+    )
+    .expect("decrypt");
+    let id = db
+        .iter_all_entries()
+        .find(|e| e.get_title() == Some(title))
+        .map(|e| e.id())
+        .expect("the entry");
+    {
+        let mut entry = db.entry_mut(id).expect("entry");
+        if protected {
+            entry.set_protected(key, value);
+        } else {
+            entry.set_unprotected(key, value);
+        }
+    }
+    let mut file = std::fs::File::create(&path).expect("rewrite");
+    db.save(&mut file, DatabaseKey::new().with_password(PASSWORD))
+        .expect("save");
+}
+
+fn anthropic() -> rusthorse::broker_profile::ProfileRequest {
+    rusthorse::broker_profile::ProfileRequest::new(rusthorse::broker_profile::Preset::Anthropic)
+}
+
+/// An Anthropic profile whose grants the automatic locks end.
+fn anthropic_ending() -> rusthorse::broker_profile::ProfileRequest {
+    rusthorse::broker_profile::ProfileRequest {
+        automatic_locks: Some(rusthorse::broker_profile::AutomaticLocks::End),
+        ..anthropic()
+    }
+}
+
+fn by_value(var: &str, entry: &str) -> rusthorse::protocol::Binding {
+    rusthorse::protocol::Binding {
+        var: var.into(),
+        entry: entry.into(),
+    }
+}
+
+fn brokered(var: &str, entry: &str, url_var: Option<&str>) -> rusthorse::protocol::BrokerBinding {
+    rusthorse::protocol::BrokerBinding {
+        var: var.into(),
+        entry: entry.into(),
+        url_var: url_var.map(str::to_string),
+    }
+}
+
+/// A run of `sh -c script` in the harness's directory, with redaction.
+fn broker_run_request(
+    h: &Harness,
+    bindings: Vec<rusthorse::protocol::Binding>,
+    brokered: Vec<rusthorse::protocol::BrokerBinding>,
+    script: &str,
+) -> rusthorse::protocol::BrokerRunRequest {
+    rusthorse::protocol::BrokerRunRequest {
+        run: rusthorse::protocol::RunRequest {
+            bindings,
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            cwd: h.dir.path().to_str().expect("utf8").into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            redact: true,
+            forward_stdin: false,
+        },
+        brokered,
+    }
+}
+
+/// What a command printed, as the client received it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn text(&self) -> String {
+        text(&self.0.lock().unwrap())
+    }
+}
+
+/// A broker run under way, sent by a thread of its own.
+struct Running {
+    answer: std::sync::mpsc::Receiver<rusthorse::protocol::Response>,
+    output: Captured,
+}
+
+impl Running {
+    /// The agent's answer, once the run is over.
+    fn wait(&self) -> rusthorse::protocol::Response {
+        self.answer
+            .recv_timeout(TEST_LIMIT)
+            .expect("the run's answer")
+    }
+}
+
+fn start(h: &Harness, request: rusthorse::protocol::BrokerRunRequest) -> Running {
     use rusthorse::client::{Client, RunIo};
-    use rusthorse::protocol::{
-        BrokerBinding, BrokerRunRequest, ErrorCode, Request, Response, read_message, send_frame,
+    let client = Client::new(h.socket.clone());
+    let output = Captured::default();
+    let io = RunIo {
+        input: None,
+        stdout: Box::new(output.clone()),
+        stderr: Box::new(output.clone()),
     };
+    let (tx, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(response) = client.broker_run_with(request, io) {
+            let _ = tx.send(response);
+        }
+    });
+    Running { answer, output }
+}
+
+/// Send a broker run and wait for its answer.
+fn broker_run(
+    h: &Harness,
+    request: rusthorse::protocol::BrokerRunRequest,
+) -> rusthorse::protocol::Response {
+    start(h, request).wait()
+}
+
+/// A command that writes its environment to `env.txt`, then waits until the
+/// test creates `go` (at most 30 seconds).
+const WAITS: &str = "env > env.new && mv env.new env.txt; i=0; \
+                     while [ ! -e go ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done";
+
+/// The environment the waiting command got, once it has started.
+fn command_env(h: &Harness) -> std::collections::BTreeMap<String, String> {
+    let path = h.dir.path().join("env.txt");
+    let text = eventually("the command to start", || {
+        std::fs::read_to_string(&path).ok()
+    });
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Let the waiting command finish.
+fn go(h: &Harness) {
+    std::fs::write(h.dir.path().join("go"), "").expect("go");
+}
+
+fn grants(h: &Harness) -> Vec<rusthorse::protocol::GrantInfo> {
+    match h.call(&rusthorse::protocol::Request::Grants) {
+        rusthorse::protocol::Response::Grants { grants } => grants,
+        other => panic!("unexpected {}", other.kind()),
+    }
+}
+
+/// The state of the grant `id`, or `None` once it has ended.
+fn grant_state(h: &Harness, id: &str) -> Option<String> {
+    grants(h).into_iter().find(|g| g.id == id).map(|g| g.state)
+}
+
+fn status(h: &Harness) -> rusthorse::protocol::StatusInfo {
+    match h.call(&rusthorse::protocol::Request::Status) {
+        rusthorse::protocol::Response::Status(info) => info,
+        other => panic!("unexpected {}", other.kind()),
+    }
+}
+
+/// The reasons the grants' end records give, by grant ID.
+fn grant_ends(h: &Harness) -> std::collections::BTreeMap<String, serde_json::Value> {
+    audit_records(h)
+        .into_iter()
+        .filter(|r| r["action"] == "grant" && r["outcome"] == "ended")
+        .map(|r| (r["grant"].as_str().unwrap_or_default().to_string(), r))
+        .collect()
+}
+
+fn ended_with(h: &Harness, id: &str) -> String {
+    eventually("the grant's end record", || {
+        grant_ends(h)
+            .get(id)
+            .map(|r| r["reason"].as_str().unwrap_or_default().to_string())
+    })
+}
+
+fn error_of(response: &rusthorse::protocol::Response) -> (rusthorse::protocol::ErrorCode, String) {
+    match response {
+        rusthorse::protocol::Response::Error { code, message } => (*code, message.clone()),
+        other => panic!("not an error: {}", other.kind()),
+    }
+}
+
+/// A run through the broker is refused before any dialog when one of its
+/// checks fails (ADR 0013: the broker program, the number of grants, the
+/// variables, the entries, their profiles and values), and so is a plain
+/// `run` that carries broker bindings: no dialog, no command, no grant, no
+/// `run` record, no broker started — and never the values instead.
+#[test]
+fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
+    use rusthorse::protocol::{ErrorCode, Request, Response, read_message, send_frame};
+    use rusthorse::vault::FIELD_BROKER;
     use std::os::unix::net::UnixStream;
+    if !python3() {
+        return;
+    }
     let h = Harness::new();
-    h.add_secret("T", "abcdefgh", &[]);
-    h.add_secret("KEY", "key-value-12345678", &[]);
+    let uuids = seed(
+        &h,
+        &[
+            ("T", "abcdefgh", None),
+            ("KEY", FAKE_KEY, Some(anthropic())),
+            ("PLAIN", FAKE_KEY, None),
+            ("SHORT", "sk-1234", Some(anthropic())),
+            ("SPACED", "sk-ant-test 0000", Some(anthropic())),
+            ("BROKEN", FAKE_KEY, None),
+            ("HIDDEN", FAKE_KEY, None),
+        ],
+    );
+    set_field_elsewhere(&h, "BROKEN", FIELD_BROKER, r#"{"version":2}"#, false);
+    let stored = anthropic().resolve().expect("profile").to_stored();
+    set_field_elsewhere(&h, "HIDDEN", FIELD_BROKER, &stored, true);
     // Had the agent asked, the run would be allowed, and the command would
     // leave this file behind.
     h.decide(&[Decision::AllowOnce]);
     let marker = h.dir.path().join("ran");
     let script = format!("touch {}", marker.display());
-    let argv = ["sh", "-c", script.as_str()];
-    let brokered = vec![BrokerBinding {
-        var: "KEY".into(),
-        entry: "KEY".into(),
-        url_var: Some("KEY_URL".into()),
-    }];
-    let client = Client::new(h.socket.clone());
-    let sinks = || RunIo {
-        input: None,
-        stdout: Box::new(std::io::sink()),
-        stderr: Box::new(std::io::sink()),
+    let request = |bindings, brokered| broker_run_request(&h, bindings, brokered, &script);
+    let refused = |request, code: ErrorCode, says: &str| {
+        let response = broker_run(&h, request);
+        let (got, message) = error_of(&response);
+        assert_eq!(got, code, "{message}");
+        assert!(message.contains(says), "{says:?} not in: {message}");
     };
+    let key = || vec![brokered("KEY", "KEY", None)];
 
-    // A binding by value beside the broker binding, with redaction.
-    let request = BrokerRunRequest {
-        run: run_request(&h, &argv, false),
-        brokered: brokered.clone(),
-    };
-    let response = client.broker_run_with(request, sinks()).expect("an answer");
-    assert!(is_invalid(&response), "{}", response.kind());
-    // Without redaction: the descriptors travel with the request, as with
-    // `run`.
-    let mut run = run_request(&h, &argv, false);
-    run.redact = false;
-    let request = BrokerRunRequest {
-        run,
-        brokered: brokered.clone(),
-    };
-    let response = client.broker_run(request).expect("an answer");
-    assert!(is_invalid(&response), "{}", response.kind());
-    // Through the broker only.
-    let mut run = run_request(&h, &argv, false);
-    run.bindings.clear();
-    let request = BrokerRunRequest {
-        run,
-        brokered: brokered.clone(),
-    };
-    let response = client.broker_run_with(request, sinks()).expect("an answer");
-    assert!(is_invalid(&response), "{}", response.kind());
+    // Before the vault is opened: the broker program, absent and unusable.
+    refused(request(vec![], key()), ErrorCode::Internal, "not installed");
+    let log = fake_broker(&h, "ready");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let program = h.broker_program();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+        refused(request(vec![], key()), ErrorCode::Internal, "chmod go-w");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    // More grants than an agent serves.
+    let many: Vec<_> = (0..17)
+        .map(|i| brokered(&format!("KEY{i}"), "KEY", None))
+        .collect();
+    refused(
+        request(vec![], many),
+        ErrorCode::InvalidRequest,
+        "at most 16 grants",
+    );
+    // No broker binding at all: that is a plain run.
+    refused(
+        request(vec![by_value("T", "T")], vec![]),
+        ErrorCode::InvalidRequest,
+        "at least one broker binding",
+    );
+    // Variables: valid, distinct across every kind, and not NO_PROXY,
+    // which the agent sets itself.
+    for (bindings, brokered_now, says) in [
+        (vec![], vec![brokered("1KEY", "KEY", None)], "not a valid"),
+        (
+            vec![],
+            vec![brokered("KEY", "KEY", Some("KEY-URL"))],
+            "not a valid",
+        ),
+        (vec![by_value("KEY", "T")], key(), "bound twice"),
+        (
+            vec![],
+            vec![brokered("KEY", "KEY", Some("KEY"))],
+            "bound twice",
+        ),
+        (
+            vec![by_value("URL", "T")],
+            vec![brokered("KEY", "KEY", Some("URL"))],
+            "bound twice",
+        ),
+        (vec![], vec![brokered("NO_PROXY", "KEY", None)], "NO_PROXY"),
+        (vec![by_value("no_proxy", "T")], key(), "no_proxy"),
+    ] {
+        refused(
+            request(bindings, brokered_now),
+            ErrorCode::InvalidRequest,
+            says,
+        );
+    }
+    assert!(
+        h.ui.password_prompts.lock().unwrap().is_empty(),
+        "the vault was unlocked for a request refused without it"
+    );
+    // Entries: the same one both ways or twice (by UUID), without a usable
+    // profile, or with a value the broker cannot carry.
+    let uuid = uuids["KEY"].as_str();
+    for (bindings, brokered_now, code, says) in [
+        (
+            vec![by_value("V", uuid)],
+            key(),
+            ErrorCode::InvalidRequest,
+            "both",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "KEY", None), brokered("B", uuid, None)],
+            ErrorCode::InvalidRequest,
+            "twice",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "PLAIN", None)],
+            ErrorCode::InvalidRequest,
+            "no broker profile",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "BROKEN", None)],
+            ErrorCode::InvalidRequest,
+            "unusable",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "HIDDEN", None)],
+            ErrorCode::InvalidRequest,
+            "protected",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "SHORT", None)],
+            ErrorCode::InvalidRequest,
+            "8 to 4096",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "SPACED", None)],
+            ErrorCode::InvalidRequest,
+            "8 to 4096",
+        ),
+        (
+            vec![],
+            vec![brokered("A", "NOWHERE", None)],
+            ErrorCode::NotFound,
+            "NOWHERE",
+        ),
+    ] {
+        refused(request(bindings, brokered_now), code, says);
+    }
+    // A dialog that would show a part too long to read is refused, never
+    // shortened.
+    let long = "V".repeat(1100);
+    refused(
+        request(vec![], vec![brokered(&long, "KEY", None)]),
+        ErrorCode::InvalidRequest,
+        "too long",
+    );
 
     // A plain run that carries broker bindings is refused, not run without
     // them.
-    let mut plain =
-        serde_json::to_value(Request::Run(run_request(&h, &argv, false))).expect("json");
-    plain["brokered"] = serde_json::to_value(&brokered).expect("json");
+    let mut plain = serde_json::to_value(Request::Run(run_request(&h, &["touch", "ran"], false)))
+        .expect("json");
+    plain["brokered"] = serde_json::to_value(key()).expect("json");
     let stream = UnixStream::connect(&h.socket).expect("connect");
     send_frame(&stream, &plain, &[]).expect("send");
     match read_message::<Response>(&stream).expect("an answer") {
@@ -3599,128 +4187,1295 @@ fn runs_with_broker_bindings_start_nothing_until_grants_are_served() {
         "an approval was used"
     );
     assert!(audit_outcomes(&h, "run").is_empty(), "{}", h.audit_text());
+    assert!(audit_outcomes(&h, "grant").is_empty(), "{}", h.audit_text());
+    assert!(broker_log(&log).is_empty(), "a broker was started");
+    assert!(grants(&h).is_empty());
 }
 
-/// Until the agent serves grants, it lists and revokes none, and says so.
-/// Neither needs the vault, nor a dialog.
+/// The command of a broker run gets a token and the broker's address in the
+/// variables it named, never the key (ADR 0013, decisions 1, 2 and 6): the
+/// broker gets the key, the token, the profile, the limits and a listening
+/// socket on 127.0.0.1, in an empty environment of its own; the grant is
+/// listed while the command runs and ends with it; the tokens are redacted
+/// from the output, and every step is in the audit log.
 #[test]
-fn grant_requests_are_refused_until_grants_are_served() {
-    use rusthorse::protocol::Request;
-    let h = Harness::new();
-    for request in [
-        Request::Grants,
-        Request::RevokeGrant { id: None },
-        Request::RevokeGrant {
-            id: Some("g0123456789abcdef".into()),
-        },
-    ] {
-        let response = h.call(&request);
-        assert!(is_invalid(&response), "{}", response.kind());
+fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key() {
+    use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+    use rusthorse::protocol::Response;
+    if !python3() {
+        return;
     }
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
-    assert!(
-        h.ui.password_prompts.lock().unwrap().is_empty(),
-        "the vault was unlocked"
+    let h = Harness::new();
+    let uuids = seed(
+        &h,
+        &[
+            ("T", "value-of-t-1234", None),
+            ("KEY", FAKE_KEY, Some(ProfileRequest::new(Preset::Openai))),
+        ],
     );
+    let log = fake_broker(&h, "ready");
+    // A long command line: a dialog that scrolls, as rusthorse-dialog's
+    // does (that one grant fits zenity's is a unit test of the agent's).
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    h.decide(&[Decision::AllowOnce]);
+    let script =
+        format!("printf 'token=%s value=%s\\n' \"$OPENAI_API_KEY\" \"$T\"; {WAITS}; echo done");
+    let mut request = broker_run_request(
+        &h,
+        vec![by_value("T", "T")],
+        vec![brokered("OPENAI_API_KEY", "KEY", Some("OPENAI_BASE_URL"))],
+        &script,
+    );
+    // What the requester sends for those variables is dropped; its
+    // NO_PROXY gets 127.0.0.1 added.
+    request.run.env.extend([
+        ("NO_PROXY".to_string(), "example.com".to_string()),
+        (
+            "OPENAI_API_KEY".to_string(),
+            "from-the-requester".to_string(),
+        ),
+        (
+            "OPENAI_BASE_URL".to_string(),
+            "http://elsewhere.example".to_string(),
+        ),
+    ]);
+    let running = start(&h, request);
+    if let Ok(early) = running.answer.recv_timeout(Duration::from_secs(5)) {
+        panic!("the run ended before its command: {:?}", error_of(&early));
+    }
+    let env = command_env(&h);
+
+    // The broker: started with nothing of the requester's, in a process
+    // group of its own, given the key, a token, the profile and a socket.
+    let installed = logged(&log, "install");
+    assert_eq!(installed["argv"], serde_json::json!([]));
+    assert_eq!(installed["environ"], "");
+    assert_eq!(installed["cwd"], "/");
+    assert_eq!(installed["stderr"], "/dev/null");
+    assert_eq!(installed["pid"], installed["pgid"]);
+    assert_eq!(installed["fds"], 1);
+    assert_eq!(installed["inet"], true);
+    assert_eq!(installed["accepting"], 1);
+    assert_eq!(installed["listen"][0], "127.0.0.1");
+    let port = installed["listen"][1].as_u64().expect("port");
+    let install = &installed["install"];
+    assert_eq!(install["type"], "install");
+    assert_eq!(install["version"], 1);
+    assert_eq!(install["credential"], FAKE_KEY);
+    let token = install["token"].as_str().expect("token").to_string();
+    assert!(
+        rusthorse::broker_protocol::is_well_formed_token(&token),
+        "{token}"
+    );
+    let id = install["grant"].as_str().expect("grant").to_string();
+    assert!(
+        rusthorse::broker_protocol::is_well_formed_grant_id(&id),
+        "{id}"
+    );
+    let profile = ProfileRequest::new(Preset::Openai)
+        .resolve()
+        .expect("profile");
+    assert_eq!(
+        install["profile"],
+        serde_json::to_value(&profile).expect("json")
+    );
+    assert_eq!(install["max_in_flight"], 16);
+    assert_eq!(install["max_connections"], 64);
+    let lifetime = install["lifetime_secs"].as_u64().expect("lifetime");
+    assert!((720 * 60 - 30..=720 * 60).contains(&lifetime), "{lifetime}");
+
+    // The command: the token and the broker's address, never the key.
+    assert_eq!(env["OPENAI_API_KEY"], token);
+    assert_eq!(
+        env["OPENAI_BASE_URL"],
+        format!("http://127.0.0.1:{port}/v1")
+    );
+    assert_eq!(env["T"], "value-of-t-1234");
+    assert_eq!(env["NO_PROXY"], "example.com,127.0.0.1");
+    assert_eq!(env["no_proxy"], "127.0.0.1");
+    let everything = std::fs::read_to_string(h.dir.path().join("env.txt")).expect("env");
+    assert!(
+        !everything.contains(FAKE_KEY),
+        "the key reached the command"
+    );
+    assert!(!everything.contains("from-the-requester"));
+    assert!(!everything.contains("elsewhere.example"));
+
+    // Listed while the command runs; never a token.
+    let listed = grants(&h);
+    assert_eq!(listed.len(), 1);
+    let grant = &listed[0];
+    assert_eq!(grant.id, id);
+    assert_eq!(grant.var, "OPENAI_API_KEY");
+    assert_eq!(grant.destination, "https://api.openai.com/v1");
+    assert_eq!(grant.preset, Preset::Openai);
+    assert!(grant.command.starts_with("sh -c "), "{}", grant.command);
+    assert!(grant.entry.starts_with("KEY ("), "{}", grant.entry);
+    assert_eq!(grant.state, "active");
+    assert_eq!((grant.requests, grant.in_flight), (0, 0));
+    assert_eq!(grant.automatic_locks, AutomaticLocks::Continue);
+    let listing = serde_json::to_string(&listed).expect("json");
+    assert!(
+        !listing.contains(&token) && !listing.contains(FAKE_KEY),
+        "{listing}"
+    );
+    let now = status(&h);
+    assert_eq!(now.grants, Some(1));
+    assert_eq!(
+        now.broker.as_deref(),
+        Some(
+            std::fs::canonicalize(h.broker_program())
+                .expect("canonical")
+                .to_str()
+                .expect("utf8")
+        )
+    );
+
+    go(&h);
+    match running.wait() {
+        Response::Exited { code, .. } => assert_eq!(code, Some(0)),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    // Redacted: the token as its variable, the value as its entry.
+    let output = running.output.text();
+    assert!(
+        output.contains("token=[REDACTED:OPENAI_API_KEY] value=[REDACTED:T]"),
+        "{output}"
+    );
+    assert!(
+        !output.contains(&token) && !output.contains(FAKE_KEY),
+        "{output}"
+    );
+
+    // Over: the grant ended with the command, its broker was told and is
+    // gone, the port is free again.
+    assert!(grants(&h).is_empty());
+    assert_eq!(status(&h).grants, Some(0));
+    let revoke = logged(&log, "revoke");
+    assert_eq!(revoke["message"]["reason"], "command_ended");
+    let pid = installed["pid"].as_u64().expect("pid");
+    assert!(process_gone(pid), "the broker outlived its run");
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok());
+
+    // The dialog said what the grant allows.
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let detail = |label: &str| approval_detail(&h, label).unwrap_or_default();
+    assert!(!asked.can_remember);
+    assert!(
+        asked.explanation.contains("temporary token, not the key"),
+        "{}",
+        asked.explanation
+    );
+    assert!(
+        asked.explanation.contains("as values"),
+        "{}",
+        asked.explanation
+    );
+    assert_eq!(asked.command.as_deref(), Some(grant.command.as_str()));
+    let key_identity = grant.entry.clone();
+    assert_eq!(
+        detail("Grant"),
+        format!(
+            "OPENAI_API_KEY ← a token for {key_identity}; OPENAI_BASE_URL ← the broker's address"
+        )
+    );
+    assert_eq!(detail("Destination"), "https://api.openai.com/v1");
+    assert!(
+        detail("Allows").contains("POST /chat/completions"),
+        "{}",
+        detail("Allows")
+    );
+    assert!(
+        detail("Ends").contains("when the command ends"),
+        "{}",
+        detail("Ends")
+    );
+    assert_eq!(detail("Requests"), "no limit; at most 16 at a time");
+    assert!(
+        detail("Secrets").starts_with("T ← T ("),
+        "{}",
+        detail("Secrets")
+    );
+    assert!(!detail("Program").is_empty() && !detail("Directory").is_empty());
+    // The requester's value for the address variable was dropped: it is
+    // not a destination of the command's.
+    assert_eq!(approval_detail(&h, "Destinations (environment)"), None);
+    assert!(!detail("Requested by (unverified)").is_empty());
+    let warnings = asked.warnings.join(" ");
+    assert!(warnings.contains("can spend credit"), "{warnings}");
+    assert!(warnings.contains("not a spending limit"), "{warnings}");
+    assert!(warnings.contains("bodies are not inspected"), "{warnings}");
+    assert!(
+        asked.facts.contains(&(
+            "Output".to_string(),
+            "secret values and tokens are redacted".to_string()
+        )),
+        "{:?}",
+        asked.facts
+    );
+
+    // The audit log: the approval with the grants it creates, the grant's
+    // creation before the command ran, its end, the command's exit — and no
+    // token or key anywhere.
+    let records = audit_records(&h);
+    let audit = h.audit_text();
+    assert!(!audit.contains(&token) && !audit.contains(FAKE_KEY));
+    let position = |action: &str, outcome: &str| {
+        records
+            .iter()
+            .position(|r| r["action"] == action && r["outcome"] == outcome)
+            .unwrap_or_else(|| panic!("no {action} {outcome}: {audit}"))
+    };
+    let approval = &records[position("run", "allowed_once")];
+    assert_eq!(
+        approval["grants"],
+        serde_json::json!([{
+            "id": id,
+            "entry": key_identity,
+            "destination": "https://api.openai.com/v1",
+        }])
+    );
+    assert_eq!(approval["entries"].as_array().map(Vec::len), Some(2));
+    assert!(position("run", "allowed_once") < position("grant", "created"));
+    assert!(position("grant", "created") < position("run", "exited"));
+    let created = &records[position("grant", "created")];
+    assert_eq!(created["grant"], id.as_str());
+    assert_eq!(created["entries"], serde_json::json!([key_identity]));
+    let ended = &records[position("grant", "ended")];
+    assert_eq!(ended["reason"], "command_ended");
+    assert_eq!(
+        ended["requests"],
+        serde_json::json!({"admitted": 0, "finished": 0, "unknown": 0, "refused": 0})
+    );
+    assert!(
+        uuids["KEY"].starts_with(&key_identity[5..13]),
+        "{key_identity}"
+    );
+}
+
+/// A broker run's approval is never remembered — each creates its grants
+/// once (ADR 0013) — and without redaction its dialog says that the token
+/// can reach whoever reads the output.
+#[test]
+fn a_broker_run_is_never_remembered_and_warns_when_its_output_is_not_filtered() {
+    use rusthorse::protocol::{ErrorCode, Request, Response, read_message, send_frame};
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let _log = fake_broker(&h, "ready");
+    // An answer that allows for a while anyway allows once.
+    h.decide(&[
+        Decision::AllowFor(Duration::from_secs(600)),
+        Decision::AllowOnce,
+    ]);
+    for _ in 0..2 {
+        let request = broker_run_request(
+            &h,
+            vec![],
+            vec![brokered("ANTHROPIC_API_KEY", "KEY", None)],
+            "true",
+        );
+        match broker_run(&h, request) {
+            Response::Exited { code, .. } => assert_eq!(code, Some(0)),
+            other => panic!("unexpected {}", other.kind()),
+        }
+        let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+        assert!(!asked.can_remember);
+    }
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        audit_outcomes(&h, "run"),
+        ["allowed_once", "exited", "allowed_once", "exited"]
+    );
+
+    // Without redaction: the descriptors travel with the request, and the
+    // dialog warns. Denied here: nothing runs, no grant is made.
+    h.decide(&[Decision::Deny]);
+    let mut request = broker_run_request(
+        &h,
+        vec![],
+        vec![brokered("ANTHROPIC_API_KEY", "KEY", None)],
+        "true",
+    );
+    request.run.redact = false;
+    let null = std::fs::File::open("/dev/null").expect("null");
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("null");
+    let stream = UnixStream::connect(&h.socket).expect("connect");
+    send_frame(
+        &stream,
+        &Request::BrokerRun(request),
+        &[null.as_fd(), sink.as_fd(), sink.as_fd()],
+    )
+    .expect("send");
+    let response = read_message::<Response>(&stream).expect("an answer");
+    assert_eq!(error_of(&response).0, ErrorCode::Denied);
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let warnings = asked.warnings.join(" ");
+    assert!(
+        warnings.contains(
+            "Output is NOT redacted: a token the command prints reaches the requester, who can \
+             use it until its grant ends."
+        ),
+        "{warnings}"
+    );
+    assert!(
+        asked
+            .facts
+            .contains(&("Output".to_string(), "not redacted".to_string())),
+        "{:?}",
+        asked.facts
+    );
+    assert!(grants(&h).is_empty());
+    // Two grants, created and ended; the denied run made none.
+    eventually("the grants' records", || {
+        (audit_outcomes(&h, "grant") == ["created", "ended", "created", "ended"]).then_some(())
+    });
+}
+
+/// A broker that exits at once, never answers, or answers for another grant
+/// or in another version fails its run before the command starts (ADR 0013,
+/// decision 6: no fallback, 125 for `run`): nothing ran, no grant is left,
+/// no broker either, and the log says what happened.
+#[test]
+fn a_broker_that_does_not_start_serving_fails_the_run_and_leaves_nothing_behind() {
+    use rusthorse::protocol::ErrorCode;
+    if !python3() {
+        return;
+    }
+    let h = Harness::with_broker_ready_timeout(Duration::from_secs(2));
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let marker = h.dir.path().join("ran");
+    let script = format!("touch {}", marker.display());
+    for mode in ["exits", "silent", "wrong_grant", "old_version"] {
+        let log = if mode == "exits" {
+            write_program(&h.broker_program(), "#!/bin/sh\nexit 3\n");
+            None
+        } else {
+            Some(fake_broker(&h, mode))
+        };
+        h.decide(&[Decision::AllowOnce]);
+        let started = Instant::now();
+        let request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
+        let response = broker_run(&h, request);
+        let (code, message) = error_of(&response);
+        assert_eq!(code, ErrorCode::Internal, "{mode}: {message}");
+        assert!(
+            message.contains("could not serve a grant"),
+            "{mode}: {message}"
+        );
+        assert!(message.contains("nothing was run"), "{mode}: {message}");
+        assert!(!message.contains(FAKE_KEY));
+        let took = started.elapsed();
+        if mode == "silent" {
+            assert!(took >= Duration::from_secs(2), "{mode}: {took:?}");
+        }
+        assert!(took < Duration::from_secs(8), "{mode}: {took:?}");
+        assert!(!marker.exists(), "{mode}: the command ran");
+        assert!(grants(&h).is_empty(), "{mode}");
+        if let Some(log) = log {
+            let pid = logged(&log, "install")["pid"].as_u64().expect("pid");
+            assert!(process_gone(pid), "{mode}: the broker was left running");
+        }
+    }
+    // A program that others can change by the time the run starts: it is
+    // checked again, and not started.
+    let log = fake_broker(&h, "ready");
+    let program = h.broker_program();
+    *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+    }));
+    h.decide(&[Decision::AllowOnce]);
+    let request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
+    let (code, message) = error_of(&broker_run(&h, request));
+    assert_eq!(code, ErrorCode::Internal, "{message}");
+    assert!(message.contains("cannot be used"), "{message}");
+    assert!(!marker.exists(), "the command ran");
+    assert!(broker_log(&log).is_empty(), "the broker was started");
+    assert!(grants(&h).is_empty());
+    let ends: Vec<String> = grant_ends(&h)
+        .values()
+        .map(|r| r["reason"].as_str().unwrap_or_default().to_string())
+        .collect();
+    // Four grants created and ended; the last one never was, on record.
+    assert_eq!(ends, ["broker_failed"; 4]);
+    assert_eq!(audit_outcomes(&h, "grant").len(), 8);
+    assert_eq!(
+        audit_outcomes(&h, "run"),
+        [
+            "allowed_once",
+            "aborted",
+            "allowed_once",
+            "aborted",
+            "allowed_once",
+            "aborted",
+            "allowed_once",
+            "aborted",
+            "allowed_once",
+            "aborted"
+        ]
+    );
+}
+
+/// `grants` and `revoke_grant` need neither an approval nor an unlocked
+/// vault (ADR 0013), and grants can outlive a lock: they are listed and
+/// revoked while it is locked. An ID that names no grant is `not_found`; a
+/// malformed one is `invalid_request`.
+#[test]
+fn grants_are_listed_and_revoked_without_a_dialog_locked_or_unlocked() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    // Locked, with no grant and no broker.
+    assert!(grants(&h).is_empty());
+    let now = status(&h);
+    assert!(now.locked);
+    assert_eq!(now.grants, Some(0));
+    assert!(
+        now.broker
+            .as_deref()
+            .is_some_and(|b| b.starts_with("none: ")),
+        "{:?}",
+        now.broker
+    );
+    match h.call(&Request::RevokeGrant { id: None }) {
+        Response::Ok { message } => assert_eq!(message, "0 grants revoked"),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    let unknown = h.call(&Request::RevokeGrant {
+        id: Some("g0123456789abcdef".into()),
+    });
+    assert_eq!(error_of(&unknown).0, ErrorCode::NotFound);
+    let malformed = h.call(&Request::RevokeGrant {
+        id: Some("g-not-an-id".into()),
+    });
+    assert_eq!(error_of(&malformed).0, ErrorCode::InvalidRequest);
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(h.ui.password_prompts.lock().unwrap().is_empty());
+
+    // Two grants that survive a screen lock (their profile says so), in a
+    // dialog that scrolls, as rusthorse-dialog's does.
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    seed(
+        &h,
+        &[
+            ("A", FAKE_KEY, Some(anthropic())),
+            ("B", "sk-ant-test-1111111111111111", Some(anthropic())),
+        ],
+    );
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let request = broker_run_request(
+        &h,
+        vec![],
+        vec![brokered("KEY_A", "A", None), brokered("KEY_B", "B", None)],
+        WAITS,
+    );
+    let running = start(&h, request);
+    command_env(&h);
+    let ids: Vec<String> = grants(&h).into_iter().map(|g| g.id).collect();
+    assert_eq!(ids.len(), 2);
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    let prompts = h.ui.password_prompts.lock().unwrap().len();
+    let now = status(&h);
+    assert!(now.locked);
+    assert_eq!(now.grants, Some(2));
+    assert_eq!(grant_state(&h, &ids[0]).as_deref(), Some("active"));
+    // Revoked by hand, while locked: done once its broker confirmed.
+    match h.call(&Request::RevokeGrant {
+        id: Some(ids[0].clone()),
+    }) {
+        Response::Ok { message } => assert_eq!(message, format!("{} revoked", ids[0])),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &ids[0]).as_deref(), Some("revoked"));
+    assert_eq!(grant_state(&h, &ids[1]).as_deref(), Some("active"));
+    let revokes: Vec<String> = broker_log(&log)
+        .into_iter()
+        .filter(|e| e["event"] == "revoke")
+        .map(|e| {
+            e["message"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(revokes, ["revoked"]);
+    match h.call(&Request::RevokeGrant {
+        id: Some(ids[0].clone()),
+    }) {
+        Response::Ok { message } => assert!(message.contains("already ended"), "{message}"),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    match h.call(&Request::RevokeGrant { id: None }) {
+        Response::Ok { message } => assert_eq!(message, "1 grant revoked"),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &ids[1]).as_deref(), Some("revoked"));
+    assert_eq!(
+        h.ui.password_prompts.lock().unwrap().len(),
+        prompts,
+        "unlocked"
+    );
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    assert!(grants(&h).is_empty());
+    for id in &ids {
+        assert_eq!(ended_with(&h, id), "revoked");
+        let detail = grant_ends(&h)[id]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.starts_with("revoked by "), "{detail}");
+    }
+}
+
+/// `rusthorse lock` ends every grant; the screen lock and a suspend end the
+/// grants whose profile says that the automatic locks end them, and keep
+/// the others (ADR 0013, decision 8).
+#[test]
+fn locks_end_the_grants_their_profiles_say() {
+    use rusthorse::protocol::{Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK, SUSPEND};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(
+        &h,
+        &[
+            ("STAYS", FAKE_KEY, Some(anthropic())),
+            ("SCREEN", FAKE_KEY, Some(anthropic_ending())),
+            ("SLEEP", FAKE_KEY, Some(anthropic_ending())),
+        ],
+    );
+    let _log = fake_broker(&h, "ready");
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    // Two runs: the suspend's grant is created after the screen lock.
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+    let first = start(
+        &h,
+        broker_run_request(
+            &h,
+            vec![],
+            vec![brokered("A", "STAYS", None), brokered("B", "SCREEN", None)],
+            WAITS,
+        ),
+    );
+    command_env(&h);
+    let id_of = |entry: &str| {
+        grants(&h)
+            .into_iter()
+            .find(|g| g.entry.starts_with(&format!("{entry} (")))
+            .map(|g| g.id)
+            .expect("a grant")
+    };
+    let (stays, screen) = (id_of("STAYS"), id_of("SCREEN"));
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    assert_eq!(grant_state(&h, &screen).as_deref(), Some("revoked"));
+    assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
+
+    std::fs::remove_file(h.dir.path().join("env.txt")).expect("rm");
+    let script = WAITS.replace("go ]", "go2 ]");
+    let second = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("C", "SLEEP", None)], &script),
+    );
+    command_env(&h);
+    let sleep = id_of("SLEEP");
+    h.agent.lock_for(SUSPEND, "test");
+    assert_eq!(grant_state(&h, &sleep).as_deref(), Some("revoked"));
+    assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
+
+    // The explicit lock ends everything.
+    match h.call(&Request::Lock) {
+        Response::Ok { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &stays).as_deref(), Some("revoked"));
+    go(&h);
+    std::fs::write(h.dir.path().join("go2"), "").expect("go");
+    assert!(matches!(first.wait(), Response::Exited { .. }));
+    assert!(matches!(second.wait(), Response::Exited { .. }));
+    assert_eq!(ended_with(&h, &screen), "screen_locked");
+    assert_eq!(ended_with(&h, &sleep), "suspend");
+    assert_eq!(ended_with(&h, &stays), "locked");
+}
+
+/// The idle timeout ends the grants whose profile says so and keeps the
+/// others; requests through the broker do not postpone it (P9).
+#[test]
+fn the_idle_lock_ends_only_the_grants_whose_profile_says_so() {
+    use rusthorse::protocol::Response;
+    if !python3() {
+        return;
+    }
+    // Long enough for the run to start before the vault locks itself.
+    let h = Harness::with_idle_timeout(Duration::from_secs(5));
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    seed(
+        &h,
+        &[
+            ("STAYS", FAKE_KEY, Some(anthropic())),
+            ("ENDS", FAKE_KEY, Some(anthropic_ending())),
+        ],
+    );
+    let _log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(
+        &h,
+        broker_run_request(
+            &h,
+            vec![],
+            vec![brokered("A", "STAYS", None), brokered("B", "ENDS", None)],
+            WAITS,
+        ),
+    );
+    command_env(&h);
+    let listed = grants(&h);
+    let id_of = |entry: &str| {
+        listed
+            .iter()
+            .find(|g| g.entry.starts_with(&format!("{entry} (")))
+            .map(|g| g.id.clone())
+            .expect("a grant")
+    };
+    let (stays, ends) = (id_of("STAYS"), id_of("ENDS"));
+    eventually("the idle lock", || status(&h).locked.then_some(()));
+    eventually("the end of the grant", || {
+        (grant_state(&h, &ends).as_deref() == Some("revoked")).then_some(())
+    });
+    assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    assert_eq!(ended_with(&h, &ends), "idle_timeout");
+    assert_eq!(ended_with(&h, &stays), "command_ended");
 }
 
 /// A change to the broker profile is a request of its own, `broker_edit`
 /// (ADR 0013): a plain `edit` that sets or clears the profile is refused
-/// before any dialog, and nothing changes. Until the agent serves grants,
-/// `broker_edit` clears a profile, once approved, and does not set one yet:
-/// its dialog cannot show the profile.
+/// before any dialog, and so is a profile that does not resolve. The dialog
+/// of a `broker_edit` shows the whole new profile and how many grants the
+/// edit ends; any change to an entry — its profile, its name, its value,
+/// its removal, its replacement — ends its grants once it is saved.
 #[test]
-fn only_broker_edit_changes_the_broker_profile() {
+fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
     use rusthorse::broker_profile::{Preset, ProfileRequest};
     use rusthorse::protocol::{EntryChanges, ErrorCode, Field, NewEntry, Request, Response};
-    let h = Harness::new();
-    // An entry with a profile, written before the agent opens the vault.
-    {
-        let mut vault =
-            Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
-        let entry = NewEntry {
-            name: "KEY".into(),
-            ..NewEntry::default()
-        };
-        let value = SecretString::new("key-value-12345678".into());
-        vault.add(&entry, &value, false).expect("add");
-        let id = vault.find("KEY").expect("find");
-        let set = EntryChanges {
-            broker: Some(ProfileRequest::new(Preset::Anthropic)),
-            ..EntryChanges::default()
-        };
-        vault.edit(id, &set, None).expect("set the profile");
-        vault.save().expect("save");
+    if !python3() {
+        return;
     }
+    let h = Harness::new();
+    seed(
+        &h,
+        &[
+            ("KEY", FAKE_KEY, None),
+            ("RENAMED", FAKE_KEY, Some(anthropic())),
+            ("REMOVED", FAKE_KEY, Some(anthropic())),
+            ("REPLACED", FAKE_KEY, Some(anthropic())),
+            ("IMPORTED", FAKE_KEY, Some(anthropic())),
+            ("UNTOUCHED", FAKE_KEY, Some(anthropic())),
+        ],
+    );
     let on_disk = std::fs::read(h.vault_path()).expect("read");
-    let set = || EntryChanges {
+    let set = |profile: ProfileRequest| EntryChanges {
         username: Some("me".into()),
-        broker: Some(ProfileRequest::new(Preset::Openai)),
+        broker: Some(profile),
         ..EntryChanges::default()
     };
     let clear = || EntryChanges {
-        username: Some("me".into()),
         clear: vec![Field::Broker],
         ..EntryChanges::default()
     };
-
-    // An edit that sets or clears the profile, with another change: an
-    // older agent would make that change and drop the profile's.
-    for changes in [set(), clear()] {
-        let request = Request::Edit {
+    // Refused before anything: a plain edit that touches the profile, a
+    // profile that does not resolve, setting and clearing it at once.
+    for changes in [set(anthropic()), clear()] {
+        let response = h.call(&Request::Edit {
             name: "KEY".into(),
             changes,
-        };
-        match h.call(&request) {
-            Response::Error {
-                code: ErrorCode::InvalidRequest,
-                message,
-            } => assert!(message.contains("broker_edit"), "{message}"),
-            other => panic!("unexpected {}", other.kind()),
-        }
+        });
+        let (code, message) = error_of(&response);
+        assert_eq!(code, ErrorCode::InvalidRequest);
+        assert!(message.contains("broker_edit"), "{message}");
     }
-    // Setting a profile waits for a dialog that can show it.
+    let no_origin = ProfileRequest::new(Preset::OpenaiCompatible);
     let response = h.call(&Request::BrokerEdit {
         name: "KEY".into(),
-        changes: set(),
+        changes: set(no_origin),
     });
-    assert!(is_invalid(&response), "{}", response.kind());
-    // Refused before anything: no dialog, not even to unlock, no record,
-    // the file as it was.
+    let (code, message) = error_of(&response);
+    assert_eq!(code, ErrorCode::InvalidRequest);
+    assert!(message.contains("no default origin"), "{message}");
+    let both = EntryChanges {
+        broker: Some(anthropic()),
+        clear: vec![Field::Broker],
+        ..EntryChanges::default()
+    };
+    let response = h.call(&Request::BrokerEdit {
+        name: "KEY".into(),
+        changes: both,
+    });
+    assert_eq!(error_of(&response).0, ErrorCode::InvalidRequest);
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
-    assert!(
-        h.ui.password_prompts.lock().unwrap().is_empty(),
-        "the vault was unlocked"
-    );
+    assert!(h.ui.password_prompts.lock().unwrap().is_empty(), "unlocked");
     assert!(audit_outcomes(&h, "edit").is_empty());
     assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
 
-    // `broker_edit` clears it, with the rest of the edit, once approved.
-    let show = || match h.call(&Request::Show { name: "KEY".into() }) {
+    // Setting a profile: the dialog shows all of it, and that it ends no
+    // grant.
+    let show = |name: &str| match h.call(&Request::Show { name: name.into() }) {
         Response::Entry { entry } => entry,
         other => panic!("unexpected {}", other.kind()),
     };
-    let anthropic = ProfileRequest::new(Preset::Anthropic)
-        .resolve()
-        .expect("profile");
-    assert_eq!(show().broker, Some(anthropic));
+    let edit = |request: Request| match h.call(&request) {
+        Response::Ok { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    };
+    let deepseek = ProfileRequest {
+        origin: Some("https://api.deepseek.com".into()),
+        max_requests: Some(50),
+        ..ProfileRequest::new(Preset::OpenaiCompatible)
+    };
     h.decide(&[Decision::AllowOnce]);
-    let response = h.call(&Request::BrokerEdit {
+    edit(Request::BrokerEdit {
         name: "KEY".into(),
+        changes: set(deepseek.clone()),
+    });
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert_eq!(
+        approval_detail(&h, "New broker profile").as_deref(),
+        Some("OpenAI-compatible preset (openai-compatible), revision 1")
+    );
+    assert_eq!(
+        approval_detail(&h, "Destination").as_deref(),
+        Some("https://api.deepseek.com/v1")
+    );
+    assert!(approval_detail(&h, "Allows").is_some_and(|a| a.contains("POST /chat/completions")));
+    assert!(approval_detail(&h, "Ends").is_some());
+    assert_eq!(
+        approval_detail(&h, "Requests").as_deref(),
+        Some("at most 50; at most 16 at a time")
+    );
+    assert!(
+        asked
+            .facts
+            .contains(&("Grants it ends".to_string(), "none".to_string())),
+        "{:?}",
+        asked.facts
+    );
+    assert!(asked.warnings.is_empty(), "{:?}", asked.warnings);
+    assert_eq!(
+        show("KEY").broker,
+        Some(deepseek.resolve().expect("profile"))
+    );
+
+    // A run with a grant of each entry, in a dialog that scrolls.
+    let log = fake_broker(&h, "ready");
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    h.decide(&[Decision::AllowOnce]);
+    let names = [
+        "KEY",
+        "RENAMED",
+        "REMOVED",
+        "REPLACED",
+        "IMPORTED",
+        "UNTOUCHED",
+    ];
+    let bindings = names
+        .iter()
+        .map(|name| brokered(&format!("V_{name}"), name, None))
+        .collect();
+    let running = start(&h, broker_run_request(&h, vec![], bindings, WAITS));
+    command_env(&h);
+    let id_of = |entry: &str| {
+        grants(&h)
+            .into_iter()
+            .find(|g| g.entry.starts_with(&format!("{entry} (")))
+            .map(|g| g.id)
+            .expect("a grant")
+    };
+    let ids: Vec<String> = names.iter().map(|name| id_of(name)).collect();
+
+    // Its profile changed: the dialog says that the edit ends its grant.
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::BrokerEdit {
+        name: "KEY".into(),
+        changes: set(anthropic()),
+    });
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert_eq!(
+        asked.warnings,
+        ["This ends 1 grant of the credential broker at once: the command using it loses access."]
+    );
+    assert_eq!(grant_state(&h, &ids[0]).as_deref(), Some("revoked"));
+    // A rename, a removal, a replacement: each ends the entry's grant.
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::Edit {
+        name: "RENAMED".into(),
+        changes: EntryChanges {
+            rename: Some("NEW_NAME".into()),
+            ..EntryChanges::default()
+        },
+    });
+    assert_eq!(grant_state(&h, &ids[1]).as_deref(), Some("revoked"));
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::Remove {
+        name: "REMOVED".into(),
+    });
+    assert_eq!(grant_state(&h, &ids[2]).as_deref(), Some("revoked"));
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::Add {
+        entry: NewEntry {
+            name: "REPLACED".into(),
+            ..NewEntry::default()
+        },
+        value: Some(SecretString::new("sk-ant-test-2222222222222222".into())),
+        generate: None,
+        replace: true,
+    });
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        asked
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("This ends 1 grant")),
+        "{:?}",
+        asked.warnings
+    );
+    assert_eq!(grant_state(&h, &ids[3]).as_deref(), Some("revoked"));
+    assert_eq!(
+        show("REPLACED").broker,
+        None,
+        "replacing removes the profile"
+    );
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::Import {
+        entries: vec![rusthorse::protocol::ImportedEntry {
+            entry: NewEntry {
+                name: "IMPORTED".into(),
+                ..NewEntry::default()
+            },
+            value: SecretString::new("sk-ant-test-3333333333333333".into()),
+        }],
+        replace: true,
+    });
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        asked
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("This ends 1 grant")),
+        "{:?}",
+        asked.warnings
+    );
+    assert_eq!(grant_state(&h, &ids[4]).as_deref(), Some("revoked"));
+    // The other entry's grant goes on.
+    assert_eq!(grant_state(&h, &ids[5]).as_deref(), Some("active"));
+    let revokes = broker_log(&log)
+        .into_iter()
+        .filter(|e| e["event"] == "revoke")
+        .count();
+    assert_eq!(revokes, 5);
+
+    // Clearing a profile works the same way, through `broker_edit` only.
+    h.decide(&[Decision::AllowOnce]);
+    edit(Request::BrokerEdit {
+        name: "UNTOUCHED".into(),
         changes: clear(),
     });
-    assert!(
-        matches!(response, Response::Ok { .. }),
-        "{}",
-        response.kind()
-    );
     assert_eq!(approval_detail(&h, "Clear").as_deref(), Some("broker"));
-    assert_eq!(approval_detail(&h, "New username").as_deref(), Some("me"));
-    let entry = show();
-    assert_eq!(entry.broker, None);
-    assert!(entry.other_fields.is_empty(), "{:?}", entry.other_fields);
-    assert_eq!(entry.fields.username.as_deref(), Some("me"));
-    assert_eq!(audit_outcomes(&h, "edit"), ["allowed_once"]);
+    assert!(show("UNTOUCHED").broker.is_none());
+    assert_eq!(grant_state(&h, &ids[5]).as_deref(), Some("revoked"));
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    for id in &ids {
+        assert_eq!(ended_with(&h, id), "entry_changed");
+    }
+}
+
+/// The unlock barrier (ADR 0013): a grant that survived a lock ends at the
+/// next unlock if the vault file was changed by another program meanwhile —
+/// even with its times kept, even in another entry — and goes on if the
+/// file is as the agent last read or wrote it. A failed unlock keeps the
+/// fingerprint the agent had, and the agent's own save updates it.
+#[test]
+fn grants_that_survive_a_lock_end_when_the_vault_file_changed_meanwhile() {
+    use rusthorse::protocol::{EntryChanges, Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(
+        &h,
+        &[
+            ("KEY", FAKE_KEY, Some(anthropic())),
+            ("OTHER", "abcdefgh", None),
+        ],
+    );
+    let _log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], WAITS),
+    );
+    command_env(&h);
+    let id = grants(&h)[0].id.clone();
+    let unlock = || match h.call(&Request::List) {
+        Response::Entries { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    };
+
+    // The file as the agent read it: the grant goes on.
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+    unlock();
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+    // The agent's own save of another entry: the file is as the agent
+    // wrote it, and the grant goes on through the next lock.
+    h.decide(&[Decision::AllowOnce]);
+    match h.call(&Request::Edit {
+        name: "OTHER".into(),
+        changes: EntryChanges {
+            username: Some("someone".into()),
+            ..EntryChanges::default()
+        },
+    }) {
+        Response::Ok { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    unlock();
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+    // A failed unlock forgets nothing: the file is unchanged at the next.
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    h.ui.passwords.lock().unwrap().extend([
+        Some("wrong one".to_string()),
+        Some("wrong two".to_string()),
+        Some("wrong three".to_string()),
+    ]);
+    assert_eq!(
+        error_of(&h.call(&Request::List)).0,
+        rusthorse::protocol::ErrorCode::UnlockFailed
+    );
+    unlock();
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+
+    // Another program changes another entry while the vault is locked, and
+    // puts the file's times back.
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    let path = h.vault_path();
+    let modified = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    {
+        let mut vault = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("open");
+        let other = vault.find("OTHER").expect("find");
+        let changes = EntryChanges {
+            username: Some("someone else".into()),
+            ..EntryChanges::default()
+        };
+        vault.edit(other, &changes, None).expect("edit");
+        vault.save().expect("save");
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(modified))
+        .expect("set the time back");
+    // A failed unlock: the change is not found yet, nothing ends.
+    h.ui.passwords.lock().unwrap().extend([
+        Some("wrong one".to_string()),
+        Some("wrong two".to_string()),
+        Some("wrong three".to_string()),
+    ]);
+    let failed = h.call(&Request::List);
+    assert_eq!(
+        error_of(&failed).0,
+        rusthorse::protocol::ErrorCode::UnlockFailed
+    );
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("active"));
+    // The next unlock finds it, and ends the grant before it completes.
+    unlock();
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    let unlocked = audit_records(&h)
+        .into_iter()
+        .rev()
+        .find(|r| r["action"] == "unlock" && r["outcome"] == "unlocked")
+        .expect("the unlock record");
+    assert!(
+        unlocked["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("changed by another program")),
+        "{unlocked}"
+    );
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    assert_eq!(ended_with(&h, &id), "vault_changed");
+}
+
+/// A vault created where the one the agent read was is a changed file too
+/// (the unlock barrier): the grants that survived the lock end.
+#[test]
+fn a_new_vault_file_ends_the_grants_that_survived_the_lock() {
+    use rusthorse::protocol::{Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let _log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], WAITS),
+    );
+    command_env(&h);
+    let id = grants(&h)[0].id.clone();
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    std::fs::remove_file(h.vault_path()).expect("rm");
+    match h.call(&Request::CreateVault) {
+        Response::Ok { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    assert_eq!(ended_with(&h, &id), "vault_changed");
+}
+
+/// A broker that breaks the conversation is killed and its grant ends
+/// (`broker_failed`), and one that does not confirm a revocation is killed
+/// within about a second; the command goes on either way, and the run's
+/// status is the command's (ADR 0013, failures).
+#[test]
+fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
+    use rusthorse::protocol::{Request, Response};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    for mode in ["bad_number", "ignore_revoke"] {
+        let log = fake_broker(&h, mode);
+        let _ = std::fs::remove_file(h.dir.path().join("env.txt"));
+        let _ = std::fs::remove_file(h.dir.path().join("go"));
+        h.decide(&[Decision::AllowOnce]);
+        let script = format!(
+            "touch {}; {WAITS}; exit 7",
+            log.with_extension("jsonl.go").display()
+        );
+        let running = start(
+            &h,
+            broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+        );
+        command_env(&h);
+        let pid = logged(&log, "install")["pid"].as_u64().expect("pid");
+        let id = logged(&log, "install")["install"]["grant"]
+            .as_str()
+            .expect("grant")
+            .to_string();
+        if mode == "bad_number" {
+            // It asks for request 5 first: killed, its grant gone.
+            assert!(process_gone(pid), "not killed");
+            eventually("the grant's end", || {
+                grant_state(&h, &id).is_none().then_some(())
+            });
+        } else {
+            let started = Instant::now();
+            match h.call(&Request::RevokeGrant {
+                id: Some(id.clone()),
+            }) {
+                Response::Ok { .. } => {}
+                other => panic!("unexpected {}", other.kind()),
+            }
+            let took = started.elapsed();
+            assert!(took >= Duration::from_secs(1), "{took:?}");
+            assert!(took < Duration::from_secs(4), "{took:?}");
+            assert!(process_gone(pid), "not killed");
+        }
+        go(&h);
+        match running.wait() {
+            Response::Exited { code, .. } => assert_eq!(code, Some(7), "{mode}"),
+            other => panic!("unexpected {}", other.kind()),
+        }
+        let reason = ended_with(&h, &id);
+        let expected = if mode == "bad_number" {
+            "broker_failed"
+        } else {
+            "revoked"
+        };
+        assert_eq!(reason, expected, "{mode}");
+    }
+}
+
+/// Every request a broker admits is recorded before it is forwarded, and
+/// again when it ends (ADR 0013, decision 9); a request limit refuses the
+/// next one, and the grant's end record counts them all.
+#[test]
+fn admissions_are_recorded_before_the_broker_forwards_anything() {
+    use rusthorse::protocol::Response;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    let limited = rusthorse::broker_profile::ProfileRequest {
+        max_requests: Some(1),
+        ..anthropic()
+    };
+    seed(&h, &[("KEY", FAKE_KEY, Some(limited))]);
+    let log = fake_broker(&h, "admit");
+    h.decide(&[Decision::AllowOnce]);
+    let go_file = log.with_extension("jsonl.go");
+    let done = log.with_extension("jsonl.done");
+    let script = format!(
+        "touch {}; i=0; while [ ! -e {} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+        go_file.display(),
+        done.display()
+    );
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+    );
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    let answers: Vec<serde_json::Value> = broker_log(&log)
+        .into_iter()
+        .filter(|e| e["event"] == "answer")
+        .map(|e| e["message"].clone())
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            serde_json::json!({"type": "admitted", "request": 1}),
+            serde_json::json!({"type": "refused", "request": 2, "reason": "exhausted"}),
+        ]
+    );
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    let records: Vec<serde_json::Value> = audit_records(&h)
+        .into_iter()
+        .filter(|r| r["action"] == "broker_request")
+        .collect();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["outcome"], "admitted");
+    assert_eq!(records[0]["grant"], id.as_str());
+    assert_eq!(records[0]["request"], 1);
+    assert_eq!(records[0]["route"], "POST /v1/messages");
+    assert_eq!(records[1]["outcome"], "completed");
+    assert_eq!(records[1]["status"], 200);
+    assert_eq!(records[1]["bytes_sent"], 10);
+    assert_eq!(records[1]["bytes_received"], 20);
+    let audit = h.audit_text();
+    assert!(
+        !audit.contains(FAKE_KEY) && !audit.contains("rh_"),
+        "{audit}"
+    );
+    assert_eq!(ended_with(&h, &id), "command_ended");
+    assert_eq!(
+        grant_ends(&h)[&id]["requests"],
+        serde_json::json!({"admitted": 1, "finished": 1, "unknown": 0, "refused": 1})
+    );
+}
+
+/// When the command's leader exits, its grants are revoked at once — before
+/// its other processes are terminated and its output drained — so that a
+/// token kept by a descendant that left its process group (`setsid`) no
+/// longer works (ADR 0013, the end of the command; threat model L17).
+#[test]
+fn the_end_of_the_command_revokes_its_grants_before_its_output_is_drained() {
+    use rusthorse::protocol::Response;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    // A descendant in a session of its own goes on printing after the
+    // leader exits, and notes when it sees the broker told to revoke.
+    let seen = h.dir.path().join("revoked-while-it-ran");
+    let descendant = h.dir.path().join("descendant.sh");
+    std::fs::write(
+        &descendant,
+        format!(
+            "i=0\nwhile [ $i -lt 100 ]; do\n  if grep -q '\"event\": \"revoke\"' '{}'; then \
+             touch '{}'; break; fi\n  echo tick\n  sleep 0.05\n  i=$((i+1))\ndone\necho after\n",
+            log.display(),
+            seen.display()
+        ),
+    )
+    .expect("write");
+    let script = format!("setsid sh '{}' & exit 3", descendant.display());
+    let response = broker_run(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+    );
+    match response {
+        Response::Exited { code, .. } => assert_eq!(code, Some(3)),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert!(
+        seen.exists(),
+        "the grant was not revoked while the output was drained"
+    );
+    let revoke = logged(&log, "revoke");
+    assert_eq!(revoke["message"]["reason"], "command_ended");
+}
+
+/// A requester that goes away ends the run: its grants first, then its
+/// command (ADR 0013, decision 8).
+#[test]
+fn a_requester_that_goes_away_ends_its_runs_grants() {
+    use rusthorse::protocol::{Request, send_frame};
+    use std::os::unix::net::UnixStream;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    // A command that ignores SIGTERM, so that terminating it takes a
+    // while: its grants end before that.
+    let script = format!("trap '' TERM; {WAITS}");
+    let request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
+    let stream = UnixStream::connect(&h.socket).expect("connect");
+    send_frame(&stream, &Request::BrokerRun(request), &[]).expect("send");
+    command_env(&h);
+    let id = grants(&h)[0].id.clone();
+    let pid = logged(&log, "install")["pid"].as_u64().expect("pid");
+    let gone = Instant::now();
+    drop(stream);
+    let revoke = logged(&log, "revoke");
+    assert!(
+        gone.elapsed() < Duration::from_secs(2),
+        "revoked only after the command: {:?}",
+        gone.elapsed()
+    );
+    assert_eq!(revoke["message"]["reason"], "command_ended");
+    eventually("the end of the run", || grants(&h).is_empty().then_some(()));
+    assert!(process_gone(pid), "the broker outlived its run");
+    assert_eq!(ended_with(&h, &id), "command_ended");
+    assert_eq!(
+        audit_outcomes(&h, "run").last().map(String::as_str),
+        Some("exited")
+    );
 }
 
 #[test]

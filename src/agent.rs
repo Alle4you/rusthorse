@@ -15,10 +15,16 @@
 //! | remove   | yes          | approval                                       |
 //! | reveal   | yes          | approval, never remembered                     |
 //! | run      | yes          | approval, may be remembered for a while        |
+//! | broker_run | yes        | approval, never remembered                     |
+//! | broker_edit | yes       | approval                                       |
+//! | grants, revoke_grant | no | none                                         |
 //!
 //! Only one dialog is shown at a time. For `run`, the agent itself resolves
 //! the program, cleans the environment, spawns the command as its own child
-//! and filters its output, so what the human approves is what runs.
+//! and filters its output, so what the human approves is what runs. A
+//! `broker_run` gives the command, for each entry it names, the token of a
+//! grant served by a broker process instead of the entry's value (ADR 0013;
+//! the grants are kept in the registry of the crate's `broker_host` module).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -41,18 +47,24 @@ use nix::sys::signal::{Signal, killpg};
 use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::{Pid, getuid};
 
-use crate::audit::{AuditEvent, AuditLog};
+use crate::audit::{AuditEvent, AuditGrant, AuditLog};
+use crate::broker_host::{self, NewGrant, Registry, RunEnder, RunGrants, Which};
+use crate::broker_profile::{BrokerProfile, is_valid_credential};
+use crate::broker_protocol::{self, EndReason, Install, MAX_CONNECTIONS as BROKER_CONNECTIONS};
 use crate::exec;
+use crate::helper_program::{self, Located};
 use crate::peer::Peer;
 use crate::protocol::{
-    self, EntryChanges, EntryFields, ErrorCode, ImportSource, ImportedEntry, NewEntry, Request,
-    Response, RevealPurpose, RunRequest, SecretString, StatusInfo, ValueChange,
+    self, BrokerBinding, EntryChanges, EntryFields, ErrorCode, ImportSource, ImportedEntry,
+    NewEntry, Request, Response, RevealPurpose, RunRequest, SecretString, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
 use crate::session_lock;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
-use crate::vault::{KdfParams, Vault, VaultError};
+use crate::vault::{
+    ContentFingerprint, FIELD_BROKER, FingerprintKey, KdfParams, Vault, VaultError,
+};
 
 /// How many wrong master passwords are tolerated per unlock.
 const UNLOCK_ATTEMPTS: u32 = 3;
@@ -103,6 +115,16 @@ pub struct AgentConfig {
     pub new_vault_kdf: KdfParams,
     /// Where imports from GNOME Keyring find the Secret Service (ADR 0012).
     pub keyring: crate::keyring::Settings,
+    /// The credential broker's program (ADR 0013). `None`, in production:
+    /// `rusthorse-broker` next to the agent's own executable
+    /// ([`helper_program::locate`]), with no fallback. `Some(path)`: that
+    /// file, with the same checks ([`helper_program::check_file`]); tests
+    /// point it at a stand-in.
+    pub broker_program: Option<PathBuf>,
+    /// How long a broker has to answer its install. `None` in production:
+    /// [`broker_protocol::READY_TIMEOUT`]. Tests shorten it, to see a broker
+    /// that never answers fail quickly.
+    pub broker_ready_timeout: Option<Duration>,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -172,9 +194,16 @@ struct State {
     /// Incremented on every lock only: a keyring listing under way when the
     /// vault is locked is not kept.
     locks: u64,
+    /// The fingerprint of the vault file's encrypted bytes as the agent last
+    /// read or wrote them, kept across locks (ADR 0013, the unlock barrier):
+    /// an unlock that reads other bytes ends every grant that survived the
+    /// lock.
+    content: Option<ContentFingerprint>,
 }
 
 impl State {
+    /// Lock the vault. The grants that the event ends are the caller's to
+    /// end ([`Registry::decide`], under this lock).
     fn lock(&mut self) {
         self.vault = None;
         self.remembered.clear();
@@ -221,28 +250,38 @@ pub struct Agent {
     dialog: Mutex<()>,
     waiting_for_dialog: AtomicUsize,
     connections: Arc<AtomicUsize>,
-    audit: AuditLog,
+    audit: Arc<AuditLog>,
     /// What else locks the vault, for `status` (ADR 0009).
     lock_triggers: Arc<session_lock::Triggers>,
     /// The watchers behind them; dropping the agent stops them.
     session_watchers: Mutex<session_lock::Watchers>,
+    /// The grants of the credential broker (ADR 0013): outside the vault's
+    /// state, so that they can outlive a lock.
+    registry: Arc<Registry>,
+    /// The key of the vault file's fingerprints, chosen at start and kept
+    /// in memory only (the unlock barrier).
+    fingerprint_key: FingerprintKey,
 }
 
 impl session_lock::Locker for Agent {
     /// Lock as `rusthorse lock` does. The generation changes even when the
     /// vault is already locked, so that an unlock whose password is being
-    /// typed now does nothing when it completes.
+    /// typed now does nothing when it completes. The grants whose profile
+    /// says that the automatic locks end them end too, and the lock is done
+    /// once their brokers have confirmed (or were killed).
     fn lock_for(&self, event: &str, source: &str) {
+        let (reason, outcome) = if event == session_lock::SUSPEND {
+            (EndReason::Suspend, "suspend")
+        } else {
+            (EndReason::ScreenLocked, "screen_locked")
+        };
         let mut state = self.state();
         let was_open = state.vault.is_some() || !state.remembered.is_empty();
         state.lock();
+        let ending = self.registry.decide(Which::EndOnAutomaticLocks, reason);
         drop(state);
+        ending.complete();
         if was_open {
-            let outcome = if event == session_lock::SUSPEND {
-                "suspend"
-            } else {
-                "screen_locked"
-            };
             let _ = self.audit.record(
                 &AuditEvent::new("lock", &Peer::agent())
                     .outcome(outcome)
@@ -255,7 +294,8 @@ impl session_lock::Locker for Agent {
 impl Agent {
     /// Build an agent that asks its questions through `ui`.
     pub fn new(config: AgentConfig, ui: Box<dyn Ui>) -> Arc<Agent> {
-        let audit = AuditLog::new(config.audit_log.clone());
+        let audit = Arc::new(AuditLog::new(config.audit_log.clone()));
+        let registry = Registry::new(Arc::clone(&audit) as Arc<dyn broker_host::Recorder>);
         Arc::new(Agent {
             config,
             ui,
@@ -266,6 +306,7 @@ impl Agent {
                 generation: 0,
                 keyring_listing: None,
                 locks: 0,
+                content: None,
             }),
             dialog: Mutex::new(()),
             waiting_for_dialog: AtomicUsize::new(0),
@@ -273,6 +314,8 @@ impl Agent {
             audit,
             lock_triggers: Arc::default(),
             session_watchers: Mutex::default(),
+            registry,
+            fingerprint_key: FingerprintKey::random(),
         })
     }
 
@@ -299,9 +342,13 @@ impl Agent {
         Ok(listener)
     }
 
-    /// Accept connections forever, one thread per connection.
+    /// Accept connections forever, one thread per connection. However this
+    /// ends — an error, a panic — every grant of the credential broker ends
+    /// with it (`agent_stopped`), and its broker is stopped.
     pub fn serve(self: &Arc<Self>, listener: UnixListener) -> anyhow::Result<()> {
+        let _grants = StopGrants(Arc::clone(&self.registry));
         self.start_idle_timer();
+        self.registry.start_timer();
         *self
             .session_watchers
             .lock()
@@ -376,7 +423,11 @@ impl Agent {
         let mut state = self.state();
         if state.vault.is_some() && state.last_used.elapsed() >= self.config.idle_timeout {
             state.lock();
+            let ending = self
+                .registry
+                .decide(Which::EndOnAutomaticLocks, EndReason::IdleTimeout);
             drop(state);
+            ending.complete();
             let _ = self
                 .audit
                 .record(&AuditEvent::new("lock", &Peer::agent()).outcome("idle_timeout"));
@@ -429,12 +480,16 @@ impl Agent {
         drop(body);
 
         let result = match request {
-            Request::Run(run) => self.run(stream, &peer, run, fds),
-            // Placeholder until the agent serves grants (ADR 0013): never
-            // run the command without the grants it asked for, nor with the
-            // values instead. (A `run` that carries broker bindings does not
-            // parse: see `Request::Run`.)
-            Request::BrokerRun(_) => Err(Failure::invalid("broker grants are not available yet")),
+            // (A `run` that carries broker bindings does not parse: see
+            // `Request::Run`. It is refused, never run without its grants.)
+            Request::Run(run) => self.run(stream, &peer, run, None, fds),
+            Request::BrokerRun(broker_run) => self.run(
+                stream,
+                &peer,
+                broker_run.run,
+                Some(broker_run.brokered),
+                fds,
+            ),
             _ if !fds.is_empty() => Err(Failure::invalid(
                 "only run requests may carry file descriptors",
             )),
@@ -452,7 +507,13 @@ impl Agent {
         match request {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Lock => {
-                self.state().lock();
+                // The explicit lock ends every grant, and is done once their
+                // brokers have confirmed (or were killed).
+                let mut state = self.state();
+                state.lock();
+                let ending = self.registry.decide(Which::All, EndReason::Locked);
+                drop(state);
+                ending.complete();
                 self.record(AuditEvent::new("lock", peer).outcome("requested"))?;
                 Ok(ok("vault locked"))
             }
@@ -480,13 +541,8 @@ impl Agent {
                 "a change to the broker profile is a broker_edit request, not an edit",
             )),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
-            // Placeholder until the agent serves grants (ADR 0013): the
-            // dialog must show the whole new profile and how many grants the
-            // edit ends, which this one cannot. Clearing a profile is shown
-            // as it is ("Clear: broker"), and there is no grant to end yet.
-            Request::BrokerEdit { changes, .. } if changes.broker.is_some() => {
-                Err(Failure::invalid("broker profiles cannot be set yet"))
-            }
+            // Its dialog shows the whole new profile and how many grants the
+            // edit ends.
             Request::BrokerEdit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
             Request::Reveal {
@@ -505,14 +561,70 @@ impl Agent {
             Request::Run(_) | Request::BrokerRun(_) => {
                 Err(Failure::invalid("run requests carry file descriptors"))
             }
-            // Placeholders until the agent serves grants (ADR 0013).
-            Request::Grants | Request::RevokeGrant { .. } => {
-                Err(Failure::invalid("broker grants are not available yet"))
-            }
+            // Like `lock`: neither needs an approval or an unlocked vault.
+            Request::Grants => Ok(Response::Grants {
+                grants: self.registry.list(),
+            }),
+            Request::RevokeGrant { id } => self.revoke_grant(peer, id),
+        }
+    }
+
+    /// End one grant, or every grant (`id` is `None`), by hand (`revoked`).
+    /// Done once their brokers have confirmed, or were killed; the audit log
+    /// is not waited for, and the end records say who revoked them. An ID
+    /// that names no grant that has not ended is `not_found`.
+    fn revoke_grant(&self, peer: &Peer, id: Option<String>) -> Result<Response, Failure> {
+        let by = Some(format!("revoked by {}", peer.describe()));
+        let Some(id) = id else {
+            let ending = self
+                .registry
+                .decide_with(Which::All, EndReason::Revoked, by);
+            let ended = ending.ended();
+            ending.complete();
+            return Ok(ok(match ended {
+                1 => "1 grant revoked".to_string(),
+                n => format!("{n} grants revoked"),
+            }));
+        };
+        if !broker_protocol::is_well_formed_grant_id(&id) {
+            return Err(Failure::invalid(format!(
+                "{} is not a grant ID (g and 16 hexadecimal digits; `rusthorse grants` lists them)",
+                util::visible(&util::truncate(&id, 40))
+            )));
+        }
+        let ending = self
+            .registry
+            .decide_with(Which::Grant(&id), EndReason::Revoked, by);
+        let (matched, ended) = (ending.matched(), ending.ended());
+        ending.complete();
+        match (matched, ended) {
+            (0, _) => Err(Failure::new(
+                ErrorCode::NotFound,
+                format!(
+                    "no grant {id} (it ended, or never existed; `rusthorse grants` lists them)"
+                ),
+            )),
+            (_, 0) => Ok(ok(format!("{id} had already ended"))),
+            _ => Ok(ok(format!("{id} revoked"))),
+        }
+    }
+
+    /// The broker program, as `status` reports it and `broker_run` needs it.
+    fn broker_program(&self) -> Located {
+        match &self.config.broker_program {
+            None => helper_program::locate(broker_protocol::PROGRAM),
+            Some(path) => helper_program::check_file(path),
         }
     }
 
     fn status(&self) -> StatusInfo {
+        // Where the broker is, without running it (`doctor` checks it), and
+        // without holding the state lock while the files are examined.
+        let broker = match self.broker_program() {
+            Located::Program(path) => path.display().to_string(),
+            Located::Absent(path) => format!("none: {} does not exist", path.display()),
+            Located::Unusable(why) => format!("none: {why}"),
+        };
         let mut state = self.state();
         let now = Instant::now();
         state.remembered.retain(|r| r.until > now);
@@ -547,9 +659,9 @@ impl Agent {
                 crate::dialog_program::Located::Unusable(why) => format!("none: {why}"),
             }),
             lock_triggers: self.lock_triggers.snapshot(),
-            // Left out until the agent serves grants (ADR 0013).
-            broker: None,
-            grants: None,
+            broker: Some(broker),
+            // Those not ended: revoked ones whose command still runs too.
+            grants: Some(self.registry.count()),
         }
     }
 
@@ -593,32 +705,45 @@ impl Agent {
     /// locked so that memory never holds changes that are not on disk — and
     /// if it failed after the file was replaced, the answer is
     /// [`ErrorCode::OutcomeUnknown`]: the change is on disk, but may not
-    /// survive a crash.
-    fn commit<R>(
-        &self,
-        generation: u64,
-        f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
-    ) -> Result<R, Failure> {
-        self.commit_reporting(generation, f)
-            .map(|(result, _)| result)
-    }
-
-    /// [`Agent::commit`], also returning — read under the same lock as the
-    /// save, so that nothing (a `lock`, say) can come in between — any problem
-    /// with the cleanup that followed the save.
+    /// survive a crash. Also returns — read under the same lock as the save,
+    /// so that nothing (a `lock`, say) can come in between — any problem with
+    /// the cleanup that followed the save.
     fn commit_reporting<R>(
         &self,
         generation: u64,
         f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
     ) -> Result<(R, Option<String>), Failure> {
+        self.commit_changing(generation, |v, _| f(v))
+    }
+
+    /// [`Agent::commit_reporting`] for a change to entries: `f` names, by
+    /// UUID, the entries it changes, replaces or removes, whose grants end
+    /// (`entry_changed`) once the change is saved — decided under the lock
+    /// that saves, and done (their brokers confirmed or killed) before this
+    /// returns. A failed save ends every grant (`save_failed`).
+    fn commit_changing<R>(
+        &self,
+        generation: u64,
+        f: impl FnOnce(&mut Vault, &mut Vec<String>) -> Result<R, Failure>,
+    ) -> Result<(R, Option<String>), Failure> {
+        let mut changed = Vec::new();
         let mut state = self.state();
         if state.generation != generation {
             return Err(locked_meanwhile());
         }
         let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
-        let result = vault.transaction(f)?;
-        if let Err(e) = vault.save() {
+        let result = vault.transaction(|v| f(v, &mut changed))?;
+        let saved = vault.save();
+        // What the file holds as far as the agent knows: what it wrote, if
+        // the save got as far as replacing the file, or else what it read.
+        let content = vault.content_fingerprint();
+        let cleanup = vault.take_cleanup_error();
+        state.content = content;
+        if let Err(e) = saved {
             state.lock();
+            let ending = self.registry.decide(Which::All, EndReason::SaveFailed);
+            drop(state);
+            ending.complete();
             let replaced = matches!(e, VaultError::NotDurable(_));
             let mut failure = Failure::from(e);
             failure.message.push_str(if replaced {
@@ -628,9 +753,13 @@ impl Agent {
             });
             return Err(failure);
         }
-        let cleanup = vault.take_cleanup_error();
         state.generation += 1;
         state.last_used = Instant::now();
+        let ending = self
+            .registry
+            .decide(Which::Entries(&changed), EndReason::EntryChanged);
+        drop(state);
+        ending.complete();
         Ok((result, cleanup))
     }
 
@@ -702,11 +831,12 @@ impl Agent {
                 continue;
             }
             tried = true;
-            match Vault::open(&self.config.vault, password) {
+            match Vault::open_fingerprinted(&self.config.vault, password, &self.fingerprint_key) {
                 Ok(vault) => {
                     let mut state = self.state();
                     if state.generation != started {
                         // `lock` was requested while the password was typed.
+                        // (The fingerprint stays the one of the last unlock.)
                         drop(state);
                         drop(vault);
                         let _ = self
@@ -717,12 +847,42 @@ impl Agent {
                             "the vault was locked while the password was being entered",
                         ));
                     }
+                    // The unlock barrier: a file whose bytes are not those
+                    // the agent last read or wrote — another program changed
+                    // it while the vault was locked — ends every grant that
+                    // survived the lock, whichever entries the change
+                    // concerned, before the unlock completes. Decided as
+                    // soon as the change is found, before the unlock is
+                    // recorded: ending grants only takes away, and must not
+                    // wait for the audit log.
+                    let fingerprint = vault.content_fingerprint();
+                    let changed = fingerprint.is_none() || state.content != fingerprint;
+                    let ending =
+                        changed.then(|| self.registry.decide(Which::All, EndReason::VaultChanged));
+                    let ended = ending.as_ref().map_or(0, |e| e.ended());
+                    let mut event = AuditEvent::new("unlock", peer).outcome("unlocked");
+                    if ended > 0 {
+                        event = event.detail(format!(
+                            "the vault file was changed by another program while it was \
+                             locked: {ended} grant(s) of the credential broker end"
+                        ));
+                    }
                     // Record first: if the audit log cannot be written, the
-                    // vault stays locked.
-                    self.record(AuditEvent::new("unlock", peer).outcome("unlocked"))?;
+                    // vault stays locked (and keeps the previous fingerprint,
+                    // so that the change is found again at the next unlock).
+                    if let Err(failure) = self.record(event) {
+                        drop(state);
+                        drop(ending);
+                        return Err(failure);
+                    }
                     state.vault = Some(vault);
+                    state.content = fingerprint;
                     state.last_used = Instant::now();
                     state.generation += 1;
+                    drop(state);
+                    if let Some(ending) = ending {
+                        ending.complete();
+                    }
                     return Ok(());
                 }
                 Err(VaultError::WrongPassword) => {
@@ -900,7 +1060,7 @@ impl Agent {
             ));
         }
         let generation = self.generation(peer)?;
-        let exists = self.with_vault(peer, |v| {
+        let (exists, current) = self.with_vault(peer, |v| {
             let exists = v.contains(&entry.name);
             // A new entry's group is checked before anyone types a value:
             // the save would refuse the recycle bin or an invalid name after
@@ -909,12 +1069,24 @@ impl Agent {
             if !exists && let Some(group) = &entry.group {
                 v.resolve_group(group)?;
             }
-            Ok(exists)
+            Ok((exists, v.find(&entry.name).ok().map(|id| v.info(id).id)))
         })?;
         if exists && !replace {
             return Err(VaultError::AlreadyExists(entry.name.clone()).into());
         }
+        // Replacing an entry ends its grants (ADR 0013).
+        let ends = current
+            .as_deref()
+            .map_or(0, |uuid| self.registry.count_for_entry(uuid));
         let verb = if exists { "Replace" } else { "Create" };
+        let overwritten = || {
+            let mut warnings = Vec::new();
+            if exists {
+                warnings.push("The current value will be overwritten.".to_string());
+            }
+            warnings.extend(ends_grants(ends));
+            warnings
+        };
         let event = AuditEvent::new("add", peer).entries(vec![entry.name.clone()]);
         let value = match (value, generate) {
             (None, Some(spec)) => {
@@ -932,11 +1104,7 @@ impl Agent {
                         ("Requested by (unverified)".into(), peer.describe()),
                     ],
                     facts: Vec::new(),
-                    warnings: if exists {
-                        vec!["The current value will be overwritten.".into()]
-                    } else {
-                        Vec::new()
-                    },
+                    warnings: overwritten(),
                     can_remember: false,
                 };
                 self.approve(request, None, event)?;
@@ -951,12 +1119,13 @@ impl Agent {
                         "Type the value of a new entry."
                     }
                     .into(),
-                    explanation: if exists {
-                        "It replaces the entry's current value."
-                    } else {
-                        ""
-                    }
-                    .into(),
+                    explanation: match (exists, ends_grants(ends)) {
+                        (false, _) => String::new(),
+                        (true, None) => "It replaces the entry's current value.".into(),
+                        (true, Some(ends)) => {
+                            format!("It replaces the entry's current value. {ends}")
+                        }
+                    },
                     notice: None,
                     details: vec![
                         ("Entry".into(), entry.name.clone()),
@@ -982,25 +1151,26 @@ impl Agent {
                         ("Requested by (unverified)".into(), peer.describe()),
                     ],
                     facts: Vec::new(),
-                    warnings: if exists {
-                        vec!["The current value will be overwritten.".into()]
-                    } else {
-                        Vec::new()
-                    },
+                    warnings: overwritten(),
                     can_remember: false,
                 };
                 self.approve(request, None, event)?;
                 value
             }
         };
-        self.commit(generation, |v| {
+        self.commit_changing(generation, |v, changed| {
+            let uuid = v.find(&entry.name).ok().map(|id| v.info(id).id);
             let replaced = v.add(&entry, &value, replace)?;
+            if replaced {
+                changed.extend(uuid);
+            }
             Ok(ok(format!(
                 "{} {}",
                 entry.name,
                 if replaced { "replaced" } else { "added" }
             )))
         })
+        .map(|(response, _)| response)
     }
 
     fn import(
@@ -1219,24 +1389,35 @@ impl Agent {
     ) -> Result<Response, Failure> {
         check_import_names(entries.iter().map(|e| e.name.as_str()), entries.len())?;
         let generation = self.generation(peer)?;
-        let (new, existing): (Vec<&str>, Vec<&str>) = self.with_vault(peer, |v| {
+        let (new, existing, uuids) = self.with_vault(peer, |v| {
             let mut new = Vec::new();
             let mut existing = Vec::new();
+            let mut uuids = Vec::new();
             for entry in &entries {
                 if v.contains(&entry.name) {
                     existing.push(entry.name.as_str());
+                    uuids.extend(v.find(&entry.name).ok().map(|id| v.info(id).id));
                 } else {
                     new.push(entry.name.as_str());
                 }
             }
-            Ok((new, existing))
+            Ok((new, existing, uuids))
         })?;
         let source = match &origin {
             Origin::Requester => crate::import::Source::Requester,
             Origin::Keyring(rows) => crate::import::Source::Keyring(rows),
             Origin::Dotenv(path) => crate::import::Source::Dotenv(path),
         };
-        let request = crate::import::approval(&source, &new, &existing, replace, &peer.describe());
+        let mut request =
+            crate::import::approval(&source, &new, &existing, replace, &peer.describe());
+        // Replacing entries ends their grants (ADR 0013).
+        if replace {
+            let ends = uuids
+                .iter()
+                .map(|uuid| self.registry.count_for_entry(uuid))
+                .sum();
+            request.warnings.extend(ends_grants(ends));
+        }
         let event = match &origin {
             Origin::Requester => AuditEvent::new("import", peer),
             Origin::Keyring(_) => AuditEvent::new("import_from", peer).detail("GNOME Keyring"),
@@ -1251,11 +1432,15 @@ impl Agent {
                 "the source gave a different number of values; nothing was imported",
             ));
         }
-        self.commit(generation, |v| {
+        self.commit_changing(generation, |v, changed| {
             let (mut added, mut replaced, mut skipped) = (0, 0, 0);
             for (entry, value) in entries.iter().zip(&values) {
+                let uuid = v.find(&entry.name).ok().map(|id| v.info(id).id);
                 match v.add(entry, value, replace) {
-                    Ok(true) => replaced += 1,
+                    Ok(true) => {
+                        replaced += 1;
+                        changed.extend(uuid);
+                    }
                     Ok(false) => added += 1,
                     Err(VaultError::AlreadyExists(_)) => skipped += 1,
                     Err(e) => return Err(e.into()),
@@ -1265,6 +1450,7 @@ impl Agent {
                 "imported {added}, replaced {replaced}, skipped {skipped}"
             )))
         })
+        .map(|(response, _)| response)
     }
 
     fn edit(
@@ -1276,6 +1462,24 @@ impl Agent {
         if changes.is_empty() {
             return Err(Failure::invalid("nothing to change"));
         }
+        // Setting and clearing the profile at once says two things: neither
+        // is guessed.
+        if changes.broker.is_some() && changes.clear.contains(&protocol::Field::Broker) {
+            return Err(Failure::invalid(
+                "an edit sets the broker profile or clears it, not both",
+            ));
+        }
+        // A new broker profile is checked before anyone is asked, and its
+        // dialog shows the whole of it: what the request resolves to is what
+        // is stored.
+        let profile = match &changes.broker {
+            Some(request) => Some(
+                request
+                    .resolve()
+                    .map_err(|e| Failure::invalid(format!("broker profile: {e}")))?,
+            ),
+            None => None,
+        };
         let generation = self.generation(peer)?;
         let (current, destination) = self.with_vault(peer, |v| {
             let id = v.find(name)?;
@@ -1303,6 +1507,9 @@ impl Agent {
             event = event.detail(format!("move from /{from} to {}", target.describe()));
         }
 
+        // Any change to an entry ends its grants (ADR 0013): how many, as
+        // the registry counts them now.
+        let ends = self.registry.count_for_entry(&current.id);
         let prompt_for_value = matches!(changes.value, Some(ValueChange::Prompt));
         if changes.touches_metadata()
             || matches!(
@@ -1315,15 +1522,23 @@ impl Agent {
                 details.push(("Move to group".into(), target.describe()));
             }
             details.extend(describe_changes(&changes));
+            if let Some(profile) = &profile {
+                details.extend(describe_profile(profile));
+            }
             details.push(("Requested by (unverified)".into(), peer.describe()));
+            let facts = if changes.touches_broker() && ends == 0 {
+                vec![("Grants it ends".to_string(), "none".to_string())]
+            } else {
+                Vec::new()
+            };
             let request = ApprovalRequest {
                 title: "Rusthorse — change an entry".into(),
                 summary: "Change an entry?".into(),
                 explanation: "The previous version is kept in the entry's history.".into(),
                 command: None,
                 details,
-                facts: Vec::new(),
-                warnings: Vec::new(),
+                facts,
+                warnings: ends_grants(ends).into_iter().collect(),
                 can_remember: false,
             };
             self.approve(request, None, event.clone())?;
@@ -1337,7 +1552,7 @@ impl Agent {
                 let prompt = Prompt {
                     title: "Rusthorse — new value".into(),
                     headline: "Type the new value of an entry.".into(),
-                    explanation: String::new(),
+                    explanation: ends_grants(ends).unwrap_or_default(),
                     notice: None,
                     details: vec![
                         ("Entry".into(), current.identity()),
@@ -1350,14 +1565,16 @@ impl Agent {
             }
             _ => None,
         };
-        self.commit(generation, |v| {
+        self.commit_changing(generation, |v, changed| {
             let id = v.find(&current.id)?;
             v.edit(id, &changes, new_value.as_ref())?;
+            changed.push(current.id.clone());
             Ok(ok(format!(
                 "{} updated",
                 changes.rename.as_deref().unwrap_or(name)
             )))
         })
+        .map(|(response, _)| response)
     }
 
     fn remove(&self, peer: &Peer, name: &str) -> Result<Response, Failure> {
@@ -1374,7 +1591,9 @@ impl Agent {
                 ("Requested by (unverified)".into(), peer.describe()),
             ],
             facts: Vec::new(),
-            warnings: vec!["This cannot be undone (the previous file is kept as vault.kdbx.bak until the next save).".into()],
+            warnings: std::iter::once("This cannot be undone (the previous file is kept as vault.kdbx.bak until the next save).".to_string())
+                .chain(ends_grants(self.registry.count_for_entry(&info.id)))
+                .collect(),
             can_remember: false,
         };
         self.approve(
@@ -1382,11 +1601,13 @@ impl Agent {
             None,
             AuditEvent::new("remove", peer).entries(vec![info.identity()]),
         )?;
-        self.commit(generation, |v| {
+        self.commit_changing(generation, |v, changed| {
             let id = v.find(&info.id)?;
             v.remove(id);
+            changed.push(info.id.clone());
             Ok(ok(format!("{} deleted", info.name)))
         })
+        .map(|(response, _)| response)
     }
 
     /// Change the master password: the human proves they know the current
@@ -1580,7 +1801,12 @@ impl Agent {
         }
         // Record first: if the audit log cannot be written, nothing is created.
         self.record(event.clone().outcome("created"))?;
-        let vault = match Vault::create(&path, first, self.config.new_vault_kdf) {
+        let vault = match Vault::create_fingerprinted(
+            &path,
+            first,
+            self.config.new_vault_kdf,
+            &self.fingerprint_key,
+        ) {
             Ok(vault) => vault,
             Err(e) => {
                 let failure = match e {
@@ -1595,7 +1821,8 @@ impl Agent {
         // No vault can have been opened meanwhile: unlocking waits for the
         // dialog lock, which this request holds.
         if state.generation != started {
-            // Locked while the password was typed: the vault exists, locked.
+            // Locked while the password was typed: the vault exists, locked
+            // (its next unlock finds a file the agent never read).
             drop(state);
             drop(vault);
             return Ok(ok(format!(
@@ -1603,9 +1830,20 @@ impl Agent {
                 path.display()
             )));
         }
+        // A new file where the one the agent last read was: as at an
+        // unlock, the grants that survived the last lock end (the unlock
+        // barrier).
+        let fingerprint = vault.content_fingerprint();
+        let ending = (fingerprint.is_none() || state.content != fingerprint)
+            .then(|| self.registry.decide(Which::All, EndReason::VaultChanged));
         state.vault = Some(vault);
+        state.content = fingerprint;
         state.last_used = Instant::now();
         state.generation += 1;
+        drop(state);
+        if let Some(ending) = ending {
+            ending.complete();
+        }
         Ok(ok(format!("vault created at {}", path.display())))
     }
 
@@ -1721,11 +1959,16 @@ impl Agent {
         )))
     }
 
+    /// Run a command with secrets in its environment: a `run`, or, with
+    /// `brokered` (a `broker_run`, ADR 0013), a run whose command gets, for
+    /// each broker binding, the token of a grant that a broker process
+    /// serves, never the entry's value.
     fn run(
         &self,
         stream: &UnixStream,
         peer: &Peer,
         run: RunRequest,
+        brokered: Option<Vec<BrokerBinding>>,
         fds: Vec<OwnedFd>,
     ) -> Result<Response, Failure> {
         // With redaction the agent never touches the client's own descriptors:
@@ -1749,21 +1992,45 @@ impl Agent {
         if run.argv.is_empty() {
             return Err(Failure::invalid("empty command"));
         }
-        if run.bindings.is_empty() {
-            return Err(Failure::invalid("no secrets requested"));
-        }
-        let mut seen = Vec::new();
-        for binding in &run.bindings {
-            if !util::is_valid_env_name(&binding.var) {
+        let brokered = match brokered {
+            None if run.bindings.is_empty() => {
+                return Err(Failure::invalid("no secrets requested"));
+            }
+            None => Vec::new(),
+            Some(brokered) if brokered.is_empty() => {
+                return Err(Failure::invalid(
+                    "a broker_run needs at least one broker binding; without any, it is a run",
+                ));
+            }
+            Some(brokered) => brokered,
+        };
+        let is_broker = !brokered.is_empty();
+        let mut seen: Vec<&str> = Vec::new();
+        let names = run
+            .bindings
+            .iter()
+            .map(|b| (b.var.as_str(), "VAR=ENTRY"))
+            .chain(brokered.iter().flat_map(|b| {
+                std::iter::once((b.var.as_str(), "VAR=ENTRY"))
+                    .chain(b.url_var.as_deref().map(|u| (u, "URLVAR=ENTRY")))
+            }));
+        for (var, form) in names {
+            if !util::is_valid_env_name(var) {
                 return Err(Failure::invalid(format!(
-                    "{:?} is not a valid environment variable name; use VAR=ENTRY",
-                    binding.var
+                    "{var:?} is not a valid environment variable name; use {form}"
                 )));
             }
-            if seen.contains(&binding.var) {
-                return Err(Failure::invalid(format!("{} is bound twice", binding.var)));
+            if seen.contains(&var) {
+                return Err(Failure::invalid(format!("{var} is bound twice")));
             }
-            seen.push(binding.var.clone());
+            // With grants, Rusthorse sets these itself (127.0.0.1 is added
+            // to them).
+            if is_broker && (var == "NO_PROXY" || var == "no_proxy") {
+                return Err(Failure::invalid(format!(
+                    "{var} cannot be bound in a run with grants: Rusthorse adds 127.0.0.1 to it"
+                )));
+            }
+            seen.push(var);
         }
         let cwd = PathBuf::from(&run.cwd);
         if !cwd.is_absolute() || !cwd.is_dir() {
@@ -1783,7 +2050,9 @@ impl Agent {
         let program_id = file_id(&program.canonical)
             .map_err(|e| Failure::invalid(format!("{}: {e}", program.canonical.display())))?;
         let cwd_id = file_id(&cwd).map_err(|e| Failure::invalid(format!("{}: {e}", run.cwd)))?;
-        let secret_vars: Vec<&str> = run.bindings.iter().map(|b| b.var.as_str()).collect();
+        // The variables that receive values, tokens or the broker's address:
+        // whatever the requester sent for them is dropped.
+        let secret_vars: Vec<&str> = seen.clone();
         let prepared = exec::prepare_env(&run.env, &secret_vars);
         // The environment the command will actually get (a later duplicate
         // wins, as with `Command::envs`), in a canonical order.
@@ -1810,28 +2079,141 @@ impl Agent {
             }
         }
 
-        // Every entry must exist (and have a value) before the human is asked.
+        // With grants: the broker program, and room for them, before
+        // anything is read from the vault.
+        let broker_program = if is_broker {
+            let program = match self.broker_program() {
+                Located::Program(path) => path,
+                Located::Absent(path) => {
+                    return Err(Failure::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "the credential broker is not installed ({} does not exist); \
+                             nothing was run",
+                            path.display()
+                        ),
+                    ));
+                }
+                Located::Unusable(why) => {
+                    return Err(Failure::new(
+                        ErrorCode::Internal,
+                        format!("the credential broker cannot be used: {why}; nothing was run"),
+                    ));
+                }
+            };
+            let active = self.registry.count();
+            if active + brokered.len() > broker_protocol::MAX_GRANTS {
+                return Err(Failure::invalid(format!(
+                    "at most {} grants can be active at once; {active} are, and this run asks \
+                     for {} more; revoke some (`rusthorse grants`)",
+                    broker_protocol::MAX_GRANTS,
+                    brokered.len()
+                )));
+            }
+            Some(program)
+        } else {
+            None
+        };
+
+        // Every entry must exist (and have a value) before the human is asked;
+        // an entry used through the broker must also have a usable profile and
+        // a value the broker can carry.
         let generation = self.generation(peer)?;
-        let entries: Vec<(String, String, String)> = self.with_vault_at(generation, |v| {
-            run.bindings
-                .iter()
-                .map(|b| {
-                    let id = v.find(&b.entry)?;
-                    if v.secret(id).is_none() {
-                        return Err(Failure::new(
-                            ErrorCode::NotFound,
-                            format!("{} has no value", b.entry),
-                        ));
-                    }
+        let (entries, grants): (Vec<(String, String, String)>, Vec<Brokered>) = self
+            .with_vault_at(generation, |v| {
+                let entries: Vec<(String, String, String)> = run
+                    .bindings
+                    .iter()
+                    .map(|b| {
+                        let id = v.find(&b.entry)?;
+                        if v.secret(id).is_none() {
+                            return Err(Failure::new(
+                                ErrorCode::NotFound,
+                                format!("{} has no value", b.entry),
+                            ));
+                        }
+                        let info = v.info(id);
+                        Ok((info.id.clone(), info.identity(), info.name))
+                    })
+                    .collect::<Result<_, Failure>>()?;
+                let mut grants: Vec<Brokered> = Vec::with_capacity(brokered.len());
+                for binding in &brokered {
+                    let id = v.find(&binding.entry)?;
                     let info = v.info(id);
-                    Ok((info.id.clone(), info.identity(), info.name))
-                })
-                .collect()
-        })?;
+                    let identity = info.identity();
+                    if entries.iter().any(|(uuid, _, _)| *uuid == info.id) {
+                        return Err(Failure::invalid(format!(
+                            "{identity} is both used through the broker and given by value; an \
+                             entry is one or the other"
+                        )));
+                    }
+                    if grants.iter().any(|g| g.uuid == info.id) {
+                        return Err(Failure::invalid(format!(
+                            "{identity} is used through the broker twice"
+                        )));
+                    }
+                    let profile = usable_profile(&info, &identity)?;
+                    match v.secret(id) {
+                        None => {
+                            return Err(Failure::new(
+                                ErrorCode::NotFound,
+                                format!("{} has no value", binding.entry),
+                            ));
+                        }
+                        Some(value) if !is_valid_credential(&value) => {
+                            return Err(Failure::invalid(format!(
+                                "the value of {identity} cannot be used through the broker: it \
+                                 must be 8 to 4096 visible ASCII characters, without spaces"
+                            )));
+                        }
+                        Some(_) => {}
+                    }
+                    grants.push(Brokered {
+                        uuid: info.id,
+                        name: info.name,
+                        identity,
+                        var: binding.var.clone(),
+                        url_var: binding.url_var.clone(),
+                        profile,
+                    });
+                }
+                Ok((entries, grants))
+            })?;
         let identities: Vec<String> = entries
             .iter()
             .map(|(_, identity, _)| identity.clone())
             .collect();
+        // What the run's records name: every entry, and the grants it
+        // creates (with their IDs, drawn now so that the record of the
+        // approval names them).
+        let audited: Vec<String> = identities
+            .iter()
+            .cloned()
+            .chain(grants.iter().map(|g| g.identity.clone()))
+            .collect();
+        let grant_ids: Vec<String> = grants
+            .iter()
+            .map(|_| broker_protocol::try_new_grant_id())
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                Failure::new(ErrorCode::Internal, format!("cannot draw a grant ID: {e}"))
+            })?;
+        let audit_grants: Option<Vec<AuditGrant>> = is_broker.then(|| {
+            grants
+                .iter()
+                .zip(&grant_ids)
+                .map(|(g, id)| AuditGrant {
+                    id: id.clone(),
+                    entry: g.identity.clone(),
+                    destination: g.profile.destination(),
+                })
+                .collect()
+        });
+        let run_record = || {
+            let mut event = run_event(peer, &run, &audited);
+            event.grants = audit_grants.clone();
+            event
+        };
 
         let mut warnings = Vec::new();
         if !prepared.removed.is_empty() {
@@ -1873,86 +2255,117 @@ impl Agent {
                 prepared.unusual.join(", ")
             ));
         }
-        if !run.redact {
-            warnings.push(
-                "Output is NOT redacted: secret values printed by the command reach the requester."
-                    .into(),
-            );
-        }
         let input = match (run.redact, run.forward_stdin) {
             (false, _) => "the requester's own standard input",
             (true, true) => "forwarded from the requester",
             (true, false) => "none (/dev/null)",
         };
-        let request = ApprovalRequest {
-            title: "Rusthorse — use a secret".into(),
-            summary: "Run a command with your secrets?".into(),
-            explanation: "Rusthorse runs it as you, outside any sandbox, with the secrets in its \
-                          environment; programs it starts can use them too. Read the command \
-                          before you allow it."
-                .into(),
-            command: Some(command_line),
-            details: vec![
-                (
-                    "Secrets".into(),
-                    run.bindings
-                        .iter()
-                        .zip(&identities)
-                        .map(|(b, identity)| format!("{} ← {identity}", b.var))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-                ("Program".into(), program_text),
-                ("Directory".into(), run.cwd.clone()),
-                ("Requested by (unverified)".into(), peer.describe()),
-            ]
-            .into_iter()
-            // The destinations its environment sets (threat model L4).
-            .chain(
-                (!endpoints.is_empty())
-                    .then(|| ("Destinations (environment)".to_string(), endpoints.clone())),
-            )
-            .collect(),
-            facts: vec![
-                ("Input".into(), input.into()),
-                (
-                    "Output".into(),
-                    if run.redact {
-                        "secret values are redacted".into()
-                    } else {
-                        "not redacted".into()
-                    },
-                ),
-            ],
-            warnings,
-            can_remember: true,
+        let secrets_shown = run
+            .bindings
+            .iter()
+            .zip(&identities)
+            .map(|(b, identity)| format!("{} ← {identity}", b.var))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shown = Shown {
+            command_line,
+            program: program_text,
+            cwd: run.cwd.clone(),
+            requester: peer.describe(),
+            endpoints: endpoints.clone(),
+            input,
         };
-        // A remembered approval covers exactly this: the same entries (by
-        // UUID) in the same vault generation, command line, program, working
-        // directory, input and output handling, and effective environment.
-        let entry_ids: Vec<&str> = entries.iter().map(|(id, _, _)| id.as_str()).collect();
-        let key = serde_json::to_string(&(
-            generation,
-            &run.bindings,
-            &entry_ids,
-            &run.argv,
-            program.canonical.display().to_string(),
-            &run.cwd,
-            run.redact,
-            run.forward_stdin,
-            &effective_env,
-        ))
-        .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
-        let mut event = run_event(peer, &run, &identities);
-        let audited: Vec<String> = [("destinations", &endpoints), ("routes", &routes)]
+        let (request, key) = if is_broker {
+            let request = broker_approval(&shown, &secrets_shown, &grants, run.redact, warnings);
+            // Each part must be readable on its own, as the command line
+            // must: refused rather than shortened.
+            if let Some((label, value)) = request
+                .details
+                .iter()
+                .find(|(_, value)| value.chars().count() > MAX_DETAIL_CHARS)
+            {
+                return Err(Failure::invalid(format!(
+                    "the {} part of the approval dialog would be too long to show ({} \
+                     characters, limit {MAX_DETAIL_CHARS}); use shorter variable names or \
+                     fewer bindings",
+                    label.to_lowercase(),
+                    value.chars().count()
+                )));
+            }
+            // Never remembered: each approval creates its grants once.
+            (request, None)
+        } else {
+            if !run.redact {
+                warnings.push(
+                    "Output is NOT redacted: secret values printed by the command reach the \
+                     requester."
+                        .into(),
+                );
+            }
+            let request = ApprovalRequest {
+                title: "Rusthorse — use a secret".into(),
+                summary: "Run a command with your secrets?".into(),
+                explanation: "Rusthorse runs it as you, outside any sandbox, with the secrets in \
+                              its environment; programs it starts can use them too. Read the \
+                              command before you allow it."
+                    .into(),
+                command: Some(shown.command_line.clone()),
+                details: vec![
+                    ("Secrets".into(), secrets_shown),
+                    ("Program".into(), shown.program.clone()),
+                    ("Directory".into(), shown.cwd.clone()),
+                    ("Requested by (unverified)".into(), shown.requester.clone()),
+                ]
+                .into_iter()
+                // The destinations its environment sets (threat model L4).
+                .chain(
+                    (!endpoints.is_empty())
+                        .then(|| ("Destinations (environment)".to_string(), endpoints.clone())),
+                )
+                .collect(),
+                facts: vec![
+                    ("Input".into(), input.into()),
+                    (
+                        "Output".into(),
+                        if run.redact {
+                            "secret values are redacted".into()
+                        } else {
+                            "not redacted".into()
+                        },
+                    ),
+                ],
+                warnings,
+                can_remember: true,
+            };
+            // A remembered approval covers exactly this: the same entries (by
+            // UUID) in the same vault generation, command line, program,
+            // working directory, input and output handling, and effective
+            // environment.
+            let entry_ids: Vec<&str> = entries.iter().map(|(id, _, _)| id.as_str()).collect();
+            let key = serde_json::to_string(&(
+                generation,
+                &run.bindings,
+                &entry_ids,
+                &run.argv,
+                program.canonical.display().to_string(),
+                &run.cwd,
+                run.redact,
+                run.forward_stdin,
+                &effective_env,
+            ))
+            .map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))?;
+            (request, Some(key))
+        };
+        let mut event = run_record();
+        let audited_env: Vec<String> = [("destinations", &endpoints), ("routes", &routes)]
             .into_iter()
             .filter(|(_, vars)| !vars.is_empty())
             .map(|(what, vars)| format!("{what}: {vars}"))
             .collect();
-        if !audited.is_empty() {
-            event = event.detail(audited.join("; "));
+        if !audited_env.is_empty() {
+            event = event.detail(audited_env.join("; "));
         }
-        self.approve(request, Some(key), event)?;
+        self.approve(request, key, event)?;
 
         // The answer may have taken a while: make sure the program and the
         // directory were not replaced meanwhile...
@@ -1960,7 +2373,7 @@ impl Agent {
             || file_id(&cwd).ok() != Some(cwd_id)
         {
             let _ = self.audit.record(
-                &run_event(peer, &run, &identities)
+                &run_record()
                     .outcome("aborted")
                     .detail("program or directory replaced after approval"),
             );
@@ -1970,21 +2383,94 @@ impl Agent {
         }
         // ...and read the values under the same lock that checks that the
         // vault did not change (no edit, lock or reload since the dialog).
+        // The grants are entered under that lock too, as starting: a lock
+        // comes either before (nothing was read) or after (it ends them).
         // From this point on the approval is consumed: a later `lock` does
-        // not stop the command.
-        let secrets: Vec<(String, String, SecretString)> = self.with_vault_at(generation, |v| {
-            run.bindings
-                .iter()
-                .zip(&entries)
-                .map(|(b, (id, _, name))| {
-                    let found = v.find(id)?;
-                    let value = v.secret(found).ok_or_else(|| {
-                        Failure::new(ErrorCode::NotFound, format!("{name} has no value"))
-                    })?;
-                    Ok((b.var.clone(), name.clone(), value))
-                })
-                .collect()
-        })?;
+        // not stop the command (it ends its grants).
+        let command_text = shell_join(&run.argv);
+        type UnderLock = (
+            Vec<(String, String, SecretString)>,
+            Vec<SecretString>,
+            Option<RunGrants>,
+        );
+        let (secrets, credentials, mut run_grants): UnderLock =
+            self.with_vault_at(generation, |v| {
+                let secrets = run
+                    .bindings
+                    .iter()
+                    .zip(&entries)
+                    .map(|(b, (id, _, name))| {
+                        let found = v.find(id)?;
+                        let value = v.secret(found).ok_or_else(|| {
+                            Failure::new(ErrorCode::NotFound, format!("{name} has no value"))
+                        })?;
+                        Ok((b.var.clone(), name.clone(), value))
+                    })
+                    .collect::<Result<Vec<_>, Failure>>()?;
+                let credentials = grants
+                    .iter()
+                    .map(|g| {
+                        let found = v.find(&g.uuid)?;
+                        v.secret(found)
+                            .filter(|value| is_valid_credential(value))
+                            .ok_or_else(|| {
+                                Failure::new(
+                                    ErrorCode::NotFound,
+                                    format!("{} has no value the broker can use", g.name),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, Failure>>()?;
+                let run_grants = if is_broker {
+                    let new: Vec<NewGrant> = grants
+                        .iter()
+                        .zip(&grant_ids)
+                        .map(|(g, id)| NewGrant {
+                            id: id.clone(),
+                            entry_uuid: g.uuid.clone(),
+                            entry: g.identity.clone(),
+                            var: g.var.clone(),
+                            profile: g.profile.clone(),
+                            command: command_text.clone(),
+                            requester: peer.describe(),
+                            lifetime: Duration::from_secs(
+                                u64::from(g.profile.max_lifetime_minutes) * 60,
+                            ),
+                        })
+                        .collect();
+                    Some(self.registry.enter(new).map_err(Failure::invalid)?)
+                } else {
+                    None
+                };
+                Ok((secrets, credentials, run_grants))
+            })?;
+
+        // With grants, before the command starts: each grant's creation is
+        // recorded, its broker started and ready, and all of them made
+        // active — or none is, and nothing runs.
+        let prepared = match (&mut run_grants, &broker_program) {
+            (Some(preparing), Some(broker)) => {
+                self.prepare_grants(peer, preparing, broker, &grants, &grant_ids, credentials)
+            }
+            _ => {
+                drop(credentials);
+                Ok((Vec::new(), Vec::new()))
+            }
+        };
+        let (tokens, ports) = match prepared {
+            Ok(prepared) => prepared,
+            Err((failure, reason)) => {
+                let _ = self.audit.record(
+                    &run_record()
+                        .outcome("aborted")
+                        .detail(failure.message.clone()),
+                );
+                if let Some(run_grants) = run_grants.take() {
+                    run_grants.finish(reason);
+                }
+                return Err(failure);
+            }
+        };
 
         let mut command = Command::new(&program.canonical);
         command
@@ -1996,6 +2482,23 @@ impl Agent {
             .process_group(0);
         for (var, _, value) in &secrets {
             command.env(var, value.as_str());
+        }
+        if is_broker {
+            // The token and the broker's address, never the key; and no
+            // proxy for the broker's address.
+            for ((grant, token), port) in grants.iter().zip(&tokens).zip(&ports) {
+                command.env(&grant.var, token.as_str());
+                if let Some(url_var) = &grant.url_var {
+                    command.env(url_var, grant.profile.local_url(*port));
+                }
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                let value = match effective_env.get(name) {
+                    Some(set) if !set.is_empty() => format!("{set},127.0.0.1"),
+                    _ => "127.0.0.1".to_string(),
+                };
+                command.env(name, value);
+            }
         }
         // With redaction the command gets only pipes owned by the agent (and
         // /dev/null as input unless forwarding was requested).
@@ -2023,12 +2526,24 @@ impl Agent {
         let internal = |e: io::Error| Failure::new(ErrorCode::Internal, e.to_string());
         let writer = Arc::new(Mutex::new(stream.try_clone().map_err(internal)?));
         let watch_stream = stream.try_clone().map_err(internal)?;
-        let mut child = command.spawn().map_err(|e| {
-            Failure::new(
-                ErrorCode::InvalidRequest,
-                format!("cannot start {}: {e}", program.canonical.display()),
-            )
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let failure = Failure::new(
+                    ErrorCode::InvalidRequest,
+                    format!("cannot start {}: {e}", program.canonical.display()),
+                );
+                if let Some(run_grants) = run_grants.take() {
+                    let _ = self.audit.record(
+                        &run_record()
+                            .outcome("aborted")
+                            .detail(failure.message.clone()),
+                    );
+                    run_grants.finish(EndReason::CommandEnded);
+                }
+                return Err(failure);
+            }
+        };
         drop(command);
         let pid = Pid::from_raw(child.id() as i32);
         // While the leader is not reaped its pid — and so the process group
@@ -2047,9 +2562,16 @@ impl Agent {
         // acknowledgement writer go through one lock (`writer`, cloned
         // above), so they never interleave.
         if run.redact {
+            // The tokens are redacted too, labelled with their variable.
             let labels: Vec<(String, Vec<u8>)> = secrets
                 .iter()
                 .map(|(_, entry, value)| (entry.clone(), value.as_bytes().to_vec()))
+                .chain(
+                    grants
+                        .iter()
+                        .zip(&tokens)
+                        .map(|(grant, token)| (grant.var.clone(), token.as_bytes().to_vec())),
+                )
                 .collect();
             let make = || Redactor::new(labels.iter().map(|(l, s)| (l.as_str(), s.as_slice())));
             for (channel, from) in [
@@ -2071,6 +2593,7 @@ impl Agent {
         }
         let child_stdin = child.stdin.take();
         drop(secrets);
+        drop(tokens);
 
         // With forwarding, the client may send input only once the command
         // has started: its whole stdin window is granted now, so input given
@@ -2101,6 +2624,7 @@ impl Agent {
                 credits: Arc::clone(&credits),
                 abort: Arc::clone(&abort),
                 finished: Arc::clone(&finished),
+                grants: run_grants.as_ref().map(RunGrants::ender),
             };
             thread::spawn(move || watch.run())
         });
@@ -2112,8 +2636,13 @@ impl Agent {
                 other => break other,
             }
         };
-        // The command has ended: nothing it started may keep running with the
-        // secrets.
+        // The command has ended: its grants end at once — before the rest of
+        // its group is terminated and its output drained, so that a token a
+        // descendant kept no longer works — and nothing it started may keep
+        // running with the secrets.
+        if let Some(run_grants) = &run_grants {
+            run_grants.ender().end(EndReason::CommandEnded);
+        }
         terminate_group(pid);
         leader_done.store(true, Ordering::SeqCst);
         // Output workers hold the secrets (in their redactors). They finish
@@ -2137,12 +2666,15 @@ impl Agent {
         if let Some(watcher) = watcher {
             let _ = watcher.join();
         }
+        // The command is over: its brokers are stopped and its ports
+        // released.
+        if let Some(run_grants) = run_grants.take() {
+            run_grants.finish(EndReason::CommandEnded);
+        }
         let unknown = |e: &dyn std::fmt::Display| {
-            let _ = self.audit.record(
-                &run_event(peer, &run, &identities)
-                    .outcome("unknown")
-                    .detail(e.to_string()),
-            );
+            let _ = self
+                .audit
+                .record(&run_record().outcome("unknown").detail(e.to_string()));
             Failure::new(
                 ErrorCode::OutcomeUnknown,
                 format!("the command started but its result could not be determined: {e}"),
@@ -2160,15 +2692,101 @@ impl Agent {
             (None, Some(sig)) => format!("killed by signal {sig}"),
             _ => "unknown exit status".into(),
         };
-        let _ = self.audit.record(
-            &run_event(peer, &run, &identities)
-                .outcome("exited")
-                .detail(detail),
-        );
+        let _ = self
+            .audit
+            .record(&run_record().outcome("exited").detail(detail));
         Ok(Response::Exited {
             code: status.code(),
             signal: status.signal(),
         })
+    }
+
+    /// Prepare a broker run's grants, which are entered as starting: check
+    /// the broker program again, record each grant's creation (fail closed),
+    /// start their brokers — each with its install: a new token, the
+    /// credential, the profile snapshot and the limits — and make them all
+    /// active. Returns the tokens and ports, in the order of `grants`; on a
+    /// failure, the reason the grants end with (the caller ends them, stops
+    /// their brokers and releases their ports before it answers).
+    fn prepare_grants(
+        &self,
+        peer: &Peer,
+        run_grants: &mut RunGrants,
+        broker: &Path,
+        grants: &[Brokered],
+        ids: &[String],
+        credentials: Vec<SecretString>,
+    ) -> Result<(Vec<SecretString>, Vec<u16>), (Failure, EndReason)> {
+        let failed = |message: String| {
+            (
+                Failure::new(ErrorCode::Internal, format!("{message}; nothing was run")),
+                EndReason::BrokerFailed,
+            )
+        };
+        // Checked again where it is used: the approval may have taken a
+        // while, and the agent's own program may have been replaced meanwhile.
+        let broker = match self.broker_program() {
+            Located::Program(path) if path == broker => path,
+            Located::Program(_) | Located::Absent(_) => {
+                return Err(failed(
+                    "the credential broker's program was moved or removed after the approval"
+                        .into(),
+                ));
+            }
+            Located::Unusable(why) => {
+                return Err(failed(format!(
+                    "the credential broker cannot be used: {why}"
+                )));
+            }
+        };
+        for (grant, id) in grants.iter().zip(ids) {
+            let mut event = AuditEvent::new("grant", peer)
+                .outcome("created")
+                .entries(vec![grant.identity.clone()]);
+            event.grant = Some(id.clone());
+            self.record(event)
+                .map_err(|failure| (failure, EndReason::AuditFailed))?;
+            run_grants.mark_created(id);
+        }
+        let tokens: Vec<SecretString> = grants
+            .iter()
+            .map(|_| broker_protocol::try_new_token())
+            .collect::<Result<_, _>>()
+            .map_err(|e| failed(format!("cannot draw a token: {e}")))?;
+        let installs: Vec<Install> = grants
+            .iter()
+            .zip(ids)
+            .zip(&tokens)
+            .zip(credentials)
+            .map(|(((grant, id), token), credential)| Install {
+                version: broker_protocol::VERSION,
+                grant: id.clone(),
+                token: token.clone(),
+                credential,
+                profile: grant.profile.clone(),
+                max_in_flight: broker_protocol::MAX_IN_FLIGHT,
+                max_connections: BROKER_CONNECTIONS,
+                lifetime_secs: run_grants.lifetime_secs(id),
+            })
+            .collect();
+        let ready = self
+            .config
+            .broker_ready_timeout
+            .unwrap_or(broker_protocol::READY_TIMEOUT);
+        let ports = run_grants.start(&broker, installs, ready).map_err(|why| {
+            failed(format!(
+                "the credential broker could not serve a grant: {why}"
+            ))
+        })?;
+        // Every grant of the run is still starting, or none becomes active:
+        // one that ended meanwhile (a lock, a revocation) fails the run.
+        run_grants.activate().map_err(|why| {
+            (
+                Failure::new(ErrorCode::Internal, format!("{why}; nothing was run")),
+                EndReason::CommandEnded,
+            )
+        })?;
+        Ok((tokens, ports))
     }
 }
 
@@ -2273,6 +2891,160 @@ fn run_event(peer: &Peer, run: &RunRequest, entries: &[String]) -> AuditEvent {
     event.argv = Some(run.argv.clone());
     event.cwd = Some(run.cwd.clone());
     event
+}
+
+/// Ends every grant when the agent's serve loop ends, however it ends.
+struct StopGrants(Arc<Registry>);
+
+impl Drop for StopGrants {
+    fn drop(&mut self) {
+        self.0.stop_all(EndReason::AgentStopped);
+    }
+}
+
+/// An entry that a broker run uses through the broker, as checked before
+/// its dialog.
+struct Brokered {
+    /// The entry's UUID.
+    uuid: String,
+    /// Its name, for messages.
+    name: String,
+    /// As dialogs and the audit log identify it.
+    identity: String,
+    /// The variable that receives the token.
+    var: String,
+    /// The variable that receives the broker's address, if any.
+    url_var: Option<String>,
+    /// Its profile, as it is now: the grant's snapshot.
+    profile: BrokerProfile,
+}
+
+/// The entry's broker profile, if the broker can use it: there is one, it
+/// is not a protected field, and it is valid.
+fn usable_profile(
+    info: &crate::protocol::EntryInfo,
+    identity: &str,
+) -> Result<BrokerProfile, Failure> {
+    if info.protected_fields.iter().any(|f| f == FIELD_BROKER) {
+        return Err(Failure::invalid(format!(
+            "the broker profile of {identity} is a protected field, which the broker cannot use; \
+             set it again with `rusthorse edit`"
+        )));
+    }
+    match &info.broker {
+        Some(profile) => Ok(profile.clone()),
+        None if info.other_fields.iter().any(|f| f == FIELD_BROKER) => {
+            Err(Failure::invalid(format!(
+                "the broker profile of {identity} is unusable (`rusthorse show` says why); set it \
+                 again with `rusthorse edit`"
+            )))
+        }
+        None => Err(Failure::invalid(format!(
+            "{identity} has no broker profile; set one with `rusthorse edit --broker PRESET`"
+        ))),
+    }
+}
+
+/// What a run's dialog shows besides its secrets and grants.
+struct Shown {
+    command_line: String,
+    program: String,
+    cwd: String,
+    requester: String,
+    /// The destinations its environment sets (threat model L4).
+    endpoints: String,
+    input: &'static str,
+}
+
+/// The approval of a broker run (ADR 0013, decision 7): for each grant,
+/// which variables get its token and the broker's address and the whole
+/// profile — destination, every route, how and when it ends, the requests —
+/// then the secrets given as values in a mixed run, the program, the
+/// directory and the requester; that the command receives a temporary token
+/// and not the key, that it can spend credit, that a request count is not a
+/// spending limit and that request bodies are not inspected; and, without
+/// redaction, that the output is not filtered.
+fn broker_approval(
+    shown: &Shown,
+    secrets: &str,
+    grants: &[Brokered],
+    redact: bool,
+    mut warnings: Vec<String>,
+) -> ApprovalRequest {
+    let mixed = !secrets.is_empty();
+    // Short sentences: with zenity, the whole dialog must fit on the screen,
+    // and a run with one grant should (a test checks a realistic one).
+    let one = grants.len() == 1;
+    let mut explanation = format!(
+        "It gets {}, not the key; Rusthorse adds the key to the requests it allows. It runs as \
+         you, outside any sandbox, and programs it starts can use the {} too.",
+        if one {
+            "a temporary token"
+        } else {
+            "a temporary token for each grant"
+        },
+        if one { "token" } else { "tokens" }
+    );
+    if mixed {
+        explanation.push_str(" The secrets listed are in its environment as values.");
+    }
+    let mut details: Vec<(String, String)> = grants
+        .iter()
+        .flat_map(|g| {
+            broker_host::grant_details(&g.var, g.url_var.as_deref(), &g.identity, &g.profile)
+        })
+        .collect();
+    if mixed {
+        details.push(("Secrets".into(), secrets.to_string()));
+    }
+    details.push(("Program".into(), shown.program.clone()));
+    details.push(("Directory".into(), shown.cwd.clone()));
+    details.push(("Requested by (unverified)".into(), shown.requester.clone()));
+    if !shown.endpoints.is_empty() {
+        details.push(("Destinations (environment)".into(), shown.endpoints.clone()));
+    }
+    warnings.insert(
+        0,
+        "It can spend credit: a request limit is not a spending limit, and request bodies are \
+         not inspected."
+            .into(),
+    );
+    if !redact {
+        warnings.push(if mixed {
+            "Output is NOT redacted: tokens and values the command prints reach the requester, \
+             who can use a token until its grant ends."
+                .into()
+        } else {
+            "Output is NOT redacted: a token the command prints reaches the requester, who can \
+             use it until its grant ends."
+                .into()
+        });
+    }
+    ApprovalRequest {
+        title: "Rusthorse — use keys through the broker".into(),
+        summary: if one {
+            "Run a command with a temporary grant?".into()
+        } else {
+            format!("Run a command with {} temporary grants?", grants.len())
+        },
+        explanation,
+        command: Some(shown.command_line.clone()),
+        details,
+        facts: vec![
+            ("Input".into(), shown.input.into()),
+            (
+                "Output".into(),
+                match (redact, mixed) {
+                    (true, true) => "secret values and tokens are redacted".into(),
+                    (true, false) => "tokens are redacted".into(),
+                    (false, _) => "not redacted".into(),
+                },
+            ),
+        ],
+        warnings,
+        // Never "Allow for…": each approval creates its grants once.
+        can_remember: false,
+    }
 }
 
 /// All names, comma-separated. Imports are capped at [`MAX_IMPORT`] entries
@@ -2454,6 +3226,40 @@ fn describe_changes(changes: &EntryChanges) -> Vec<(String, String)> {
         None => {}
     }
     out
+}
+
+/// The warning of a dialog whose change ends grants of the credential broker
+/// (ADR 0013: any change to an entry ends its grants); `None` when it ends
+/// none.
+fn ends_grants(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(
+            "This ends 1 grant of the credential broker at once: the command using it loses \
+             access."
+                .into(),
+        ),
+        n => Some(format!(
+            "This ends {n} grants of the credential broker at once: the commands using them \
+             lose access."
+        )),
+    }
+}
+
+/// A new broker profile as an edit's dialog shows it: the preset and its
+/// revision, then the whole of what it allows ([`BrokerProfile::describe`]).
+fn describe_profile(profile: &BrokerProfile) -> Vec<(String, String)> {
+    let mut details = vec![(
+        "New broker profile".to_string(),
+        format!(
+            "{} preset ({}), revision {}",
+            profile.preset.label(),
+            profile.preset.as_str(),
+            profile.revision
+        ),
+    )];
+    details.extend(profile.describe());
+    details
 }
 
 fn describe_spec(spec: crate::generate::Spec) -> String {
@@ -2681,17 +3487,24 @@ struct Watch {
     credits: Arc<Credits>,
     abort: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    /// The run's grants, which end when the requester goes away.
+    grants: Option<RunEnder>,
 }
 
 impl Watch {
     /// Cancel the request: stop every worker, shut the socket down (which
-    /// fails any send in progress at once, without taking the send lock) and
-    /// terminate the command's process group.
+    /// fails any send in progress at once, without taking the send lock),
+    /// end the run's grants and terminate the command's process group.
     fn cancel(&self) {
         self.abort.store(true, Ordering::SeqCst);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         self.credits.wake();
         self.acks.wake();
+        // Before the group is terminated: a token kept by a process that
+        // escapes it stops working first.
+        if let Some(grants) = &self.grants {
+            grants.end(EndReason::CommandEnded);
+        }
         terminate_group(self.pgid);
     }
 
@@ -2868,6 +3681,8 @@ mod tests {
                 session_lock: Default::default(),
                 new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
                 keyring: Default::default(),
+                broker_program: None,
+                broker_ready_timeout: None,
             },
             Box::new(NoDialogs),
         );
@@ -2881,7 +3696,7 @@ mod tests {
             ..NewEntry::default()
         };
         let failure = agent
-            .commit(generation, |v| {
+            .commit_reporting(generation, |v| {
                 v.add(&entry, &SecretString::new("abcd".into()), false)?;
                 Ok(())
             })
@@ -2896,6 +3711,74 @@ mod tests {
         assert!(agent.state().vault.is_none(), "locked, to reload from disk");
         let on_disk = Vault::open(&path, password()).expect("reopen");
         assert!(on_disk.find("X").is_ok(), "the change is in the file");
+    }
+
+    /// A save that fails ends every grant (ADR 0013, decision 8:
+    /// `save_failed`), as it locks the vault.
+    #[test]
+    fn a_failed_save_ends_every_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.kdbx");
+        let password = || SecretString::new("correct horse".into());
+        let mut vault =
+            Vault::create(&path, password(), KdfParams::INSECURE_FOR_TESTS).expect("create");
+        vault.fail_directory_sync();
+        let audit = dir.path().join("audit.jsonl");
+        let agent = Agent::new(
+            AgentConfig {
+                vault: path.clone(),
+                socket: dir.path().join("agent.sock"),
+                audit_log: audit.clone(),
+                idle_timeout: Duration::ZERO,
+                request_timeout: Duration::from_secs(10),
+                send_buffer: None,
+                session_lock: Default::default(),
+                new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+                keyring: Default::default(),
+                broker_program: None,
+                broker_ready_timeout: None,
+            },
+            Box::new(NoDialogs),
+        );
+        let generation = {
+            let mut state = agent.state();
+            state.vault = Some(vault);
+            state.generation
+        };
+        let profile =
+            crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
+                .resolve()
+                .expect("profile");
+        let id = broker_protocol::new_grant_id();
+        let run = agent
+            .registry
+            .enter(vec![NewGrant {
+                id: id.clone(),
+                entry_uuid: "some-other-entry".into(),
+                entry: "OTHER (someothe)".into(),
+                var: "KEY".into(),
+                profile,
+                command: "true".into(),
+                requester: "test".into(),
+                lifetime: Duration::from_secs(60),
+            }])
+            .expect("enter");
+        run.mark_created(&id);
+        let entry = NewEntry {
+            name: "X".into(),
+            ..NewEntry::default()
+        };
+        agent
+            .commit_reporting(generation, |v| {
+                v.add(&entry, &SecretString::new("abcd".into()), false)?;
+                Ok(())
+            })
+            .expect_err("the save did not complete");
+        assert!(agent.state().vault.is_none());
+        assert_eq!(agent.registry.list()[0].state, "revoked");
+        run.finish(EndReason::CommandEnded);
+        let records = std::fs::read_to_string(&audit).expect("audit");
+        assert!(records.contains(r#""reason":"save_failed""#), "{records}");
     }
 
     #[test]
@@ -2921,6 +3804,8 @@ mod tests {
                 session_lock: Default::default(),
                 new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
                 keyring: Default::default(),
+                broker_program: None,
+                broker_ready_timeout: None,
             },
             Box::new(NoDialogs),
         );
@@ -2942,6 +3827,60 @@ mod tests {
         let records = std::fs::read_to_string(&audit).expect("audit");
         assert!(records.contains(r#""outcome":"suspend""#), "{records}");
         assert!(records.contains(r#""detail":"logind""#), "{records}");
+    }
+
+    /// A broker run with one grant, as Claude Code would be run through it
+    /// (ADR 0013): its dialog fits on the screen with zenity, which cannot
+    /// scroll, with or without a value given beside it and with or without
+    /// redaction.
+    #[test]
+    fn the_dialog_of_a_run_with_one_grant_fits_the_screen() {
+        let profile =
+            crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
+                .resolve()
+                .expect("profile");
+        let shown = Shown {
+            command_line: "claude --model claude-sonnet-4-5 -p 'Summarise the changes in this \
+                           branch'"
+                .into(),
+            program: "/home/someone/.local/bin/claude → \
+                      /home/someone/.local/share/claude/versions/2.1.316"
+                .into(),
+            cwd: "/home/someone/dev/rusthorse".into(),
+            requester: "rusthorse[123456] ← bash[123400] ← claude[120000] ← node[119999] ← \
+                        bash[1000]"
+                .into(),
+            endpoints: String::new(),
+            input: "the requester's own standard input",
+        };
+        let grant = Brokered {
+            uuid: "8d2f6c1e-0000-4000-8000-000000000000".into(),
+            name: "ANTHROPIC_API_KEY".into(),
+            identity: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
+            var: "ANTHROPIC_AUTH_TOKEN".into(),
+            url_var: Some("ANTHROPIC_BASE_URL".into()),
+            profile,
+        };
+        for mixed in ["", "GITHUB_TOKEN ← Dev/GITHUB_TOKEN (1a2b3c4d)"] {
+            for redact in [true, false] {
+                let request = broker_approval(
+                    &shown,
+                    mixed,
+                    std::slice::from_ref(&grant),
+                    redact,
+                    Vec::new(),
+                );
+                let text = crate::ui::approval_text(&request);
+                assert!(text.chars().count() <= MAX_DIALOG_CHARS, "{text}");
+                assert_eq!(
+                    crate::ui::approval_too_tall(&request),
+                    None,
+                    "{mixed:?} {redact}: {} pixels",
+                    crate::ui::approval_height(&request)
+                );
+                assert!(!request.can_remember);
+            }
+        }
     }
 
     #[test]

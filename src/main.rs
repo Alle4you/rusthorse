@@ -875,6 +875,9 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         },
         new_vault_kdf: KdfParams::DEFAULT,
         keyring: Default::default(),
+        // `rusthorse-broker` next to this program, with no fallback.
+        broker_program: None,
+        broker_ready_timeout: None,
     };
     let ui = DesktopUi {
         remember_for: args.remember,
