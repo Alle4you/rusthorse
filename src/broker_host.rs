@@ -15,8 +15,19 @@
 //! ([`RunGrants::activate`]), `exhausted` once it has admitted its request
 //! limit, `revoked` once something ended it ([`Registry::decide`]), and ended
 //! — removed from the registry — once its broker has exited. A grant never
-//! becomes active again, and a grant that ended while it was starting never
-//! gets a broker.
+//! becomes active again.
+//!
+//! A broker is entered in the registry as soon as its process exists, and
+//! sent its install under the same hold of the registry's lock, only while
+//! its grant is still starting: a grant that has ended gets no install, so
+//! no credential. From then on a revocation contains it: a broker that has
+//! not answered ready yet, and so has served nothing, is killed; one that
+//! has is told to revoke.
+//!
+//! Containing a broker means that it confirmed the revocation, or that its
+//! process is gone: killed and reaped. Asking for a kill is not containing
+//! it: every revocation that finds a kill asked for and not done yet does it
+//! itself, or waits for whoever is doing it, before it is done.
 //!
 //! Each broker is read by a thread of its own, which checks every message
 //! against the conversation of [`crate::broker_protocol`] — anything else is
@@ -39,6 +50,10 @@
 //! confirmation. No thread that writes records waits for a broker's
 //! confirmation (only, at most [`ANSWER_TIMEOUT`], for it to take an
 //! answer), and a grant's end record is best effort.
+//!
+//! Lifetimes are checked by a timer thread ([`Registry::start_timer`]).
+//! Should it not start, nothing would end a grant when its lifetime passes:
+//! the registry then refuses to enter any grant.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -61,7 +76,7 @@ use crate::broker_protocol::{
 };
 use crate::peer::Peer;
 use crate::protocol::GrantInfo;
-use crate::supervise::{Supervised, write_all_by};
+use crate::supervise::{Exit, Supervised, write_all_by};
 
 /// How long a broker has to take an answer to one of its admissions off the
 /// control channel. A broker that reads its channel takes it at once; one
@@ -207,6 +222,20 @@ impl GrantMeta {
     }
 }
 
+/// A broker's process, as its [`Link`] knows it.
+enum Broker {
+    /// Running, or exited and not reaped yet.
+    Running(Supervised),
+    /// No process: in tests, a thread plays the broker, and is cut off once
+    /// its channel is shut down.
+    Thread,
+    /// A thread is killing and reaping it ([`Link::kill`], [`Link::close`]).
+    Ending,
+    /// Gone: killed or exited, and reaped — or, for a [`Broker::Thread`],
+    /// its channel shut down.
+    Gone,
+}
+
 /// The agent's end of a broker's control channel, and its process.
 struct Link {
     /// Written under `send`, read by the grant's reader thread (through a
@@ -214,12 +243,45 @@ struct Link {
     channel: UnixStream,
     /// Writes from several threads go through this one lock.
     send: Mutex<()>,
-    /// The broker; `None` once killed or reaped, and in tests, where a
-    /// thread plays the broker.
-    process: Mutex<Option<Supervised>>,
+    /// The broker's process. Its lock is held only for a moment: never while
+    /// the process is killed or waited for, and never together with the
+    /// registry's lock.
+    broker: Mutex<Broker>,
+    /// Notified when the broker is gone.
+    ended: Condvar,
+    /// The broker is gone ([`Broker::Gone`]), readable without its lock.
+    gone: AtomicBool,
 }
 
 impl Link {
+    fn new(channel: UnixStream, process: Option<Supervised>) -> Link {
+        Link {
+            channel,
+            send: Mutex::new(()),
+            broker: Mutex::new(process.map_or(Broker::Thread, Broker::Running)),
+            ended: Condvar::new(),
+            gone: AtomicBool::new(false),
+        }
+    }
+
+    fn broker(&self) -> MutexGuard<'_, Broker> {
+        self.broker.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the broker is gone: its process killed or exited, and
+    /// reaped. Only then is it contained without its confirmation.
+    fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::SeqCst)
+    }
+
+    /// Note that the broker is gone, and wake whoever waits for that.
+    fn mark_gone(&self, mut broker: MutexGuard<'_, Broker>) {
+        *broker = Broker::Gone;
+        self.gone.store(true, Ordering::SeqCst);
+        drop(broker);
+        self.ended.notify_all();
+    }
+
     /// Send one message, whole by `deadline` (see [`Link::send_all`]).
     fn send(&self, message: &ToBroker, deadline: Instant) -> io::Result<()> {
         self.send_all(std::slice::from_ref(message), deadline)
@@ -261,29 +323,91 @@ impl Link {
     }
 
     /// Kill the broker now: its channel ends, and its process group is killed
-    /// and the leader reaped.
+    /// and the leader reaped. Returns once the broker is gone, whoever ends
+    /// it: a kill or a close already under way on another thread is waited
+    /// for, and a close still waiting for the broker to exit is cut short.
     fn kill(&self) {
         self.shutdown();
-        let process = self
-            .process
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
-        drop(process);
+        let mut broker = self.broker();
+        loop {
+            match std::mem::replace(&mut *broker, Broker::Ending) {
+                Broker::Running(process) => {
+                    drop(broker);
+                    // Kills the group, then reaps the leader.
+                    drop(process);
+                    self.mark_gone(self.broker());
+                    return;
+                }
+                Broker::Thread | Broker::Gone => {
+                    self.mark_gone(broker);
+                    return;
+                }
+                Broker::Ending => {
+                    broker = self.ended.wait(broker).unwrap_or_else(|p| p.into_inner());
+                }
+            }
+        }
     }
 
     /// End the conversation and wait for the broker to exit, killing its
-    /// process group if it is still there [`EXIT_KILL_DELAY`] later.
+    /// process group if it is still there [`EXIT_KILL_DELAY`] later. Returns
+    /// once the broker is gone, as [`Link::kill`] does.
     fn close(&self) {
         self.shutdown();
-        let process = self
-            .process
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
-        if let Some(process) = process {
-            let _ = process.exit_by(Instant::now() + EXIT_KILL_DELAY);
-            drop(process);
+        let deadline = Instant::now() + EXIT_KILL_DELAY;
+        let mut broker = self.broker();
+        loop {
+            match &*broker {
+                Broker::Gone => return,
+                Broker::Thread => {
+                    self.mark_gone(broker);
+                    return;
+                }
+                Broker::Ending => {
+                    broker = self.ended.wait(broker).unwrap_or_else(|p| p.into_inner());
+                }
+                Broker::Running(process) => {
+                    // An error says nothing more will be learnt by waiting.
+                    let exited = !matches!(process.exited(), Ok(None));
+                    if exited || Instant::now() >= deadline {
+                        let Broker::Running(process) =
+                            std::mem::replace(&mut *broker, Broker::Ending)
+                        else {
+                            unreachable!("matched as running");
+                        };
+                        drop(broker);
+                        drop(process);
+                        self.mark_gone(self.broker());
+                        return;
+                    }
+                    // Look again in a moment; a kill may come meanwhile.
+                    broker = self
+                        .ended
+                        .wait_timeout(broker, Duration::from_millis(10))
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0;
+                }
+            }
+        }
+    }
+
+    /// How the broker's process ended, once it has, by `deadline`; `None`
+    /// when it has not, or is no longer this link's to look at (killed, or
+    /// being killed).
+    fn exit_by(&self, deadline: Instant) -> Option<Exit> {
+        loop {
+            match &*self.broker() {
+                Broker::Running(process) => {
+                    if let Ok(Some(exit)) = process.exited() {
+                        return Some(exit);
+                    }
+                }
+                _ => return None,
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -326,7 +450,14 @@ struct Grant {
     open: BTreeMap<u64, String>,
     /// The number of the last request the broker asked to admit.
     last_admit: u64,
+    /// Its broker, from the moment its process exists: entered, and sent its
+    /// install, under the registry's lock ([`Registry::register`]).
     link: Option<Arc<Link>>,
+    /// Its broker answered ready and its conversation is served
+    /// ([`Registry::attach`]): a revocation tells it, and its reader thread
+    /// removes the grant once the broker has exited. A broker that has not
+    /// is killed by a revocation, and the grant is removed by its run.
+    attached: bool,
     /// When the confirmation of its revocation is due: set when the
     /// revocation is decided for a grant that has a broker.
     revoke_due: Option<Instant>,
@@ -335,8 +466,9 @@ struct Grant {
     told: bool,
     /// Its broker confirmed the revocation: it sends nothing more.
     confirmed: bool,
-    /// Its broker was killed (its confirmation is no longer waited for).
-    killed: bool,
+    /// Its broker is to be killed: its confirmation is no longer waited for,
+    /// but its end is ([`Link::kill`]). A request, not the kill itself.
+    kill_requested: bool,
     /// Its `created` record was written: its end is recorded too.
     created_recorded: bool,
     end_recorded: bool,
@@ -514,11 +646,19 @@ fn room(inner: &Inner, asked: usize) -> Result<(), String> {
 /// limits (see the module's documentation).
 pub(crate) struct Registry {
     inner: Mutex<Inner>,
-    /// Notified when a grant confirms a revocation or ends.
+    /// Notified when a grant confirms a revocation or ends, or its broker is
+    /// killed.
     changed: Condvar,
     audit: Arc<dyn Recorder>,
+    /// The timer was started, or its start tried ([`Registry::start_timer`]).
     timer: AtomicBool,
+    /// The timer could not start: no grant is entered.
+    no_timer: AtomicBool,
 }
+
+/// Why a broker does not serve its grant once the grant ended while the
+/// broker was being started.
+const ENDED_WHILE_STARTING: &str = "the grant ended while its broker was starting";
 
 impl Registry {
     /// An empty registry that writes its records to `audit`.
@@ -532,11 +672,45 @@ impl Registry {
             changed: Condvar::new(),
             audit,
             timer: AtomicBool::new(false),
+            no_timer: AtomicBool::new(false),
         })
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Refused when the timer that ends grants could not start: a grant
+    /// whose lifetime nothing would end is not served (fail closed).
+    fn timer_running(&self) -> Result<(), String> {
+        if self.no_timer.load(Ordering::SeqCst) {
+            return Err(
+                "the agent could not start the timer that ends grants when their lifetime \
+                 passes, so it serves no grant; restart the agent"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the grant `id` is still starting.
+    fn starting(&self, id: &str) -> bool {
+        self.inner()
+            .grants
+            .get(id)
+            .is_some_and(|g| g.state == State::Starting)
+    }
+
+    /// `why` a broker of the grant `id` failed to start serving — or, when
+    /// the grant is no longer starting, that it ended meanwhile: whatever
+    /// else went wrong then (a revocation kills such a broker) follows from
+    /// that.
+    fn ended_or(&self, id: &str, why: String) -> String {
+        if self.starting(id) {
+            why
+        } else {
+            ENDED_WHILE_STARTING.into()
+        }
     }
 
     /// The grants that have not ended, revoked ones whose broker still runs
@@ -560,7 +734,9 @@ impl Registry {
     /// Whether `asked` more grants fit within [`MAX_GRANTS`], which counts
     /// every grant that has not ended: a revoked one too holds a broker and
     /// a port until its command ends. The refusal says how many are revoked.
+    /// None fits when the timer could not start.
     pub(crate) fn room_for(&self, asked: usize) -> Result<(), String> {
+        self.timer_running()?;
         room(&self.inner(), asked)
     }
 
@@ -605,8 +781,9 @@ impl Registry {
     /// same lock that checks the vault's generation and reads the
     /// credentials, so that a lock comes either before (nothing was read)
     /// or after (it ends them). Refused when more than [`MAX_GRANTS`] grants
-    /// would then not have ended.
+    /// would then not have ended, and when the timer could not start.
     pub(crate) fn enter(self: &Arc<Self>, grants: Vec<NewGrant>) -> Result<RunGrants, String> {
+        self.timer_running()?;
         let mut inner = self.inner();
         room(&inner, grants.len())?;
         let mut ids: Vec<&str> = grants.iter().map(|g| g.id.as_str()).collect();
@@ -649,10 +826,11 @@ impl Registry {
                 open: BTreeMap::new(),
                 last_admit: 0,
                 link: None,
+                attached: false,
                 revoke_due: None,
                 told: false,
                 confirmed: false,
-                killed: false,
+                kill_requested: false,
                 created_recorded: false,
                 end_recorded: false,
             };
@@ -700,8 +878,9 @@ impl Registry {
             }
             ending.matched += 1;
             if grant.state == State::Revoked {
-                // Ended by an earlier event, perhaps not confirmed yet.
-                if !grant.confirmed && !grant.killed {
+                // Ended by an earlier event, perhaps not contained yet: this
+                // ending waits for it too (it skips one that is).
+                if grant.link.is_some() && !grant.confirmed {
                     ending.wait.push(grant.meta.id.clone());
                 }
                 continue;
@@ -711,8 +890,14 @@ impl Registry {
             grant.ended_by = by.clone();
             ending.newly += 1;
             if let Some(link) = &grant.link {
-                grant.revoke_due = Some(now + REVOKE_SEND_TIMEOUT + REVOKE_CONFIRM_TIMEOUT);
-                ending.tell.push((grant.meta.id.clone(), Arc::clone(link)));
+                if grant.attached {
+                    grant.revoke_due = Some(now + REVOKE_SEND_TIMEOUT + REVOKE_CONFIRM_TIMEOUT);
+                    ending.tell.push((grant.meta.id.clone(), Arc::clone(link)));
+                } else {
+                    // Its broker has not answered ready, and has served
+                    // nothing: it is killed, not told.
+                    grant.kill_requested = true;
+                }
                 ending.wait.push(grant.meta.id.clone());
             }
         }
@@ -728,23 +913,38 @@ impl Registry {
     }
 
     /// Check the grants' lifetimes every second, on a thread of its own
-    /// (once; later calls do nothing).
-    pub(crate) fn start_timer(self: &Arc<Self>) {
+    /// (once; later calls do nothing). Should that thread not start, the
+    /// error is returned and no grant is entered from then on
+    /// ([`Registry::enter`] and [`Registry::room_for`] refuse): nothing would
+    /// end one when its lifetime passes.
+    pub(crate) fn start_timer(self: &Arc<Self>) -> io::Result<()> {
+        self.start_timer_with(|timer| {
+            thread::Builder::new()
+                .name("rusthorse-grants".into())
+                .spawn(timer)
+                .map(drop)
+        })
+    }
+
+    /// [`Registry::start_timer`], with the thread started by `spawn`.
+    fn start_timer_with(
+        self: &Arc<Self>,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.timer.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         let weak = Arc::downgrade(self);
-        let _ = thread::Builder::new()
-            .name("rusthorse-grants".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(EXPIRY_CHECK);
-                    let Some(registry) = weak.upgrade() else {
-                        return;
-                    };
-                    registry.expire();
-                }
-            });
+        let timer = Box::new(move || {
+            loop {
+                thread::sleep(EXPIRY_CHECK);
+                let Some(registry) = weak.upgrade() else {
+                    return;
+                };
+                registry.expire();
+            }
+        });
+        spawn(timer).inspect_err(|_| self.no_timer.store(true, Ordering::SeqCst))
     }
 
     /// End every grant for `reason`, then end the conversation with every
@@ -778,7 +978,7 @@ impl Registry {
                 let Some(grant) = inner.grants.get_mut(id) else {
                     continue;
                 };
-                if grant.killed || grant.told {
+                if grant.kill_requested || grant.told || !grant.attached {
                     continue;
                 }
                 grant.told = true;
@@ -802,36 +1002,43 @@ impl Registry {
         }
     }
 
-    /// Wait until each of the grants `ids` has confirmed its revocation, or
-    /// ended; kill a broker whose confirmation is overdue.
+    /// Wait until the broker of each of the grants `ids` is contained: it
+    /// confirmed the revocation, or it is gone (killed or exited, and
+    /// reaped). A broker whose confirmation is overdue, or whose kill was
+    /// asked for (by this revocation or another), is killed here — or, when
+    /// another thread is killing it already, waited for: a kill that was only
+    /// asked for is not taken as done.
     fn wait_confirmed(&self, ids: &[String]) {
         let mut inner = self.inner();
         loop {
             let now = Instant::now();
-            let mut overdue = Vec::new();
+            let mut kill = Vec::new();
             let mut next: Option<Instant> = None;
             for id in ids {
                 let Some(grant) = inner.grants.get_mut(id) else {
+                    // Removed: its broker exited and was reaped.
                     continue;
                 };
-                if grant.confirmed || grant.killed {
-                    continue;
-                }
                 let Some(link) = grant.link.clone() else {
                     continue;
                 };
-                // A grant with a broker has a due time from its decision.
+                if grant.confirmed || link.is_gone() {
+                    continue;
+                }
+                // A broker that was told has a due time from its decision;
+                // one that was not is killed at once.
                 let due = grant.revoke_due.unwrap_or(now);
-                if now >= due {
-                    grant.killed = true;
-                    overdue.push(link);
+                if grant.kill_requested || now >= due {
+                    grant.kill_requested = true;
+                    kill.push(link);
                 } else {
                     next = Some(next.map_or(due, |n| n.min(due)));
                 }
             }
-            if !overdue.is_empty() {
+            if !kill.is_empty() {
                 drop(inner);
-                for link in overdue {
+                for link in kill {
+                    // Returns once it is gone, whoever kills it.
                     link.kill();
                 }
                 self.changed.notify_all();
@@ -849,17 +1056,22 @@ impl Registry {
         }
     }
 
-    /// Wait until none of the grants `ids` is left, at most `limit`; then
-    /// kill the brokers of those left, and wait a moment for their threads.
+    /// Wait until none of the grants `ids` is left with a broker, at most
+    /// `limit`; then kill the brokers of those left, and wait a moment for
+    /// their threads. A grant whose broker never answered ready has no
+    /// thread to remove it: its broker being gone is enough.
     fn wait_gone(&self, ids: &[String], limit: Duration) {
+        let left = |inner: &Inner| -> Vec<Arc<Link>> {
+            ids.iter()
+                .filter_map(|id| inner.grants.get(id))
+                .filter(|g| g.attached || g.link.as_ref().is_some_and(|l| !l.is_gone()))
+                .filter_map(|g| g.link.clone())
+                .collect()
+        };
         let deadline = Instant::now() + limit;
         let mut inner = self.inner();
         loop {
-            let left: Vec<Arc<Link>> = ids
-                .iter()
-                .filter_map(|id| inner.grants.get(id))
-                .filter_map(|g| g.link.clone())
-                .collect();
+            let left = left(&inner);
             if left.is_empty() {
                 return;
             }
@@ -873,7 +1085,11 @@ impl Registry {
                 // channels end.
                 let until = Instant::now() + STOP_MARGIN;
                 let mut inner = self.inner();
-                while ids.iter().any(|id| inner.grants.contains_key(id)) && Instant::now() < until {
+                while ids
+                    .iter()
+                    .any(|id| inner.grants.get(id).is_some_and(|g| g.attached))
+                    && Instant::now() < until
+                {
                     inner = self
                         .changed
                         .wait_timeout(inner, until.saturating_duration_since(Instant::now()))
@@ -892,9 +1108,12 @@ impl Registry {
 
     /// Kill a grant's broker: it is broken, or did not take or confirm a
     /// revocation in time. A grant not ended yet ends (`broker_failed`).
+    /// The kill is asked for first, so that a revocation meanwhile kills the
+    /// broker too or waits for it ([`Registry::wait_confirmed`]); this
+    /// returns once the broker is gone.
     fn kill(&self, id: &str, link: &Link) {
         if let Some(grant) = self.inner().grants.get_mut(id) {
-            grant.killed = true;
+            grant.kill_requested = true;
             if grant.state.live() {
                 grant.state = State::Revoked;
                 grant.reason = Some(EndReason::BrokerFailed);
@@ -912,62 +1131,109 @@ impl Registry {
         }
     }
 
-    /// Serve the conversation with a grant's broker, which answered
-    /// [`FromBroker::Ready`]: start the thread that reads it and the thread
-    /// that writes its records. Refused — and the broker killed — when the
-    /// grant is no longer starting: it ended meanwhile, and its broker must
-    /// not serve it. `process` is `None` in tests, where a thread plays the
-    /// broker.
-    fn attach(
-        self: &Arc<Self>,
+    /// Enter the broker being started for the grant `id`, and send it its
+    /// `install` with the listening socket, both under the registry's lock,
+    /// which every revocation takes to decide: a revocation comes either
+    /// before — the grant is no longer starting, so the broker gets nothing,
+    /// no credential, and is killed — or after, and then kills the broker
+    /// and waits for it to be gone ([`Registry::decide`]), whether it has
+    /// answered ready or not. The install is written without waiting
+    /// ([`send_install`]), so that the lock is never held over a wait. A
+    /// broker whose install cannot be sent is killed, and stays entered
+    /// until it is gone, so that a revocation meanwhile waits for it too. In
+    /// tests, where a thread plays the broker, `process` and `install` are
+    /// `None`.
+    fn register(
+        &self,
         id: &str,
         channel: UnixStream,
         process: Option<Supervised>,
-    ) -> Result<(), String> {
-        let reader = channel
-            .try_clone()
-            .map_err(|e| format!("cannot copy its channel: {e}"))?;
-        let link = Arc::new(Link {
-            channel,
-            send: Mutex::new(()),
-            process: Mutex::new(process),
-        });
+        install: Option<(ToBroker, &TcpListener)>,
+    ) -> Result<Arc<Link>, String> {
+        let link = Arc::new(Link::new(channel, process));
+        let mut inner = self.inner();
+        let entered = match inner.grants.get_mut(id) {
+            Some(grant) if grant.state == State::Starting && grant.link.is_none() => {
+                grant.link = Some(Arc::clone(&link));
+                let sent = install.map_or(Ok(()), |(install, listener)| {
+                    send_install(&link.channel, listener, install)
+                });
+                if sent.is_err() {
+                    grant.kill_requested = true;
+                }
+                sent
+            }
+            _ => Err(ENDED_WHILE_STARTING.into()),
+        };
+        drop(inner);
+        if entered.is_err() {
+            link.kill();
+            self.changed.notify_all();
+        }
+        entered.map(|()| link)
+    }
+
+    /// Serve the conversation with the broker of the grant `id`, entered
+    /// with [`Registry::register`], which answered [`FromBroker::Ready`]:
+    /// start the thread that reads it and the thread that writes its
+    /// records. Refused — and the broker killed — when the grant is no
+    /// longer starting: it ended meanwhile, and its broker must not serve it.
+    fn attach(self: &Arc<Self>, id: &str, link: &Arc<Link>) -> Result<(), String> {
+        let refuse = |why: String| {
+            if let Some(grant) = self.inner().grants.get_mut(id) {
+                grant.attached = false;
+                grant.kill_requested = true;
+            }
+            link.kill();
+            self.changed.notify_all();
+            Err(why)
+        };
+        let reader = match link.channel.try_clone() {
+            Ok(reader) => reader,
+            Err(e) => return refuse(format!("cannot copy its channel: {e}")),
+        };
         let meta = {
             let mut inner = self.inner();
             match inner.grants.get_mut(id) {
-                Some(grant) if grant.state == State::Starting => {
-                    grant.link = Some(Arc::clone(&link));
+                Some(grant)
+                    if grant.state == State::Starting
+                        && !grant.kill_requested
+                        && grant.link.as_ref().is_some_and(|l| Arc::ptr_eq(l, link)) =>
+                {
+                    grant.attached = true;
                     Arc::clone(&grant.meta)
                 }
                 _ => {
                     drop(inner);
-                    link.kill();
-                    return Err("the grant ended while its broker was starting".into());
+                    return refuse(ENDED_WHILE_STARTING.into());
                 }
             }
         };
         let (jobs, queue) = mpsc::sync_channel(JOB_QUEUE);
         let started = (|| -> io::Result<()> {
             let (registry, recorded, recording) =
-                (Arc::clone(self), Arc::clone(&meta), Arc::clone(&link));
+                (Arc::clone(self), Arc::clone(&meta), Arc::clone(link));
             thread::Builder::new()
                 .name("rusthorse-grant-audit".into())
                 .spawn(move || registry.record_jobs(&recorded, &recording, queue))?;
-            let (registry, grant, answering) =
-                (Arc::clone(self), id.to_string(), Arc::clone(&link));
+            let (registry, grant, answering) = (Arc::clone(self), id.to_string(), Arc::clone(link));
             thread::Builder::new()
                 .name("rusthorse-grant".into())
                 .spawn(move || registry.read_broker(&grant, &reader, &answering, jobs))?;
             Ok(())
         })();
         if let Err(e) = started {
-            if let Some(grant) = self.inner().grants.get_mut(id) {
-                grant.link = None;
-            }
-            link.kill();
-            return Err(format!("cannot start a thread for it: {e}"));
+            return refuse(format!("cannot start a thread for it: {e}"));
         }
         Ok(())
+    }
+
+    /// [`Registry::register`] and [`Registry::attach`] at once, for a
+    /// broker played by a thread of the test.
+    #[cfg(test)]
+    fn attach_channel(self: &Arc<Self>, id: &str, channel: UnixStream) -> Result<(), String> {
+        let link = self.register(id, channel, None, None)?;
+        self.attach(id, &link)
     }
 
     /// Read a broker until its channel ends, checking every message, and
@@ -1282,10 +1548,12 @@ impl Ending {
         self.newly
     }
 
-    /// Tell the brokers at once, then wait for them together: until each
-    /// has confirmed, or is killed — when it cannot be told within
-    /// [`REVOKE_SEND_TIMEOUT`] or has not confirmed within
-    /// [`REVOKE_CONFIRM_TIMEOUT`] after that.
+    /// Tell the brokers at once, then wait for them together until each is
+    /// contained: it has confirmed, or it is gone, killed and reaped — when
+    /// it cannot be told within [`REVOKE_SEND_TIMEOUT`], has not confirmed
+    /// within [`REVOKE_CONFIRM_TIMEOUT`] after that, or never answered ready
+    /// (it is killed at once). A kill under way on another thread is waited
+    /// for.
     pub(crate) fn complete(mut self) {
         self.finish();
     }
@@ -1404,9 +1672,17 @@ impl RunGrants {
     /// channel and standard error `/dev/null`; then [`ToBroker::Install`]
     /// with the socket attached, and [`FromBroker::Ready`] from each by one
     /// deadline, `ready_timeout` from now. Returns each grant's port, in the
-    /// order of `installs`. On a failure, the brokers already serving are
-    /// left for [`RunGrants::finish`] (or the drop) to stop, and the others
-    /// are killed; the error never holds a secret.
+    /// order of `installs`.
+    ///
+    /// Each broker is entered in the registry and sent its install under the
+    /// registry's lock, only if its grant is still starting
+    /// ([`Registry::register`]): a grant that ended before gets no install,
+    /// and one that ends later has its broker killed and waited for by the
+    /// revocation that ends it, whether it answered ready or not. On a
+    /// failure, every broker started is left for [`RunGrants::finish`] (or
+    /// the drop), which the run calls at once: it tells those serving to
+    /// revoke and stops them, and kills the others. The error never holds a
+    /// secret.
     pub(crate) fn start(
         &mut self,
         program: &Path,
@@ -1415,8 +1691,7 @@ impl RunGrants {
     ) -> Result<Vec<u16>, String> {
         struct Pending {
             id: String,
-            channel: UnixStream,
-            process: Supervised,
+            link: Arc<Link>,
             listener: TcpListener,
             port: u16,
         }
@@ -1424,31 +1699,41 @@ impl RunGrants {
         let mut pending = Vec::with_capacity(installs.len());
         for install in installs {
             let id = install.grant.clone();
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .map_err(|e| format!("cannot listen on 127.0.0.1: {e}"))?;
-            let port = listener
-                .local_addr()
-                .map_err(|e| format!("cannot read the port it listens on: {e}"))?
-                .port();
-            let (ours, theirs) =
-                UnixStream::pair().map_err(|e| format!("cannot create a socket pair: {e}"))?;
-            let process = spawn(program, theirs)
-                .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
-            send_install(&ours, &listener, ToBroker::Install(install), deadline)?;
-            pending.push(Pending {
-                id,
-                channel: ours,
-                process,
-                listener,
-                port,
-            });
+            let started = (|| {
+                if Instant::now() >= deadline {
+                    return Err("no time was left to start it".to_string());
+                }
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .map_err(|e| format!("cannot listen on 127.0.0.1: {e}"))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|e| format!("cannot read the port it listens on: {e}"))?
+                    .port();
+                let (ours, theirs) =
+                    UnixStream::pair().map_err(|e| format!("cannot create a socket pair: {e}"))?;
+                let process = spawn(program, theirs)
+                    .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
+                // Entered in the registry and given its install at once,
+                // under its lock; refused, and killed, if the grant is no
+                // longer starting.
+                let install = (ToBroker::Install(install), &listener);
+                let link = self
+                    .registry
+                    .register(&id, ours, Some(process), Some(install))?;
+                Ok(Pending {
+                    id: id.clone(),
+                    link,
+                    listener,
+                    port,
+                })
+            })();
+            pending.push(started.map_err(|why| self.registry.ended_or(&id, why))?);
         }
         let mut ports = Vec::with_capacity(pending.len());
-        // On a failure, those not attached yet are dropped: killed.
         for started in pending {
-            await_ready(&started.channel, &started.id, deadline, &started.process)?;
-            self.registry
-                .attach(&started.id, started.channel, Some(started.process))?;
+            await_ready(&started.link, &started.id, deadline)
+                .and_then(|()| self.registry.attach(&started.id, &started.link))
+                .map_err(|why| self.registry.ended_or(&started.id, why))?;
             self.listeners.push(started.listener);
             ports.push(started.port);
         }
@@ -1463,7 +1748,7 @@ impl RunGrants {
             inner
                 .grants
                 .get(id)
-                .is_some_and(|g| g.state == State::Starting && g.link.is_some())
+                .is_some_and(|g| g.state == State::Starting && g.attached)
         });
         if !ready {
             return Err(
@@ -1493,6 +1778,7 @@ impl RunGrants {
             return;
         }
         self.done = true;
+        // Kills the brokers that never answered ready, and waits for them.
         self.registry
             .decide(Which::Run(self.run), reason)
             .complete();
@@ -1505,9 +1791,11 @@ impl RunGrants {
                     continue;
                 };
                 match &grant.link {
-                    Some(link) => links.push(Arc::clone(link)),
-                    // No broker, so no thread to remove it: removed here.
-                    None => {
+                    // Its reader thread removes it once its broker exits.
+                    Some(link) if grant.attached => links.push(Arc::clone(link)),
+                    // No broker, or one that never served and is gone: no
+                    // thread removes it, so it is removed here.
+                    _ => {
                         if let Some(mut grant) = inner.grants.remove(id)
                             && let Some(end) = grant.end_record()
                         {
@@ -1518,11 +1806,12 @@ impl RunGrants {
             }
         }
         self.registry.changed.notify_all();
-        for (meta, end) in orphans {
-            self.registry.record_end(&meta, end);
-        }
+        // The brokers are told first; the records can wait.
         for link in &links {
             link.shutdown();
+        }
+        for (meta, end) in orphans {
+            self.registry.record_end(&meta, end);
         }
         self.registry
             .wait_gone(&self.ids, EXIT_KILL_DELAY + STOP_MARGIN);
@@ -1548,34 +1837,30 @@ fn spawn(program: &Path, channel: UnixStream) -> io::Result<Supervised> {
     Supervised::spawn(cmd)
 }
 
-/// Send a broker its install, with the listening socket attached, by
-/// `deadline`.
+/// Send a broker its install, with the listening socket attached, without
+/// waiting: the registry's lock is held ([`Registry::register`]). The
+/// channel is new and empty, and a frame is at most
+/// [`broker_protocol::MAX_FRAME`] bytes, which a socket buffer of the
+/// usual size (Linux's default is about 200 KiB) takes at once; a channel
+/// that does not take it whole is a failure — the broker is not served —
+/// never a wait.
 fn send_install(
     channel: &UnixStream,
     listener: &TcpListener,
     install: ToBroker,
-    deadline: Instant,
 ) -> Result<(), String> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err("no time was left to start it".into());
-    }
     let sent = channel
-        .set_write_timeout(Some(left))
-        .and_then(|()| broker_protocol::write_message(channel, &install, &[listener.as_fd()]))
-        .and_then(|()| channel.set_write_timeout(None));
+        .set_nonblocking(true)
+        .and_then(|()| broker_protocol::write_message(channel, &install, &[listener.as_fd()]));
     drop(install);
-    sent.map_err(|e| format!("cannot send it its grant: {e}"))
+    let blocking = channel.set_nonblocking(false);
+    sent.and(blocking)
+        .map_err(|e| format!("cannot send it its grant: {e}"))
 }
 
 /// Read a broker's [`FromBroker::Ready`] by `deadline`, and check it.
-fn await_ready(
-    channel: &UnixStream,
-    grant: &str,
-    deadline: Instant,
-    process: &Supervised,
-) -> Result<(), String> {
-    match broker_protocol::read_message::<FromBroker>(channel, Some(deadline)) {
+fn await_ready(link: &Link, grant: &str, deadline: Instant) -> Result<(), String> {
+    match broker_protocol::read_message::<FromBroker>(&link.channel, Some(deadline)) {
         Ok((_, fds)) if !fds.is_empty() => Err("it sent descriptors with its answer".into()),
         Ok((
             FromBroker::Ready {
@@ -1598,10 +1883,7 @@ fn await_ready(
         Ok(_) => Err("its first answer was not ready".into()),
         Err(e) if e.kind() == io::ErrorKind::TimedOut => Err("it did not answer in time".into()),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            let exit = process
-                .exit_by(Instant::now() + Duration::from_millis(500))
-                .ok()
-                .flatten();
+            let exit = link.exit_by(Instant::now() + Duration::from_millis(500));
             Err(match exit {
                 Some(exit) => format!("it ended without answering ({exit})"),
                 None => "it closed its channel without answering".into(),
@@ -1947,7 +2229,7 @@ mod tests {
             .expect("enter");
         run.mark_created(&id);
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
-        registry.attach(&id, agent_end, None).expect("attach");
+        registry.attach_channel(&id, agent_end).expect("attach");
         run.activate().expect("activate");
         Setup {
             log,
@@ -2745,7 +3027,7 @@ mod tests {
         // A small buffer, which the agent's answers fill at once.
         nix::sys::socket::setsockopt(&agent_end, nix::sys::socket::sockopt::SndBuf, &1)
             .expect("buffer");
-        registry.attach(&id, agent_end, None).expect("attach");
+        registry.attach_channel(&id, agent_end).expect("attach");
         run.activate().expect("activate");
         // The broker asks and asks, and never reads the answers: the agent's
         // threads that answer are soon stuck writing one, the first holding
@@ -2959,7 +3241,7 @@ mod tests {
         // killed (its channel ends).
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
         let broker = FakeBroker::new(broker_end, Confirm::AtOnce, 0);
-        let err = registry.attach(&id, agent_end, None).expect_err("ended");
+        let err = registry.attach_channel(&id, agent_end).expect_err("ended");
         assert!(err.contains("ended while its broker was starting"), "{err}");
         assert!(broker.sees_the_end());
         assert!(run.activate().is_err(), "none of the run becomes active");
@@ -2991,7 +3273,7 @@ mod tests {
             .expect("enter");
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
         let broker_a = FakeBroker::new(broker_end, Confirm::AtOnce, 0);
-        registry.attach(&a, agent_end, None).expect("attach");
+        registry.attach_channel(&a, agent_end).expect("attach");
         // B has no broker yet: neither becomes active.
         assert!(run.activate().is_err());
         assert_eq!(info(&registry, &a).state, "starting");
@@ -3029,7 +3311,7 @@ mod tests {
         run.mark_created(&id);
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
         let broker = FakeBroker::new(broker_end, Confirm::AfterAnswers, 0);
-        registry.attach(&id, agent_end, None).expect("attach");
+        registry.attach_channel(&id, agent_end).expect("attach");
         registry.decide(Which::All, EndReason::Locked).complete();
         assert!(matches!(
             broker.next(),
@@ -3055,9 +3337,9 @@ mod tests {
             0,
         );
         let started = Instant::now();
-        s.registry.start_timer();
+        s.registry.start_timer().expect("the timer");
         // Once: a second call starts no other timer.
-        s.registry.start_timer();
+        s.registry.start_timer().expect("the timer");
         assert!(matches!(
             s.broker.next(),
             ToBroker::Revoke {
@@ -3068,6 +3350,389 @@ mod tests {
         assert!(took < Duration::from_secs(3), "{took:?}");
         assert_eq!(info(&s.registry, &s.id).state, "revoked");
         assert_eq!(s.log.end_of(&s.id).reason.as_deref(), Some("expired"));
+        // Grants are still served.
+        assert_eq!(s.registry.room_for(1), Ok(()));
+    }
+
+    /// Without the timer, nothing would end a grant when its lifetime
+    /// passes: when its thread cannot start, no grant is served from then
+    /// on (fail closed) — `room_for`, which a run checks before its dialog,
+    /// and `enter` refuse, saying why.
+    #[test]
+    fn no_grant_is_served_when_the_timer_cannot_start() {
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(log as Arc<dyn Recorder>);
+        let err = registry
+            .start_timer_with(|_| Err(io::Error::other("no thread for the test")))
+            .expect_err("the timer did not start");
+        assert_eq!(err.to_string(), "no thread for the test");
+        let refused = registry.room_for(1).expect_err("room without a timer");
+        assert!(
+            refused.contains("could not start the timer that ends grants"),
+            "{refused}"
+        );
+        let entered = registry.enter(vec![new_grant(
+            &broker_protocol::new_grant_id(),
+            "KEY",
+            anthropic(),
+            Duration::from_secs(60),
+        )]);
+        assert_eq!(entered.err(), Some(refused));
+        assert_eq!(registry.count(), 0);
+        // A later call starts nothing, and changes nothing.
+        assert!(registry.start_timer().is_ok());
+        assert!(registry.room_for(1).is_err());
+    }
+
+    /// A process that plays a broker's process (the conversation is played
+    /// by a [`FakeBroker`] on the channel): it runs until it is killed.
+    fn helper_process() -> Supervised {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Supervised::spawn(cmd).expect("spawn")
+    }
+
+    /// A kill that was asked for is not a kill done: when one revocation
+    /// has decided to kill a broker (its confirmation overdue) and has not
+    /// killed it yet, a second revocation does not report itself done while
+    /// that broker still runs — it kills it, or waits for the kill, and its
+    /// process is gone by the time it returns.
+    #[test]
+    fn a_revocation_racing_another_waits_until_the_broker_is_gone() {
+        use crate::supervise::tests::alive;
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
+        let id = broker_protocol::new_grant_id();
+        let run = registry
+            .enter(vec![new_grant(
+                &id,
+                "KEY",
+                anthropic(),
+                Duration::from_secs(60),
+            )])
+            .expect("enter");
+        run.mark_created(&id);
+        let (agent_end, broker_end) = UnixStream::pair().expect("pair");
+        let process = helper_process();
+        let pid = process.id();
+        let link = registry
+            .register(&id, agent_end, Some(process), None)
+            .expect("register");
+        registry.attach(&id, &link).expect("attach");
+        run.activate().expect("activate");
+        let broker = FakeBroker::new(broker_end, Confirm::Never, 0);
+        // The first revocation will find the process held, as a thread
+        // delayed just before the kill would.
+        let held = link.broker();
+        let first = {
+            let registry = Arc::clone(&registry);
+            let id = id.clone();
+            thread::spawn(move || {
+                registry
+                    .decide(Which::Grant(&id), EndReason::Revoked)
+                    .complete()
+            })
+        };
+        assert!(matches!(broker.next(), ToBroker::Revoke { .. }));
+        // Its broker never confirms: the first revocation asks for the kill
+        // once the confirmation is overdue.
+        wait_for(|| {
+            registry
+                .inner()
+                .grants
+                .get(&id)
+                .is_some_and(|g| g.kill_requested)
+                .then_some(())
+        });
+        let (done, second) = mpsc::channel();
+        {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || {
+                registry.decide(Which::All, EndReason::Locked).complete();
+                let _ = done.send(());
+            });
+        }
+        assert!(
+            second.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the lock was done while the broker ran"
+        );
+        assert!(alive(pid), "the broker was killed while held");
+        drop(held);
+        second.recv_timeout(PATIENCE).expect("the lock is done");
+        assert!(!alive(pid), "the lock was done before the broker was gone");
+        first.join().expect("the first revocation is done");
+        wait_for(|| (registry.count() == 0).then_some(()));
+        assert_eq!(log.end_of(&id).reason.as_deref(), Some("revoked"));
+        drop(run);
+    }
+
+    /// A grant served by a [`FakeBroker`] that never confirms, with
+    /// [`helper_process`] as its broker's process: the registry, the run,
+    /// the grant, its link, the broker and the process ID.
+    fn setup_with_process() -> (
+        Arc<Log>,
+        Arc<Registry>,
+        RunGrants,
+        String,
+        Arc<Link>,
+        FakeBroker,
+        u32,
+    ) {
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
+        let id = broker_protocol::new_grant_id();
+        let run = registry
+            .enter(vec![new_grant(
+                &id,
+                "KEY",
+                anthropic(),
+                Duration::from_secs(60),
+            )])
+            .expect("enter");
+        run.mark_created(&id);
+        let (agent_end, broker_end) = UnixStream::pair().expect("pair");
+        let process = helper_process();
+        let pid = process.id();
+        let link = registry
+            .register(&id, agent_end, Some(process), None)
+            .expect("register");
+        registry.attach(&id, &link).expect("attach");
+        run.activate().expect("activate");
+        let broker = FakeBroker::new(broker_end, Confirm::Never, 0);
+        (log, registry, run, id, link, broker, pid)
+    }
+
+    /// A kill under way on another thread — the process taken, not reaped
+    /// yet — is waited for: a revocation that finds it is done only once the
+    /// process is gone.
+    #[test]
+    fn a_revocation_waits_for_a_kill_under_way_on_another_thread() {
+        use crate::supervise::tests::alive;
+        /// The kill under way on another thread: the process taken out of
+        /// the link, not reaped yet. Dropped — also when the test fails, so
+        /// that nothing waits for it forever — it kills and reaps the
+        /// process, and says so.
+        struct KillUnderWay(Option<Supervised>, Arc<Link>);
+        impl Drop for KillUnderWay {
+            fn drop(&mut self) {
+                drop(self.0.take());
+                self.1.mark_gone(self.1.broker());
+            }
+        }
+        let (_log, registry, run, _id, link, _broker, pid) = setup_with_process();
+        // Another thread has taken the process to kill it, and is slow.
+        let Broker::Running(process) = std::mem::replace(&mut *link.broker(), Broker::Ending)
+        else {
+            panic!("the process runs");
+        };
+        let under_way = KillUnderWay(Some(process), Arc::clone(&link));
+        let (done, revoked) = mpsc::channel();
+        {
+            let registry = Arc::clone(&registry);
+            thread::spawn(move || {
+                registry.decide(Which::All, EndReason::Locked).complete();
+                let _ = done.send(());
+            });
+        }
+        // A kill of its own returns only once the broker is gone, too.
+        let (done, killed) = mpsc::channel();
+        {
+            let link = Arc::clone(&link);
+            thread::spawn(move || {
+                link.kill();
+                let _ = done.send(());
+            });
+        }
+        // Its confirmation is overdue after REVOKE_SEND_TIMEOUT and
+        // REVOKE_CONFIRM_TIMEOUT; it waits for the kill under way after that.
+        assert!(
+            revoked
+                .recv_timeout(
+                    REVOKE_SEND_TIMEOUT + REVOKE_CONFIRM_TIMEOUT + Duration::from_millis(500)
+                )
+                .is_err(),
+            "the lock was done while the broker ran"
+        );
+        assert!(killed.try_recv().is_err(), "a kill returned while it ran");
+        assert!(alive(pid));
+        // The other thread kills and reaps it, and says so.
+        drop(under_way);
+        revoked.recv_timeout(PATIENCE).expect("the lock is done");
+        killed.recv_timeout(PATIENCE).expect("the kill is done");
+        assert!(!alive(pid));
+        drop(run);
+        assert_eq!(registry.count(), 0);
+    }
+
+    /// A broker that closes its channel and does not exit is given a moment
+    /// to exit ([`Link::close`]); a revocation meanwhile does not wait for
+    /// that moment, nor take it as the end: it kills the broker at once, and
+    /// is done once the process is gone.
+    #[test]
+    fn a_revocation_while_a_broker_is_given_time_to_exit_kills_it_at_once() {
+        use crate::supervise::tests::alive;
+        let (_log, registry, run, id, _link, broker, pid) = setup_with_process();
+        // The broker's channel ends; its process goes on.
+        let _ = broker.writer.lock().expect("lock").shutdown(Shutdown::Both);
+        thread::sleep(Duration::from_millis(200));
+        assert!(alive(pid));
+        let started = Instant::now();
+        registry
+            .decide(Which::Grant(&id), EndReason::Revoked)
+            .complete();
+        let took = started.elapsed();
+        assert!(!alive(pid), "the revocation was done while the broker ran");
+        assert!(took < EXIT_KILL_DELAY / 2, "{took:?}");
+        drop(run);
+        assert_eq!(registry.count(), 0);
+    }
+
+    /// A stand-in broker program that writes its process ID to `pid` and
+    /// copies whatever it is sent to `received`, and never answers.
+    fn copying_broker(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let (program, pid, received) = (
+            dir.join("rusthorse-broker"),
+            dir.join("pid"),
+            dir.join("received"),
+        );
+        write_program(
+            &program,
+            &format!(
+                "#!/bin/sh\necho $$ > '{pid}.new' && /bin/mv '{pid}.new' '{pid}'\n\
+                 exec /bin/cat > '{received}'\n",
+                pid = pid.display(),
+                received = received.display()
+            ),
+        );
+        (program, pid, received)
+    }
+
+    /// Write an executable file from another process, and put it in place at
+    /// once: a file that this process held open for writing could not be run
+    /// while a process forked meanwhile by another test still held that
+    /// descriptor ("Text file busy").
+    fn write_program(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "cat > \"$1.new\" && chmod 700 \"$1.new\" && mv -f \"$1.new\" \"$1\"",
+                "sh",
+            ])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(text.as_bytes())
+            .expect("write");
+        assert!(child.wait().expect("wait").success());
+    }
+
+    /// An install for the grant `id`, with a fake credential.
+    fn install(id: &str) -> Install {
+        Install {
+            version: broker_protocol::VERSION,
+            grant: id.into(),
+            token: broker_protocol::new_token(),
+            credential: crate::protocol::SecretString::new("sk-ant-test-0000000000000000".into()),
+            profile: anthropic(),
+            max_in_flight: MAX_IN_FLIGHT,
+            max_connections: broker_protocol::MAX_CONNECTIONS,
+            lifetime_secs: 60,
+        }
+    }
+
+    /// A grant that ended before its broker was started — a lock while its
+    /// run recorded its creation — gets no install: the broker is entered
+    /// in the registry only while its grant is starting, which is checked
+    /// before anything is sent to it, so no credential reaches it.
+    #[test]
+    fn a_grant_that_ended_before_its_broker_started_gets_no_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (program, _, received) = copying_broker(dir.path());
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
+        let id = broker_protocol::new_grant_id();
+        let mut run = registry
+            .enter(vec![new_grant(
+                &id,
+                "KEY",
+                anthropic(),
+                Duration::from_secs(60),
+            )])
+            .expect("enter");
+        run.mark_created(&id);
+        registry.decide(Which::All, EndReason::Locked).complete();
+        let err = run
+            .start(&program, vec![install(&id)], Duration::from_secs(2))
+            .expect_err("the grant ended");
+        assert_eq!(err, ENDED_WHILE_STARTING);
+        // Time for a broker that got an install to write it down.
+        thread::sleep(Duration::from_millis(300));
+        let got = std::fs::read(&received).unwrap_or_default();
+        assert!(got.is_empty(), "a broker received {} bytes", got.len());
+        assert!(run.activate().is_err());
+        run.finish(EndReason::CommandEnded);
+        assert_eq!(registry.count(), 0);
+        assert_eq!(log.end_of(&id).reason.as_deref(), Some("locked"));
+    }
+
+    /// A revocation while a broker has its install and has not answered
+    /// ready kills it, and is done only once its process is gone; the run's
+    /// start fails at once, saying that the grant ended, without waiting for
+    /// the answer that will never come.
+    #[test]
+    fn a_revocation_kills_a_broker_that_has_not_answered_ready() {
+        use crate::supervise::tests::alive;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (program, pid_file, received) = copying_broker(dir.path());
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
+        let id = broker_protocol::new_grant_id();
+        let mut run = registry
+            .enter(vec![new_grant(
+                &id,
+                "KEY",
+                anthropic(),
+                Duration::from_secs(60),
+            )])
+            .expect("enter");
+        run.mark_created(&id);
+        let started = thread::scope(|scope| {
+            let starting =
+                scope.spawn(|| run.start(&program, vec![install(&id)], Duration::from_secs(30)));
+            // The broker has its install, and does not answer.
+            let pid: u32 = wait_for(|| {
+                std::fs::read(&received)
+                    .ok()
+                    .filter(|got| !got.is_empty())?;
+                std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok()
+            });
+            assert!(alive(pid));
+            let revoking = Instant::now();
+            registry.decide(Which::All, EndReason::Locked).complete();
+            assert!(!alive(pid), "the lock was done while the broker ran");
+            assert!(
+                revoking.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                revoking.elapsed()
+            );
+            starting.join().expect("the start ends")
+        });
+        assert_eq!(started.expect_err("the grant ended"), ENDED_WHILE_STARTING);
+        assert!(run.activate().is_err());
+        let finishing = Instant::now();
+        run.finish(EndReason::CommandEnded);
+        assert!(finishing.elapsed() < Duration::from_secs(1));
+        assert_eq!(registry.count(), 0);
+        assert_eq!(log.end_of(&id).reason.as_deref(), Some("locked"));
     }
 
     #[test]
@@ -3100,7 +3765,7 @@ mod tests {
             for id in served {
                 let (agent_end, broker_end) = UnixStream::pair().expect("pair");
                 brokers.push(FakeBroker::new(broker_end, Confirm::AtOnce, 0));
-                registry.attach(id, agent_end, None).expect("attach");
+                registry.attach_channel(id, agent_end).expect("attach");
             }
             run.activate().expect("activate");
         }

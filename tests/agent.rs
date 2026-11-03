@@ -3806,6 +3806,80 @@ fn logged(log: &Path, event: &str) -> serde_json::Value {
     })
 }
 
+/// The first entry of a stand-in broker's log with this event, if it is
+/// there within `limit`.
+fn logged_within(log: &Path, event: &str, limit: Duration) -> Option<serde_json::Value> {
+    let until = Instant::now() + limit;
+    loop {
+        if let Some(found) = broker_log(log)
+            .into_iter()
+            .find(|entry| entry["event"] == event)
+        {
+            return Some(found);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The audit log, blocked: a FIFO in its place, which nobody opens until
+/// [`BlockedAudit::release`]. A record waits to open it; once it can, it
+/// fails (a FIFO cannot be synced to disk), as a log on a failing disk
+/// would. Dropping it puts the log back: the records that follow are kept.
+struct BlockedAudit {
+    path: PathBuf,
+    reader: Option<std::fs::File>,
+}
+
+impl BlockedAudit {
+    fn new(h: &Harness) -> BlockedAudit {
+        let path = h.audit.clone();
+        let _ = std::fs::remove_file(&path);
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        BlockedAudit { path, reader: None }
+    }
+
+    /// Let the records waiting for the log go on, to fail.
+    fn release(&mut self) {
+        // For reading and writing: opening it never waits, and the records
+        // written meanwhile stay in the pipe, unread.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .expect("open the FIFO");
+        self.reader = Some(reader);
+    }
+}
+
+impl Drop for BlockedAudit {
+    fn drop(&mut self) {
+        // Records still waiting — a test that failed before it released
+        // them — go on, to fail, rather than wait forever.
+        if self.reader.is_none() {
+            self.reader = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .ok();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether the process `pid` runs now: it exists and is not a zombie.
+fn process_alive(pid: u64) -> bool {
+    match std::fs::read(format!("/proc/{pid}/stat")) {
+        Err(_) => false,
+        Ok(stat) => {
+            let close = stat.iter().rposition(|&b| b == b')').unwrap_or(0);
+            !matches!(stat.get(close + 2), Some(b'Z' | b'X'))
+        }
+    }
+}
+
 /// Whether the process `pid` is gone (or a zombie nobody waits for any
 /// more), within a few seconds.
 fn process_gone(pid: u64) -> bool {
@@ -4755,11 +4829,53 @@ fn a_run_whose_broker_fails_to_start_keeps_none_of_its_grants() {
     assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "aborted"]);
 }
 
+/// A run that fails once its grants are active — its command cannot be
+/// started — ends them before it records why nothing ran: with the audit
+/// log blocked from the moment the brokers have their installs, the broker
+/// is told to revoke while that record waits (ADR 0013: revocation never
+/// waits for the audit log), and the run fails, nothing run, once the log
+/// gives up.
+#[test]
+fn a_run_whose_command_cannot_start_ends_its_grants_before_it_waits_for_the_audit_log() {
+    use rusthorse::protocol::ErrorCode;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "held_ready");
+    let ready = log.with_extension("jsonl.ready");
+    // A program the agent finds and the human approves, which cannot start:
+    // its interpreter does not exist.
+    let program = h.dir.path().join("cannot-start");
+    write_program(&program, "#!/nonexistent/rusthorse-test-interpreter\n");
+    let mut request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], "");
+    request.run.argv = vec![program.to_str().expect("utf8").into()];
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(&h, request);
+    // The grant's creation is recorded and its broker has its install: from
+    // now on the audit log blocks. Then the broker answers ready.
+    let pid = logged(&log, "install")["pid"].as_u64().expect("pid");
+    let mut audit = BlockedAudit::new(&h);
+    std::fs::write(&ready, "").expect("ready");
+    let revoke = logged_within(&log, "revoke", Duration::from_secs(5))
+        .expect("the broker was not told while the run's record waited");
+    assert_eq!(revoke["message"]["reason"], "command_ended");
+    audit.release();
+    let (code, message) = error_of(&running.wait());
+    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+    assert!(message.contains("cannot start"), "{message}");
+    assert!(process_gone(pid), "the broker was left running");
+    drop(audit);
+    assert!(grants(&h).is_empty(), "a grant was left");
+}
+
 /// A lock while a run's brokers start ends the run's grants, which were
 /// entered as starting — a screen lock too, whatever their profile says
 /// about the automatic locks, since nothing of the run has been used yet —
-/// and the run fails before anything runs: a broker that answers ready
-/// after that is killed, not attached (ADR 0013, preparing a run's grants).
+/// and the run fails before anything runs: a broker that has its install
+/// and has not answered ready is killed, and the lock is done only once it
+/// is gone (ADR 0013, preparing a run's grants and revocation).
 #[test]
 fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
     use rusthorse::protocol::{ErrorCode, Request, Response};
@@ -4797,8 +4913,15 @@ fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
                 other => panic!("unexpected {}", other.kind()),
             }
         }
-        assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"), "{lock}");
-        // Its broker answers ready only now: too late.
+        // Done once its broker, which had not answered, is gone.
+        assert!(!process_alive(pid), "{lock}: done while the broker ran");
+        // Revoked, or ended already: the run, whose broker is gone, fails.
+        let state = grant_state(&h, &id);
+        assert!(
+            matches!(state.as_deref(), Some("revoked") | None),
+            "{lock}: {state:?}"
+        );
+        // An answer now would be too late (nobody is left to give it).
         std::fs::write(&ready, "").expect("ready");
         let (code, message) = error_of(&running.wait());
         assert_eq!(code, ErrorCode::Internal, "{lock}: {message}");
@@ -5471,6 +5594,142 @@ fn grants_that_survive_a_lock_end_when_the_vault_file_changed_meanwhile() {
     go(&h);
     assert!(matches!(running.wait(), Response::Exited { .. }));
     assert_eq!(ended_with(&h, &id), "vault_changed");
+}
+
+/// The unlock barrier tells the brokers before anything waits for the audit
+/// log (ADR 0013: revocation never waits for the audit log): with the log
+/// blocked, the broker of a grant that survived the lock is told to revoke
+/// while the unlock's record still waits; once the log fails, the unlock
+/// fails and the vault stays locked.
+#[test]
+fn the_unlock_barrier_tells_the_brokers_before_it_waits_for_the_audit_log() {
+    use rusthorse::protocol::{EntryChanges, ErrorCode, Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(
+        &h,
+        &[
+            ("KEY", FAKE_KEY, Some(anthropic())),
+            ("OTHER", "abcdefgh", None),
+        ],
+    );
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], WAITS),
+    );
+    command_env(&h);
+    let id = grants(&h)[0].id.clone();
+    // The grant survives a screen lock; another program changes the file.
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    {
+        let path = h.vault_path();
+        let mut vault = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("open");
+        let other = vault.find("OTHER").expect("find");
+        let changes = EntryChanges {
+            username: Some("someone else".into()),
+            ..EntryChanges::default()
+        };
+        vault.edit(other, &changes, None).expect("edit");
+        vault.save().expect("save");
+    }
+    let mut audit = BlockedAudit::new(&h);
+    let socket = h.socket.clone();
+    let (answer, unlocked) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answer.send(rusthorse::client::Client::new(socket).call(&Request::List));
+    });
+    let revoke = logged_within(&log, "revoke", Duration::from_secs(5))
+        .expect("the broker was not told while the unlock's record waited");
+    assert_eq!(revoke["message"]["reason"], "vault_changed");
+    assert!(unlocked.try_recv().is_err(), "the unlock was done");
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    // The log fails: so does the unlock, and the vault stays locked.
+    audit.release();
+    let failed = unlocked
+        .recv_timeout(TEST_LIMIT)
+        .expect("the unlock's answer")
+        .expect("call");
+    let (code, message) = error_of(&failed);
+    assert_eq!(code, ErrorCode::Internal, "{message}");
+    assert!(message.contains("cannot write the audit log"), "{message}");
+    assert!(status(&h).locked);
+    drop(audit);
+    // With the log back, the vault unlocks; the grant had ended already.
+    match h.call(&Request::List) {
+        Response::Entries { .. } => {}
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+}
+
+/// No lock waits for the audit record of an unlock: while an unlock that
+/// ends no grant (the file is as the agent left it) waits to record itself,
+/// `rusthorse lock` still ends every grant and tells its broker at once;
+/// the unlock then does not take effect.
+#[test]
+fn a_lock_does_not_wait_for_the_record_of_an_unlock() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], WAITS),
+    );
+    command_env(&h);
+    let id = grants(&h)[0].id.clone();
+    h.agent.lock_for(SCREEN_LOCK, "test");
+    let prompts = h.ui.password_prompts.lock().unwrap().len();
+    let mut audit = BlockedAudit::new(&h);
+    let call = |request: Request| {
+        let socket = h.socket.clone();
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(rusthorse::client::Client::new(socket).call(&request));
+        });
+        answered
+    };
+    let unlocked = call(Request::List);
+    // The password is typed; the unlock then waits to record itself.
+    eventually("the unlock dialog", || {
+        (h.ui.password_prompts.lock().unwrap().len() > prompts).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(unlocked.try_recv().is_err(), "the unlock was done");
+    let locked = call(Request::Lock);
+    let revoke = logged_within(&log, "revoke", Duration::from_secs(5))
+        .expect("the lock waited for the unlock's record");
+    assert_eq!(revoke["message"]["reason"], "locked");
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    audit.release();
+    let answer = |answered: std::sync::mpsc::Receiver<anyhow::Result<Response>>| -> Response {
+        answered
+            .recv_timeout(TEST_LIMIT)
+            .expect("an answer")
+            .expect("call")
+    };
+    // The unlock's record fails: it does not take effect.
+    let (code, message) = error_of(&answer(unlocked));
+    assert_eq!(code, ErrorCode::Internal, "{message}");
+    // The lock was done before its own record, which fails too. (So did
+    // the grant's end record: the broker's answer is what tells.)
+    let _ = answer(locked);
+    drop(audit);
+    assert!(status(&h).locked);
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
 }
 
 /// A vault created where the one the agent read was is a changed file too
