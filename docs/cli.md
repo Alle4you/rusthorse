@@ -29,7 +29,7 @@ terminal; `rusthorse --help` ends by pointing AI agents to
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
 | `124` | The outcome is unknown: the request was sent but no usable answer came back, or the agent could not confirm that it took effect (it could not determine the result of a command it had started, or could not sync a change to disk). For `run`, the command may or may not have run; for a change (`add`, `edit`, `remove`, `import`, `passwd`, `backup`), check with `rusthorse list` or `show` before repeating it. Read-only commands exit with 1 instead. |
-| `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. |
+| `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. With `--broker`, also when a grant could not be served: there is no fallback to the entry's value. |
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141, without a message, when `rusthorse run` could not write the command's output — see [`run`](#rusthorse-run)). |
 
 Messages go to standard error; data (listings, JSON, revealed values) goes to
@@ -126,9 +126,17 @@ Shows the agent version, the vault path, whether it is locked, when it will
 lock itself, how many approvals are remembered, which program shows its
 dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why), what
 else locks the vault, and the program file the agent runs (with a note if it
-was replaced since the agent started). For example:
+was replaced since the agent started). From an agent that reports them, it
+also shows the credential broker's program (the path of `rusthorse-broker`,
+or `none:` and why it cannot be used) and the number of grants the agent
+reports (see [`run --broker`](#through-the-credential-broker---broker)),
+which can include a revoked grant whose command still runs:
+[`rusthorse grants`](#rusthorse-grants) lists each one with its state. For
+example:
 
 ```
+broker:     /usr/bin/rusthorse-broker
+grants:     1 (`rusthorse grants` shows their state)
 locks on:   suspend: logind (locks before the computer sleeps)
             screen lock: logind (session lock signals of this user), org.cinnamon.ScreenSaver
 ```
@@ -166,7 +174,8 @@ particular kind); an AI agent looking for an API key can start with
 username, URL, host or tags contain the text (case-insensitive).
 Values and notes are never included, nor any field that the KeePass file marks
 as protected. JSON output is an array of objects with the fields described in
-[protocol.md](protocol.md#entryinfo), including each entry's UUID.
+[protocol.md](protocol.md#entryinfo), including each entry's UUID and, for an
+entry that has one, its broker profile (`broker`).
 
 ## `rusthorse show`
 
@@ -177,6 +186,25 @@ rusthorse show NAME [--json]
 Shows one entry's metadata: name, group, kind, username, URL, host, port,
 tags, whether it has a value and notes, the names of protected and other
 fields, and the last modification time.
+
+For an entry with a [broker profile](#broker-profiles), it then shows the
+profile's preset and revision, and what the approval dialog of a grant says
+of it: the destination, every route, when a grant ends and its limits.
+
+```
+broker:     anthropic preset, revision 1
+            Destination: https://api.anthropic.com
+            Allows: POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /v1/models/{id}
+            Ends: when the command ends, on rusthorse lock, when revoked or the entry changes, or after 12h; not when the screen locks, the computer suspends or the vault locks after idle time
+            Requests: no limit; at most 16 at a time
+```
+
+A profile this Rusthorse does not read — not one line of valid JSON, longer
+than 1000 characters, an unknown version, preset, revision or field, a value
+out of range — is shown as `unusable`, and one the KeePass file marks as
+protected as `withheld` (the field is also listed under `fields:` or
+`protected:`); either way the entry cannot be used with the broker.
+`show --json` has the profile as `broker` only when it is usable.
 
 ## Entry kinds
 
@@ -240,14 +268,18 @@ rusthorse edit NAME [--kind KIND] [--username USER] [--url URL] [--host HOST]
                     [--port PORT] [--notes TEXT] [--rename NEW] [--group PATH]
                     [--clear FIELD]... [--add-tag TAG]... [--remove-tag TAG]...
                     [--value | --stdin | --generate [--length N] [--alphabet KIND]]
+                    [--broker PRESET [--broker-origin URL] [--broker-base-path PATH]
+                     [--broker-locks end|continue] [--broker-lifetime MINUTES]
+                     [--broker-requests N]]
 ```
 
 Changes an entry. Requires approval; the dialog lists every change. `--value`
 makes the agent ask you for a new value in a dialog; `--stdin` reads it from
 standard input; `--generate` replaces it with a new random value (to rotate a
 credential: generate, then update it at the provider with `rusthorse run`). `--clear` removes a field: `username`, `url`, `host`, `port`,
-`notes` or `kind`; `--kind other` also removes the kind. The previous state is
-kept in the entry's KeePass history.
+`notes`, `kind` or `broker` (the [broker profile](#broker-profiles));
+`--kind other` also removes the kind. The previous state is kept in the
+entry's KeePass history.
 
 `--group` moves the entry to the group at `PATH` (`Work/Servers`), creating
 the group if needed; `/` (or an empty path) moves it to the top level. Spaces
@@ -274,6 +306,64 @@ the entry moved from and to. The entry records its previous group and when
 it moved (the KDBX fields `PreviousParentGroup` and `LocationChanged`), and
 its previous version goes to its history, as with every edit.
 
+### Broker profiles
+
+```
+rusthorse edit NAME --broker PRESET [--broker-origin URL] [--broker-base-path PATH]
+                    [--broker-locks end|continue] [--broker-lifetime MINUTES]
+                    [--broker-requests N]
+rusthorse edit NAME --clear broker
+```
+
+A broker profile says what a grant of the credential broker
+([ADR 0013](adr/0013-credential-broker.md)) allows for the entry, so that
+[`run --broker`](#through-the-credential-broker---broker) can use it: a
+preset — the routes, how the command presents its token and how the key is
+presented to the API — the API's origin and base path, and when a grant
+ends. Only an approved edit sets or clears a profile, with or without other
+changes; `add` and `import` cannot set one, and `add --replace` and
+`import --replace` remove it. A profile holds no secret: `show` and
+`list --json` show it without approval. Any change to an entry, its profile
+included, ends its grants.
+
+| Preset | Destination unless `--broker-origin` and `--broker-base-path` say otherwise | Routes |
+|---|---|---|
+| `anthropic` | `https://api.anthropic.com` | `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /v1/models/{id}` |
+| `openai` | `https://api.openai.com/v1` | `POST /chat/completions`, `POST /responses`, `POST /responses/input_tokens`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
+| `openai-compatible` | none: `--broker-origin` names it; the base path is `/v1` | `POST /chat/completions`, `POST /embeddings`, `GET /models`, `GET /models/{id}` |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--broker-origin URL` | the preset's | `https://` and a lowercase host name, with an optional port: no IP address, user, path, query or fragment |
+| `--broker-base-path PATH` | the preset's | What the client's base URL adds after the origin: `/` and segments of letters, digits, `.`, `_`, `~` and `-`, none of them `.` or `..`, without a trailing `/`; `''` for nothing |
+| `--broker-locks end\|continue` | `continue` | Whether the screen locking, a suspend and the idle timeout end the entry's grants (`rusthorse lock` always does) |
+| `--broker-lifetime MINUTES` | `720` (12 hours) | The longest a grant lasts: 1 to 1440 |
+| `--broker-requests N` | no limit | The most requests one grant admits: 1 to 1000000 |
+
+The options after `--broker` need it: without it they are a usage error
+(exit status 2). `rusthorse edit` sends only the options given: the agent
+fills in the defaults of the preset's latest revision, and stores the
+profile with every field written out, so that a later default never changes
+it. But `rusthorse edit` checks the profile first, as the agent will:
+an unknown preset or policy is a usage error (2), and an invalid origin, base
+path, lifetime or limit, `openai-compatible` without `--broker-origin`, and
+`--broker` together with `--clear broker` are refused (exit status 1) before
+anything is sent. The approval dialog shows the whole new profile, and how
+many grants the edit ends.
+
+An edit that sets or clears the profile is sent as a request of its own,
+`broker_edit` ([protocol](protocol.md)): an agent of an older protocol
+refuses it whole, instead of making the other changes without the profile's.
+
+Examples:
+
+```sh
+rusthorse edit anthropic --broker anthropic
+rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.deepseek.com
+rusthorse edit openai --broker openai --broker-locks end --broker-lifetime 60 --broker-requests 500
+rusthorse edit openai --clear broker
+```
+
 ## `rusthorse remove`
 
 ```
@@ -287,12 +377,16 @@ previous file is still available as `vault.kdbx.bak`.
 ## `rusthorse run`
 
 ```
-rusthorse run [--no-redact] [--stdin] [--url VAR=NAME]... SECRET... -- COMMAND [ARG]...
+rusthorse run [--no-redact] [--stdin] [--broker VAR=NAME]... [--url VAR=NAME]...
+              [SECRET]... -- COMMAND [ARG]...
 ```
 
 Runs `COMMAND` with secrets in its environment. Each `SECRET` is either
 `NAME` (the variable is named like the entry, which must then be a valid
-variable name) or `VAR=NAME`.
+variable name) or `VAR=NAME`. At least one `SECRET` or `--broker` is needed
+(without either, a usage error, exit status 2). `--broker` gives the command
+a temporary token instead of an API key: see
+[below](#through-the-credential-broker---broker).
 
 `--url VAR=NAME` also puts entry `NAME`'s URL — for an API key, its
 endpoint — in variable `VAR`. `rusthorse run` reads the URL from the entry's
@@ -428,7 +522,7 @@ If the agent runs with `--remember`, the dialog also offers "Allow for …",
 which lets **identical** requests (same vault state, entries, command line,
 program, directory, input and output handling, and the complete environment)
 run without asking for that long. It does not cover what the command reads, so use it only for commands
-whose input you control.
+whose input you control. It never applies to a run with `--broker`.
 
 Examples:
 
@@ -441,6 +535,131 @@ rusthorse run TOKEN=cloudflare -- sh -c 'curl -sH "Authorization: Bearer $TOKEN"
 ```
 
 Exit status: the command's, `125` if it did not run, or `124` if Rusthorse cannot tell.
+
+### Through the credential broker: `--broker`
+
+`--broker VAR=NAME` uses entry `NAME` through the credential broker
+([ADR 0013](adr/0013-credential-broker.md)): the command gets, in `VAR`, a
+temporary **token** of a grant — never the entry's value — and a broker
+process of the agent's adds the real key to the requests it forwards. The
+entry needs a [broker profile](#broker-profiles), which fixes where those
+requests go and which ones are allowed. `--broker NAME` names the variable
+like the entry. Each `--broker` is one grant, with its own token and its own
+local address; `--broker` can be given several times, and combined with
+`SECRET`s for other entries, which the command gets by value as always.
+
+`--url URLVAR=NAME` for an entry given with `--broker` puts the broker's
+address in `URLVAR`, instead of the entry's own URL:
+`http://127.0.0.1:PORT` followed by the profile's base path
+(`http://127.0.0.1:PORT/v1` for `openai`). Give it for the variable the
+program reads its base URL from (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`):
+without it, the program sends the token wherever its environment or its
+defaults say, usually to the API's own address, where the token is useless
+but which it reaches over the network. An entry given with `--broker` takes
+at most one `--url`. For any other entry, `--url` means what it always
+means. What the environment of `rusthorse run` has in the variable of a
+token or of the broker's address is not sent: the agent sets them.
+
+Before anything is sent — exit status 125, nothing asked, nothing run —
+`rusthorse run` refuses a variable that is not a valid name, that is set
+twice (by a `SECRET`, a `--broker` or a `--url`), or that changes how
+programs start (`LD_*` and the risky variables above) for a token or an
+address; `NO_PROXY`, in any case, for a token or the broker's address, since
+the agent adds `127.0.0.1` to it; an entry given to `--broker` twice; an
+entry given both with `--broker` and as a `SECRET` (by the name written: the
+agent compares UUIDs); and a second `--url` for an entry given with
+`--broker`. A `--url` that names a brokered entry by another name
+(`AI/anthropic` and `anthropic`, or its UUID) is refused once that entry has
+been read: write the same name in both. A run with `--broker` is sent as a
+request of its own, `broker_run` ([protocol](protocol.md)), which an agent
+of an older protocol refuses whole, instead of running the command without
+its grants.
+
+The agent checks, before its dialog, that each brokered entry has a usable
+profile and a value the broker can send (8 to 4096 visible ASCII
+characters), that it would then serve no more than 16 grants at once, and
+that the broker's program is usable; and it adds `127.0.0.1` to `NO_PROXY` and
+`no_proxy` in the command's environment. The dialog says what each grant
+allows — the entry, the destination, every route, how and when the grant
+ends, its request limit and the requests at a time — that the command gets a
+temporary token and not the key, which variables get real values in a mixed
+run, and that the command can spend credit, that a request count is not a
+spending limit and that request bodies are not inspected.
+
+There is no fallback: if a grant cannot be served before the command
+starts, the run fails with 125 and nothing ran; the command never gets the
+value instead. Once the command has started, `rusthorse run` exits with its
+status as without the broker, or 124 when that cannot be told; what became
+of each request is in the [audit log](#rusthorse-audit). The run's grants
+end when the command ends, and before on `rusthorse lock`,
+[`rusthorse grants revoke`](#rusthorse-grants), a change to the entry, the
+end of their lifetime, and the automatic locks if the profile says `end`.
+
+With redaction (the default), the tokens are redacted from the output like
+the values. `--no-redact` is allowed, and the dialog warns about it: the
+output is then not filtered, and whoever reads a token can use its grant
+until it ends. It is what an interactive program such as Claude Code needs,
+since only without redaction does the command get the terminal.
+
+Examples:
+
+```sh
+rusthorse run --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
+rusthorse run PGPASSWORD=prod-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python etl.py
+env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \
+    --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude
+```
+
+The last one runs Claude Code through the broker, as Claude Code's
+documentation describes it; it has not been tried with Claude Code itself
+yet. `ANTHROPIC_AUTH_TOKEN` makes it send the token as
+`Authorization: Bearer`; `env -u ANTHROPIC_API_KEY` keeps a key your
+environment may hold out of the command (Claude Code may send it with the
+token or instead of it, and the broker refuses a request that presents
+anything but the token in `x-api-key` or `Authorization`); and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, set in the environment that
+`rusthorse run` passes on, turns off its non-essential requests, some of
+which would go straight to `api.anthropic.com`. An `env` block in Claude
+Code's settings files overrides the variables `run` sets, and an
+`apiKeyHelper` there can give it another key: check them first
+([guide for AI agents](#rusthorse-guide)).
+
+## `rusthorse grants`
+
+```
+rusthorse grants [--json]
+rusthorse grants revoke ID
+rusthorse grants revoke --all
+```
+
+Lists the grants of the credential broker
+([`run --broker`](#through-the-credential-broker---broker)), never a token:
+one line each, with its ID (`g` and 16 hexadecimal digits, also in the
+audit log), entry, destination, state, when it started and how long its
+lifetime has left, the requests admitted of those allowed, the requests in
+flight, whether the automatic locks end it, the requester and the command.
+The state is `starting` (its run is being prepared: nothing is admitted
+yet); `active`; `exhausted` (its request limit is reached: no new request is
+admitted, those admitted finish); or `revoked` (it has ended; its broker
+answers `403` until the command ends, and it stays in the list until then).
+What the agent reports is shown
+with control and invisible characters escaped (`\u{…}`), so that a command
+line or a process name cannot rewrite the terminal. `--json` prints the
+agent's list as it is ([protocol](protocol.md)).
+
+```
+ID                 ENTRY                    DESTINATION                STATE   STARTED                    ENDS IN  REQUESTS      IN FLIGHT  AUTOMATIC LOCKS  REQUESTER                     COMMAND
+g3f9a0c1d2e4b5a67  AI/anthropic (8d2f6c1e)  https://api.anthropic.com  active  2026-11-02T18:00:00-03:00  11h59m   3 (no limit)  1          continue         rusthorse[4300] ← bash[4242]  claude
+```
+
+`grants revoke ID` ends one grant, and `grants revoke --all` every grant
+(one or the other, not both): new requests are refused at once and open ones
+are closed — a stream in progress ends — while a request already sent to its
+destination may still take effect. Neither needs an approval, like `lock`.
+An ID not of the form above is refused before anything is sent; one the agent
+does not know is an error.
+
+Exit status: 0, or 1 on an error.
 
 ## `rusthorse reveal`
 
@@ -584,6 +803,29 @@ other records are being written or the disk is slow. It comes from the system
 clock, so setting the clock back can make a later record show an earlier
 time.
 
+For the credential broker ([`run --broker`](#through-the-credential-broker---broker)),
+the `run` record of a run with `--broker` names the grants it creates (`grants:`
+each one's ID, entry and destination); a `grant` record is `created` or
+`ended`, with the grant's ID and, at its end, the reason (`reason:`
+`command_ended`, `locked`, `revoked`, `entry_changed`, `expired`, …) and
+what became of its requests (`requests:` admitted, of which finished and
+unknown, and refused before admission); a `broker_request` record is
+`admitted`, before the request is forwarded, then `completed`,
+`not_forwarded`, `client_closed`, `revoked` or `unknown`, with the grant, the
+request's number (`#1`), its route (`POST /v1/messages`, never the raw path)
+and, at its end, the destination's status and the bytes sent and received.
+Never a token, a key, a header, a query or a body. For example:
+
+```
+2026-11-02T18:00:05-03:00  broker_request admitted             grant g3f9a0c1d2e4b5a67 #1 POST /v1/messages  by rusthorse[4300] ← bash[4242]
+2026-11-02T18:00:09-03:00  broker_request completed            grant g3f9a0c1d2e4b5a67 #1 status 200 (1450 bytes sent, 38211 received)  by rusthorse[4300] ← bash[4242]
+```
+
+Any program of yours can write to the log (threat model L13): control and
+invisible characters in a record are shown escaped (`\u{…}`), so that a
+record cannot rewrite the terminal or look like two. `--json` prints the
+records as they are.
+
 ## `rusthorse doctor`
 
 ```
@@ -611,6 +853,31 @@ is reported as a warning — see the threat model), Yama `ptrace_scope`, the
 vault's format and permissions, and the socket directory's permissions. Exits
 with status 1 if anything failed.
 
+Two checks concern the credential broker
+([`run --broker`](#through-the-credential-broker---broker)); without what
+they check, no grant can be served, and they say so:
+
+- its program, `rusthorse-broker`: the one the agent reports using, run by
+  its path with `--check`, which opens nothing and reports its version and
+  broker protocol, under the same supervision and 5-second limit as the
+  dialog program; both must be this `rusthorse`'s. When the agent reports
+  that it cannot use the program, its reason is the error, unless nothing at
+  all is next to the agent's program file: the program is then not
+  installed. From an agent that does not report it, the program next to the
+  agent's program file is checked as the agent checks it, and run (next to
+  this `rusthorse` when no agent answers). Not installed is a warning, since
+  everything else works without it; unusable, of another version or not
+  running is an error;
+- the file of certificate authorities the broker trusts: the first of
+  `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`
+  and `/etc/ssl/ca-bundle.pem` that exists, which must be a regular file
+  owned by root, in directories owned by root, none of them writable by its
+  group or by others — checked as a broker checks it. Missing or unsafe is an
+  error, or a warning when the broker's program is not installed either.
+  `doctor` does not read the certificates in it: a broker does, when a grant
+  starts, and a file without a usable certificate authority makes that run
+  fail with 125.
+
 ## `rusthorse completions`
 
 ```
@@ -633,7 +900,8 @@ rusthorse guide ai
 Prints a guide in Markdown on standard output; it needs no agent. `ai` is
 written for AI agents: the rules they follow (never ask for, print or write
 a value; no `reveal`; stop after a denial), how to find entries and read
-their metadata, how to use `run`, the exit statuses and what to do about
+their metadata, how to use `run` (and `run --broker` for an entry with a
+broker profile, Claude Code included), the exit statuses and what to do about
 each, and how to store secrets without seeing them. It is built into the
 binary, so it describes the version that prints it. A test parses every
 command line it shows with the CLI's own parser — complete, apart from a few
@@ -648,7 +916,11 @@ Commands that talk to the agent first check that it speaks the same protocol
 version (for `run`, a missing or incompatible agent exits with 125: the
 command did not run). After upgrading the binary, restart the agent
 (`systemctl --user restart rusthorse-agent`); until then those commands stop
-with an explanation instead of failing in confusing ways.
+with an explanation instead of failing in confusing ways. A run with
+`--broker` and an edit of a broker profile are requests that an agent of an
+older protocol refuses whole, should one be met after that check (restarted
+in between): it never runs the command without its grants, or makes an edit
+without its profile.
 
 ## Separate visual manager
 

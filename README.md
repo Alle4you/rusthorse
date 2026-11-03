@@ -177,13 +177,15 @@ requester is an AI.
 | `agent` | Run the agent (normally via systemd) | — |
 | `status` | Agent and lock state | — |
 | `unlock` / `lock` | Unlock (master password dialog) / lock now | — |
-| `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags | — |
+| `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags, broker profile | — |
 | `add NAME` | New entry; you type the value in a dialog | the dialog itself |
 | `add NAME --stdin` | New entry with a value from standard input | yes |
 | `add NAME --generate` | New entry with a random value nobody sees | yes |
-| `edit NAME …` | Change fields, tags, name, group or value | yes |
+| `edit NAME …` | Change fields, tags, name, group, value or broker profile | yes |
 | `remove NAME` | Delete an entry | yes |
 | `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
+| `run --broker VAR=NAME… -- CMD` | Run `CMD` with a temporary token instead of an API key; Rusthorse adds the key to the requests its profile allows | yes (never remembered) |
+| `grants`, `grants revoke ID` | List the broker's grants (never a token), end one or all | — |
 | `reveal NAME [--notes]` | Print a value or the notes (for humans; avoid in automation) | yes (never remembered) |
 | `backup DEST` | Copy the encrypted vault and verify the copy opens | — |
 | `open NAME` | Open the entry's URL (access link) in the browser | — |

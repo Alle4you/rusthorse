@@ -4,7 +4,8 @@ Rusthorse keeps this computer's secrets (API keys, passwords, tokens) in an
 encrypted KeePass vault. You never see a value. You find entries by their
 metadata and run commands through `rusthorse run`. The human approves each
 use in a dialog on their screen, and the command gets the secret in its
-environment.
+environment, or, for an API key with a broker profile, a temporary token
+that works only through Rusthorse.
 
 This guide is built into the `rusthorse` that printed it, so it matches that
 version. Each command also has `--help`, for example `rusthorse run --help`.
@@ -47,9 +48,10 @@ rusthorse show NAME --json        # one entry's metadata
 ```
 
 The JSON objects have `name`, `group`, `kind`, `username`, `url`, `host`,
-`port`, `tags`, `has_password` and `id`. The `id` is a UUID, which also works
-as `NAME`. Fields without a value are left out. A field named in
-`protected_fields` is withheld like a secret.
+`port`, `tags`, `has_password`, `broker` and `id`. The `id` is a UUID, which
+also works as `NAME`. Fields without a value are left out. A field named in
+`protected_fields` is withheld like a secret. An entry with `broker` has a
+broker profile: use it through the broker (below).
 
 Use the metadata before you ask the human anything. An entry often already
 has the address, port and username you need (a router's IP address, an SSH
@@ -111,6 +113,100 @@ not a secret and is not redacted.
   script, and every file the command reads, as they are when the command
   reads them. Do not change them while a request is waiting or running.
 
+## Using an API key through the broker: `run --broker`
+
+An entry with a broker profile (`broker` in `rusthorse show NAME --json`)
+can be used without the command ever getting its key. When an entry has
+one, prefer `--broker` to giving the command the value: the command gets a
+temporary token instead of the key, the profile fixes where its requests go
+and which ones it may make, and the grant ends with the command.
+
+```sh
+rusthorse run --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
+rusthorse run --broker ANTHROPIC_API_KEY=anthropic --url ANTHROPIC_BASE_URL=anthropic -- python app.py
+rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py   # one by value, one through the broker
+```
+
+- `--broker VAR=NAME` puts the token in `VAR`, never the key, and
+  `--broker NAME` puts it in a variable named like the entry. `--url` for
+  the same entry puts the broker's address in its variable
+  (`http://127.0.0.1:PORT` and the profile's base path) instead of the
+  entry's URL. Always give it, for the variable the program reads its base
+  URL from: without it, the program sends the token to the API's own
+  address, where it does not work.
+- Rusthorse adds the key to each request it forwards, sends it only to the
+  profile's destination, and forwards only the requests the profile's
+  routes allow: everything else is refused.
+- The grant ends when the command ends, or before: for example on
+  `rusthorse lock`, when the human revokes it, when the entry changes or
+  when its lifetime is over. Requests after that fail.
+- The token is a secret too. Do not print, log or store it, and send it only
+  to the broker's address. Output is redacted as with `run`, the token
+  included. With `--no-redact` it is not, and whoever reads the token can use
+  the grant until it ends.
+- The dialog says what the grant allows: the destination, every route, when
+  it ends and how many requests it admits. A request limit is not a spending
+  limit, and the broker does not read request bodies: within those routes,
+  the command can still spend credit and send what it wants.
+- There is no fallback. When a grant cannot be served (no broker program, no
+  profile, a value the broker cannot send), `rusthorse run` exits with `125`
+  and nothing ran. Never retry with the key by value: tell the human.
+- Every retry of an SDK is a new request: it counts against the grant's
+  limit, and a retried POST may be acted on twice. Turn the retries off in
+  code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
+- A program that uses an Anthropic SDK reads `ANTHROPIC_API_KEY` before
+  `ANTHROPIC_AUTH_TOKEN`: give it the token in `ANTHROPIC_API_KEY`, as above.
+  A key that your own environment holds in another variable the program
+  reads reaches the command like the rest of your environment: leave it out
+  of the run with `env -u NAME` before `rusthorse run`.
+- `rusthorse grants` lists the grants, each with its state, never a token:
+  their ID, entry, destination, command, requester, requests and when they
+  end. A revoked grant can stay in the list until its command ends.
+  `rusthorse grants revoke ID` ends one.
+
+Setting a profile is the human's decision, in a dialog that shows the whole
+profile: suggest one of these, and do not run it unasked.
+`openai-compatible` has no destination of its own: give its origin with
+`--broker-origin`.
+
+```sh
+rusthorse edit anthropic --broker anthropic
+rusthorse edit OPENAI_API_KEY --broker openai
+rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.deepseek.com
+```
+
+### Claude Code through the broker
+
+This recipe follows what Claude Code's documentation says; it has not been
+tried with Claude Code itself yet. If it does not work, tell the human:
+never fall back to the key.
+
+```sh
+env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \
+  --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude
+```
+
+- `ANTHROPIC_AUTH_TOKEN` makes Claude Code send the token as
+  `Authorization: Bearer`, and `ANTHROPIC_BASE_URL` sends its requests to the
+  broker. `env -u ANTHROPIC_API_KEY` keeps a key your environment may hold
+  out of the command: Claude Code may send it with the token or instead of
+  it, and the broker refuses a request that presents anything but the token.
+- `--no-redact` gives Claude Code the terminal; with redaction it would get
+  pipes. The dialog warns that its output is not filtered.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns off its non-essential
+  requests, some of which would go straight to `api.anthropic.com` instead
+  of through the broker. A variable set before `rusthorse run` reaches the
+  command, like the rest of your environment.
+- Check Claude Code's settings files first: `~/.claude/settings.json`, and
+  `.claude/settings.json` and `.claude/settings.local.json` in the project.
+  An `env` block there overrides the variables `rusthorse run` sets, so it
+  must not set `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY`, a proxy (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`) or
+  `NO_PROXY`, and there must be no `apiKeyHelper`. Any of these can make
+  Claude Code use another key, or send the token past the broker.
+- Claude Code retries failed requests by itself; each retry counts as a
+  request of the grant.
+
 ## Exit statuses
 
 ### `rusthorse run`
@@ -126,7 +222,7 @@ message, tells as little as `124`.)
 
 | Status | Meaning | What to do |
 |---|---|---|
-| `125` | Rusthorse refused or failed before the command started (denied, timed out, the agent is not running or is out of date, the entry is missing). The command did not run. | Read the message. If it was denied or timed out, stop and ask the human. |
+| `125` | Rusthorse refused or failed before the command started (denied, timed out, the agent is not running or is out of date, the entry is missing, with `--broker` a grant that cannot be served). The command did not run. | Read the message. If it was denied or timed out, stop and ask the human. |
 | `124` | The outcome is unknown: the command may or may not have run. | Check whether its effects happened before you repeat anything that is not idempotent. `rusthorse audit -n 5` can help, but an approval there does not prove that the command ran, and a missing record of its end does not prove that it did not. |
 | `2` | Invalid command line, with `error:` and the usage. Nothing was asked and nothing ran. | Check `rusthorse run --help`. |
 | `141` | With redaction, Rusthorse could not write the command's output: whatever read it stopped early (such as `head`), or the disk is full. It asks the agent to stop the command and returns at once, so the command may go on for a few seconds, and it may have done some or all of its work. A command killed by `SIGPIPE` exits with `141` too. | Do not take it for the command's result. Wait a few seconds, check its effects before you repeat it, and let `rusthorse run` write its whole output (to a file, if it is long). |
@@ -136,7 +232,7 @@ message, tells as little as `124`.)
 | Status | Meaning | What to do |
 |---|---|---|
 | `0` | Success. | |
-| `1` | An error: the agent is not running, the entry was not found, the input is invalid, … | Read the message. |
+| `1` | An error: the agent is not running, the entry or grant was not found, the input is invalid, … | Read the message. |
 | `2` | Invalid command line. | Check the command's `--help`. |
 | `4` | The human denied or cancelled the request, or the dialog timed out. | Stop and ask the human. |
 | `124` | The outcome is unknown: a change may or may not have been saved. | Check with `rusthorse list` or `rusthorse show NAME` before you repeat it. |
