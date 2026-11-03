@@ -210,7 +210,9 @@ not guaranteed.
   (`packaging/check-broker.py`). Never turn it on outside tests.
 - **The packaging tests** (`tests/packaging.rs`) run the scripts of
   `packaging/` with `/usr/bin/python3` (without it they fail, unless
-  `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them).
+  `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them), and `cargo
+  metadata` and `cargo tree`, which read the crates' sources in Cargo's
+  registry (cargo downloads missing ones from crates.io).
 - Tests that rely on file permissions skip their check when run as root.
 - A test that fails intermittently is a bug: reproduce it under load
   (parallel runs, CPU load) before and after the fix.
@@ -248,7 +250,7 @@ present and capture only its window, in a dark and a light theme
 | `src/main.rs` | The CLI |
 | `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; a test checks the commands and options it names |
 | `tests/agent.rs` | End-to-end tests |
-| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests: `check-broker.py`), the generated copyright file and documentation (tested in `tests/packaging.rs`) |
+| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests: `check-broker.py`), the generated copyright file (`copyright.py`, with the crates checked by hand) and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
 | `docs/roadmap.md` | Planned work, led by the credential broker |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

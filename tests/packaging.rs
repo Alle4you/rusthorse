@@ -1,6 +1,7 @@
 //! The files that installations put on the system agree with each other,
 //! and the Debian package holds what it should: every program of the
-//! workspace, and never a credential broker built for tests.
+//! workspace, never a credential broker built for tests, and the licenses
+//! of every crate compiled in.
 
 use std::fs;
 use std::path::Path;
@@ -749,3 +750,333 @@ check.TIMEOUT_SECONDS = 0.5
 sys.argv = sys.argv[1:]
 check.main()
 "#;
+
+/// The copyright file, written by packaging/copyright.py as build-deb.sh
+/// runs it.
+fn copyright_file() -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("copyright");
+    let out = python(
+        &root().join("packaging/copyright.py"),
+        &[output.as_os_str()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(&output).expect("the copyright file")
+}
+
+#[test]
+fn the_copyright_file_covers_every_crate_the_programs_are_built_from() {
+    if !python3() {
+        return;
+    }
+    let copyright = copyright_file();
+    // The crates of the programs' release build, as `cargo tree` sees them
+    // without dev-dependencies: not as copyright.py finds them.
+    let tree = cargo(&[
+        "tree",
+        "--workspace",
+        "--locked",
+        "--edges",
+        "normal",
+        "--prefix",
+        "none",
+        "--format",
+        "{p}",
+    ]);
+    let mut crates = BTreeSet::new();
+    for line in tree.lines() {
+        // The workspace's own packages are Rusthorse.
+        if line.contains(" (/") {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        if let (Some(name), Some(version)) =
+            (words.next(), words.next().and_then(|v| v.strip_prefix('v')))
+        {
+            crates.insert((name.to_string(), version.to_string()));
+        }
+    }
+    for broker_crate in ["hyper", "tokio", "rustls", "ring"] {
+        assert!(
+            crates.iter().any(|(name, _)| name == broker_crate),
+            "{broker_crate} is not compiled in: {crates:?}"
+        );
+    }
+    let lines: Vec<&str> = copyright.lines().collect();
+    let shippers: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("Text "))
+        .collect();
+    for (name, version) in &crates {
+        let listed = lines
+            .iter()
+            .position(|line| line.starts_with(&format!(" {name} {version} — ")))
+            .unwrap_or_else(|| panic!("{name} {version} is not listed"));
+        let shipped = format!(" {name} {version} (");
+        let no_code = lines
+            .get(listed + 1)
+            .is_some_and(|line| line.trim() == "(no license file; the crate contains no code)");
+        assert!(
+            no_code || shippers.iter().any(|line| line.contains(&shipped)),
+            "no license text of {name} {version}"
+        );
+    }
+    // The programs it names are the workspace's.
+    let names: Vec<String> = programs(&workspace()).into_iter().collect();
+    let (last, others) = names.split_last().expect("programs");
+    let words = copyright.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains(&format!(
+            "{} and {last} are built from these",
+            others.join(", ")
+        )),
+        "{}",
+        copyright.chars().take(1500).collect::<String>()
+    );
+
+    // ring's licenses are not all at its top: those below it whose code is
+    // compiled in, and the notices at the top of its source files, as its
+    // LICENSE says.
+    let ring = &crates
+        .iter()
+        .find(|(name, _)| name == "ring")
+        .expect("ring")
+        .1;
+    for file in [
+        "src/polyfill/once_cell/LICENSE-MIT",
+        "src/polyfill/once_cell/LICENSE-APACHE",
+        "third_party/fiat/LICENSE",
+    ] {
+        assert!(
+            shippers
+                .iter()
+                .any(|line| line.contains(&format!(" ring {ring} ({file})"))),
+            "{file}"
+        );
+    }
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&format!(" ring {ring} — ")))
+        .expect("ring is listed");
+    let entry: Vec<&str> = lines[at + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| line.starts_with("   "))
+        .collect();
+    assert!(
+        entry.contains(&"   Copyright 2015-2020 the fiat-crypto authors (see the AUTHORS file)"),
+        "{entry:#?}"
+    );
+    let sources = entry
+        .iter()
+        .position(|line| *line == "   At the top of its source files:")
+        .expect("the notices of ring's source files");
+    assert!(
+        entry[sources + 1..]
+            .iter()
+            .filter(|line| line.starts_with("     Copyright"))
+            .count()
+            > 10,
+        "{entry:#?}"
+    );
+}
+
+/// What copyright.py's own functions find for a stand-in crate, version
+/// 1.0.0, in `dir`, listed in NESTED_LICENSE_FILES as `listed` (a JSON
+/// object), and with NOTICES_IN_SOURCES naming its `src` directory, as
+/// JSON, or why it stops. `licenses`: the files whose texts
+/// `license_texts` includes and their notices, in a build with the features
+/// `extra` (a JSON array); `sources`: `source_notices`; `checked`:
+/// `check_hand_checked`, with the versions `extra` of the crate compiled in;
+/// `main`: the whole script on the workspace's crates, with the stand-in
+/// added to the crates checked by hand.
+const PROBE: &str = r#"
+import importlib.util, json, sys
+script, directory, what, listed, extra = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("copyright", script)
+copyright = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(copyright)
+key = ("stand-in", "1.0.0")
+crate = {"name": key[0], "version": key[1], "license_file": None,
+         "manifest_path": directory + "/Cargo.toml"}
+if what == "main":
+    copyright.NOTICES_IN_SOURCES[key] = ["src"]
+    sys.argv = [script, directory + "/copyright"]
+    copyright.main()
+    print(json.dumps("written"))
+    sys.exit(0)
+copyright.NESTED_LICENSE_FILES = {key: json.loads(listed)}
+copyright.NOTICES_IN_SOURCES = {key: ["src"]}
+if what == "licenses":
+    texts = copyright.license_texts(crate, {key: set(json.loads(extra))})
+    print(json.dumps({"files": [name for name, _ in texts],
+                      "notices": copyright.notices(texts)}))
+elif what == "sources":
+    print(json.dumps(copyright.source_notices(crate)))
+else:
+    copyright.check_hand_checked([{"name": key[0], "version": v} for v in json.loads(extra)])
+    print(json.dumps("checked"))
+"#;
+
+fn probe(dir: &Path, what: &str, listed: &str, extra: &str) -> Result<Value, String> {
+    let probe = dir.join("probe.py");
+    fs::write(&probe, PROBE).expect("write the probe");
+    let script = root().join("packaging/copyright.py");
+    let crate_dir = dir.join("stand-in");
+    let out = python(
+        &probe,
+        &[
+            script.as_os_str(),
+            crate_dir.as_os_str(),
+            what.as_ref(),
+            listed.as_ref(),
+            extra.as_ref(),
+        ],
+    );
+    if out.status.success() {
+        Ok(serde_json::from_slice(&out.stdout).expect("JSON"))
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+#[test]
+fn copyright_stops_at_a_license_file_below_a_crate_that_nobody_checked() {
+    if !python3() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stand_in = dir.path().join("stand-in");
+    let file = |relative: &str, text: &[u8]| {
+        let path = stand_in.join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, text).expect("write");
+    };
+    file("Cargo.toml", b"");
+    // A license written as a comment: its notice is found all the same.
+    file(
+        "LICENSE",
+        b"// Copyright 2020 A Stand-In\n//\n// Permission to use, copy, modify...\n",
+    );
+    file(
+        "vendored/LICENSE-BSD",
+        b"Copyright (c) 2019 Vendored Code\nRedistribution and use...\n",
+    );
+
+    let refused = |result: Result<Value, String>, why: &str| match result {
+        Err(said) => assert!(said.contains(why), "{said}"),
+        Ok(found) => panic!("not refused: {found}"),
+    };
+    // Nobody said whether its code is compiled in.
+    refused(
+        probe(dir.path(), "licenses", "{}", "[]"),
+        "ships vendored/LICENSE-BSD, a license file below its top directory",
+    );
+    // Compiled in: its text and notice are included.
+    let found = probe(
+        dir.path(),
+        "licenses",
+        r#"{"vendored/LICENSE-BSD": true}"#,
+        "[]",
+    )
+    .expect("included");
+    assert_eq!(
+        found["files"],
+        serde_json::json!(["LICENSE", "vendored/LICENSE-BSD"])
+    );
+    assert_eq!(
+        found["notices"],
+        serde_json::json!([
+            "Copyright 2020 A Stand-In",
+            "Copyright (c) 2019 Vendored Code"
+        ])
+    );
+    // Compiled only without a feature: left out while the build enables it.
+    let found = probe(
+        dir.path(),
+        "licenses",
+        r#"{"vendored/LICENSE-BSD": "std"}"#,
+        r#"["std"]"#,
+    )
+    .expect("left out");
+    assert_eq!(found["files"], serde_json::json!(["LICENSE"]));
+    refused(
+        probe(
+            dir.path(),
+            "licenses",
+            r#"{"vendored/LICENSE-BSD": "std"}"#,
+            "[]",
+        ),
+        "no longer enables",
+    );
+    // Never compiled in, whatever the features: left out.
+    let found = probe(
+        dir.path(),
+        "licenses",
+        r#"{"vendored/LICENSE-BSD": false}"#,
+        "[]",
+    )
+    .expect("left out");
+    assert_eq!(found["files"], serde_json::json!(["LICENSE"]));
+    // A file listed but gone: the crate changed, check it again.
+    refused(
+        probe(
+            dir.path(),
+            "licenses",
+            r#"{"vendored/LICENSE-BSD": true, "gone/LICENSE": true}"#,
+            "[]",
+        ),
+        "has no gone/LICENSE",
+    );
+    // A directory named like a license file holds license files too.
+    file("LICENSES/MIT.txt", b"MIT License\n");
+    refused(
+        probe(
+            dir.path(),
+            "licenses",
+            r#"{"vendored/LICENSE-BSD": true}"#,
+            "[]",
+        ),
+        "ships LICENSES/MIT.txt",
+    );
+
+    // The notices at the top of source files, each once; files that are
+    // not text are skipped.
+    file(
+        "src/a.c",
+        b"/* Copyright (c) 2014, Someone Inc.\n *\n * Permission to use...\n */\n",
+    );
+    file(
+        "src/deep/b.rs",
+        b"// Copyright 2016 Another Author.\n// Copyright (c) 2014, Someone Inc.\n",
+    );
+    file("src/c.o", b"\x7fELF\0\0\nCopyright 1999 Not Text\n");
+    assert_eq!(
+        probe(dir.path(), "sources", "{}", "[]").expect("notices"),
+        serde_json::json!([
+            "Copyright (c) 2014, Someone Inc.",
+            "Copyright 2016 Another Author."
+        ])
+    );
+    // A crate whose source files were checked by hand, replaced by another
+    // version: nobody checked that one.
+    assert_eq!(
+        probe(dir.path(), "checked", "{}", r#"["1.0.0"]"#).expect("checked"),
+        "checked"
+    );
+    refused(
+        probe(dir.path(), "checked", "{}", r#"["1.0.1"]"#),
+        "stand-in 1.0.0, which NOTICES_IN_SOURCES lists, is no longer compiled in",
+    );
+    // The script checks it, and writes nothing then.
+    refused(
+        probe(dir.path(), "main", "{}", "[]"),
+        "stand-in 1.0.0, which NOTICES_IN_SOURCES lists, is no longer compiled in",
+    );
+    assert!(!stand_in.join("copyright").exists());
+}
