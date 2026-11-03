@@ -65,20 +65,21 @@ fn script(name: &str) -> PathBuf {
 /// `systemctl` writes its arguments to `calls` and answers `is-active` with
 /// the number in `active-USER` (3, "not running", by default) and `stop`
 /// with the one in `stop-USER` (0 by default).
+///
+/// They are written by another process (`write_program`): one that this
+/// process held open for writing could not be run while a child forked
+/// meanwhile by another test held that descriptor, and the shell would then
+/// run the next one on PATH, the real `/usr/bin/systemctl` included.
 struct Fakes(tempfile::TempDir);
 
 impl Fakes {
     fn new() -> Fakes {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let tool = |name: &str, body: &str| {
-            let path = dir.path().join(name);
-            fs::write(
-                &path,
-                format!("#!/bin/sh\nF={}\n{body}", dir.path().display()),
-            )
-            .expect("write");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            write_program(
+                &dir.path().join(name),
+                &format!("#!/bin/sh\nF={}\n{body}", dir.path().display()),
+            );
         };
         tool(
             "loginctl",
