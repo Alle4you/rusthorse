@@ -128,12 +128,15 @@ dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why), what
 else locks the vault, and the program file the agent runs (with a note if it
 was replaced since the agent started). From an agent that reports them, it
 also shows the credential broker's program (the path of `rusthorse-broker`,
-or `none:` and why it cannot be used) and how many grants are active (see
-[`run --broker`](#through-the-credential-broker---broker)). For example:
+or `none:` and why it cannot be used) and the number of grants the agent
+reports (see [`run --broker`](#through-the-credential-broker---broker)),
+which can include a revoked grant whose command still runs:
+[`rusthorse grants`](#rusthorse-grants) lists each one with its state. For
+example:
 
 ```
 broker:     /usr/bin/rusthorse-broker
-grants:     1 active
+grants:     1 (`rusthorse grants` shows their state)
 locks on:   suspend: logind (locks before the computer sleeps)
             screen lock: logind (session lock signals of this user), org.cinnamon.ScreenSaver
 ```
@@ -574,8 +577,8 @@ its grants.
 
 The agent checks, before its dialog, that each brokered entry has a usable
 profile and a value the broker can send (8 to 4096 visible ASCII
-characters), that no more than 16 grants would then be active, and that the
-broker's program is usable; and it adds `127.0.0.1` to `NO_PROXY` and
+characters), that it would then serve no more than 16 grants at once, and
+that the broker's program is usable; and it adds `127.0.0.1` to `NO_PROXY` and
 `no_proxy` in the command's environment. The dialog says what each grant
 allows — the entry, the destination, every route, how and when the grant
 ends, its request limit and the requests at a time — that the command gets a
@@ -607,16 +610,19 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
     --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude
 ```
 
-The last one runs Claude Code through the broker: `ANTHROPIC_AUTH_TOKEN`
-makes it send the token as `Authorization: Bearer`; `env -u
-ANTHROPIC_API_KEY` keeps a key your environment may hold out of the command
-(Claude Code would send it too, and the broker refuses a request that
-presents anything but the token in `x-api-key` or `Authorization`); and
+The last one runs Claude Code through the broker, as Claude Code's
+documentation describes it; it has not been tried with Claude Code itself
+yet. `ANTHROPIC_AUTH_TOKEN` makes it send the token as
+`Authorization: Bearer`; `env -u ANTHROPIC_API_KEY` keeps a key your
+environment may hold out of the command (Claude Code may send it with the
+token or instead of it, and the broker refuses a request that presents
+anything but the token in `x-api-key` or `Authorization`); and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, set in the environment that
-`rusthorse run` passes on, stops the requests it would make straight to
-`api.anthropic.com`. An `env` block in Claude Code's settings files
-overrides the variables `run` sets, and an `apiKeyHelper` there gives it
-another key: check them first ([guide for AI agents](#rusthorse-guide)).
+`rusthorse run` passes on, turns off its non-essential requests, some of
+which would go straight to `api.anthropic.com`. An `env` block in Claude
+Code's settings files overrides the variables `run` sets, and an
+`apiKeyHelper` there can give it another key: check them first
+([guide for AI agents](#rusthorse-guide)).
 
 ## `rusthorse grants`
 
@@ -632,9 +638,11 @@ one line each, with its ID (`g` and 16 hexadecimal digits, also in the
 audit log), entry, destination, state, when it started and how long its
 lifetime has left, the requests admitted of those allowed, the requests in
 flight, whether the automatic locks end it, the requester and the command.
-The state is `active`; `exhausted` (its request limit is reached: no new
-request is admitted, those admitted finish); or `revoked` (it has ended; its
-broker answers `403` until the command ends). What the agent reports is shown
+The state is `starting` (its run is being prepared: nothing is admitted
+yet); `active`; `exhausted` (its request limit is reached: no new request is
+admitted, those admitted finish); or `revoked` (it has ended; its broker
+answers `403` until the command ends, and it stays in the list until then).
+What the agent reports is shown
 with control and invisible characters escaped (`\u{…}`), so that a command
 line or a process name cannot rewrite the terminal. `--json` prints the
 agent's list as it is ([protocol](protocol.md)).
@@ -866,6 +874,9 @@ they check, no grant can be served, and they say so:
   owned by root, in directories owned by root, none of them writable by its
   group or by others — checked as a broker checks it. Missing or unsafe is an
   error, or a warning when the broker's program is not installed either.
+  `doctor` does not read the certificates in it: a broker does, when a grant
+  starts, and a file without a usable certificate authority makes that run
+  fail with 125.
 
 ## `rusthorse completions`
 

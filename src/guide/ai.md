@@ -159,15 +159,27 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
   A key that your own environment holds in another variable the program
   reads reaches the command like the rest of your environment: leave it out
   of the run with `env -u NAME` before `rusthorse run`.
-- `rusthorse grants` lists the active grants, never a token: their ID,
-  entry, destination, command, requester, requests and when they end.
+- `rusthorse grants` lists the grants, each with its state, never a token:
+  their ID, entry, destination, command, requester, requests and when they
+  end. A revoked grant can stay in the list until its command ends.
   `rusthorse grants revoke ID` ends one.
-- Setting a profile is the human's decision:
-  `rusthorse edit NAME --broker anthropic` (or `openai`,
-  `openai-compatible`) asks them in a dialog that shows the whole profile.
-  Suggest it; do not run it unasked.
+
+Setting a profile is the human's decision, in a dialog that shows the whole
+profile: suggest one of these, and do not run it unasked.
+`openai-compatible` has no destination of its own: give its origin with
+`--broker-origin`.
+
+```sh
+rusthorse edit anthropic --broker anthropic
+rusthorse edit OPENAI_API_KEY --broker openai
+rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.deepseek.com
+```
 
 ### Claude Code through the broker
+
+This recipe follows what Claude Code's documentation says; it has not been
+tried with Claude Code itself yet. If it does not work, tell the human:
+never fall back to the key.
 
 ```sh
 env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \
@@ -177,20 +189,21 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
 - `ANTHROPIC_AUTH_TOKEN` makes Claude Code send the token as
   `Authorization: Bearer`, and `ANTHROPIC_BASE_URL` sends its requests to the
   broker. `env -u ANTHROPIC_API_KEY` keeps a key your environment may hold
-  out of the command: Claude Code would send it too, and the broker refuses
-  a request that presents anything but the token.
+  out of the command: Claude Code may send it with the token or instead of
+  it, and the broker refuses a request that presents anything but the token.
 - `--no-redact` gives Claude Code the terminal; with redaction it would get
   pipes. The dialog warns that its output is not filtered.
-- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` stops the requests it would
-  make straight to `api.anthropic.com`. A variable set before
-  `rusthorse run` reaches the command, like the rest of your environment.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns off its non-essential
+  requests, some of which would go straight to `api.anthropic.com` instead
+  of through the broker. A variable set before `rusthorse run` reaches the
+  command, like the rest of your environment.
 - Check Claude Code's settings files first: `~/.claude/settings.json`, and
   `.claude/settings.json` and `.claude/settings.local.json` in the project.
   An `env` block there overrides the variables `rusthorse run` sets, so it
   must not set `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
   `ANTHROPIC_API_KEY`, a proxy (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`) or
-  `NO_PROXY`, and there must be no `apiKeyHelper`. Any of these makes Claude
-  Code use another key, or send the token past the broker.
+  `NO_PROXY`, and there must be no `apiKeyHelper`. Any of these can make
+  Claude Code use another key, or send the token past the broker.
 - Claude Code retries failed requests by itself; each retry counts as a
   request of the grant.
 

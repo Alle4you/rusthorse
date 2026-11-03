@@ -1137,12 +1137,17 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     if let Some(dialogs) = &info.dialogs {
         println!("dialogs:    {dialogs}");
     }
-    // The credential broker (ADR 0013), from agents that report it.
+    // The credential broker (ADR 0013), from agents that report it. The
+    // count is the agent's, which may include grants that are no longer
+    // active (a revoked grant whose command still runs): it is not called
+    // "active" here, and `rusthorse grants` says what each one is.
     if let Some(broker) = &info.broker {
         println!("broker:     {broker}");
     }
-    if let Some(grants) = info.grants {
-        println!("grants:     {grants} active");
+    match info.grants {
+        Some(0) => println!("grants:     none"),
+        Some(grants) => println!("grants:     {grants} (`rusthorse grants` shows their state)"),
+        None => {}
     }
     for (i, line) in rusthorse::session_lock::summary(&info.lock_triggers)
         .iter()
@@ -1494,10 +1499,14 @@ struct RunPlan {
 /// one `--url` for a brokered entry, which then names the variable of the
 /// broker's address.
 fn plan_run(secrets: &[String], brokers: &[String], urls: &[String]) -> anyhow::Result<RunPlan> {
-    let bindings = secrets
-        .iter()
-        .map(|s| parse_binding(s))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut bindings: Vec<Binding> = Vec::new();
+    for spec in secrets {
+        let binding = parse_binding(spec)?;
+        if bindings.iter().any(|b| b.var == binding.var) {
+            bail!("{spec}: the variable is already set by another binding");
+        }
+        bindings.push(binding);
+    }
     let mut brokered: Vec<BrokerBinding> = Vec::new();
     for spec in brokers {
         let Binding { var, entry } =
@@ -2386,13 +2395,18 @@ fn not_installed(path: &Path) -> BrokerProgram {
 }
 
 /// The file of certificate authorities the credential broker trusts, as
-/// [`rusthorse::broker_protocol::open_ca_file`] opened and checked it — the
-/// same checks a broker makes. Without it no grant can be served: an error
-/// when the broker's program is installed, a warning when it is not either.
+/// [`rusthorse::broker_protocol::open_ca_file`] opened and checked it: the
+/// checks a broker makes of the file, its owner and its directories. Only a
+/// broker reads the certificates in it, when a grant starts (a file without
+/// a usable one fails then), so the line that passes says no more than
+/// where they are read from. Without the file no grant can be served: an
+/// error when the broker's program is installed, a warning when it is not
+/// either.
 fn ca_file_check(opened: Result<PathBuf, String>, broker_installed: bool) -> Check {
     match opened {
         Ok(path) => Check::Ok(format!(
-            "the broker trusts the certificate authorities in {}",
+            "the broker reads its certificate authorities from {}, which only root can change; \
+             it reads the certificates themselves when a grant starts",
             path.display()
         )),
         Err(why) => {
@@ -2947,6 +2961,9 @@ mod tests {
                 urls: vec![binding("KEY_URL", "KEY")],
             }
         );
+        // One entry in two variables is not one variable set twice.
+        let twice = plan_run(&strings(&["A=k", "B=k"]), &[], &[]).expect("two variables");
+        assert_eq!(twice.bindings, [binding("A", "k"), binding("B", "k")]);
         // Through the broker only.
         let only = plan_run(&[], &strings(&["T=k"]), &[]).expect("broker only");
         assert!(only.bindings.is_empty() && only.urls.is_empty());
@@ -2969,7 +2986,28 @@ mod tests {
 
     #[test]
     fn run_refuses_mistakes_in_broker_bindings_before_anything_is_sent() {
-        let cases: [Refusal; 21] = [
+        let cases: [Refusal; 24] = [
+            // Every variable is set once: two SECRETs too, with --broker or
+            // without it (the agent refuses them anyway; the CLI sends
+            // nothing).
+            (
+                &["K=a", "K=b"],
+                &[],
+                &[],
+                "K=b: the variable is already set by another binding",
+            ),
+            (
+                &["K", "K"],
+                &[],
+                &[],
+                "K: the variable is already set by another binding",
+            ),
+            (
+                &["K=a", "K=b"],
+                &["T=x"],
+                &[],
+                "K=b: the variable is already set by another binding",
+            ),
             (
                 &[],
                 &["1BAD=x"],
@@ -3348,9 +3386,20 @@ mod tests {
             requester: "\u{1b}[8mhidden".into(),
             ..grant()
         };
-        let table = grants_table(&[grant(), limited]);
+        // Every other cell the agent reports, forged too: the entry's
+        // identity comes from a group and a title that any program writing
+        // the vault file can choose (threat model L9).
+        let forged = GrantInfo {
+            id: "g\u{1b}[1Afake".into(),
+            entry: "AI/evil\u{1b}[2J\u{1b}[1;1Hfake".into(),
+            destination: "https://api.example.com\u{202e}moc.live".into(),
+            state: "active\u{1b}[8m".into(),
+            started: "2026-11-02\u{200b}T18:00\n".into(),
+            ..grant()
+        };
+        let table = grants_table(&[grant(), limited, forged]);
         let lines: Vec<&str> = table.lines().collect();
-        assert_eq!(lines.len(), 3, "{table}");
+        assert_eq!(lines.len(), 4, "{table}");
         for header in [
             "ID",
             "ENTRY",
@@ -3383,13 +3432,26 @@ mod tests {
         for cell in ["gfedcba9876543210", "exhausted", "200 of 200", "end"] {
             assert!(lines[2].contains(cell), "{cell}: {}", lines[2]);
         }
-        assert!(!table.contains('\u{1b}'), "{table:?}");
+        assert!(
+            !table.contains(['\u{1b}', '\u{202e}', '\u{200b}']),
+            "{table:?}"
+        );
+        assert_eq!(table.matches('\n').count(), lines.len(), "{table:?}");
         assert!(
             lines[2].contains(r"\u{1b}[2J\u{a}g0000000000000000"),
             "{}",
             lines[2]
         );
         assert!(lines[2].contains(r"\u{1b}[8mhidden"), "{}", lines[2]);
+        for escaped in [
+            r"g\u{1b}[1Afake",
+            r"AI/evil\u{1b}[2J\u{1b}[1;1Hfake",
+            r"https://api.example.com\u{202e}moc.live",
+            r"active\u{1b}[8m",
+            r"2026-11-02\u{200b}T18:00\u{a}",
+        ] {
+            assert!(lines[3].contains(escaped), "{escaped}: {}", lines[3]);
+        }
         // The columns line up: every cell starts where its header does.
         let at = |line: &str, text: &str| line.find(text).expect(text);
         assert_eq!(at(lines[0], "STATE"), at(lines[1], "active"));
@@ -3649,11 +3711,18 @@ mod tests {
     #[test]
     fn doctor_says_which_certificate_file_the_broker_trusts_or_why_none() {
         let path = "/etc/ssl/certs/ca-certificates.crt";
+        // The file's checks pass; what is in it only a broker reads, so the
+        // line says where it reads from, not that what it reads is usable.
         for installed in [true, false] {
-            assert!(matches!(
-                ca_file_check(Ok(PathBuf::from(path)), installed),
-                Check::Ok(m) if m == format!("the broker trusts the certificate authorities in {path}")
-            ));
+            let check = ca_file_check(Ok(PathBuf::from(path)), installed);
+            assert!(
+                matches!(&check, Check::Ok(m) if m == &format!(
+                    "the broker reads its certificate authorities from {path}, which only root \
+                     can change; it reads the certificates themselves when a grant starts"
+                )),
+                "{}",
+                check_text(&check)
+            );
         }
         for why in [
             "none of the certificate authority files exists: /a, /b, /c",
@@ -3939,6 +4008,39 @@ mod tests {
         assert!(alone.len() > 5, "{alone:?}");
         for long in alone {
             assert!(all.iter().any(|a| a == long), "--{long} is no option");
+        }
+    }
+
+    /// The AI guide shows how to give an entry a profile of every preset, and
+    /// every profile it shows is one `rusthorse edit` sends: an AI agent
+    /// suggests these lines to the human as they are, and one that `edit`
+    /// refuses (`openai-compatible` without `--broker-origin`) helps nobody.
+    #[test]
+    fn the_ai_guide_shows_a_profile_of_every_preset_that_edit_accepts() {
+        let guide = GuideTopic::Ai.text();
+        let mut shown = Vec::new();
+        for (line, _) in guide_command_lines(&guide) {
+            let argv = std::iter::once("rusthorse".to_string()).chain(shell_words(&line));
+            let Ok(Cli {
+                command: Command::Edit(args),
+                ..
+            }) = Cli::try_parse_from(argv)
+            else {
+                continue;
+            };
+            if let Some(PresetArg(preset)) = args.broker.preset {
+                if let Err(e) = args.broker.request() {
+                    panic!("`rusthorse {line}`: {e}");
+                }
+                shown.push(preset);
+            }
+        }
+        for preset in Preset::ALL {
+            assert!(
+                shown.contains(&preset),
+                "the guide shows no `rusthorse edit NAME --broker {}`",
+                preset.as_str()
+            );
         }
     }
 

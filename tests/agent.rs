@@ -6009,6 +6009,17 @@ mod broker_cli {
                 125,
                 "already set by another binding",
             ),
+            // Two SECRETs in one variable, with --broker or without it.
+            (
+                &["run", "K=a", "K=b", "--broker", "T=x", "--", "true"][..],
+                125,
+                "K=b: the variable is already set by another binding",
+            ),
+            (
+                &["run", "K=a", "K=b", "--", "true"][..],
+                125,
+                "K=b: the variable is already set by another binding",
+            ),
             // No secret and no --broker: a usage error.
             (
                 &["run", "--", "true"][..],
@@ -6364,11 +6375,26 @@ mod broker_cli {
             shown.contains("broker:     /opt/rusthorse/rusthorse-broker\n"),
             "{shown}"
         );
-        assert!(shown.contains("grants:     2 active\n"), "{shown}");
+        // Not called active: the agent's count can include a revoked grant
+        // whose command still runs, which `rusthorse grants` shows as such.
+        let grants = |shown: &str| {
+            let line = shown.lines().find(|l| l.starts_with("grants:"));
+            line.expect("a grants line").to_string()
+        };
+        assert_eq!(
+            grants(&shown),
+            "grants:     2 (`rusthorse grants` shows their state)",
+            "{shown}"
+        );
         let out = agent.run(&["status", "--json"]);
         let json: Value = serde_json::from_slice(&out.stdout).expect("json");
         assert_eq!(json["broker"], "/opt/rusthorse/rusthorse-broker");
         assert_eq!(json["grants"], 2);
+        let mut idle = status(Some("/opt/rusthorse/rusthorse-broker"), "");
+        idle.grants = Some(0);
+        let agent = FakeAgent::new(idle, |request| panic!("unexpected {request:?}"));
+        let shown = text(&agent.run(&["status"]).stdout);
+        assert_eq!(grants(&shown), "grants:     none", "{shown}");
         // An agent that does not report them: nothing about them.
         let agent = FakeAgent::new(plain_status(), |request| panic!("unexpected {request:?}"));
         let shown = text(&agent.run(&["status"]).stdout);
@@ -6541,7 +6567,8 @@ mod broker_cli {
         match rusthorse::broker_protocol::open_ca_file() {
             Ok(ca) => {
                 let line = format!(
-                    "  ok    the broker trusts the certificate authorities in {}\n",
+                    "  ok    the broker reads its certificate authorities from {}, which only \
+                     root can change; it reads the certificates themselves when a grant starts\n",
                     ca.path.display()
                 );
                 assert!(installed.contains(&line), "{installed}");
@@ -6624,5 +6651,126 @@ mod broker_cli {
         // The JSON is the records as they are.
         let out = audit(&["audit", "-n", "10", "--json"]);
         assert_eq!(text(&out.stdout), lines);
+    }
+
+    #[test]
+    fn edit_and_grants_refuse_an_agent_of_another_protocol() {
+        // An agent one protocol older that would take whatever it is sent:
+        // only the version check, which `edit` and `grants` make once their
+        // arguments are checked, keeps from it an edit it would misread (an
+        // older agent drops a change it does not know) and requests it does
+        // not have.
+        let mut older = plain_status();
+        older.protocol_version = PROTOCOL_VERSION - 1;
+        let agent = FakeAgent::new(older, |request| match request {
+            Request::Grants => Some(Response::Grants { grants: vec![] }),
+            _ => ok("done"),
+        });
+        let commands: [&[&str]; 8] = [
+            &["edit", "KEY", "--username", "x"],
+            &["edit", "KEY", "--group", "Work"],
+            &["edit", "KEY", "--broker", "anthropic"],
+            &["edit", "KEY", "--clear", "broker"],
+            &["grants"],
+            &["grants", "--json"],
+            &["grants", "revoke", "--all"],
+            &["grants", "revoke", "g0123456789abcdef"],
+        ];
+        for args in commands {
+            let out = agent.run(args);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains(&format!("speaks protocol {}", PROTOCOL_VERSION - 1))
+                    && stderr.contains("restart the agent"),
+                "{args:?}: {stderr}"
+            );
+            assert!(out.stdout.is_empty(), "{args:?}: {}", text(&out.stdout));
+        }
+        // Each asked for the version, and sent nothing else.
+        assert_eq!(agent.requests().len(), commands.len());
+        assert!(agent.sent().is_empty(), "{:?}", agent.sent());
+    }
+
+    #[test]
+    fn doctor_without_an_agent_checks_the_broker_program_next_to_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        // This rusthorse in a directory of its own — a hard link, in the
+        // target directory so that one can be made — next to a broker
+        // program of its version; nothing listens on the socket.
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical");
+        let binary = root.join("rusthorse");
+        if std::fs::hard_link(env!("CARGO_BIN_EXE_rusthorse"), &binary).is_err() {
+            std::fs::copy(env!("CARGO_BIN_EXE_rusthorse"), &binary).expect("copy");
+        }
+        let program = root.join(rusthorse::broker_protocol::PROGRAM);
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho '{{\"version\":\"{}\",\"protocol\":{}}}'\n",
+                env!("CARGO_PKG_VERSION"),
+                rusthorse::broker_protocol::VERSION
+            ),
+        )
+        .expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        // Again while the program is busy: another test's child may hold it
+        // open for writing until its exec ("Text file busy").
+        let doctor = || {
+            for _ in 0..50 {
+                let out = Command::new(&binary)
+                    .arg("doctor")
+                    .env("RUSTHORSE_SOCKET", root.join("nobody.sock"))
+                    .env("RUSTHORSE_VAULT", root.join("vault.kdbx"))
+                    .env("RUSTHORSE_AUDIT_LOG", root.join("audit.jsonl"))
+                    .stdin(Stdio::null())
+                    .finish();
+                let report = text(&out.stdout);
+                if !report.contains("Text file busy") {
+                    return (out.status.code(), report);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the program stayed busy")
+        };
+        let ca_line = |installed: bool| match rusthorse::broker_protocol::open_ca_file() {
+            Ok(ca) => format!(
+                "  ok    the broker reads its certificate authorities from {}",
+                ca.path.display()
+            ),
+            Err(why) => format!(
+                "  {}  {why}: no grant",
+                if installed { "FAIL" } else { "warn" }
+            ),
+        };
+
+        let (code, report) = doctor();
+        assert_eq!(
+            code,
+            Some(1),
+            "an agent that does not answer fails: {report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "  ok    broker: rusthorse-broker {} ({})\n",
+                env!("CARGO_PKG_VERSION"),
+                program.display()
+            )),
+            "{report}"
+        );
+        assert!(report.contains(&ca_line(true)), "{report}");
+        // Nothing there: not installed, a warning that says where it was
+        // looked for.
+        std::fs::remove_file(&program).expect("remove");
+        let (_, report) = doctor();
+        assert!(
+            report.contains(&format!(
+                "  warn  {} is not installed: no grant of the credential broker can be served",
+                program.display()
+            )),
+            "{report}"
+        );
+        assert!(report.contains(&ca_line(false)), "{report}");
     }
 }
