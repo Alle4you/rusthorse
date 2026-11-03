@@ -431,7 +431,8 @@ requests are refused ("fail closed"). See [cli.md](cli.md#rusthorse-audit).
 | [`src/protocol.rs`](../src/protocol.rs) | Request and response types, framing, fd passing. |
 | [`src/client.rs`](../src/client.rs) | Client side of the protocol; relays a `run`'s input and output. |
 | [`src/ui.rs`](../src/ui.rs) | The `Ui` trait, `dialog_text`, and the zenity implementation. |
-| [`src/dialog_program.rs`](../src/dialog_program.rs) | Finding, starting and supervising `rusthorse-dialog`; falling back to zenity. |
+| [`src/dialog_program.rs`](../src/dialog_program.rs) | Starting and supervising `rusthorse-dialog`; falling back to zenity when it is not installed. |
+| [`src/helper_program.rs`](../src/helper_program.rs) | Finding and checking the helper programs the agent starts, such as `rusthorse-dialog`, next to its own executable; running their `--check` for `doctor`. |
 | [`src/dialog_protocol.rs`](../src/dialog_protocol.rs) | The protocol between the agent and `rusthorse-dialog`. |
 | [`dialog/`](../dialog) | `rusthorse-dialog`, the GTK 4 dialog program, and its tests on a virtual display. |
 | [`manager/`](../manager) | `rusthorse-manager`, the GTK 4 window to manage entries: agent requests on a worker, the window, tests on a virtual display. |

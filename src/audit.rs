@@ -24,10 +24,17 @@ pub struct AuditEvent {
     /// answered (usually within a moment), not when the request arrived.
     /// [`AuditLog::record`] sets it.
     pub time: String,
-    /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...
+    /// What was attempted: `unlock`, `lock`, `run`, `run_exit`, `reveal`, ...;
+    /// for the credential broker (ADR 0013), `grant` and `broker_request`.
     pub action: String,
     /// How it ended: `allowed_once`, `allowed_remembered`, `denied`,
     /// `timed_out` (nobody answered the dialog), `cancelled`, ...
+    ///
+    /// A `grant` record is `created` (before the command starts) or `ended`.
+    /// A `broker_request` record is `admitted` (before the request is
+    /// forwarded), or else it records how an admitted request ended:
+    /// `completed`, `not_forwarded`, `client_closed`, `revoked` or `unknown`
+    /// ([`RequestOutcome::as_str`](crate::broker_protocol::RequestOutcome::as_str)).
     pub outcome: String,
     /// Entries involved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +50,71 @@ pub struct AuditEvent {
     /// Extra information (exit status, error message, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The grant's ID, on `grant` and `broker_request` records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// On the `run` record of a `broker_run`: the grants the run creates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<AuditGrant>>,
+    /// On `broker_request` records: the request's number within its grant,
+    /// as the broker numbered it (from 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<u64>,
+    /// On `broker_request` records: the route the request matched, as
+    /// [`Route::template`](crate::broker_profile::Route::template) writes it
+    /// (`POST /v1/messages`) — never a raw path or a query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// On the record of an admitted request's end: the status of the
+    /// destination's answer, or of the broker's own answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// On the record of an admitted request's end: the bytes of the request
+    /// body sent to the destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_sent: Option<u64>,
+    /// On the record of an admitted request's end: the bytes of the response
+    /// body received from the destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_received: Option<u64>,
+    /// On the `grant` record of its end: why the grant ended, as
+    /// [`EndReason::as_str`](crate::broker_protocol::EndReason::as_str)
+    /// writes it (`command_ended`, `revoked`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// On the `grant` record of its end: what became of its requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<AuditRequestCounts>,
+}
+
+/// A grant, as the `run` record of the `broker_run` that creates it lists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditGrant {
+    /// The grant's ID (`g` and 16 hexadecimal digits).
+    pub id: String,
+    /// Its entry, as records identify entries (in `entries`):
+    /// [`EntryInfo::identity`](crate::protocol::EntryInfo::identity).
+    pub entry: String,
+    /// Where its requests go: the profile's
+    /// [`destination`](crate::broker_profile::BrokerProfile::destination),
+    /// its origin and base path (`https://api.openai.com/v1`).
+    pub destination: String,
+}
+
+/// What became of a grant's requests, on the `grant` record of its end.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditRequestCounts {
+    /// Requests admitted: each spent one of the grant's uses.
+    pub admitted: u64,
+    /// Admitted requests whose end the broker reported, whatever their
+    /// outcome.
+    pub finished: u64,
+    /// Admitted requests whose end the broker never reported (it failed, or
+    /// was stopped first): the destination may have acted on them.
+    pub unknown: u64,
+    /// Requests refused before admission, by the broker's own checks or by
+    /// the agent: none of them was forwarded.
+    pub refused: u64,
 }
 
 impl AuditEvent {
@@ -57,6 +129,15 @@ impl AuditEvent {
             argv: None,
             cwd: None,
             detail: None,
+            grant: None,
+            grants: None,
+            request: None,
+            route: None,
+            status: None,
+            bytes_sent: None,
+            bytes_received: None,
+            reason: None,
+            requests: None,
         }
     }
 
@@ -179,6 +260,138 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// A record with every field the credential broker's records use.
+    fn broker_event() -> AuditEvent {
+        let mut event = AuditEvent::new("grant", &Peer::agent()).outcome("ended");
+        event.grant = Some("g0123456789abcdef".into());
+        event.grants = Some(vec![AuditGrant {
+            id: "g0123456789abcdef".into(),
+            entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
+            destination: "https://api.anthropic.com".into(),
+        }]);
+        event.request = Some(7);
+        event.route = Some("POST /v1/messages".into());
+        event.status = Some(200);
+        event.bytes_sent = Some(1234);
+        event.bytes_received = Some(u64::MAX);
+        event.reason = Some("command_ended".into());
+        event.requests = Some(AuditRequestCounts {
+            admitted: 3,
+            finished: 2,
+            unknown: 1,
+            refused: 4,
+        });
+        event
+    }
+
+    #[test]
+    fn records_without_the_brokers_fields_still_parse() {
+        // A record as earlier versions wrote it.
+        let old = r#"{"time":"2026-11-02T10:00:00-03:00","action":"run","outcome":"allowed_once","entries":["API_KEY (8d2f6c1e)"],"requester":"rusthorse[1]","argv":["true"],"cwd":"/","detail":"x"}"#;
+        let event: AuditEvent = serde_json::from_str(old).expect("parse");
+        assert_eq!(event.action, "run");
+        assert_eq!(event.argv, Some(vec!["true".to_string()]));
+        assert_eq!(event.grant, None);
+        assert_eq!(event.grants, None);
+        assert_eq!(event.request, None);
+        assert_eq!(event.route, None);
+        assert_eq!(event.status, None);
+        assert_eq!(event.bytes_sent, None);
+        assert_eq!(event.bytes_received, None);
+        assert_eq!(event.reason, None);
+        assert_eq!(event.requests, None);
+        // Written back, it is what it was.
+        assert_eq!(
+            serde_json::to_value(&event).expect("json"),
+            serde_json::from_str::<serde_json::Value>(old).expect("json")
+        );
+        // The log reader takes both kinds of record.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let broker = broker_event();
+        let new = serde_json::to_string(&broker).expect("json");
+        std::fs::write(&path, format!("{old}\n{new}\n")).expect("write");
+        assert_eq!(tail(&path, 10).expect("tail"), vec![event, broker]);
+    }
+
+    #[test]
+    fn the_brokers_fields_round_trip_under_their_names() {
+        let event = broker_event();
+        let json = serde_json::to_value(&event).expect("json");
+        assert_eq!(json["grant"], "g0123456789abcdef");
+        assert_eq!(
+            json["grants"],
+            serde_json::json!([{
+                "id": "g0123456789abcdef",
+                "entry": "AI/ANTHROPIC_API_KEY (8d2f6c1e)",
+                "destination": "https://api.anthropic.com",
+            }])
+        );
+        assert_eq!(json["request"], 7);
+        assert_eq!(json["route"], "POST /v1/messages");
+        assert_eq!(json["status"], 200);
+        assert_eq!(json["bytes_sent"], 1234);
+        assert_eq!(json["bytes_received"], u64::MAX);
+        assert_eq!(json["reason"], "command_ended");
+        assert_eq!(
+            json["requests"],
+            serde_json::json!({"admitted": 3, "finished": 2, "unknown": 1, "refused": 4})
+        );
+        assert_eq!(
+            serde_json::from_value::<AuditEvent>(json).expect("parse"),
+            event
+        );
+        // Through the log file too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = AuditLog::new(dir.path().join("audit.jsonl"));
+        log.record(&event).expect("record");
+        let read = tail(log.path(), 1).expect("tail");
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0],
+            AuditEvent {
+                time: read[0].time.clone(),
+                ..event
+            }
+        );
+    }
+
+    #[test]
+    fn absent_fields_are_left_out() {
+        let keys = |event: &AuditEvent| -> std::collections::BTreeSet<String> {
+            let line = serde_json::to_string(event).expect("json");
+            assert!(!line.contains("null"), "{line}");
+            let json: serde_json::Value = serde_json::from_str(&line).expect("json");
+            json.as_object().expect("object").keys().cloned().collect()
+        };
+        let lock = AuditEvent::new("lock", &Peer::agent()).outcome("requested");
+        assert_eq!(
+            keys(&lock),
+            ["action", "outcome", "requester", "time"]
+                .map(String::from)
+                .into()
+        );
+        // An admission: only the fields it sets.
+        let mut admitted = AuditEvent::new("broker_request", &Peer::agent()).outcome("admitted");
+        admitted.grant = Some("g0123456789abcdef".into());
+        admitted.request = Some(1);
+        admitted.route = Some("POST /v1/messages".into());
+        assert_eq!(
+            keys(&admitted),
+            [
+                "action",
+                "grant",
+                "outcome",
+                "request",
+                "requester",
+                "route",
+                "time"
+            ]
+            .map(String::from)
+            .into()
+        );
     }
 
     #[test]

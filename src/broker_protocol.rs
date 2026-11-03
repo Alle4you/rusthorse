@@ -29,11 +29,17 @@
 //! credential are kept in buffers that are wiped on drop and never printed:
 //! [`Install`]'s `Debug` hides them, and frames are built in one buffer of
 //! fixed size ([`encode`]), so that no reallocation leaves a copy behind.
+//!
+//! The module also names the broker program ([`PROGRAM`]) and opens the file
+//! of certificate authorities the broker trusts ([`open_ca_file`]).
 
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -45,6 +51,11 @@ use crate::protocol::{self, SecretString};
 
 /// Version of this protocol. Both sides refuse any other.
 pub const VERSION: u32 = 1;
+
+/// File name of the broker program, which the agent looks for next to its
+/// own executable ([`helper_program::locate`](crate::helper_program::locate)).
+/// Unlike the dialog program, it has no fallback (ADR 0013).
+pub const PROGRAM: &str = "rusthorse-broker";
 
 /// Largest frame body, in bytes.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -126,13 +137,154 @@ pub const EXIT_KILL_DELAY: Duration = Duration::from_secs(1);
 
 /// Where the broker reads its certificate authorities: the first of these
 /// files that exists, which must be owned by root and not writable by group
-/// or others. No environment variable changes it (`rusthorse doctor` checks
-/// the same files).
+/// or others ([`open_ca_file`]). No environment variable changes it
+/// (`rusthorse doctor` checks the same files).
 pub const CA_FILES: [&str; 3] = [
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
 ];
+
+/// The file of certificate authorities the broker trusts, as
+/// [`open_ca_file`] opened and checked it: the checks were made on this open
+/// file, so what was checked is what is read.
+#[derive(Debug)]
+pub struct CaFile {
+    /// Its path, links resolved.
+    pub path: PathBuf,
+    /// The file, open for reading.
+    pub file: File,
+}
+
+/// Open the file of certificate authorities the broker trusts: the first of
+/// [`CA_FILES`] that exists, links resolved. It must be a regular file owned
+/// by root and not writable by its group or by others, which is checked on
+/// the open file; and every directory from its parent up to `/` must be
+/// owned by root and not writable by its group or by others, so that nobody
+/// but root can put another file in its place. The first file that exists
+/// decides: when it fails a check, the error names it and says why, and the
+/// next one is not tried — nor is it when whether a file exists cannot be
+/// told (its directory cannot be examined). The error is plain text, for
+/// `rusthorse doctor` to show.
+pub fn open_ca_file() -> Result<CaFile, String> {
+    open_ca_file_from(&CA_FILES.map(Path::new), 0, Path::new("/"))
+}
+
+/// [`open_ca_file`] with its parameters: the files to look for, in order;
+/// the owner the file and its directories must have (root: 0); and the
+/// highest directory checked, `top` itself included (`/`; when `top` is not
+/// on the way, every directory up to `/` is checked).
+fn open_ca_file_from(candidates: &[&Path], owner: u32, top: &Path) -> Result<CaFile, String> {
+    let mut found = None;
+    for candidate in candidates {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                found = Some(*candidate);
+                break;
+            }
+            // Nothing there, not even a broken link; a path through a file
+            // names nothing either.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            // Whether it exists cannot be told: the next one is not tried.
+            Err(e) => return Err(format!("cannot examine {}: {e}", candidate.display())),
+        }
+    }
+    let Some(found) = found else {
+        let names: Vec<String> = candidates.iter().map(|c| c.display().to_string()).collect();
+        return Err(format!(
+            "none of the certificate authority files exists: {}",
+            names.join(", ")
+        ));
+    };
+    let path =
+        fs::canonicalize(found).map_err(|e| format!("cannot resolve {}: {e}", found.display()))?;
+    let file = open_no_follow(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot examine {}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.uid() != owner {
+        return Err(format!(
+            "{} is not owned by {}",
+            path.display(),
+            owner_name(owner)
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} can be modified by its group or by others",
+            path.display()
+        ));
+    }
+    check_directories(&path, owner, top)?;
+    Ok(CaFile { path, file })
+}
+
+/// Open `path` for reading without following a link at its end
+/// (`O_NOFOLLOW`), closed on exec (`O_CLOEXEC`), and without waiting
+/// (`O_NONBLOCK`, cleared once it is open): a FIFO is then refused as not a
+/// regular file instead of waiting for a writer.
+fn open_no_follow(path: &Path) -> io::Result<File> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::libc::{O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        .open(path)?;
+    let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL)?);
+    fcntl(
+        &file,
+        FcntlArg::F_SETFL(flags.difference(OFlag::O_NONBLOCK)),
+    )?;
+    Ok(file)
+}
+
+/// Check every directory from the parent of `path` up to `top`, included
+/// (up to `/` when `top` is not on the way): a directory, owned by `owner`,
+/// not writable by its group or by others.
+fn check_directories(path: &Path, owner: u32, top: &Path) -> Result<(), String> {
+    for dir in path.ancestors().skip(1) {
+        let meta = fs::symlink_metadata(dir)
+            .map_err(|e| format!("cannot examine {}: {e}", dir.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        if meta.uid() != owner {
+            return Err(format!(
+                "{} is in {}, which is not owned by {}",
+                path.display(),
+                dir.display(),
+                owner_name(owner)
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{} is in {}, which can be modified by its group or by others",
+                path.display(),
+                dir.display()
+            ));
+        }
+        if dir == top {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// How errors name the owner a file must have.
+fn owner_name(owner: u32) -> String {
+    if owner == 0 {
+        "root".into()
+    } else {
+        format!("user {owner}")
+    }
+}
 
 /// What every token starts with.
 pub const TOKEN_PREFIX: &str = "rh_";
@@ -1184,5 +1336,371 @@ mod tests {
         assert_eq!(MAX_FRAME, 64 * 1024);
         assert_eq!(TOKEN_LEN, 67);
         assert_eq!(GRANT_ID_LEN, 17);
+        // Components and processes: the program, and the files it trusts.
+        assert_eq!(PROGRAM, "rusthorse-broker");
+        assert_eq!(
+            CA_FILES,
+            [
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/ssl/ca-bundle.pem",
+            ]
+        );
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// A temporary directory for files of certificate authorities, links
+    /// resolved, with mode 0755 whatever the umask: the highest directory
+    /// the checks look at in these tests.
+    fn ca_top() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let top = fs::canonicalize(dir.path()).expect("canonical");
+        set_mode(&top, 0o755);
+        (dir, top)
+    }
+
+    /// A file of certificate authorities at `path` (any text will do here),
+    /// with mode 0644 whatever the umask.
+    fn ca_file(path: &Path, text: &str) -> PathBuf {
+        fs::write(path, text).expect("write");
+        set_mode(path, 0o644);
+        path.to_path_buf()
+    }
+
+    /// The test's user: the owner its files have.
+    fn me() -> u32 {
+        nix::unistd::geteuid().as_raw()
+    }
+
+    /// The file `open_ca_file_from` opens, with the test's user as owner:
+    /// its path and what reading it gives.
+    fn opened(candidates: &[&Path], top: &Path) -> Result<(PathBuf, String), String> {
+        let mut ca = open_ca_file_from(candidates, me(), top)?;
+        let mut text = String::new();
+        ca.file.read_to_string(&mut text).expect("read");
+        Ok((ca.path, text))
+    }
+
+    #[test]
+    fn the_ca_file_is_the_first_that_exists() {
+        let (_dir, top) = ca_top();
+        let a = top.join("a.crt");
+        let b = top.join("b.crt");
+        // None exists: the error lists them.
+        assert_eq!(
+            opened(&[&a, &b], &top),
+            Err(format!(
+                "none of the certificate authority files exists: {}, {}",
+                a.display(),
+                b.display()
+            ))
+        );
+        // The first missing, the second used.
+        ca_file(&b, "B");
+        assert_eq!(opened(&[&a, &b], &top), Ok((b.clone(), "B".into())));
+        // A path through a file names nothing either.
+        let through = b.join("inner.crt");
+        assert_eq!(opened(&[&through, &b], &top), Ok((b.clone(), "B".into())));
+        // The first that exists, even when a later one does too.
+        ca_file(&a, "A");
+        assert_eq!(opened(&[&a, &b], &top), Ok((a.clone(), "A".into())));
+        assert_eq!(opened(&[&b, &a], &top), Ok((b.clone(), "B".into())));
+        // Links are resolved: the path is the target's, and so is the file.
+        let link = top.join("link.crt");
+        std::os::unix::fs::symlink(&b, &link).expect("symlink");
+        let chain = top.join("chain.crt");
+        std::os::unix::fs::symlink(&link, &chain).expect("symlink");
+        let relative = top.join("relative.crt");
+        std::os::unix::fs::symlink("b.crt", &relative).expect("symlink");
+        for candidate in [&link, &chain, &relative] {
+            assert_eq!(
+                opened(&[candidate, &a], &top),
+                Ok((b.clone(), "B".into())),
+                "{}",
+                candidate.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_ca_file_must_be_a_regular_file_nobody_else_can_change() {
+        let (_dir, top) = ca_top();
+        let file = ca_file(&top.join("ca.crt"), "CA");
+        for mode in [0o664, 0o646, 0o666, 0o660, 0o606, 0o620, 0o602] {
+            set_mode(&file, mode);
+            assert_eq!(
+                opened(&[&file], &top),
+                Err(format!(
+                    "{} can be modified by its group or by others",
+                    file.display()
+                )),
+                "{mode:o}"
+            );
+        }
+        for mode in [0o644, 0o640, 0o604, 0o600, 0o444, 0o400] {
+            set_mode(&file, mode);
+            assert_eq!(
+                opened(&[&file], &top),
+                Ok((file.clone(), "CA".into())),
+                "{mode:o}"
+            );
+        }
+        // A directory is not a regular file, even one nobody else can change.
+        let dir = top.join("dir.crt");
+        fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, 0o755);
+        assert_eq!(
+            opened(&[&dir], &top),
+            Err(format!("{} is not a regular file", dir.display()))
+        );
+        // Nor is a FIFO, which is refused without waiting for a writer.
+        let fifo = top.join("fifo.crt");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644))
+            .expect("mkfifo");
+        set_mode(&fifo, 0o644);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (candidate, highest) = (fifo.clone(), top.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(opened(&[&candidate], &highest));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer");
+        assert_eq!(
+            result,
+            Err(format!("{} is not a regular file", fifo.display()))
+        );
+    }
+
+    #[test]
+    fn the_ca_file_is_opened_without_following_a_link_or_waiting() {
+        use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+        let (_dir, top) = ca_top();
+        let file = ca_file(&top.join("ca.crt"), "CA");
+        // Links are resolved first; one that appears at the end of the path
+        // after that is not followed.
+        let link = top.join("link.crt");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        let err = open_no_follow(&link).expect_err("a link at the end");
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP), "{err}");
+        // The file it gives waits as files do, and is closed on exec.
+        let ca = open_ca_file_from(&[&link], me(), &top).expect("opened");
+        assert_eq!(ca.path, file);
+        let flags = OFlag::from_bits_retain(fcntl(&ca.file, FcntlArg::F_GETFL).expect("flags"));
+        assert!(!flags.contains(OFlag::O_NONBLOCK), "{flags:?}");
+        let fd = FdFlag::from_bits_retain(fcntl(&ca.file, FcntlArg::F_GETFD).expect("fd flags"));
+        assert!(fd.contains(FdFlag::FD_CLOEXEC), "{fd:?}");
+    }
+
+    #[test]
+    fn the_ca_file_and_its_directories_must_belong_to_root() {
+        if nix::unistd::geteuid().is_root() {
+            return; // the test's files belong to root
+        }
+        let (_dir, top) = ca_top();
+        let file = ca_file(&top.join("ca.crt"), "CA");
+        assert_eq!(
+            open_ca_file_from(&[&file], 0, &top).map(|ca| ca.path),
+            Err(format!("{} is not owned by root", file.display()))
+        );
+        // Its directories too (which only these checks can show: the file
+        // itself belongs to the test's user as well).
+        assert_eq!(
+            check_directories(&file, 0, &top),
+            Err(format!(
+                "{} is in {}, which is not owned by root",
+                file.display(),
+                top.display()
+            ))
+        );
+        assert_eq!(check_directories(&file, me(), &top), Ok(()));
+        // Above the top, nothing is checked; but with `/` as the top, or a
+        // top that is not on the way, every directory up to `/` is, and one
+        // of those above the temporary directory belongs to root, at least
+        // `/` itself.
+        let elsewhere = top.join("elsewhere");
+        for highest in [Path::new("/"), &elsewhere] {
+            let err = open_ca_file_from(&[&file], me(), highest)
+                .map(|ca| ca.path)
+                .expect_err("checked up to /");
+            let above = top.ancestors().skip(1).any(|dir| {
+                err.starts_with(&format!(
+                    "{} is in {}, which ",
+                    file.display(),
+                    dir.display()
+                ))
+            });
+            assert!(above, "{err}");
+        }
+    }
+
+    #[test]
+    fn the_directories_of_the_ca_file_are_checked_up_to_the_top() {
+        let (_dir, top) = ca_top();
+        let a = top.join("a");
+        let b = a.join("b");
+        fs::create_dir_all(&b).expect("mkdir");
+        set_mode(&a, 0o755);
+        set_mode(&b, 0o755);
+        let file = ca_file(&b.join("ca.crt"), "CA");
+        assert_eq!(opened(&[&file], &top), Ok((file.clone(), "CA".into())));
+        for (dir, mode) in [
+            (&b, 0o775),
+            (&b, 0o757),
+            (&b, 0o777),
+            (&a, 0o775),
+            (&a, 0o1777),
+            (&top, 0o775),
+            (&top, 0o757),
+        ] {
+            set_mode(dir, mode);
+            assert_eq!(
+                opened(&[&file], &top),
+                Err(format!(
+                    "{} is in {}, which can be modified by its group or by others",
+                    file.display(),
+                    dir.display()
+                )),
+                "{} {mode:o}",
+                dir.display()
+            );
+            set_mode(dir, 0o755);
+        }
+        // Read-only directories are fine, and so are those only the owner
+        // can enter.
+        set_mode(&a, 0o555);
+        set_mode(&b, 0o700);
+        assert_eq!(opened(&[&file], &top), Ok((file.clone(), "CA".into())));
+        set_mode(&a, 0o755);
+        set_mode(&b, 0o755);
+        // The directory the checks start from is the file's, links resolved.
+        let link = top.join("link.crt");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        set_mode(&b, 0o777);
+        assert_eq!(
+            opened(&[&link], &top),
+            Err(format!(
+                "{} is in {}, which can be modified by its group or by others",
+                file.display(),
+                b.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_ca_file_that_fails_a_check_is_not_passed_over() {
+        let (_dir, top) = ca_top();
+        let good = ca_file(&top.join("good.crt"), "GOOD");
+        let bad = ca_file(&top.join("bad.crt"), "BAD");
+        set_mode(&bad, 0o666);
+        let writable = |path: &Path| {
+            format!(
+                "{} can be modified by its group or by others",
+                path.display()
+            )
+        };
+        assert_eq!(opened(&[&bad, &good], &top), Err(writable(&bad)));
+        // Through a link too: the error names the file it resolves to.
+        let link = top.join("link.crt");
+        std::os::unix::fs::symlink(&bad, &link).expect("symlink");
+        assert_eq!(opened(&[&link, &good], &top), Err(writable(&bad)));
+        // A directory where the file should be.
+        let dir = top.join("dir.crt");
+        fs::create_dir(&dir).expect("mkdir");
+        set_mode(&dir, 0o755);
+        assert_eq!(
+            opened(&[&dir, &good], &top),
+            Err(format!("{} is not a regular file", dir.display()))
+        );
+        // A file in a directory others can change.
+        let shared = top.join("shared");
+        fs::create_dir(&shared).expect("mkdir");
+        set_mode(&shared, 0o777);
+        let inside = ca_file(&shared.join("ca.crt"), "SHARED");
+        assert_eq!(
+            opened(&[&inside, &good], &top),
+            Err(format!(
+                "{} is in {}, which can be modified by its group or by others",
+                inside.display(),
+                shared.display()
+            ))
+        );
+        // A broken link is not "absent".
+        let broken = top.join("broken.crt");
+        std::os::unix::fs::symlink(top.join("nowhere"), &broken).expect("symlink");
+        let err = opened(&[&broken, &good], &top).expect_err("a broken link");
+        assert!(
+            err.starts_with(&format!("cannot resolve {}: ", broken.display())),
+            "{err}"
+        );
+        // Nor is a file whose directory cannot be examined: whether it exists
+        // cannot be told (not as root, who can examine anything).
+        if !nix::unistd::geteuid().is_root() {
+            let closed = top.join("closed");
+            fs::create_dir(&closed).expect("mkdir");
+            set_mode(&closed, 0o000);
+            let hidden = closed.join("ca.crt");
+            let result = opened(&[&hidden, &good], &top);
+            set_mode(&closed, 0o755);
+            let err = result.expect_err("cannot be told");
+            assert!(
+                err.starts_with(&format!("cannot examine {}: ", hidden.display())),
+                "{err}"
+            );
+        }
+        // Another owner (not as root, whose files belong to root).
+        if !nix::unistd::geteuid().is_root() {
+            assert_eq!(
+                open_ca_file_from(&[&good, &bad], 0, &top).map(|ca| ca.path),
+                Err(format!("{} is not owned by root", good.display()))
+            );
+        }
+        // With the bad files out of the way, the good one is used.
+        assert_eq!(
+            opened(&[&top.join("missing.crt"), &good, &bad], &top),
+            Ok((good.clone(), "GOOD".into()))
+        );
+    }
+
+    /// Whether `path` resolves to a regular file owned by root that nobody
+    /// else can change, in directories that only root can change, up to
+    /// `/`: what `open_ca_file` requires, found here the simple way.
+    fn trusted_by_root(path: &Path) -> bool {
+        let Ok(real) = fs::canonicalize(path) else {
+            return false;
+        };
+        let safe = |meta: fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+        fs::metadata(&real).is_ok_and(|meta| meta.is_file() && safe(meta))
+            && real
+                .ancestors()
+                .skip(1)
+                .all(|dir| fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir() && safe(meta)))
+    }
+
+    #[test]
+    fn the_systems_ca_file_is_the_first_of_the_fixed_ones() {
+        let first = CA_FILES
+            .iter()
+            .map(Path::new)
+            .find(|file| fs::symlink_metadata(file).is_ok());
+        match (first, open_ca_file()) {
+            (None, Err(e)) => assert!(
+                e.starts_with("none of the certificate authority files exists: "),
+                "{e}"
+            ),
+            (None, Ok(ca)) => panic!("{} opened, where none exists", ca.path.display()),
+            (Some(first), Ok(ca)) => {
+                assert!(trusted_by_root(first), "{} trusted", first.display());
+                assert_eq!(ca.path, fs::canonicalize(first).expect("canonical"));
+                assert_eq!(ca.file.metadata().expect("metadata").uid(), 0);
+            }
+            (Some(first), Err(e)) => {
+                assert!(!trusted_by_root(first), "{} refused: {e}", first.display());
+            }
+        }
     }
 }
