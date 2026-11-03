@@ -325,6 +325,12 @@ pub enum ToBroker {
     /// agent answers at once every admission still waiting for its answer —
     /// [`ToBroker::Refused`], `revoked` — without waiting for its audit
     /// record, so that the confirmation never waits for the audit log.
+    ///
+    /// The agent accepts a [`FromBroker::Revoked`] that comes before the
+    /// [`FromBroker::Finished`] of some admitted requests: it counts each of
+    /// them as `unknown` in the grant's end record (the destination may have
+    /// acted on it). Nothing may follow the confirmation: any message after
+    /// it is a broken broker, which the agent kills.
     Revoke {
         /// Why the grant ends.
         reason: EndReason,
