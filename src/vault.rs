@@ -198,25 +198,32 @@ impl Fingerprint {
 }
 
 /// The key of the fingerprints of a vault file's encrypted bytes
-/// ([`ContentFingerprint`]): random, chosen once (the agent chooses one when
-/// it starts), kept in memory only and never shown. A program that does not
-/// know it cannot make a changed file have the fingerprint of the file it
-/// replaced, except by chance.
+/// ([`ContentFingerprint`]): one random key of the standard library's keyed
+/// hash ([`RandomState`]: 128 bits, for SipHash-1-3 today), chosen once
+/// (the agent chooses one when it starts), kept in memory only and never
+/// shown. A program that does not know it, and never sees a fingerprint,
+/// cannot make a changed file have the fingerprint of the file it replaced,
+/// except by chance.
 #[derive(Clone)]
 pub struct FingerprintKey {
-    first: RandomState,
-    second: RandomState,
+    state: RandomState,
 }
 
 impl FingerprintKey {
-    /// A new random key: two keyed hashes of the standard library
-    /// ([`RandomState`], SipHash), each with a 64-bit result, for a 128-bit
-    /// fingerprint.
+    /// A new random key, which the standard library draws, as a best effort,
+    /// from a secure random source of the operating system, without
+    /// blocking. It is drawn on a thread of its own when one can be started:
+    /// the standard library draws one key for each thread and derives from
+    /// it the keys of the hash tables that thread makes later, so that this
+    /// key is not related to the keys of the agent's hash tables.
     pub fn random() -> Self {
-        Self {
-            first: RandomState::new(),
-            second: RandomState::new(),
-        }
+        let state = std::thread::Builder::new()
+            .name("rusthorse-key".into())
+            .spawn(RandomState::new)
+            .ok()
+            .and_then(|drawing| drawing.join().ok())
+            .unwrap_or_default();
+        Self { state }
     }
 }
 
@@ -227,9 +234,13 @@ impl std::fmt::Debug for FingerprintKey {
 }
 
 /// A fingerprint of the encrypted bytes of a vault file, as a [`Vault`] read
-/// or wrote them, keyed with a [`FingerprintKey`]: equal for the same bytes
-/// under the same key, different (but for odds of about 2^-128) for other
-/// bytes, whatever the file's name, times or inode.
+/// or wrote them, keyed with a [`FingerprintKey`]: two 64-bit values of the
+/// keyed hash of those bytes under that one key, each preceded by a byte of
+/// its own, for 128 bits. Equal for the same bytes under the same key; for
+/// other bytes, whatever the file's name, times or inode, equal only by
+/// chance — odds of about 2^-128 if the keyed hash, under a key one does not
+/// know, behaves as a random function. The standard library promises less:
+/// a hash that resists HashDoS attacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentFingerprint([u64; 2]);
 
@@ -248,8 +259,14 @@ struct ContentHasher {
 
 impl ContentHasher {
     fn new(key: &FingerprintKey) -> Self {
+        let mut hashers = [key.state.build_hasher(), key.state.build_hasher()];
+        // Two hashes of the same bytes under one key: each begins with a
+        // byte of its own.
+        for (first, hasher) in (0u8..).zip(&mut hashers) {
+            hasher.write_u8(first);
+        }
         Self {
-            hashers: [key.first.build_hasher(), key.second.build_hasher()],
+            hashers,
             block: [0; FINGERPRINT_BLOCK],
             filled: 0,
             total: 0,
@@ -2551,6 +2568,9 @@ mod tests {
         };
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
         let whole = fingerprint(&[&data]);
+        // Its two halves are hashes of different inputs, not one twice.
+        let [first, second] = whole.0;
+        assert_ne!(first, second);
         for size in [1, 3, 63, 64, 65, 128, 200, 999, 1000] {
             let chunks: Vec<&[u8]> = data.chunks(size).collect();
             assert_eq!(fingerprint(&chunks), whole, "chunks of {size}");
