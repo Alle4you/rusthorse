@@ -218,7 +218,8 @@ pub fn answer(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Handler {
 
 /// The fake HTTPS destination: a TLS server on `127.0.0.1` with a
 /// certificate of the test's authority, one thread per connection, which
-/// reads one request, records it and lets the handler answer.
+/// reads one request (or only its head), records it and lets the handler
+/// answer.
 pub struct Destination {
     pub port: u16,
     received: Arc<(Mutex<Vec<Received>>, Condvar)>,
@@ -236,6 +237,23 @@ impl Destination {
     }
 
     pub fn with_config(config: Arc<rustls::ServerConfig>, handler: Handler) -> Destination {
+        Self::start(config, handler, true)
+    }
+
+    /// A destination for `localhost` signed by `ca` that reads each
+    /// request's head only, never its body, before `handler` answers (what
+    /// came of the body with the head is recorded as its body). Its
+    /// connections take little into their receive buffers, so that what
+    /// it does not read stays with the broker.
+    pub fn head_only(ca: &TestCa, handler: Handler) -> Destination {
+        Self::start(
+            ca.server_config(&["localhost"], BOTH_VERSIONS),
+            handler,
+            false,
+        )
+    }
+
+    fn start(config: Arc<rustls::ServerConfig>, handler: Handler, whole: bool) -> Destination {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("address").port();
         let received = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
@@ -263,7 +281,7 @@ impl Destination {
                         failures.clone(),
                     );
                     std::thread::spawn(move || {
-                        if serve_one(stream, config, handler, received).is_err() {
+                        if serve_one(stream, config, handler, received, whole).is_err() {
                             failures.fetch_add(1, Ordering::SeqCst);
                         }
                     });
@@ -334,8 +352,14 @@ fn serve_one(
     config: Arc<rustls::ServerConfig>,
     handler: Handler,
     received: Arc<(Mutex<Vec<Received>>, Condvar)>,
+    whole: bool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(PATIENCE))?;
+    if !whole {
+        // A fixed, small receive buffer (no growing as data arrives).
+        nix::sys::socket::setsockopt(&stream, nix::sys::socket::sockopt::RcvBuf, &(64 * 1024))
+            .map_err(io::Error::from)?;
+    }
     let connection = rustls::ServerConnection::new(config).map_err(io::Error::other)?;
     let mut tls = rustls::StreamOwned::new(connection, stream);
     // The head, then the body by its length.
@@ -371,7 +395,7 @@ fn serve_one(
         .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse().ok())
         .unwrap_or(0);
     let mut body = data[head_end + 4..].to_vec();
-    while body.len() < length {
+    while whole && body.len() < length {
         let mut buf = vec![0u8; length - body.len()];
         let n = tls.read(&mut buf)?;
         if n == 0 {
@@ -1153,6 +1177,124 @@ impl Drop for Counter {
             let _ = thread.join();
         }
     }
+}
+
+/// A listener that accepts connections and never answers on them: a
+/// destination whose TLS handshake stalls. It keeps them open until it is
+/// dropped.
+pub struct Silent {
+    pub port: u16,
+    accepted: Arc<(Mutex<Vec<TcpStream>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Silent {
+    pub fn new() -> Silent {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let accepted: Arc<(Mutex<Vec<TcpStream>>, Condvar)> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (accepted, stop) = (accepted.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Ok(stream) = stream {
+                        let (lock, changed) = &*accepted;
+                        lock.lock().expect("lock").push(stream);
+                        changed.notify_all();
+                    }
+                }
+            })
+        };
+        Silent {
+            port,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The origin of a profile for this listener.
+    pub fn origin(&self) -> String {
+        format!("https://localhost:{}", self.port)
+    }
+
+    /// Connections accepted so far.
+    pub fn connections(&self) -> usize {
+        self.accepted.0.lock().expect("lock").len()
+    }
+
+    /// Connection `n` (from 0), once it has been accepted.
+    fn connection(&self, n: usize) -> TcpStream {
+        let (lock, changed) = &*self.accepted;
+        let deadline = Instant::now() + PATIENCE;
+        let mut accepted = lock.lock().expect("lock");
+        while accepted.len() <= n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "{} connections, not {}",
+                accepted.len(),
+                n + 1
+            );
+            accepted = changed.wait_timeout(accepted, left).expect("wait").0;
+        }
+        accepted[n].try_clone().expect("clone")
+    }
+
+    /// Wait until the other end of connection `n` has sent something (the
+    /// start of a TLS handshake), and leave it unread.
+    pub fn wait_for_data(&self, n: usize) {
+        let stream = self.connection(n);
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(stream.peek(&mut byte), Ok(1)),
+            "connection {n} sent nothing"
+        );
+    }
+
+    /// Whether the other end of connection `n` closed it within `limit`
+    /// (what it sent is read and dropped).
+    pub fn closed_within(&self, n: usize, limit: Duration) -> bool {
+        let mut stream = self.connection(n);
+        let deadline = Instant::now() + limit;
+        let mut buf = [0u8; 4096];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            stream.set_read_timeout(Some(left)).expect("timeout");
+            match stream.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) if is_timeout(&e) => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+}
+
+impl Drop for Silent {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The largest send buffer a TCP socket grows to (Linux's `tcp_wmem`), if
+/// it can be read.
+pub fn largest_send_buffer() -> Option<usize> {
+    let limits = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_wmem").ok()?;
+    limits.split_whitespace().nth(2)?.parse().ok()
 }
 
 /// A one-shot signal between a test and a destination's handler.

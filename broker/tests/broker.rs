@@ -224,6 +224,20 @@ fn check_answers_the_contract_of_check_program() {
     .expect("--check");
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
     assert_eq!(protocol, rusthorse::broker_protocol::VERSION);
+    // The whole answer: a build with the test feature says so, so that it
+    // cannot pass for a release; a release says nothing more.
+    let output = std::process::Command::new(program())
+        .arg("--check")
+        .env_clear()
+        .output()
+        .expect("--check");
+    assert!(output.status.success(), "{output:?}");
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let mut expected = serde_json::json!({ "version": version, "protocol": protocol });
+    if TEST_UPSTREAM {
+        expected["test_upstream"] = serde_json::Value::Bool(true);
+    }
+    assert_eq!(answer, expected);
 }
 
 #[test]
@@ -570,6 +584,142 @@ fn the_body_budget_holds_and_refusals_give_it_back() {
         broker.refused(n, AdmissionRefusal::Exhausted);
     }
     client.response().assert_local(403);
+}
+
+/// The largest request body: 16 MiB.
+#[cfg(feature = "test-upstream")]
+const LARGEST_BODY: usize = 16 * 1024 * 1024;
+
+/// The head of a request for `/v1/messages` that declares the largest body.
+#[cfg(feature = "test-upstream")]
+fn largest_head(broker: &Broker) -> Vec<u8> {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nx-api-key: {}\r\ncontent-length: {LARGEST_BODY}\r\n\r\n",
+        broker.port, broker.token
+    )
+    .into_bytes()
+}
+
+/// Send four requests of 16 MiB, which fill the 64 MiB budget, to
+/// `destination`; `sent` runs on each once it reached the destination.
+/// While the broker may still hold any of the bodies, a fifth request does
+/// not fit: `503`, retry after a second, not asked.
+#[cfg(feature = "test-upstream")]
+fn fill_the_budget(
+    broker: &Broker,
+    destination: &Destination,
+    sent: impl Fn(&mut Client),
+) -> Vec<Client> {
+    let body = vec![b'x'; LARGEST_BODY];
+    let request = broker.request("POST", "/v1/messages", &[], &body);
+    let mut held = Vec::new();
+    for n in 1..=4 {
+        let mut client = broker.connect();
+        client.write(&request);
+        destination.wait_for(n);
+        sent(&mut client);
+        held.push(client);
+    }
+    let mut fifth = broker.connect();
+    fifth.write(&largest_head(broker));
+    // Answered at once; let in, it would wait for its body instead.
+    fifth
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    assert!(
+        matches!(fifth.stream.peek(&mut [0u8; 1]), Ok(1)),
+        "a fifth body was let in: {} asked",
+        broker.admits()
+    );
+    let response = fifth.response();
+    response.assert_local(503);
+    assert_eq!(response.header("retry-after"), Some("1"));
+    assert_eq!(broker.admits(), 4);
+    held
+}
+
+/// Once the four requests have ended, their room has come back: a request
+/// of 16 MiB is asked for.
+#[cfg(feature = "test-upstream")]
+fn assert_the_room_came_back(broker: &Broker) {
+    for request in 1..=4 {
+        broker.wait_finished(request);
+    }
+    let mut client = broker.connect();
+    client.write(&largest_head(broker));
+    broker.wait_admit(5);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn bodies_a_destination_does_not_read_keep_their_room() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // It reads each head, then neither reads nor answers.
+    let (release, wait) = signal();
+    let destination = Destination::head_only(
+        &ca,
+        Arc::new(move |_, _| {
+            let _ = wait.lock().expect("lock").recv_timeout(PATIENCE);
+        }),
+    );
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca));
+    let _held = fill_the_budget(&broker, &destination, |_| {});
+    drop(release);
+    assert_the_room_came_back(&broker);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn bodies_keep_their_room_until_the_destination_answers() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // It reads each body whole, then does not answer: the broker holds none
+    // of the bytes, and keeps the room until the answer.
+    let (release, wait) = signal();
+    let destination = Destination::new(
+        &ca,
+        Arc::new(move |_, _| {
+            let _ = wait.lock().expect("lock").recv_timeout(PATIENCE);
+        }),
+    );
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca));
+    let _held = fill_the_budget(&broker, &destination, |_| {});
+    drop(release);
+    assert_the_room_came_back(&broker);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn bodies_the_broker_has_not_written_keep_their_room_after_the_answer() {
+    use std::sync::Arc;
+    // The broker's send buffer must hold much less than a body, for most of
+    // it to stay with the broker (Linux's default largest is 4 MiB).
+    if largest_send_buffer().is_none_or(|largest| largest > LARGEST_BODY / 2) {
+        eprintln!("skipped: the kernel's send buffers may hold a whole body");
+        return;
+    }
+    let ca = TestCa::new();
+    // It reads each head, answers at once with the start of a stream, and
+    // reads nothing more.
+    let (release, wait) = signal();
+    let destination = Destination::head_only(
+        &ca,
+        Arc::new(move |_, peer| {
+            let _ = peer.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+            let _ = peer.chunk(b"data: 1\n\n");
+            let _ = wait.lock().expect("lock").recv_timeout(PATIENCE);
+        }),
+    );
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca));
+    let _held = fill_the_budget(&broker, &destination, |client| {
+        // The answer reached the client: the broker has the head.
+        assert_eq!(client.head().0, 200);
+        assert_eq!(client.chunk().as_deref(), Some(&b"data: 1\n\n"[..]));
+    });
+    drop(release);
+    assert_the_room_came_back(&broker);
 }
 
 #[test]
@@ -1227,7 +1377,7 @@ fn a_build_without_the_test_feature_refuses_a_loopback_destination() {
 
 #[cfg(not(feature = "test-upstream"))]
 #[test]
-fn a_build_without_the_test_feature_never_reads_its_environment() {
+fn a_build_without_the_test_feature_ignores_the_test_variables() {
     // Variables that a build with the feature refuses to start with.
     let ca = TestCa::new();
     let options = Options::nowhere(&ca)
@@ -1249,6 +1399,7 @@ fn test_variables_that_do_not_parse_stop_a_test_build() {
         ("RUSTHORSE_BROKER_TEST_ADDRESSES", "not an address"),
         ("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "soon"),
         ("RUSTHORSE_BROKER_TEST_ROOTS", "/nonexistent/roots.pem"),
+        ("RUSTHORSE_BROKER_TEST_PANIC", "later"),
     ] {
         let options = Options::nowhere(&ca).env(name, value);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1778,6 +1929,213 @@ fn revocation_is_confirmed_once_every_admission_is_answered_and_every_request_en
     assert_eq!(destination.received().len(), 1);
 }
 
+/// Requests open at once in the tests of a revocation of open requests. A
+/// revocation closes their clients' connections too, so each sees both at
+/// once and must report the revocation's outcome: each is one more chance
+/// to catch it reported otherwise.
+#[cfg(feature = "test-upstream")]
+const OPEN_AT_THE_REVOCATION: u64 = 10;
+
+/// Start that many requests, admitted by hand, and give the broker time to
+/// take each to its next step.
+#[cfg(feature = "test-upstream")]
+fn admitted_requests(broker: &Broker, raw: &[u8]) -> Vec<Client> {
+    let mut clients = Vec::new();
+    for request in 1..=OPEN_AT_THE_REVOCATION {
+        let mut client = broker.connect();
+        client.write(raw);
+        broker.wait_admit(request);
+        broker.admitted(request);
+        clients.push(client);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    clients
+}
+
+/// Revoke while the admitted requests have sent nothing yet: each ends
+/// `revoked`, the revocation is confirmed within the time the agent allows,
+/// and the clients' connections are closed (a request may get its `403`
+/// first: closing it and answering it race).
+#[cfg(feature = "test-upstream")]
+fn assert_revoked_before_anything_was_sent(broker: &Broker, clients: &mut [Client]) {
+    use rusthorse::broker_protocol::REVOKE_CONFIRM_TIMEOUT;
+    broker.revoke(EndReason::Revoked);
+    let revoked = Instant::now();
+    assert_eq!(broker.wait_revoked(), 0);
+    let took = revoked.elapsed();
+    assert!(took < REVOKE_CONFIRM_TIMEOUT, "{took:?}");
+    for request in 1..=OPEN_AT_THE_REVOCATION {
+        assert_eq!(
+            broker.wait_finished(request),
+            FromBroker::Finished {
+                request,
+                outcome: RequestOutcome::Revoked,
+                status: None,
+                bytes_sent: 0,
+                bytes_received: 0,
+            }
+        );
+    }
+    for client in clients {
+        assert_closed_or_refused(client);
+    }
+}
+
+/// A client's connection closed by a revocation, after a `403` or not.
+#[cfg(feature = "test-upstream")]
+fn assert_closed_or_refused(client: &mut Client) {
+    if !client.closed_within(Duration::from_secs(5)) {
+        let response = client.response();
+        response.assert_local(403);
+        assert_eq!(response.header("connection"), Some("close"));
+        assert!(client.closed_within(Duration::from_secs(5)));
+    }
+}
+
+/// Revoke while the admitted requests may have reached the destination:
+/// each ends `unknown`, with `status`, and the revocation is confirmed
+/// within the time the agent allows.
+#[cfg(feature = "test-upstream")]
+fn assert_revoked_once_sent(broker: &Broker, status: Option<u16>) {
+    use rusthorse::broker_protocol::REVOKE_CONFIRM_TIMEOUT;
+    broker.revoke(EndReason::Revoked);
+    let revoked = Instant::now();
+    assert_eq!(broker.wait_revoked(), 0);
+    let took = revoked.elapsed();
+    assert!(took < REVOKE_CONFIRM_TIMEOUT, "{took:?}");
+    for request in 1..=OPEN_AT_THE_REVOCATION {
+        let finished = broker.wait_finished(request);
+        assert!(
+            matches!(
+                finished,
+                FromBroker::Finished {
+                    outcome: RequestOutcome::Unknown,
+                    status: got,
+                    bytes_sent: 2,
+                    ..
+                } if got == status
+            ),
+            "{finished:?}"
+        );
+    }
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_revocation_before_the_destination_answers_ends_unknown() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // It reads each request whole, and does not answer.
+    let (_release, wait) = signal();
+    let destination = Destination::new(
+        &ca,
+        Arc::new(move |_, _| {
+            let _ = wait.lock().expect("lock").recv_timeout(PATIENCE);
+        }),
+    );
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca));
+    let raw = broker.request("POST", "/v1/messages", &[], b"{}");
+    let mut clients = Vec::new();
+    for _ in 1..=OPEN_AT_THE_REVOCATION {
+        let mut client = broker.connect();
+        client.write(&raw);
+        clients.push(client);
+    }
+    destination.wait_for(OPEN_AT_THE_REVOCATION as usize);
+    assert_revoked_once_sent(&broker, None);
+    for client in &mut clients {
+        assert_closed_or_refused(client);
+    }
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_revocation_while_clients_fall_behind_ends_unknown() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // Each stream is more than the sockets and the broker's queues between
+    // the two ends hold: once its client stops reading, the broker waits to
+    // pass a piece on.
+    let handler: Handler = Arc::new(|_, peer| {
+        let _ = peer.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..512 {
+            if peer.chunk(&block).is_err() {
+                return;
+            }
+        }
+        let _ = peer.end_chunks();
+    });
+    let destination = Destination::new(&ca, handler);
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca));
+    let raw = broker.request("POST", "/v1/messages", &[], b"{}");
+    let mut clients = Vec::new();
+    for _ in 1..=OPEN_AT_THE_REVOCATION {
+        let mut client = broker.connect();
+        client.write(&raw);
+        assert_eq!(client.head().0, 200);
+        clients.push(client);
+    }
+    // Time for each stream to fill what lies between.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_revoked_once_sent(&broker, Some(200));
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_revocation_while_bodies_arrive_sends_nothing() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    let broker = Broker::start(Options::anthropic(&destination.origin(), &ca).admit(Admit::Manual));
+    let full = broker.request("POST", "/v1/messages", &[], b"{\"twenty bytes\":1}");
+    let mut clients = admitted_requests(&broker, &full[..full.len() - 5]);
+    assert_revoked_before_anything_was_sent(&broker, &mut clients);
+    assert_eq!(destination.connections(), 0);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_revocation_during_resolutions_sends_nothing() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"{}"));
+    // Four resolve, the others wait for a place.
+    let broker = Broker::start(
+        Options::anthropic(&destination.origin(), &ca)
+            .admit(Admit::Manual)
+            .env("RUSTHORSE_BROKER_TEST_RESOLVE_DELAY_MS", "60000")
+            .timeouts("connect=120000"),
+    );
+    let raw = broker.request("POST", "/v1/messages", &[], b"{}");
+    let mut clients = admitted_requests(&broker, &raw);
+    assert_revoked_before_anything_was_sent(&broker, &mut clients);
+    assert_eq!(destination.connections(), 0);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_revocation_during_tls_handshakes_sends_nothing() {
+    let ca = TestCa::new();
+    let silent = Silent::new();
+    let broker = Broker::start(
+        Options::anthropic(&silent.origin(), &ca)
+            .admit(Admit::Manual)
+            .timeouts("tls=60000"),
+    );
+    let raw = broker.request("POST", "/v1/messages", &[], b"{}");
+    let mut clients = admitted_requests(&broker, &raw);
+    // The broker started each handshake, which waits for an answer.
+    let open = OPEN_AT_THE_REVOCATION as usize;
+    for connection in 0..open {
+        silent.wait_for_data(connection);
+    }
+    assert_revoked_before_anything_was_sent(&broker, &mut clients);
+    // Each handshake is dropped with its connection.
+    for connection in 0..open {
+        assert!(silent.closed_within(connection, Duration::from_secs(5)));
+    }
+    assert_eq!(silent.connections(), open);
+}
+
 #[cfg(feature = "test-upstream")]
 #[test]
 fn requests_that_end_in_another_order_are_reported_by_number() {
@@ -1937,6 +2295,74 @@ fn a_response_body_that_pauses_too_long_is_cut() {
 
 #[cfg(feature = "test-upstream")]
 #[test]
+fn a_tls_handshake_that_stalls_ends_within_its_deadline() {
+    let ca = TestCa::new();
+    let silent = Silent::new();
+    let broker = Broker::start(Options::anthropic(&silent.origin(), &ca).timeouts("tls=500"));
+    let started = Instant::now();
+    broker
+        .send(&broker.request("GET", "/v1/models", &[], b""))
+        .assert_unreachable();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(450) && took < Duration::from_secs(3),
+        "{took:?}"
+    );
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::NotForwarded,
+            status: Some(502),
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    );
+    assert_eq!(silent.connections(), 1);
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_client_that_stops_reading_is_gone_after_the_longest_pause() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // More than the sockets and the broker's queues between the two ends
+    // hold, and less than the most relayed: the stream stops only because
+    // the client takes nothing.
+    let handler: Handler = Arc::new(|_, peer| {
+        let _ = peer.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+        let block = vec![b'x'; 64 * 1024];
+        for _ in 0..512 {
+            if peer.chunk(&block).is_err() {
+                return;
+            }
+        }
+        let _ = peer.end_chunks();
+    });
+    let destination = Destination::new(&ca, handler);
+    let broker =
+        Broker::start(Options::anthropic(&destination.origin(), &ca).timeouts("pause=500"));
+    let mut client = broker.connect();
+    client.write(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    assert_eq!(client.head().0, 200);
+    // It reads nothing more.
+    let finished = broker.wait_finished(1);
+    assert!(
+        matches!(
+            finished,
+            FromBroker::Finished {
+                outcome: RequestOutcome::ClientClosed,
+                status: Some(200),
+                bytes_sent: 2,
+                ..
+            }
+        ),
+        "{finished:?}"
+    );
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
 fn heads_must_arrive_within_their_deadline() {
     let ca = TestCa::new();
     let broker = Broker::start(
@@ -2074,6 +2500,47 @@ fn a_connection_carries_one_request_after_another() {
     assert_eq!(destination.connections(), 4);
 }
 
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_response_in_progress_keeps_its_connection_from_idling() {
+    use std::sync::Arc;
+    let ca = TestCa::new();
+    // Events far apart: the stream lasts four times the idle limit.
+    let handler: Handler = Arc::new(|_, peer| {
+        let _ = peer.send(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+        );
+        for n in 0..5 {
+            let _ = peer.chunk(format!("data: {n}\n\n").as_bytes());
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = peer.end_chunks();
+    });
+    let destination = Destination::new(&ca, handler);
+    let broker = Broker::start(
+        Options::anthropic(&destination.origin(), &ca).timeouts("idle=300,header=60000"),
+    );
+    let started = Instant::now();
+    let response = broker.send(&broker.request("POST", "/v1/messages", &[], b"{}"));
+    assert!(started.elapsed() >= Duration::from_millis(1200));
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(response.complete, "the stream was cut: {response:?}");
+    assert_eq!(
+        response.text(),
+        "data: 0\n\ndata: 1\n\ndata: 2\n\ndata: 3\n\ndata: 4\n\n"
+    );
+    assert_eq!(
+        broker.wait_finished(1),
+        FromBroker::Finished {
+            request: 1,
+            outcome: RequestOutcome::Completed,
+            status: Some(200),
+            bytes_sent: 2,
+            bytes_received: 45,
+        }
+    );
+}
+
 #[test]
 fn a_client_that_expects_100_continue_gets_it_only_once_admitted() {
     let ca = TestCa::new();
@@ -2132,6 +2599,22 @@ fn a_serving_broker_is_not_dumpable_and_makes_no_core_files() {
         .expect("a core limit");
     let values: Vec<&str> = core.split_whitespace().skip(4).take(2).collect();
     assert_eq!(values, vec!["0", "0"], "{core}");
+}
+
+#[cfg(feature = "test-upstream")]
+#[test]
+fn an_internal_error_ends_the_broker_at_once() {
+    let ca = TestCa::new();
+    let mut broker =
+        Broker::start(Options::nowhere(&ca).env("RUSTHORSE_BROKER_TEST_PANIC", "request"));
+    let mut client = broker.connect();
+    client.write(&broker.request("GET", "/v1/models", &[], b""));
+    // The panic hook ends the process, rather than let the runtime go on
+    // without the task that failed.
+    let status = broker.exit_within(Duration::from_secs(5)).expect("exits");
+    assert_eq!(status.code(), Some(5), "{status:?}");
+    assert!(broker.channel_ended(Duration::from_secs(5)));
+    assert!(client.closed_within(Duration::from_secs(5)), "answered");
 }
 
 #[cfg(feature = "test-upstream")]

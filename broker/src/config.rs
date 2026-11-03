@@ -3,9 +3,19 @@
 //!
 //! A release build uses [`Config::release`]: the deadlines of
 //! `rusthorse::broker_protocol`, no extra trust, no loopback destination,
-//! and it never reads its environment. A build with `test-upstream` (for
-//! tests only, never in a release) reads `RUSTHORSE_BROKER_TEST_*` variables
-//! once at startup ([`Config::load`]):
+//! and the broker's own code reads no environment variable. What it is
+//! built on reads a few of its own, all unset in the empty environment the
+//! agent starts it with: tokio reads `TOKIO_UNSTABLE_SHARDED_BLOCKING_QUEUE`
+//! when the runtime is built, and the C library's loader and DNS resolver
+//! read theirs, such as `LD_*`, `GLIBC_TUNABLES`, `LOCALDOMAIN` and
+//! `RES_OPTIONS`. std reads `RUST_MIN_STACK` only for a thread started
+//! without a stack size, and the runtime gives its threads one; it reads
+//! `RUST_BACKTRACE` only in its own panic hook, which the broker replaces.
+//!
+//! A build with `test-upstream` (for tests only, never in a release; a
+//! build without debug assertions refuses it, and `--check` reports it)
+//! reads `RUSTHORSE_BROKER_TEST_*` variables once at startup
+//! ([`Config::load`]):
 //!
 //! - `RUSTHORSE_BROKER_TEST_ROOTS`: a PEM file of certificate authorities
 //!   trusted besides the system's file;
@@ -16,7 +26,9 @@
 //!   blocks first, as a resolver that hangs would;
 //! - `RUSTHORSE_BROKER_TEST_TIMEOUTS`: shorter deadlines, as `name=ms` pairs
 //!   separated by commas (`ready`, `header`, `idle`, `body`, `connect`,
-//!   `tls`, `response`, `pause`).
+//!   `tls`, `response`, `pause`);
+//! - `RUSTHORSE_BROKER_TEST_PANIC`: `request` makes handling a request
+//!   panic, as an internal error would (for the test of the panic hook).
 //!
 //! With the feature, a destination may also be on loopback (`127.0.0.0/8`
 //! and `::1`, never another private address). A variable that does not
@@ -81,6 +93,9 @@ pub struct Config {
     pub addresses: Option<Vec<IpAddr>>,
     /// How long each resolution blocks before it starts.
     pub resolve_delay: Duration,
+    /// Whether handling a request panics (for the test of the panic hook).
+    #[cfg(feature = "test-upstream")]
+    pub panic_on_request: bool,
 }
 
 impl Config {
@@ -92,11 +107,13 @@ impl Config {
             extra_roots: None,
             addresses: None,
             resolve_delay: Duration::ZERO,
+            #[cfg(feature = "test-upstream")]
+            panic_on_request: false,
         }
     }
 
-    /// The configuration of this build: [`Config::release`]; the
-    /// environment is never read.
+    /// The configuration of this build: [`Config::release`], without
+    /// reading any environment variable.
     #[cfg(not(feature = "test-upstream"))]
     pub fn load() -> Result<Config, &'static str> {
         Ok(Config::release())
@@ -127,6 +144,12 @@ impl Config {
         }
         if let Some(pairs) = text("RUSTHORSE_BROKER_TEST_TIMEOUTS")? {
             apply_timeouts(&mut config.limits, &pairs)?;
+        }
+        if let Some(when) = text("RUSTHORSE_BROKER_TEST_PANIC")? {
+            if when != "request" {
+                return Err("a test panic is not `request`");
+            }
+            config.panic_on_request = true;
         }
         Ok(config)
     }
@@ -198,6 +221,8 @@ mod tests {
         assert_eq!(config.extra_roots, None);
         assert_eq!(config.addresses, None);
         assert_eq!(config.resolve_delay, Duration::ZERO);
+        #[cfg(feature = "test-upstream")]
+        assert!(!config.panic_on_request);
     }
 
     /// That the variables change nothing in such a build is shown end to

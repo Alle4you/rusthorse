@@ -70,6 +70,10 @@ pub struct Server {
     pub limits: Limits,
     /// The most client connections open at once.
     pub max_connections: usize,
+    /// Whether handling a request panics, as an internal error would (a
+    /// hook of the test feature, for the test of the panic hook).
+    #[cfg(feature = "test-upstream")]
+    pub panic_on_request: bool,
 }
 
 /// Answer `ready` and serve the grant until the control channel ends or the
@@ -122,6 +126,8 @@ pub async fn run(prepared: Prepared, config: Config) -> u8 {
         server_name,
         limits: config.limits,
         max_connections,
+        #[cfg(feature = "test-upstream")]
+        panic_on_request: config.panic_on_request,
     });
     tokio::spawn(accept(listener, Arc::clone(&server)));
     tokio::select! {
@@ -189,6 +195,10 @@ async fn handle(
     server: Arc<Server>,
     activity: Arc<Activity>,
 ) -> Result<Response<ResponseBody>, Infallible> {
+    #[cfg(feature = "test-upstream")]
+    if server.panic_on_request {
+        panic!("a panic of the test feature, as an internal error would be");
+    }
     let busy = activity.start();
     let response = match screen(&server, request) {
         Ok(admission) => exchange::respond(Arc::clone(&server), admission).await,

@@ -23,10 +23,13 @@
 //! [`headers`] (what crosses, each way), [`answer`] (local answers and
 //! response bodies) and [`control`] (the control channel once ready);
 //! [`config`] holds the deadlines and the hooks of the `test-upstream`
-//! feature, which is for tests only and never in a release.
+//! feature, which is for tests only and never in a release: a build
+//! without debug assertions refuses it, and `--check` reports it.
 //!
 //! `rusthorse-broker --check` prints its version and the control channel's
-//! protocol version as JSON, for `rusthorse doctor`, and exits.
+//! protocol version as JSON, for `rusthorse doctor`, and exits. A build with
+//! the test feature adds `"test_upstream":true`, so that it cannot pass for
+//! a release.
 //!
 //! Exit statuses: [`EXIT_CHANNEL_ENDED`] (0) when the agent closed the
 //! control channel; [`EXIT_SETUP`] when the grant could not be served
@@ -37,6 +40,13 @@
 //! channel (or the answer to `--check`) is ever written to standard output.
 
 use std::process::ExitCode;
+
+// The test feature trusts what its environment says: a build of it must
+// never pass for a release.
+#[cfg(all(feature = "test-upstream", not(debug_assertions)))]
+compile_error!(
+    "the test-upstream feature is for tests only: a build without debug assertions, as a release is, refuses it"
+);
 
 mod answer;
 mod config;
@@ -71,6 +81,11 @@ pub const EXIT_PANIC: u8 = 5;
 /// does once it serves (`destination::Resolver` keeps the same limit).
 const MAX_BLOCKING_THREADS: usize = rusthorse::broker_protocol::MAX_CONCURRENT_RESOLUTIONS;
 
+/// The stack of each of those threads: std's own default for the threads it
+/// starts. Given explicitly, so that std does not read `RUST_MIN_STACK`
+/// from the environment to choose it.
+const BLOCKING_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+
 fn main() -> ExitCode {
     // A panic anywhere ends the process at once, with nothing printed: the
     // default hook would read RUST_BACKTRACE from the environment and could
@@ -93,10 +108,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// The answer to `--check`: `{"version":"…","protocol":N}`.
+/// The answer to `--check`: `{"version":"…","protocol":N}`, with
+/// `"test_upstream":true` in a build with the test feature (and nothing
+/// more in one without it).
 fn check_answer() -> String {
+    let test_upstream = if cfg!(feature = "test-upstream") {
+        r#","test_upstream":true"#
+    } else {
+        ""
+    };
     format!(
-        r#"{{"version":"{}","protocol":{}}}"#,
+        r#"{{"version":"{}","protocol":{}{test_upstream}}}"#,
         env!("CARGO_PKG_VERSION"),
         rusthorse::broker_protocol::VERSION
     )
@@ -135,6 +157,7 @@ fn run() -> u8 {
         .enable_io()
         .enable_time()
         .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_stack_size(BLOCKING_THREAD_STACK_BYTES)
         .build()
     {
         Ok(runtime) => runtime,
@@ -153,12 +176,14 @@ mod tests {
     #[test]
     fn the_check_answer_is_the_contract_of_check_program() {
         let answer: serde_json::Value = serde_json::from_str(&check_answer()).expect("JSON");
-        assert_eq!(
-            answer,
-            serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "protocol": rusthorse::broker_protocol::VERSION,
-            })
-        );
+        let mut expected = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol": rusthorse::broker_protocol::VERSION,
+        });
+        // A build for tests says so; a release adds nothing.
+        if cfg!(feature = "test-upstream") {
+            expected["test_upstream"] = serde_json::Value::Bool(true);
+        }
+        assert_eq!(answer, expected);
     }
 }

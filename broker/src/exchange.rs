@@ -18,9 +18,28 @@
 //! revocation included); `client_closed` when the client went away, or
 //! stopped reading, once something was sent; `completed` when the whole
 //! response was passed on; `unknown` for anything else once the request may
-//! have reached the destination, a revocation during it included. A
-//! revocation closes the client's connection too: a client that is gone
-//! once the grant is revoked counts as closed by the revocation.
+//! have reached the destination, a revocation during it included.
+//!
+//! A revocation closes the client's connection too, so a request open then
+//! sees its client go at the same moment. Every wait therefore looks at the
+//! revocation first (`biased` selects): once the grant is revoked, the
+//! request's next step is the revocation's, whatever else became ready. The
+//! runtime has a single thread and the revocation comes from another task,
+//! so it cannot happen while this one runs; each time this one runs again,
+//! the first thing it polls is a wait on the revocation, with tokio's
+//! cooperative budget fresh (a wait polled once that budget is spent may
+//! say "not yet" without looking, but nothing can have changed by then).
+//! So a client found gone anywhere else left before the revocation.
+//!
+//! The room a request's body reserved in the broker's budget comes back
+//! only once the broker holds none of the body. Two holders share it
+//! ([`held_body`]): the request keeps it until the destination's response
+//! head has arrived, or until the request ends; and the body's bytes keep
+//! it for as long as any of them is alive, in hyper's queue of bytes not yet
+//! written to the destination's connection among them. hyper drops the
+//! request body it sends as soon as it has taken its bytes, long before it
+//! has written them all; it keeps the bytes until the destination has read
+//! them or the connection is dropped.
 //!
 //! What it holds of the credential is wiped when dropped, except the copy
 //! in the header value that hyper sends, which is an ordinary buffer
@@ -243,16 +262,10 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     let grant = &server.grant;
     let limits = &server.limits;
     let mut revoked = grant.subscribe();
-    // How a request ends when its client is no longer there, `sent` saying
-    // whether anything may have reached the destination. A revocation
-    // closes every connection, and is decided before it does: when it
-    // closed this one, the outcome is the revocation's.
-    let left = |sent: bool| match (grant.is_revoked(), sent) {
-        (true, false) => Revoked,
-        (true, true) => Unknown,
-        (false, false) => NotForwarded,
-        (false, true) => ClientClosed,
-    };
+    // How a request ends when its client went away, `sent` saying whether
+    // anything may have reached the destination. Never after a revocation:
+    // every wait below looks at it first.
+    let left = |sent: bool| if sent { ClientClosed } else { NotForwarded };
     // An admission answered after the revocation is not forwarded.
     if grant.is_revoked() {
         return Outcome::new(Revoked, None);
@@ -263,6 +276,8 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
 
     // 6. The body, whole, within its deadline.
     let body = tokio::select! {
+        biased;
+        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         body = timeout(limits.request_body, read_body(request.body, request.body_len)) => match body {
             Ok(Some(body)) => body,
             // Cut short: the client went away.
@@ -272,9 +287,12 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
                 return Outcome::new(NotForwarded, Some(408));
             }
         },
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         _ = client.gone() => return Outcome::new(left(false), None),
     };
+    // The body's room: held here until the response head arrives, and by
+    // the body's bytes for as long as any of them is alive.
+    let room = Arc::new(request.reservation);
+    let body = held_body(body, Arc::clone(&room));
     let Some(credential) = grant.credential() else {
         return Outcome::new(Revoked, None);
     };
@@ -285,24 +303,30 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
         Outcome::new(NotForwarded, Some(502))
     };
     let tcp = tokio::select! {
+        biased;
+        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         tcp = server.destination.connect() => match tcp {
             Ok(tcp) => tcp,
             Err(_) => return unreachable(client),
         },
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         _ = client.gone() => return Outcome::new(left(false), None),
     };
     let _ = tcp.set_nodelay(true);
     let handshake = server.tls.connect(server.server_name.clone(), tcp);
     let tls = tokio::select! {
+        biased;
+        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         tls = timeout(limits.tls_handshake, handshake) => match tls {
             Ok(Ok(tls)) => tls,
             _ => return unreachable(client),
         },
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Revoked, None),
         _ = client.gone() => return Outcome::new(left(false), None),
     };
+    // Writes queued as they are, never copied into hyper's own buffer: the
+    // body's bytes stay in the allocation that keeps its room until they are
+    // written (`held_body`).
     let Ok((mut sender, connection)) = hyper::client::conn::http1::Builder::new()
+        .writev(true)
         .handshake::<_, OutBody>(TokioIo::new(tls))
         .await
     else {
@@ -311,7 +335,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     let _connection = AbortOnDrop(tokio::spawn(async move {
         let _ = connection.await;
     }));
-    let body = OutBody::new(body, request.reservation, request.sent);
+    let body = OutBody::new(body, request.sent);
     let Some(outgoing) = build_request(
         server,
         &request.method,
@@ -326,6 +350,8 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
 
     // From here on, the request may reach the destination.
     let response = tokio::select! {
+        biased;
+        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Unknown, None),
         response = timeout(limits.response_headers, sender.send_request(outgoing)) => match response {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
@@ -337,9 +363,11 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
                 return Outcome::new(Unknown, Some(504));
             }
         },
-        _ = revoked.wait_for(|revoked| *revoked) => return Outcome::new(Unknown, None),
         _ = client.gone() => return Outcome::new(left(true), None),
     };
+    // The destination answered: from now on, only the bytes of the body
+    // that hyper has not written yet keep its room.
+    drop(room);
 
     // 8. The response: checked before anything is passed on.
     let status = response.status();
@@ -371,10 +399,11 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     let mut received: u64 = 0;
     loop {
         let frame = tokio::select! {
-            frame = timeout(pause, body.frame()) => frame,
+            biased;
             _ = revoked.wait_for(|revoked| *revoked) => {
                 return Outcome::new(Unknown, code).received(received);
             }
+            frame = timeout(pause, body.frame()) => frame,
             // The client went away while the destination was quiet.
             _ = chunks.closed() => return Outcome::new(left(true), code).received(received),
         };
@@ -432,16 +461,17 @@ async fn deliver(
     revoked: &mut watch::Receiver<bool>,
 ) -> Delivery {
     tokio::select! {
+        biased;
+        _ = revoked.wait_for(|revoked| *revoked) => Delivery::Revoked,
         sent = timeout(pause, chunks.send(chunk)) => match sent {
             Ok(Ok(())) => Delivery::Delivered,
             Ok(Err(_)) | Err(_) => Delivery::Gone,
         },
-        _ = revoked.wait_for(|revoked| *revoked) => Delivery::Revoked,
     }
 }
 
 /// Read a body of `len` bytes whole; `None` if it ends early or breaks.
-async fn read_body(mut body: Incoming, len: u64) -> Option<Bytes> {
+async fn read_body(mut body: Incoming, len: u64) -> Option<BytesMut> {
     let len = usize::try_from(len).ok()?;
     let mut whole = BytesMut::with_capacity(len);
     while let Some(frame) = body.frame().await {
@@ -452,7 +482,28 @@ async fn read_body(mut body: Incoming, len: u64) -> Option<Bytes> {
             whole.extend_from_slice(&data);
         }
     }
-    (whole.len() == len).then(|| whole.freeze())
+    (whole.len() == len).then_some(whole)
+}
+
+/// A request body read whole, and its share of the body's room in the
+/// budget.
+struct HeldBody {
+    data: BytesMut,
+    _room: Arc<Reservation>,
+}
+
+impl AsRef<[u8]> for HeldBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// The bytes of a request body read whole, which keep a share of `room`
+/// until the last of them is dropped, wherever they went meanwhile (hyper
+/// keeps the ones it has not written yet). The room comes back once every
+/// share of it is dropped.
+fn held_body(data: BytesMut, room: Arc<Reservation>) -> Bytes {
+    Bytes::from_owner(HeldBody { data, _room: room })
 }
 
 /// The request to the destination, from what was checked: the method, the
@@ -492,22 +543,22 @@ fn build_request(
     Some(outgoing)
 }
 
-/// A request body sent whole, counting what was handed to the connection
-/// and holding its room in the budget until it is dropped.
+/// A request body sent whole, counting what was handed to the connection.
+/// hyper drops it as soon as it has taken its bytes, long before it has
+/// written them all: the bytes themselves keep their share of the body's
+/// room ([`held_body`]).
 pub struct OutBody {
     data: Option<Bytes>,
     len: u64,
     sent: Arc<AtomicU64>,
-    _reservation: Reservation,
 }
 
 impl OutBody {
-    fn new(data: Bytes, reservation: Reservation, sent: Arc<AtomicU64>) -> OutBody {
+    fn new(data: Bytes, sent: Arc<AtomicU64>) -> OutBody {
         OutBody {
             len: data.len() as u64,
             data: Some(data).filter(|data| !data.is_empty()),
             sent,
-            _reservation: reservation,
         }
     }
 
@@ -546,5 +597,38 @@ struct AbortOnDrop(JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grant::Budget;
+    use bytes::Buf;
+
+    fn body_of(data: &[u8], room: &Arc<Reservation>) -> Bytes {
+        held_body(BytesMut::from(data), Arc::clone(room))
+    }
+
+    #[test]
+    fn a_bodys_room_comes_back_once_neither_the_request_nor_its_bytes_hold_it() {
+        let budget = Budget::new(100);
+        // The request lets go first; hyper still holds bytes not written.
+        let room = Arc::new(budget.reserve(60).expect("fits"));
+        let body = body_of(b"0123456789", &room);
+        let mut queued = body.clone();
+        drop(body);
+        queued.advance(4);
+        drop(room);
+        assert_eq!(budget.held(), 60, "the unwritten bytes hold it");
+        assert_eq!(&queued[..], b"456789");
+        drop(queued);
+        assert_eq!(budget.held(), 0);
+        // The bytes go first (all written); the request still holds it.
+        let room = Arc::new(budget.reserve(60).expect("fits"));
+        drop(body_of(b"0123456789", &room));
+        assert_eq!(budget.held(), 60, "the request holds it");
+        drop(room);
+        assert_eq!(budget.held(), 0);
     }
 }

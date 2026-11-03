@@ -8,9 +8,14 @@
 //! `admit` gets exactly one answer, and only a number that is waiting may be
 //! answered; each admitted request gets exactly one `finished`; and once
 //! the agent says `revoke`, nothing more is admitted, every open request is
-//! closed, the credential is dropped, and `revoked` is sent once every
-//! `admit` has been answered and every admitted request has finished —
-//! after which nothing else is sent.
+//! closed and the credential is dropped. `revoked` follows the agent's
+//! answers to every `admit` sent before it, and the `finished` of every
+//! admitted request (an `admitted` that comes after the revoke included:
+//! its request ends `revoked`, unsent); nothing else is sent after it. So
+//! the confirmation waits for the agent too: an agent that answers a
+//! waiting `admit` only once its audit record is written delays it, and
+//! should answer every waiting `admit` at once (`refused`, `revoked`) when
+//! it revokes.
 //!
 //! It also refuses by itself, as a backstop to the agent: a grant being
 //! revoked, a grant past its lifetime (on the boot-time clock, so time spent
@@ -306,7 +311,10 @@ impl Grant {
     }
 
     /// The agent said `revoke`: admit nothing more, drop the credential, and
-    /// tell every open request and connection to close.
+    /// tell every open request and connection to close. `revoked` goes at
+    /// once if no `admit` waits for its answer and no admitted request is
+    /// open; otherwise after the last answer ([`Grant::on_answer`]) and the
+    /// last `finished` ([`Grant::finish`]).
     pub fn on_revoke(&self) -> Result<(), Violation> {
         let mut state = lock(&self.state);
         if state.phase != Phase::Serving {
@@ -319,7 +327,7 @@ impl Grant {
         Ok(())
     }
 
-    /// Send `revoked` once every `admit` is answered and every admitted
+    /// Send `revoked` once every `admit` sent is answered and every admitted
     /// request has finished.
     fn confirm_if_done(&self, state: &mut State) {
         if state.phase == Phase::Revoking && state.waiting.is_empty() && state.admitted.is_empty() {

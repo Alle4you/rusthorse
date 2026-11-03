@@ -327,9 +327,16 @@ mod tests {
         }
     }
 
+    /// Through a destination built as the broker builds it, on a runtime
+    /// whose pool of blocking threads is far larger than the limit: only the
+    /// resolver's places hold the lookups back.
     #[tokio::test(flavor = "current_thread")]
-    async fn at_most_the_allowed_lookups_run_at_once_even_abandoned_ones() {
-        let resolver = Arc::new(Resolver::new(MAX_CONCURRENT_RESOLUTIONS));
+    async fn a_destination_runs_at_most_the_allowed_lookups_at_once_even_abandoned_ones() {
+        use rusthorse::broker_profile::{Preset, ProfileRequest};
+        let profile = ProfileRequest::new(Preset::Anthropic)
+            .resolve()
+            .expect("profile");
+        let destination = Arc::new(Destination::new(&profile, &Config::release()));
         let running = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
         let (release, released) = mpsc::channel::<()>();
@@ -345,10 +352,10 @@ mod tests {
         };
         // Lookups whose callers give up keep their places.
         for _ in 0..MAX_CONCURRENT_RESOLUTIONS + 2 {
-            let resolver = resolver.clone();
+            let destination = destination.clone();
             let lookup = lookup();
             let abandoned = tokio::time::timeout(Duration::from_millis(50), async move {
-                resolver.run(lookup).await
+                destination.resolver.run(lookup).await
             })
             .await;
             assert!(abandoned.is_err(), "the lookup blocks");
@@ -357,9 +364,9 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), MAX_CONCURRENT_RESOLUTIONS);
         // Another one waits for a place.
         let waiting = tokio::spawn({
-            let resolver = resolver.clone();
+            let destination = destination.clone();
             let lookup = lookup();
-            async move { resolver.run(lookup).await }
+            async move { destination.resolver.run(lookup).await }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!waiting.is_finished());
