@@ -1993,7 +1993,14 @@ impl Manager {
         let usage = group(
             "Use it from a command",
             Some(&match model::profile(&entry) {
-                Profile::Usable(_) => "Replace your-command. After your approval the command gets a temporary token in the first variable — never the key — and the broker's local address in the second, and its output is redacted. The broker adds the key only to the command's requests to the profile's destination, and the token stops working when the command ends. The snippet holds the entry's UUID, never the value.".to_string(),
+                Profile::Usable(profile) => {
+                    let mut text = "Replace your-command. After your approval the command gets a temporary token in the first variable — never the key — and the broker's local address in the second, and its output is redacted. The broker adds the key only to the command's requests to the profile's destination, and the token stops working when the command ends. The snippet holds the entry's UUID, never the value.".to_string();
+                    if let Some(note) = model::broker_snippet_note(profile.preset) {
+                        text.push(' ');
+                        text.push_str(note);
+                    }
+                    text
+                }
                 Profile::Protected | Profile::Unusable => format!(
                     "The entry's broker profile cannot be used, so this command gets the value itself. {by_value}"
                 ),

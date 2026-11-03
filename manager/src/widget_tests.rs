@@ -2648,11 +2648,12 @@ fn broker_profiles() {
     let settle_frame = Instant::now() + Duration::from_millis(200);
     spin_until(|| Instant::now() >= settle_frame);
     snapshot(&s, "details-broker.png");
-    // Its command goes through the broker, and copies as shown.
+    // Its command goes through the broker, the token in the variable the
+    // Anthropic libraries send as x-api-key, and copies as shown.
     let expected = crate::model::snippet(&usable);
     assert!(
         expected.starts_with(&format!(
-            "rusthorse run \\\n  --broker ANTHROPIC_AUTH_TOKEN={} \\\n  \
+            "rusthorse run \\\n  --broker ANTHROPIC_API_KEY={} \\\n  \
              --url ANTHROPIC_BASE_URL={} ",
             usable.id, usable.id
         )),
@@ -2660,6 +2661,13 @@ fn broker_profiles() {
     );
     assert_eq!(snippet_shown(&s), expected);
     assert!(usage(&s).contains("temporary token"), "{}", usage(&s));
+    // What would compete with the token is named, and Claude Code is sent
+    // to its own recipe.
+    assert!(
+        usage(&s).ends_with(crate::model::broker_snippet_note(Preset::Anthropic).unwrap()),
+        "{}",
+        usage(&s)
+    );
     button(&s.detail, "Copy command snippet").emit_clicked();
     let copied = glib::MainContext::default()
         .block_on(s.window.clipboard().read_text_future())

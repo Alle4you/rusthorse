@@ -333,14 +333,34 @@ pub(crate) fn snippet(entry: &EntryInfo) -> String {
 }
 
 /// The variables that get the token and the broker's address in a command
-/// given an entry through the broker: those its preset's clients read. The
-/// Anthropic libraries and Claude Code send `ANTHROPIC_AUTH_TOKEN` as
-/// `Authorization: Bearer` and read `ANTHROPIC_BASE_URL`; the OpenAI
-/// libraries read `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+/// given an entry through the broker: those its preset's libraries read, as
+/// the recipes of `rusthorse guide ai` bind them. The Anthropic libraries
+/// send `ANTHROPIC_API_KEY` as `x-api-key`, where the `anthropic` preset
+/// takes the token, so the token goes there and `run` replaces whatever key
+/// that variable held in the environment; they read `ANTHROPIC_BASE_URL`. A
+/// library that also sends `ANTHROPIC_AUTH_TOKEN`, when the environment
+/// sets it, presents something other than the token and is refused, which
+/// the note says ([`broker_snippet_note`]), with Claude Code's own recipe.
+/// The OpenAI libraries read `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
 pub(crate) fn broker_variables(preset: Preset) -> (&'static str, &'static str) {
     match preset {
-        Preset::Anthropic => ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"),
+        Preset::Anthropic => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
         Preset::Openai | Preset::OpenaiCompatible => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    }
+}
+
+/// What the explanation of a command through the broker adds for a
+/// preset, if anything. For `anthropic`: the command suits the Anthropic
+/// libraries, which must not find another credential in
+/// `ANTHROPIC_AUTH_TOKEN`; and Claude Code, which reads the token from
+/// `ANTHROPIC_AUTH_TOKEN` and must not find a key in `ANTHROPIC_API_KEY`,
+/// has a recipe of its own in `rusthorse guide ai`.
+pub(crate) fn broker_snippet_note(preset: Preset) -> Option<&'static str> {
+    match preset {
+        Preset::Anthropic => Some(
+            "This command suits the Anthropic libraries. Unset ANTHROPIC_AUTH_TOKEN if your environment sets it: a library that sends it as well presents something other than the token, and the broker refuses the request. Claude Code has a recipe of its own in rusthorse guide ai: the token in ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_API_KEY unset.",
+        ),
+        Preset::Openai | Preset::OpenaiCompatible => None,
     }
 }
 
@@ -961,10 +981,12 @@ pub(crate) mod tests {
         entry.fields.kind = Some(EntryKind::ApiKey);
         entry.fields.url = Some("https://api.anthropic.com".into());
         entry.broker = Some(usable(Preset::Anthropic));
+        // The token in the variable the Anthropic libraries send as
+        // x-api-key: `run` replaces any key the environment holds there.
         assert_eq!(
             snippet(&entry),
             "rusthorse run \\\n  \
-             --broker ANTHROPIC_AUTH_TOKEN=11111111-2222-3333-4444-555555555555 \\\n  \
+             --broker ANTHROPIC_API_KEY=11111111-2222-3333-4444-555555555555 \\\n  \
              --url ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555 \\\n  \
              -- your-command"
         );
@@ -977,7 +999,7 @@ pub(crate) mod tests {
         assert!(words.status.success());
         assert_eq!(
             String::from_utf8_lossy(&words.stdout),
-            "--broker\nANTHROPIC_AUTH_TOKEN=11111111-2222-3333-4444-555555555555\n--url\n\
+            "--broker\nANTHROPIC_API_KEY=11111111-2222-3333-4444-555555555555\n--url\n\
              ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555\n--\nyour-command\n"
         );
         // The variables are those the preset's clients read, whatever the
@@ -1017,6 +1039,52 @@ pub(crate) mod tests {
             text.contains("--url 'OPENAI_BASE_URL=a'\\''$(echo fake)'"),
             "{text}"
         );
+    }
+
+    /// `rusthorse guide ai`, the guide for AI agents, whose recipes the
+    /// commands through the broker and their note follow.
+    const AI_GUIDE: &str = include_str!("../../src/guide/ai.md");
+
+    #[test]
+    fn commands_through_the_broker_follow_the_guide_for_ai_agents() {
+        // The guide's commands for the libraries bind the same variables.
+        let (token, url) = broker_variables(Preset::Anthropic);
+        assert!(
+            AI_GUIDE.contains(&format!(
+                "--broker {token}=anthropic --url {url}=anthropic -- python app.py"
+            )),
+            "{token}, {url}"
+        );
+        let (token, url) = broker_variables(Preset::Openai);
+        assert!(
+            AI_GUIDE.contains(&format!(
+                "--broker {token} --url {url}={token} -- python app.py"
+            )),
+            "{token}, {url}"
+        );
+        assert_eq!(
+            broker_variables(Preset::OpenaiCompatible),
+            broker_variables(Preset::Openai)
+        );
+        // The note says what would compete with the token in the
+        // libraries' command, and that Claude Code's is the guide's own: where,
+        // and how it differs, as the guide does.
+        let note = broker_snippet_note(Preset::Anthropic).expect("a note for Anthropic");
+        for said in [
+            "Unset ANTHROPIC_AUTH_TOKEN if your environment sets it",
+            "the broker refuses the request",
+            "rusthorse guide ai",
+            "the token in ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_API_KEY unset",
+        ] {
+            assert!(note.contains(said), "{said}: {note}");
+        }
+        assert!(AI_GUIDE.contains("### Claude Code through the broker"));
+        assert!(AI_GUIDE.contains(
+            "env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \\\n  \
+             --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude"
+        ));
+        assert_eq!(broker_snippet_note(Preset::Openai), None);
+        assert_eq!(broker_snippet_note(Preset::OpenaiCompatible), None);
     }
 
     #[test]
