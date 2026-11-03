@@ -52,10 +52,12 @@ has hidden failures before.
 source ~/.cargo/env            # if cargo is not on PATH in your shell
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings     # as released: no feature for tests
 cargo test --all-features
 cargo test --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo +1.89 check --all-targets    # MSRV; CI runs the same
+cargo +1.89 check --all-targets                  # MSRV; CI runs the same,
+cargo +1.89 check --all-targets --all-features   # and with the code for tests
 
 # rusthorse-dialog (dialog/): needs libgtk-4-dev and libadwaita-1-dev; its
 # widget tests run on a virtual display (xvfb, xdotool), never on yours.
@@ -67,15 +69,28 @@ cargo clippy -p rusthorse-manager --all-targets -- -D warnings
 cargo test -p rusthorse-manager
 ```
 
-The workspace's default member is `rusthorse`, so plain `cargo` commands do
-not build the dialog or manager; `cargo fmt --all` formats all members.
+The workspace's default members are `rusthorse` and `rusthorse-broker`
+(the credential broker, `broker/`), so the plain `cargo` commands above
+build, lint, test and document both, and `--all-features` turns on their
+features for tests (`fake-keyring`, the broker's `test-upstream`). They do
+not build the dialog or the manager, which need GTK; `cargo fmt --all`
+formats all members, and `cargo run` runs `rusthorse`.
+
+The broker's tests start the real broker, which reads the system's file of
+certificate authorities before it serves anything: the first of
+`/etc/ssl/certs/ca-certificates.crt` (from `ca-certificates`),
+`/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/ca-bundle.pem` that
+exists, a regular file owned by root, in directories owned by root, none of
+them writable by group or others. Without such a file they fail; the CI
+checks it on its runner first.
 
 Documentation of public items must not link to private ones: `cargo doc`
 with `-D warnings` fails on it.
 
-The MSRV is **1.89**: do not use newer standard-library APIs, and avoid APIs
-deprecated in newer releases whose replacements 1.89 lacks (for example
-`AtomicUsize::fetch_update`; use a `Mutex`).
+The MSRV is **1.89**, for `rusthorse` and `rusthorse-broker` (the dialog and
+the manager need 1.92, for GTK): do not use newer standard-library APIs, and
+avoid APIs deprecated in newer releases whose replacements 1.89 lacks (for
+example `AtomicUsize::fetch_update`; use a `Mutex`).
 
 ## Security invariants
 
@@ -180,6 +195,22 @@ not guaranteed.
 - **Fake agents** that must refuse a later connection remove their socket
   file before their last answer: a child forked by another test keeps a copy
   of the listener until its exec.
+- **The broker's tests** (`broker/tests/`) run the real `rusthorse-broker`,
+  played by a fake agent, in front of a fake HTTPS destination in the test
+  process, with a certificate authority made for the test and fake keys;
+  nothing leaves the loopback interface. Those that need the broker to
+  reach that destination need its `test-upstream` feature (`--all-features`);
+  the others run in both builds.
+- **`test-upstream` is for tests only, never in a release**: with it the
+  broker trusts certificate authorities and addresses named in its
+  environment and may reach loopback destinations. A build without debug
+  assertions refuses it (`compile_error!`; the CI checks a release build),
+  the broker's `--check` reports it, `rusthorse doctor` fails on such a
+  build, and `packaging/build-deb.sh` refuses to package one
+  (`packaging/check-broker.py`). Never turn it on outside tests.
+- **The packaging tests** (`tests/packaging.rs`) run the scripts of
+  `packaging/` with `/usr/bin/python3` (without it they fail, unless
+  `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them).
 - Tests that rely on file permissions skip their check when run as root.
 - A test that fails intermittently is a bug: reproduce it under load
   (parallel runs, CPU load) before and after the fix.
@@ -201,7 +232,13 @@ present and capture only its window, in a dark and a light theme
 | `src/agent.rs` | The agent: policy, approvals, dialogs, `run` |
 | `src/ui.rs` | The `Ui` trait, `dialog_text`, zenity dialogs and their height estimate |
 | `src/dialog_program.rs`, `src/dialog_protocol.rs` | Driving `rusthorse-dialog`; the protocol between them |
+| `src/helper_program.rs` | Finding and checking the programs the agent starts next to its own (`rusthorse-dialog`, `rusthorse-broker`) |
+| `broker/` | `rusthorse-broker`, the credential broker (ADR 0013): one process per grant, serving it on a loopback port; its tests run it in front of a fake HTTPS destination |
+| `src/broker_profile.rs` | Broker profiles and presets: destinations, routes, headers, tokens; shared with the broker |
+| `src/broker_protocol.rs` | The control channel between the agent and a broker, tokens and grant IDs, phase 1's limits, the file of certificate authorities |
+| `src/broker_host.rs` | The agent's side of the broker: the registry of grants, starting and supervising brokers, admission, revocation, expiry |
 | `manager/` | The GTK metadata client; Show requires agent approval (ADR 0007). |
+| `manager/src/window.rs`, `manager/src/model.rs` | The manager's window and pages — the grants page among them, which lists the broker's grants and revokes them — and what the pages show |
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/session_lock.rs` | Locking on suspend and screen lock (D-Bus watchers, ADR 0009) |
@@ -211,7 +248,7 @@ present and capture only its window, in a dark and a light theme
 | `src/main.rs` | The CLI |
 | `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; a test checks the commands and options it names |
 | `tests/agent.rs` | End-to-end tests |
-| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): service file, maintainer scripts, `build-deb.sh`, the generated copyright file and documentation (tested in `tests/packaging.rs`) |
+| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests: `check-broker.py`), the generated copyright file and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
 | `docs/roadmap.md` | Planned work, led by the credential broker |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

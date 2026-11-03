@@ -8,18 +8,30 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 7)
+  ok    rusthorse 0.1.0 (protocol 8)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/usr/bin/rusthorse)
+  ok    dialogs: rusthorse-dialog 0.1.0 (/usr/bin/rusthorse-dialog)
+  ok    broker: rusthorse-broker 0.1.0 (/usr/bin/rusthorse-broker)
+  ok    the vault locks when the computer suspends (told by logind)
+  ok    the vault locks when the screen locks (told by logind, org.cinnamon.ScreenSaver)
   FAIL  no vault at /home/me/.local/share/rusthorse/vault.kdbx — run `rusthorse init`
+  ok    the broker reads its certificate authorities from /etc/ssl/certs/ca-certificates.crt, which only root can change; it reads the certificates themselves when a grant starts
   ok    the systemd user service is enabled
   ok    zenity is installed
   warn  X11 session: any program of your user can click "Allow" or read keystrokes (threat model L2)
   ok    Yama ptrace_scope = 1
+  ok    checking the files of the agent's configuration
+  ok    /run/user/1000/rusthorse is private (700)
 ```
 
 A `FAIL` line says what to do. The X11 warning is not an error; it is the most
-important limitation to understand (see [§6](#6-know-the-limits)).
+important limitation to understand (see [§6](#6-know-the-limits)). The
+`broker:` line and the one about certificate authorities check what the
+credential broker needs — its program, `rusthorse-broker`, and the system's
+file of certificate authorities (from `ca-certificates`); without them
+everything else works, but `rusthorse run --broker` runs nothing (see
+[installation.md](installation.md#requirements)).
 
 ## 2. Create the vault
 

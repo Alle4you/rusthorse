@@ -14,21 +14,26 @@ a vault, migrating existing secrets and uninstalling.
 | `zenity` | The fallback when `rusthorse-dialog` is not installed. Tested with 3.44. Install with `sudo apt install zenity`. |
 | Rust 1.89 or newer (1.92 for `rusthorse-dialog` and the manager) | Only to build from source, or to build the package. Install with [rustup](https://rustup.rs). |
 | A Secret Service provider (optional) | Only for `rusthorse import secret-service` (GNOME Keyring, KWallet). |
+| The system's certificate authorities | For the credential broker (`rusthorse run --broker`): it trusts the first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/ca-bundle.pem` that exists, links resolved, which must be a regular file owned by root, in directories owned by root, none of them writable by group or others. The `ca-certificates` package installs one (`sudo apt install ca-certificates`); most systems have it already. |
 
 Rusthorse does not use Flatpak or Snap ([ADR 0004](adr/0004-native-distribution.md)).
-It installs three programs: `rusthorse` (the command-line program and the
-agent), `rusthorse-dialog` (the agent's dialogs) and `rusthorse-manager`
-(the visual manager). Installed from source, it needs no root.
+It installs four programs: `rusthorse` (the command-line program and the
+agent), `rusthorse-dialog` (the agent's dialogs), `rusthorse-broker` (the
+credential broker, which the agent starts for `rusthorse run --broker`) and
+`rusthorse-manager` (the visual manager). Installed from source, it needs
+no root.
 
 ## 1. Install
 
 ### Debian, Ubuntu, Linux Mint: the package
 
-The package installs the three programs, enables the agent for every user
+The package installs the four programs, enables the agent for every user
 and puts **Rusthorse** in the applications menu; apt removes it again
 ([ADR 0010](adr/0010-debian-package.md)). It needs Ubuntu 24.04, Linux
 Mint 22, Debian 13 or later: it depends on GTK 4.12, libadwaita 1.4 and
-glibc 2.39.
+glibc 2.39. It recommends `ca-certificates`, which apt installs with it
+unless told not to: the credential broker reads the certificate
+authorities from it.
 
 No release has been published yet, so build the package from a clone. That
 needs what building from source needs (Rust, and the GTK 4 and libadwaita
@@ -51,7 +56,7 @@ sudo apt install ./target/debian/rusthorse_0.1.0-1_amd64.deb
 
 | Installed | What |
 |---|---|
-| `/usr/bin/rusthorse`, `rusthorse-dialog`, `rusthorse-manager` | The programs |
+| `/usr/bin/rusthorse`, `rusthorse-dialog`, `rusthorse-broker`, `rusthorse-manager` | The programs |
 | `/usr/lib/systemd/user/rusthorse-agent.service` | The agent's service, enabled for every user |
 | `/usr/share/applications/`, `/usr/share/icons/` | The menu entry and icon of the manager |
 | `/usr/share/bash-completion/`, `zsh/`, `fish/` | Shell completions |
@@ -67,6 +72,9 @@ Then [create a vault](#3-create-a-vault) — section 2 is done for you.
 
 - The programs in `/usr/bin` belong to root, so `chmod go-w` is not needed,
   and AI agents' shells find `rusthorse` on their `PATH`.
+- `rusthorse doctor` checks the credential broker's program and the file of
+  certificate authorities it reads; without either, everything works but
+  `rusthorse run --broker`, which then runs nothing.
 - If you installed Rusthorse with `cargo` before, [remove that
   installation](#a-source-installation) first: a service file in
   `~/.config/systemd/user/` takes precedence over the package's and would
@@ -123,6 +131,31 @@ that, and should be run again after every upgrade. When `rusthorse-dialog`
 is not installed, the agent shows its dialogs with zenity; one that is
 installed but can be modified by others is refused, with no fallback.
 `rusthorse doctor` says which one the agent uses.
+
+Then install `rusthorse-broker`, the credential broker that the agent
+starts for `rusthorse run --broker`
+([ADR 0013](adr/0013-credential-broker.md)). It needs nothing that
+`rusthorse` does not: its cryptography library, ring, compiles C code with
+the C compiler that Rust already uses to link programs.
+
+```sh
+cargo install --locked --path broker      # from the clone
+# or: cargo install --locked --git https://github.com/Alle4you/rusthorse rusthorse-broker
+chmod go-w ~/.cargo/bin/rusthorse-broker
+```
+
+It too must sit next to `rusthorse`, be of the same version and not be
+modifiable by its group or by others (`chmod go-w`, again after every
+upgrade). There is no fallback, and everything else works without it: when
+it is missing or one the agent refuses, `rusthorse run --broker` fails
+before its dialog; when it cannot serve the grant — a broker that speaks
+another version of the agent's protocol for brokers, or no usable file of
+certificate authorities (see the [requirements](#requirements)) — the run
+fails after the approval. Either way it exits with status 125 and runs
+nothing. `rusthorse doctor` checks both: it runs the broker the agent uses
+with `--check`, and checks the file of certificate authorities, its owner
+and its directories as the broker does (the broker reads the certificates
+in it when a grant starts).
 
 AI agents usually run commands in non-interactive shells, which on many
 distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds
@@ -366,19 +399,24 @@ identical).
 
 With the package, install the newer package as in
 [section 1](#debian-ubuntu-linux-mint-the-package), then run `systemctl
---user daemon-reload` and restart the agent (or log in again). From source, install a specific release, then restart the
-agent so that both sides run the same version:
+--user daemon-reload` and restart the agent (or log in again). From source,
+install a specific release of the programs the agent uses — `cargo install
+--git` needs their names, since the repository holds several — then restart
+the agent so that all of them run the same version:
 
 ```sh
-cargo install --locked --git https://github.com/Alle4you/rusthorse --tag v0.1.0 --force
+cargo install --locked --git https://github.com/Alle4you/rusthorse --tag v0.1.0 --force \
+    rusthorse rusthorse-dialog rusthorse-broker
+chmod go-w ~/.cargo/bin/rusthorse ~/.cargo/bin/rusthorse-dialog ~/.cargo/bin/rusthorse-broker
 systemctl --user restart rusthorse-agent
 rusthorse doctor
 ```
 
 Commands refuse to talk to an agent that speaks another protocol version and
 say how to restart it; `rusthorse doctor` also notices an agent that still
-runs the build an upgrade replaced, even when the protocol did not change. Read [CHANGELOG.md](../CHANGELOG.md) before
-upgrading.
+runs the build an upgrade replaced, even when the protocol did not change,
+and a broker of another version than `rusthorse`. Read
+[CHANGELOG.md](../CHANGELOG.md) before upgrading.
 
 ## File locations
 
@@ -390,6 +428,7 @@ upgrading.
 | Audit log | `$XDG_STATE_HOME/rusthorse/audit.jsonl` (`~/.local/state/…`) | `RUSTHORSE_AUDIT_LOG`, `--audit-log` |
 | Programs | `/usr/bin` (package) or `~/.cargo/bin` (source) | — |
 | Service file | `/usr/lib/systemd/user/` (package) or `~/.config/systemd/user/` (source) | A drop-in: `systemctl --user edit rusthorse-agent` |
+| Certificate authorities the broker trusts | The first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/ca-bundle.pem` that exists | — (no variable changes it) |
 
 Directories are created with mode `0700` and files with `0600`. systemd
 creates the socket's directory when the agent starts and removes it, with the
@@ -423,7 +462,7 @@ outside home directories.
 systemctl --user disable --now rusthorse-agent
 rm ~/.config/systemd/user/rusthorse-agent.service
 systemctl --user daemon-reload
-cargo uninstall rusthorse rusthorse-dialog
+cargo uninstall rusthorse rusthorse-dialog rusthorse-broker
 rm -f ~/.local/bin/rusthorse       # if you linked it there
 ```
 

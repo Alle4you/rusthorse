@@ -15,8 +15,10 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-# One build for the three programs, so that `rusthorse` keeps its default
-# features (the dialog and the manager use the library without them).
+# One build for the four programs, so that `rusthorse` keeps its default
+# features (the dialog, the manager and the broker use the library without
+# them). No feature is named: the credential broker's only feature,
+# `test-upstream`, is for tests and never in a release.
 cargo build --release --locked --workspace
 
 # Files generated for the package go next to the programs; cargo-deb reads
@@ -24,6 +26,13 @@ cargo build --release --locked --workspace
 # (CARGO_TARGET_DIR).
 target=$(cargo metadata --format-version 1 --no-deps --locked |
     python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+version=$(cargo metadata --format-version 1 --no-deps --locked |
+    python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rusthorse"))')
+
+# A broker built for tests (feature test-upstream) says so when asked
+# `--check`, as `rusthorse doctor` asks it: never package one.
+python3 -I packaging/check-broker.py "$target/release/rusthorse-broker" "$version"
+
 generated="$target/release/packaging"
 rm -rf "$generated"
 mkdir -p "$generated/completions"
@@ -39,8 +48,7 @@ python3 -I packaging/copyright.py "$generated/copyright"
 
 # The documentation, with links to files the package does not install (the
 # source code) pointing to them on GitHub at this revision.
-revision=$(git rev-parse HEAD 2>/dev/null || echo "v$(cargo metadata --format-version 1 --no-deps --locked |
-    python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rusthorse"))')")
+revision=$(git rev-parse HEAD 2>/dev/null || echo "v$version")
 python3 -I packaging/docs.py "$generated/doc" "$revision"
 
 cargo deb --no-build --locked -p rusthorse "$@"
