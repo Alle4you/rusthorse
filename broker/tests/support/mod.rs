@@ -1,13 +1,16 @@
 //! The test harness of `rusthorse-broker`: a certificate authority made for
 //! the test, a fake HTTPS destination in the test process that records
-//! exactly what it receives, the real broker program played by a fake agent
-//! over a socket pair, and a small HTTP/1.1 client that talks to the broker
-//! over raw TCP.
+//! exactly what it receives (and a [`Gate`] its handlers can wait on), the
+//! real broker program played by a fake agent over a socket pair, and a
+//! small HTTP/1.1 client that talks to a broker over raw TCP, as a client
+//! that holds a grant's token does ([`Endpoint`]: the full-system tests get
+//! one from the command the agent ran).
 //!
 //! Every key here is fake, and nothing leaves the loopback interface.
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -834,6 +837,57 @@ impl Broker {
         true
     }
 
+    /// Where a client reaches this broker's grant.
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            port: self.port,
+            token: self.token.clone(),
+        }
+    }
+
+    /// [`Endpoint::request`] for this broker's grant.
+    pub fn request(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        self.endpoint().request(method, target, headers, body)
+    }
+
+    /// [`Endpoint::bearer_request`] for this broker's grant.
+    pub fn bearer_request(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        self.endpoint()
+            .bearer_request(method, target, headers, body)
+    }
+
+    /// Send `raw` on a new connection and read the response.
+    pub fn send(&self, raw: &[u8]) -> Response {
+        self.endpoint().send(raw)
+    }
+
+    /// Open a connection to the broker.
+    pub fn connect(&self) -> Client {
+        self.endpoint().connect()
+    }
+}
+
+/// Where a client reaches a grant: its broker's port on `127.0.0.1` and its
+/// token. (No `Debug`: it holds a token, fake as it is.)
+#[derive(Clone)]
+pub struct Endpoint {
+    pub port: u16,
+    pub token: String,
+}
+
+impl Endpoint {
     /// A request in the form clients send: `method target`, `Host` the
     /// broker's address, the token in `x-api-key`, and `headers` and
     /// `body` (with its length when there is one).
@@ -974,6 +1028,19 @@ impl Response {
     }
 }
 
+/// The next piece of a chunked body ([`Client::next_chunk`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Next {
+    /// A chunk of data.
+    Data(Vec<u8>),
+    /// The last chunk: the body is complete.
+    Last,
+    /// The connection ended, closed or reset, before the last chunk.
+    Closed,
+    /// Nothing came within the time allowed; the connection is still open.
+    Stalled,
+}
+
 /// A client connection to the broker.
 pub struct Client {
     pub stream: TcpStream,
@@ -982,12 +1049,18 @@ pub struct Client {
 
 impl Client {
     pub fn connect(port: u16) -> Client {
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the broker");
-        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
-        Client {
+        Self::try_connect(port).expect("connect to the broker")
+    }
+
+    /// A connection, if the broker's port takes one (a port nobody holds
+    /// any more refuses it).
+    pub fn try_connect(port: u16) -> io::Result<Client> {
+        let stream = TcpStream::connect(("127.0.0.1", port))?;
+        stream.set_read_timeout(Some(PATIENCE))?;
+        Ok(Client {
             stream,
             buffer: Vec::new(),
-        }
+        })
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -1079,6 +1152,55 @@ impl Client {
         );
         self.buffer.drain(..line_end + 4 + size);
         Some(data)
+    }
+
+    /// The next piece of a chunked body, waiting at most `limit` for each
+    /// read: unlike [`Client::chunk`], it tells a connection that ended
+    /// from one that only went quiet.
+    pub fn next_chunk(&mut self, limit: Duration) -> Next {
+        self.stream.set_read_timeout(Some(limit)).expect("timeout");
+        let next = self.read_chunk();
+        self.stream
+            .set_read_timeout(Some(PATIENCE))
+            .expect("timeout");
+        next
+    }
+
+    fn read_chunk(&mut self) -> Next {
+        // Why reading stopped, if it did.
+        let stopped = |read: io::Result<usize>| match read {
+            Ok(0) => Some(Next::Closed),
+            Ok(_) => None,
+            Err(e) if is_timeout(&e) => Some(Next::Stalled),
+            Err(_) => Some(Next::Closed),
+        };
+        let line_end = loop {
+            if let Some(end) = find(&self.buffer, b"\r\n") {
+                break end;
+            }
+            if let Some(next) = stopped(self.fill()) {
+                return next;
+            }
+        };
+        let size_text = String::from_utf8_lossy(&self.buffer[..line_end]).into_owned();
+        let size = usize::from_str_radix(size_text.trim(), 16)
+            .unwrap_or_else(|_| panic!("a chunk size: {size_text:?}"));
+        while self.buffer.len() < line_end + 2 + size + 2 {
+            if let Some(next) = stopped(self.fill()) {
+                return next;
+            }
+        }
+        let data = self.buffer[line_end + 2..line_end + 2 + size].to_vec();
+        assert_eq!(
+            &self.buffer[line_end + 2 + size..line_end + 4 + size],
+            b"\r\n"
+        );
+        self.buffer.drain(..line_end + 4 + size);
+        if data.is_empty() {
+            Next::Last
+        } else {
+            Next::Data(data)
+        }
     }
 
     /// The next whole response.
@@ -1305,6 +1427,39 @@ pub fn largest_send_buffer() -> Option<usize> {
 pub fn signal() -> (mpsc::Sender<()>, Arc<Mutex<mpsc::Receiver<()>>>) {
     let (tx, rx) = mpsc::channel();
     (tx, Arc::new(Mutex::new(rx)))
+}
+
+/// Lets a destination's handlers wait until the test lets them go, by name:
+/// a name once opened stays open, for every handler that waits for it.
+#[derive(Clone, Default)]
+pub struct Gate(Arc<(Mutex<HashSet<String>>, Condvar)>);
+
+impl Gate {
+    pub fn open(&self, name: &str) {
+        let (lock, changed) = &*self.0;
+        lock.lock().expect("lock").insert(name.to_string());
+        changed.notify_all();
+    }
+
+    /// Wait until `name` is open, at most [`PATIENCE`]; whether it opened.
+    pub fn wait(&self, name: &str) -> bool {
+        self.wait_within(name, PATIENCE)
+    }
+
+    /// Wait until `name` is open, at most `limit`; whether it opened.
+    pub fn wait_within(&self, name: &str, limit: Duration) -> bool {
+        let (lock, changed) = &*self.0;
+        let deadline = Instant::now() + limit;
+        let mut open = lock.lock().expect("lock");
+        while !open.contains(name) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            open = changed.wait_timeout(open, left).expect("wait").0;
+        }
+        true
+    }
 }
 
 /// Whether `path` exists (for the error messages of the setup tests).

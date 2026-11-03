@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use keepass::{Database, DatabaseKey};
 use rusthorse::broker_profile::{Preset, ProfileRequest};
 use rusthorse::protocol::{EntryChanges, EntryFields, NewEntry, SecretString};
-use rusthorse::vault::{FIELD_BROKER, Vault};
+use rusthorse::vault::{FIELD_BROKER, KdfParams, Vault};
 
 const FIXTURE: &str = "tests/fixtures/keepassxc-2.7.12-kdbx41.kdbx";
 const PASSWORD: &str = "demopass";
@@ -165,6 +165,117 @@ fn a_broker_profile_survives_a_round_trip_through_a_keepassxc_vault() {
     let info = reopened.info(reopened.find(&edited).expect("find"));
     assert_eq!(info.broker, Some(profile));
     assert!(!info.other_fields.iter().any(|f| f == FIELD_BROKER));
+    assert!(!info.protected_fields.iter().any(|f| f == FIELD_BROKER));
+}
+
+/// A broker profile survives KeePassXC itself saving the file (ADR 0013): a
+/// vault written through the library, with a profile on one entry, in
+/// which `keepassxc-cli` changes another entry and saves the file, reads
+/// back with the profile's field intact and unprotected, and still usable.
+///
+/// It needs `keepassxc-cli`, so it is ignored by default: run `cargo test
+/// --test keepassxc_compat -- --ignored` where it is installed. The program
+/// opens nothing of the user's: only this test's file, with its settings in
+/// the test's own directory and the (fake) password on its standard input.
+#[test]
+#[ignore = "needs keepassxc-cli: run with --ignored where it is installed"]
+fn a_broker_profile_survives_keepassxc_cli_saving_the_vault() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.kdbx");
+    let password = "a fake test passphrase";
+    let mut vault = Vault::create(
+        &path,
+        SecretString::new(password.into()),
+        KdfParams::INSECURE_FOR_TESTS,
+    )
+    .expect("create");
+    for name in ["KEY", "OTHER"] {
+        let entry = NewEntry {
+            name: name.into(),
+            ..NewEntry::default()
+        };
+        let value = SecretString::new(format!("sk-ant-test-0000FAKE0000{name}-0000"));
+        vault.add(&entry, &value, false).expect("add");
+    }
+    let request = ProfileRequest {
+        origin: Some("https://api.deepseek.com".into()),
+        max_requests: Some(200),
+        ..ProfileRequest::new(Preset::OpenaiCompatible)
+    };
+    let profile = request.resolve().expect("profile");
+    let key = vault.find("KEY").expect("find");
+    vault
+        .edit(
+            key,
+            &EntryChanges {
+                broker: Some(request),
+                ..EntryChanges::default()
+            },
+            None,
+        )
+        .expect("set the profile");
+    vault.save().expect("save");
+    drop(vault);
+
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).expect("a home for keepassxc-cli");
+    let mut child = Command::new("keepassxc-cli")
+        .args(["edit", "--quiet", "--username", "changed-by-keepassxc"])
+        .arg(&path)
+        .arg("OTHER")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("QT_QPA_PLATFORM", "offscreen")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("keepassxc-cli");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{password}\n").as_bytes())
+        .expect("the password");
+    let output = child.wait_with_output().expect("wait");
+    assert!(
+        output.status.success(),
+        "keepassxc-cli failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Read by another reader: KeePassXC changed the other entry and kept
+    // the profile's field as it was, unprotected.
+    let db = Database::open(
+        &mut std::fs::File::open(&path).expect("open"),
+        DatabaseKey::new().with_password(password),
+    )
+    .expect("decrypt");
+    let by_title = |title: &str| {
+        db.iter_all_entries()
+            .find(|e| e.get_title() == Some(title))
+            .unwrap_or_else(|| panic!("no entry {title}"))
+    };
+    assert_eq!(
+        by_title("OTHER").get_username(),
+        Some("changed-by-keepassxc")
+    );
+    let key = by_title("KEY");
+    let field = key.fields.get(FIELD_BROKER).expect("the profile's field");
+    assert!(!field.is_protected(), "KeePassXC protected the profile");
+    assert_eq!(field.get(), &profile.to_stored());
+    // And Rusthorse reads it as the usable profile it was.
+    let reopened = Vault::open(&path, SecretString::new(password.into())).expect("reopen");
+    let info = reopened.info(reopened.find("KEY").expect("find"));
+    assert_eq!(info.broker, Some(profile));
     assert!(!info.protected_fields.iter().any(|f| f == FIELD_BROKER));
 }
 
