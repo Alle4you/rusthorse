@@ -206,13 +206,19 @@ not guaranteed.
   environment and may reach loopback destinations. A build without debug
   assertions refuses it (`compile_error!`; the CI checks a release build),
   the broker's `--check` reports it, `rusthorse doctor` fails on such a
-  build, and `packaging/build-deb.sh` refuses to package one
-  (`packaging/check-broker.py`). Never turn it on outside tests.
+  build, and `packaging/build-deb.sh` refuses to package one: it checks the
+  broker it built and every broker in the packages cargo-deb wrote, and
+  deletes those packages if one is refused (`packaging/check-broker.py`).
+  Never turn it on outside tests.
 - **The packaging tests** (`tests/packaging.rs`) run the scripts of
   `packaging/` with `/usr/bin/python3` (without it they fail, unless
   `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them), and `cargo
   metadata` and `cargo tree`, which read the crates' sources in Cargo's
-  registry (cargo downloads missing ones from crates.io).
+  registry (cargo downloads missing ones from crates.io). They run
+  `build-deb.sh` whole, on stand-ins for `cargo` (except what
+  `copyright.py` asks it) and `dpkg-deb`, so nothing is built or packaged;
+  one test packages and unpacks with the real `/usr/bin/dpkg-deb`, and is
+  skipped, saying so, where it is not installed.
 - Tests that rely on file permissions skip their check when run as root.
 - A test that fails intermittently is a bug: reproduce it under load
   (parallel runs, CPU load) before and after the fix.
@@ -250,7 +256,7 @@ present and capture only its window, in a dark and a light theme
 | `src/main.rs` | The CLI |
 | `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; a test checks the commands and options it names |
 | `tests/agent.rs` | End-to-end tests |
-| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests: `check-broker.py`), the generated copyright file (`copyright.py`, with the crates checked by hand) and documentation (tested in `tests/packaging.rs`) |
+| `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests, built or packaged: `check-broker.py`), the generated copyright file (`copyright.py`, with the crates checked by hand) and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
 | `docs/roadmap.md` | Planned work, led by the credential broker |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

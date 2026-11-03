@@ -2,10 +2,12 @@
 # Build the Debian package: target/debian/rusthorse_<version>-1_<arch>.deb
 #
 # Needs what building from source needs (Rust, the GTK 4 and libadwaita
-# development packages) and cargo-deb (`cargo install --locked cargo-deb`).
-# The package is described in Cargo.toml, [package.metadata.deb]; the files
-# it installs besides the programs are in packaging/deb/ and data/.
-# Extra arguments go to cargo-deb (for example `--output DIR`).
+# development packages), cargo-deb (`cargo install --locked cargo-deb`) and
+# dpkg-deb, which every Debian system has. The package is described in
+# Cargo.toml, [package.metadata.deb]; the files it installs besides the
+# programs are in packaging/deb/ and data/. Extra arguments go to cargo-deb
+# (for example `--output DIR`), except those that would install the package
+# or build it for another target (below).
 #
 # Build on the oldest release the package should install on: the package
 # depends on the versions of GTK, libadwaita and glibc it was built against
@@ -14,6 +16,28 @@
 set -eu
 
 cd "$(dirname "$0")/.."
+
+# cargo-deb's --install would install the package before the check of what
+# cargo-deb wrote (at the end) could refuse it. Another target is not
+# supported: the package is built for the system that builds it, and for one
+# target cargo-deb also leaves a copy of the package where that check does
+# not look.
+for arg in "$@"; do
+    case $arg in
+    --install | --install=* | --no-install-dbgsym | --no-install-dbgsym=*)
+        echo "build-deb.sh: $arg would install the package before its credential broker is checked; install it with apt once this script has written it" >&2
+        exit 1
+        ;;
+    --target | --target=*)
+        echo "build-deb.sh: $arg is not supported: the package is built for the system that builds it" >&2
+        exit 1
+        ;;
+    esac
+done
+if [ -n "${CARGO_BUILD_TARGET+set}" ]; then
+    echo "build-deb.sh: CARGO_BUILD_TARGET is set; unset it: the package is built for the system that builds it" >&2
+    exit 1
+fi
 
 # One build for the four programs, so that `rusthorse` keeps its default
 # features (the dialog, the manager and the broker use the library without
@@ -30,8 +54,9 @@ version=$(cargo metadata --format-version 1 --no-deps --locked |
     python3 -I -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rusthorse"))')
 
 # A broker built for tests (feature test-upstream) says so when asked
-# `--check`, as `rusthorse doctor` asks it: never package one.
-python3 -I packaging/check-broker.py "$target/release/rusthorse-broker" "$version"
+# `--check`, as `rusthorse doctor` asks it: never package one. The checks
+# stop the script themselves, whatever `set -e` does.
+python3 -I packaging/check-broker.py "$target/release/rusthorse-broker" "$version" || exit 1
 
 generated="$target/release/packaging"
 rm -rf "$generated"
@@ -51,4 +76,14 @@ python3 -I packaging/copyright.py "$generated/copyright"
 revision=$(git rev-parse HEAD 2>/dev/null || echo "v$version")
 python3 -I packaging/docs.py "$generated/doc" "$revision"
 
-cargo deb --no-build --locked -p rusthorse "$@"
+# cargo-deb prints the path of each package it writes (and of its -dbgsym
+# package, when asked for one).
+packages=$(cargo deb --no-build --locked -p rusthorse "$@")
+
+# What ships is checked too: options, variants and the environment of
+# cargo-deb can make it take the programs from elsewhere than the file
+# checked above. If a package is refused, every package of this run is
+# deleted.
+printf '%s\n' "$packages" |
+    python3 -I packaging/check-broker.py --packages "$version" "$generated" || exit 1
+printf '%s\n' "$packages"

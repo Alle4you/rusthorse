@@ -462,37 +462,6 @@ fn the_packaged_service_starts_a_packaged_program() {
     );
 }
 
-#[test]
-fn the_package_is_built_without_features_and_only_after_the_broker_is_checked() {
-    let script = fs::read_to_string(root().join("packaging/build-deb.sh")).expect("build-deb.sh");
-    let commands: Vec<&str> = script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-    let at = |start: &str| {
-        commands
-            .iter()
-            .position(|line| line.starts_with(start))
-            .unwrap_or_else(|| panic!("build-deb.sh does not run {start}"))
-    };
-    let strict = at("set -eu");
-    let build = at("cargo build --release --locked --workspace");
-    let check =
-        at(r#"python3 -I packaging/check-broker.py "$target/release/rusthorse-broker" "$version""#);
-    let package = at("cargo deb --no-build");
-    assert!(strict < build && build < check && check < package);
-    // The broker's only feature is for tests: no feature is ever turned on.
-    for line in &commands {
-        assert!(
-            !["--features", "--all-features", " -F"]
-                .iter()
-                .any(|flag| line.contains(flag)),
-            "{line}"
-        );
-    }
-}
-
 /// The features for tests only, never in a release: the main package's
 /// fake Secret Service and the broker's hooks for its tests (extra
 /// certificate authorities and loopback destinations).
@@ -609,7 +578,6 @@ fn python(script: &Path, args: &[&std::ffi::OsStr]) -> Output {
 /// ("Text file busy").
 fn write_program(path: &Path, text: &str) {
     use std::io::Write;
-    use std::process::Stdio;
     let mut child = Command::new("/bin/sh")
         .args([
             "-c",
@@ -629,6 +597,19 @@ fn write_program(path: &Path, text: &str) {
     assert!(child.wait().expect("wait").success());
 }
 
+/// A stand-in broker at `path` that answers `--check` with `answer`, but
+/// only when asked as `rusthorse doctor` asks it: with nothing in its
+/// environment and `/` as working directory.
+fn write_broker(path: &Path, answer: &str) {
+    write_program(
+        path,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --check ] && [ -z \"${{HOME-}}\" ] && \
+             [ \"$(pwd -P)\" = / ] || exit 9\nprintf '%s\\n' '{answer}'\n"
+        ),
+    );
+}
+
 #[test]
 fn only_a_release_build_of_the_broker_is_packaged() {
     if !python3() {
@@ -644,16 +625,7 @@ fn only_a_release_build_of_the_broker_is_packaged() {
         )
     };
     let answering = |answer: &str| {
-        // The answer of a broker that is asked --check with nothing in its
-        // environment and `/` as working directory, as `rusthorse doctor`
-        // asks it.
-        write_program(
-            &broker,
-            &format!(
-                "#!/bin/sh\n[ \"$1\" = --check ] && [ -z \"${{HOME-}}\" ] && \
-                 [ \"$(pwd -P)\" = / ] || exit 9\nprintf '%s\\n' '{answer}'\n"
-            ),
-        );
+        write_broker(&broker, answer);
         check()
     };
     let release = format!(r#"{{"version":"{version}","protocol":1}}"#);
@@ -751,6 +723,586 @@ check.TIMEOUT_SECONDS = 0.5
 sys.argv = sys.argv[1:]
 check.main()
 "#;
+
+// What ships: packaging/check-broker.py --packages on stand-in packages
+// (tar archives, unpacked by a stand-in `dpkg-deb -x`), on a real package
+// where dpkg-deb is installed, and packaging/build-deb.sh run whole on
+// stand-ins for cargo and dpkg-deb.
+
+use std::process::Stdio;
+
+/// A directory `bin` in `dir` holding a stand-in `dpkg-deb`: `-x ARCHIVE
+/// DIR` unpacks a tar archive into DIR, as dpkg-deb unpacks a package, and
+/// anything else fails. It appends its arguments to `dir/dpkg-deb-calls`.
+fn dpkg_deb_stand_in(dir: &Path) -> PathBuf {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    write_program(
+        &bin.join("dpkg-deb"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+             [ $# = 3 ] && [ \"$1\" = -x ] || {{ echo \"dpkg-deb stand-in: $*\" >&2; exit 2; }}\n\
+             mkdir -p \"$3\" && tar -xf \"$2\" -C \"$3\"\n",
+            dir.join("dpkg-deb-calls").display()
+        ),
+    );
+    bin
+}
+
+/// A stand-in package at `path`: a tar archive of the directory `stage`.
+fn pack(stage: &Path, path: &Path) {
+    let out = Command::new("tar")
+        .arg("-cf")
+        .arg(path)
+        .arg("-C")
+        .arg(stage)
+        .arg(".")
+        .output()
+        .expect("tar");
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// packaging/check-broker.py --packages, with `path` as PATH, the package
+/// paths `packages` on its standard input, one per line, and `scratch` as
+/// the directory it unpacks them in.
+fn check_packages(path: &str, packages: &[&Path], scratch: &Path) -> Output {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut child = Command::new("/usr/bin/python3")
+        .args(["-I", "-B"])
+        .arg(root().join("packaging/check-broker.py"))
+        .arg("--packages")
+        .arg(env!("CARGO_PKG_VERSION"))
+        .arg(scratch)
+        .env("PATH", path)
+        .current_dir(root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run check-broker.py");
+    let mut input = Vec::new();
+    for package in packages {
+        input.extend_from_slice(package.as_os_str().as_bytes());
+        input.push(b'\n');
+    }
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(&input).expect("write the paths");
+    drop(stdin);
+    child.wait_with_output().expect("wait")
+}
+
+/// What `--check` answers: a release build of this version, and a build
+/// with the broker's feature for tests.
+fn release_answer() -> String {
+    format!(
+        r#"{{"version":"{}","protocol":1}}"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn for_tests_answer() -> String {
+    format!(
+        r#"{{"version":"{}","protocol":1,"test_upstream":true}}"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// A refusal of check-broker.py: status 1, and a message saying `why`.
+fn assert_refused(out: &Output, why: &str) {
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(said.contains(why), "{said}");
+    assert!(said.contains("refusing to package it"), "{said}");
+}
+
+#[test]
+fn a_package_whose_broker_is_not_a_release_build_is_deleted() {
+    if !python3() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dpkg_deb_stand_in(dir.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("mkdir");
+    // A package of the brokers `brokers` (path in the package, --check
+    // answer), written to `name` in `dir`.
+    let package = |name: &str, brokers: &[(&str, &str)]| {
+        let stage = dir.path().join(format!("stage-{name}"));
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(stage.join("usr/share/doc/rusthorse")).expect("mkdir");
+        for (inside, answer) in brokers {
+            let at = stage.join(inside);
+            fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+            write_broker(&at, answer);
+        }
+        let deb = dir.path().join(name);
+        pack(&stage, &deb);
+        deb
+    };
+    let release = release_answer();
+    let for_tests = for_tests_answer();
+    let broker = "usr/bin/rusthorse-broker";
+
+    // Accepted: the broker of the package is a release build, and a package
+    // of debugging symbols, which has none, may go with it.
+    let deb = package("rusthorse.deb", &[(broker, &release)]);
+    let ddeb = package("rusthorse-dbgsym.ddeb", &[]);
+    let out = check_packages(&path, &[&ddeb, &deb], &scratch);
+    assert!(out.status.success(), "{out:?}");
+    assert!(deb.exists() && ddeb.exists());
+    let calls = fs::read_to_string(dir.path().join("dpkg-deb-calls")).expect("calls");
+    for unpacked in [&ddeb, &deb] {
+        assert!(
+            calls.contains(&format!("-x {} {}/", unpacked.display(), scratch.display())),
+            "{calls}"
+        );
+    }
+    // Unpacked in a directory of its own, removed afterwards.
+    assert_eq!(fs::read_dir(&scratch).expect("scratch").count(), 0);
+
+    // A build for tests: refused, and every package of the run deleted.
+    let deb = package("rusthorse.deb", &[(broker, &for_tests)]);
+    let ddeb = package("rusthorse-dbgsym.ddeb", &[]);
+    let out = check_packages(&path, &[&ddeb, &deb], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{broker} in {} is a build for tests (its --check reports test_upstream)",
+            deb.display()
+        ),
+    );
+    assert!(!deb.exists() && !ddeb.exists());
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!("deleted {}, {}", ddeb.display(), deb.display())),
+        "{said}"
+    );
+
+    // Every broker in the package is checked, wherever it is.
+    let deb = package(
+        "rusthorse.deb",
+        &[
+            (broker, &release),
+            ("usr/local/bin/rusthorse-broker", &for_tests),
+        ],
+    );
+    assert_refused(
+        &check_packages(&path, &[&deb], &scratch),
+        "usr/local/bin/rusthorse-broker in",
+    );
+    assert!(!deb.exists());
+
+    // Something else than a broker, a regular file, under its name.
+    for (what, make) in [
+        ("a link", "ln -s /bin/true \"$1/usr/bin/rusthorse-broker\""),
+        ("a directory", "mkdir \"$1/usr/bin/rusthorse-broker\""),
+    ] {
+        let stage = dir.path().join("stage-odd");
+        let _ = fs::remove_dir_all(&stage);
+        fs::create_dir_all(stage.join("usr/bin")).expect("mkdir");
+        let made = Command::new("/bin/sh")
+            .args(["-c", make, "sh"])
+            .arg(&stage)
+            .status()
+            .expect("sh");
+        assert!(made.success(), "{what}");
+        let deb = dir.path().join("odd.deb");
+        pack(&stage, &deb);
+        assert_refused(
+            &check_packages(&path, &[&deb], &scratch),
+            &format!("{broker} in {} is not a regular file", deb.display()),
+        );
+        assert!(!deb.exists(), "{what}");
+    }
+
+    // No broker at all: a package that does not hold the program checked
+    // above; the check would otherwise check nothing.
+    let deb = package("rusthorse.deb", &[]);
+    assert_refused(
+        &check_packages(&path, &[&deb], &scratch),
+        &format!("no rusthorse-broker in {}", deb.display()),
+    );
+    assert!(!deb.exists());
+
+    // A package that cannot be unpacked, or is not there, or none named.
+    let deb = dir.path().join("rusthorse.deb");
+    fs::write(&deb, "not an archive").expect("write");
+    assert_refused(
+        &check_packages(&path, &[&deb], &scratch),
+        &format!(
+            "{} cannot be unpacked (dpkg-deb -x: exit status",
+            deb.display()
+        ),
+    );
+    assert!(!deb.exists());
+    assert_refused(
+        &check_packages(&path, &[&deb], &scratch),
+        &format!("{}, which cargo-deb named, is not a file", deb.display()),
+    );
+    assert_refused(
+        &check_packages(&path, &[], &scratch),
+        "cargo-deb named no package it wrote",
+    );
+    // Only packages are deleted: not another file it was given.
+    let deb = package("rusthorse.deb", &[(broker, &for_tests)]);
+    let other = dir.path().join("notes.txt");
+    fs::write(&other, "kept").expect("write");
+    let out = check_packages(&path, &[&deb, &other], &scratch);
+    assert_refused(&out, "is a build for tests");
+    assert!(!deb.exists() && other.exists());
+    assert_eq!(fs::read_dir(&scratch).expect("scratch").count(), 0);
+    // Whatever stops the check (here, no directory to unpack in), no
+    // package is left behind.
+    let deb = package("rusthorse.deb", &[(broker, &release)]);
+    let out = check_packages(&path, &[&deb], &dir.path().join("gone"));
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!deb.exists());
+}
+
+/// `python3 -c PACK_HIDDEN STAGE ARCHIVE`: a tar archive of STAGE, in which
+/// usr/lib/hidden has no permissions.
+const PACK_HIDDEN: &str = r#"
+import sys, tarfile
+def hide(info):
+    if info.name == "./usr/lib/hidden":
+        info.mode = 0
+    return info
+with tarfile.open(sys.argv[2], "w") as archive:
+    archive.add(sys.argv[1], arcname=".", filter=hide)
+"#;
+
+#[test]
+fn a_directory_of_the_package_that_cannot_be_read_is_refused() {
+    if !python3() || nix::unistd::geteuid().is_root() {
+        // Root reads any directory.
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dpkg_deb_stand_in(dir.path());
+    let stage = dir.path().join("stage");
+    fs::create_dir_all(stage.join("usr/lib/hidden")).expect("mkdir");
+    fs::create_dir_all(stage.join("usr/bin")).expect("mkdir");
+    write_broker(&stage.join("usr/bin/rusthorse-broker"), &release_answer());
+    write_broker(
+        &stage.join("usr/lib/hidden/rusthorse-broker"),
+        &for_tests_answer(),
+    );
+    // Recorded with no permissions: tar gives the directory that mode once
+    // it has unpacked what is inside.
+    let deb = dir.path().join("rusthorse.deb");
+    let out = Command::new("/usr/bin/python3")
+        .args(["-I", "-B", "-c", PACK_HIDDEN])
+        .arg(&stage)
+        .arg(&deb)
+        .output()
+        .expect("python3");
+    assert!(out.status.success(), "{out:?}");
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("mkdir");
+    let out = check_packages(
+        &format!("{}:/usr/bin:/bin", bin.display()),
+        &[&deb],
+        &scratch,
+    );
+    assert_refused(&out, "cannot be read in the unpacked package");
+    assert!(!deb.exists());
+    // What it unpacked is removed, unreadable directory included.
+    assert_eq!(fs::read_dir(&scratch).expect("scratch").count(), 0);
+}
+
+#[test]
+fn what_ships_is_checked_with_the_real_dpkg_deb() {
+    if !python3() {
+        return;
+    }
+    if !Path::new("/usr/bin/dpkg-deb").exists() {
+        eprintln!("skipped: /usr/bin/dpkg-deb is not installed here");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stage = dir.path().join("stage");
+    let control = stage.join("DEBIAN");
+    fs::create_dir_all(&control).expect("mkdir");
+    fs::create_dir_all(stage.join("usr/bin")).expect("mkdir");
+    for directory in [&stage, &control, &stage.join("usr"), &stage.join("usr/bin")] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    fs::write(
+        control.join("control"),
+        format!(
+            "Package: rusthorse\nVersion: {}-1\nArchitecture: all\n\
+             Maintainer: A Stand-In <stand-in@example.invalid>\n\
+             Description: a stand-in package for a test\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .expect("write");
+    fs::set_permissions(control.join("control"), fs::Permissions::from_mode(0o644)).expect("chmod");
+    let deb = dir.path().join("rusthorse.deb");
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("mkdir");
+    let build = |answer: &str| {
+        write_broker(&stage.join("usr/bin/rusthorse-broker"), answer);
+        let out = Command::new("/usr/bin/dpkg-deb")
+            .args(["--build", "--root-owner-group"])
+            .arg(&stage)
+            .arg(&deb)
+            .output()
+            .expect("dpkg-deb --build");
+        assert!(out.status.success(), "{out:?}");
+    };
+    build(&release_answer());
+    let out = check_packages("/usr/bin:/bin", &[&deb], &scratch);
+    assert!(out.status.success(), "{out:?}");
+    assert!(deb.exists());
+    build(&for_tests_answer());
+    assert_refused(
+        &check_packages("/usr/bin:/bin", &[&deb], &scratch),
+        "usr/bin/rusthorse-broker in",
+    );
+    assert!(!deb.exists());
+}
+
+/// A run of packaging/build-deb.sh on stand-ins, in a temporary directory
+/// F. Its `cargo`, first on PATH, appends its arguments to F/cargo-calls:
+/// `build` copies the programs of F/built to F/target/release, as a build
+/// writes them there; `metadata --no-deps` describes a workspace whose
+/// target directory is F/target; `deb` packages F/target/release's broker
+/// (or F/shipped-broker, if there is one) as usr/bin/rusthorse-broker, in a
+/// tar archive written to `--output DIR` or F/target/debian, and prints its
+/// path, as cargo-deb does; whatever else it is asked (copyright.py's
+/// `metadata` and `tree`) goes to the real cargo. Its `dpkg-deb -x` unpacks
+/// those archives. Everything else is real: the checks, the copyright file
+/// and the documentation, which are generated in F/target/release/packaging.
+struct DebBuild(tempfile::TempDir);
+
+/// The stand-in `cargo` of `DebBuild`; F, REAL_CARGO and DEB are set before
+/// it.
+const CARGO_STAND_IN: &str = r#"
+printf '%s\n' "$*" >> "$F/cargo-calls"
+case $1 in
+build)
+    cp -p "$F/built/rusthorse" "$F/built/rusthorse-broker" "$F/target/release/"
+    ;;
+metadata)
+    case " $* " in
+    *" --no-deps "*) cat "$F/metadata.json" ;;
+    *) exec "$REAL_CARGO" "$@" ;;
+    esac
+    ;;
+deb)
+    out=$F/target/debian
+    while [ $# -gt 0 ]; do
+        [ "$1" = --output ] && out=$2
+        shift
+    done
+    broker=$F/target/release/rusthorse-broker
+    [ -e "$F/shipped-broker" ] && broker=$F/shipped-broker
+    mkdir -p "$F/stage/usr/bin" "$out"
+    cp -p "$broker" "$F/stage/usr/bin/rusthorse-broker"
+    tar -cf "$out/$DEB" -C "$F/stage" .
+    printf '%s\n' "$out/$DEB"
+    ;;
+*)
+    exec "$REAL_CARGO" "$@"
+    ;;
+esac
+"#;
+
+/// The real cargo, for the stand-in to call.
+fn real_cargo() -> PathBuf {
+    std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO").map(PathBuf::from))
+        .expect("CARGO: the path of cargo")
+}
+
+/// The name of the package the stand-in `cargo deb` writes.
+fn deb_name() -> String {
+    format!("rusthorse_{}-1_amd64.deb", env!("CARGO_PKG_VERSION"))
+}
+
+impl DebBuild {
+    /// Stand-ins whose build writes a broker that answers `--check` with
+    /// `built`.
+    fn new(built: &str) -> DebBuild {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path();
+        for directory in ["built", "target/release"] {
+            fs::create_dir_all(f.join(directory)).expect("mkdir");
+        }
+        dpkg_deb_stand_in(f);
+        write_program(
+            &f.join("bin/cargo"),
+            &format!(
+                "#!/bin/sh\nF='{}'\nREAL_CARGO='{}'\nDEB='{}'\n{CARGO_STAND_IN}",
+                f.display(),
+                real_cargo().display(),
+                deb_name()
+            ),
+        );
+        let metadata = serde_json::json!({
+            "target_directory": f.join("target"),
+            "packages": [{"name": "rusthorse", "version": env!("CARGO_PKG_VERSION")}],
+        });
+        fs::write(f.join("metadata.json"), metadata.to_string()).expect("write");
+        write_program(
+            &f.join("built/rusthorse"),
+            "#!/bin/sh\n[ \"$1\" = completions ] && echo \"# completions for $2\"\n",
+        );
+        write_broker(&f.join("built/rusthorse-broker"), built);
+        DebBuild(dir)
+    }
+
+    fn path(&self, relative: &str) -> PathBuf {
+        self.0.path().join(relative)
+    }
+
+    /// Run build-deb.sh with `args`, and `env` added to the environment.
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let path = std::env::var("PATH").unwrap_or_default();
+        Command::new("/bin/sh")
+            .arg(root().join("packaging/build-deb.sh"))
+            .args(args)
+            .env("PATH", format!("{}:{path}", self.path("bin").display()))
+            .env_remove("CARGO_BUILD_TARGET")
+            .envs(env.iter().copied())
+            .output()
+            .expect("run build-deb.sh")
+    }
+
+    /// What the stand-in `cargo` was asked, one call a line.
+    fn cargo_calls(&self) -> Vec<String> {
+        fs::read_to_string(self.path("cargo-calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+}
+
+#[test]
+fn the_package_is_built_without_features_and_only_after_the_broker_is_checked() {
+    if !python3() {
+        return;
+    }
+    let release = release_answer();
+    let for_tests = for_tests_answer();
+
+    // A release build: built without features, checked, packaged, checked
+    // again as it ships, and the package's path printed.
+    let run = DebBuild::new(&release);
+    let output = run.path("out");
+    let out = run.run(&["--output", output.to_str().expect("UTF-8")], &[]);
+    assert!(out.status.success(), "{out:?}");
+    let calls = run.cargo_calls();
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("build --release --locked --workspace"),
+        "{calls:#?}"
+    );
+    assert_eq!(
+        calls.last(),
+        Some(&format!(
+            "deb --no-build --locked -p rusthorse --output {}",
+            output.display()
+        )),
+        "{calls:#?}"
+    );
+    // The broker's only feature is for tests: no feature is ever turned on.
+    for call in &calls {
+        assert!(
+            !["--features", "--all-features", " -F"]
+                .iter()
+                .any(|flag| call.contains(flag)),
+            "{call}"
+        );
+    }
+    let deb = output.join(deb_name());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", deb.display())
+    );
+    assert!(deb.exists());
+    assert!(
+        fs::read_to_string(run.path("dpkg-deb-calls"))
+            .expect("the package is checked")
+            .starts_with(&format!("-x {} ", deb.display()))
+    );
+    assert!(run.path("target/release/packaging/copyright").is_file());
+
+    // The build wrote a broker for tests over a release build: refused
+    // before anything is packaged.
+    let run = DebBuild::new(&for_tests);
+    write_broker(&run.path("target/release/rusthorse-broker"), &release);
+    let out = run.run(&[], &[]);
+    assert_refused(&out, "is a build for tests");
+    assert!(
+        !run.cargo_calls().iter().any(|call| call.starts_with("deb")),
+        "{:#?}",
+        run.cargo_calls()
+    );
+    assert!(!run.path("target/release/packaging").exists());
+
+    // cargo-deb packaged another broker than the one checked: refused once
+    // it is written, and the package deleted.
+    let run = DebBuild::new(&release);
+    write_broker(&run.path("shipped-broker"), &for_tests);
+    let out = run.run(&[], &[]);
+    let deb = run.path("target/debian").join(deb_name());
+    assert_refused(
+        &out,
+        &format!(
+            "usr/bin/rusthorse-broker in {} is a build for tests",
+            deb.display()
+        ),
+    );
+    assert!(
+        run.cargo_calls().iter().any(|call| call.starts_with("deb")),
+        "{:#?}",
+        run.cargo_calls()
+    );
+    assert!(!deb.exists());
+    assert!(out.stdout.is_empty(), "{out:?}");
+
+    // What would install the package before its check, or build it for
+    // another target: refused before anything is built.
+    for (args, env) in [
+        (&["--install"][..], &[][..]),
+        (&["--no-install-dbgsym"][..], &[][..]),
+        (&["--target", "x86_64-unknown-linux-gnu"][..], &[][..]),
+        (&["--target=x86_64-unknown-linux-gnu"][..], &[][..]),
+        (
+            &[][..],
+            &[("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu")][..],
+        ),
+    ] {
+        let run = DebBuild::new(&release);
+        let out = run.run(args, env);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?} {env:?}: {said}");
+        let named = args.first().copied().unwrap_or("CARGO_BUILD_TARGET");
+        assert!(
+            said.starts_with(&format!("build-deb.sh: {named}")),
+            "{said}"
+        );
+        assert!(run.cargo_calls().is_empty(), "{:#?}", run.cargo_calls());
+    }
+
+    // Any step that fails stops the script.
+    let run = DebBuild::new(&release);
+    write_program(&run.path("built/rusthorse"), "#!/bin/sh\nexit 1\n");
+    let out = run.run(&[], &[]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        !run.cargo_calls().iter().any(|call| call.starts_with("deb")),
+        "{:#?}",
+        run.cargo_calls()
+    );
+}
 
 /// The copyright file, written by packaging/copyright.py as build-deb.sh
 /// runs it.
