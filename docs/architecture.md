@@ -700,23 +700,27 @@ file and every parent directory are root-owned and not group/other-writable. A
 bad first candidate fails closed; it is not skipped. `doctor` checks the file
 properties but leaves certificate parsing to broker startup.
 
-`packaging/build-deb.sh` refuses install-before-check and cross-target
-options, builds the workspace in release mode without test features, checks
-the built broker, generates completions/licenses/docs, and runs `cargo deb`.
-It then extracts the reported packages, checks every entry named
-`rusthorse-broker` (at least one across the run), and only then reports the
-package paths. On refusal, cleanup considers only the reported paths. Regular
-files beginning as Debian packages are emptied before deletion, whatever their
-names, so another hard link cannot retain the package. If permission prevents
-emptying one, it is deleted only when no other hard link keeps it; otherwise
-it is named for manual removal. Regular files recognized only by a
-`.deb`/`.ddeb` extension (any case) are deleted without emptying. Nothing else
-is deleted. Symbolic links are not followed and are named; unreadable or
-undeletable candidates are reported without stopping the cleanup of other
-paths. See `packaging/check-broker.py` and Q01 in the review history
-(`b999e72` and `3953912`, merged in `453e772`). `--check` reports
-`test_upstream`; doctor and packaging refuse such a build. Without debug
-assertions the feature does not compile. With the feature but no
-`RUSTHORSE_BROKER_TEST_ROOTS`, the broker still uses production configuration;
-the agent clears its environment. This does not replace trust in the helper
-program itself.
+`packaging/build-deb.sh` refuses install-before-check, cross-target and
+`--manifest-path` options (cargo-deb names each package after the package
+name of its manifest, unchecked, which could put it outside the staging
+directory), takes `--output DIR` itself (default `target/debian`; a DIR
+given that exists and is not a directory is refused before anything is
+built), builds the workspace in release mode without test features, checks
+the built broker, generates completions/licenses/docs, and runs `cargo deb`
+with a new staging directory of its own as its output
+(`target/release/packaging/staging.*`, mode 0700).
+`check-broker.py --staged` then lists that directory: every entry must be a
+regular file, examined without being followed, and there must be at least
+one. It extracts each package, checks every entry named `rusthorse-broker`
+(at least one across the run), and only when all pass moves the packages to
+DIR under cargo-deb's names (a rename on the same file system; otherwise a
+copy into a new file in DIR, flushed, then renamed), replacing any link at
+those names without following it, and prints their paths. On a refusal or
+any other failure it deletes the staging directory whole and moves nothing
+more; `build-deb.sh` also deletes it if cargo-deb fails or the script is
+interrupted. See `packaging/check-broker.py` and R01–R04 in the review
+history. `--check` reports `test_upstream`; doctor and packaging refuse
+such a build. Without debug assertions the feature does not compile. With
+the feature but no `RUSTHORSE_BROKER_TEST_ROOTS`, the broker still uses
+production configuration; the agent clears its environment. This does not
+replace trust in the helper program itself.

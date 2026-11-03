@@ -35,17 +35,18 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   on replacement.
 - **Broker distribution**: the package installs `/usr/bin/rusthorse-broker` as
   its fourth program and recommends `ca-certificates`. The build script checks
-  both the built broker and every broker in the packages it produces, refuses
-  test builds and cleans up the paths reported by cargo-deb on refusal:
-  regular files beginning as Debian packages are emptied, then deleted. If
-  permission prevents emptying one, it is deleted only when no other hard link
-  keeps it; otherwise it is named for manual removal. Regular files recognized
-  only by a `.deb`/`.ddeb` extension (any case) are deleted without emptying;
-  nothing else is deleted. Symbolic links are not followed and are named, as
-  are paths that cannot be deleted. Its copyright file covers all four
-  programs, including ring's nested license texts and source notices. Default
-  Cargo commands now cover the main package and the broker; `cargo run` still
-  runs `rusthorse`.
+  both the built broker and every broker in the packages it produces, and
+  refuses test builds and the options that would install the package before
+  that check, build it for another target or package another manifest
+  (`--manifest-path`). cargo-deb writes the packages into a private staging
+  directory; only if every one passes are they moved to the output directory
+  (`--output DIR`, which the script takes itself; `target/debian` by
+  default), replacing a file or a link already at their names there without
+  following it or writing through it. A refused package never reaches it:
+  the staging directory is deleted instead. The package's copyright file
+  covers all four programs, including ring's nested license texts and source
+  notices. Default Cargo commands now cover the main package and the broker;
+  `cargo run` still runs `rusthorse`.
 - **Move an entry to another group**: `rusthorse edit NAME --group PATH`
   (`/` for the top level) and the **Group** of the manager's **Edit** form,
   which used to be locked. In the manager's forms the group is chosen from a

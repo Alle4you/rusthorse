@@ -89,16 +89,19 @@ Rusthorse's guarantees hold only if all of the following are trustworthy:
 - `rusthorse-dialog`, `zenity` and the GTK stack they use, the X server or
   Wayland compositor that displays dialogs and delivers your keystrokes;
 - the packaging checks used to distribute the programs: `build-deb.sh` checks
-  the built broker and every broker in the reported packages before reporting
-  success. On refusal, `check-broker.py` considers only reported paths:
-  regular files beginning as Debian packages are emptied, then deleted,
-  regardless of name. If permission prevents emptying one, it is deleted only
-  without other hard links; otherwise it is named for manual removal. Regular
-  files recognized only by a `.deb`/`.ddeb` extension (any case) are deleted
-  without emptying. Nothing else is deleted. Symbolic links are not followed
-  and are named; unreadable or undeletable candidates are reported while
-  cleanup continues. This checks trusted build artifacts; it does not
-  authenticate a malicious replacement binary;
+  the built broker, has cargo-deb write the packages into a new staging
+  directory that only the user can enter (it refuses another manifest, whose
+  package name cargo-deb would put unchecked in their file names), checks
+  every broker in them there, and moves them to the output directory only if
+  all pass, replacing rather than following a link at their names; otherwise
+  it deletes the staging directory, and nothing reaches the output
+  directory. Outside `target/release/packaging`, which it makes again on
+  each run, the script removes only what a package that passed replaces at
+  its name and the new file of a copy that fails (cargo-deb itself deletes
+  the packages of rusthorse it finds in `target/debian`). This checks
+  trusted build artifacts; it does not authenticate a malicious replacement
+  binary, and it assumes that no other process of the user changes the
+  staging directory between the check and the move;
 - the kernel (Yama `ptrace_scope ≥ 1`, which is the default on Ubuntu, Mint,
   Debian and Fedora) and the file system holding the vault;
 - **every program you approve**, for the secrets you approve it for, and

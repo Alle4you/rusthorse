@@ -224,20 +224,26 @@ not guaranteed.
   (`compile_error!`; the CI checks a release build), the broker's `--check`
   reports it, `rusthorse doctor` fails on such a build, and
   `packaging/build-deb.sh` refuses to package one
-  (`packaging/check-broker.py`): it checks the broker it built and every
-  broker in the packages cargo-deb wrote, and if one is refused it deletes
-  those packages, whatever their names, and names any it cannot delete, such
-  as one behind a symbolic link, which it does not follow. Never turn it on
-  outside tests.
+  (`packaging/check-broker.py`): it checks the broker it built, has cargo-deb
+  write the packages into a new staging directory of its own, checks every
+  broker in them there, and moves them to the output directory only if all
+  pass. If one is refused, or the check stops otherwise, it deletes the
+  staging directory: no package that has not passed reaches the output
+  directory. Never turn it on outside tests.
 - **The packaging tests** (`tests/packaging.rs`) run the scripts of
   `packaging/` with `/usr/bin/python3` (without it they fail, unless
   `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them), and `cargo
   metadata` and `cargo tree`, which read the crates' sources in Cargo's
   registry (cargo downloads missing ones from crates.io). They run
-  `build-deb.sh` whole, on stand-ins for `cargo` (except what
+  `build-deb.sh` whole, through `/usr/bin/env --default-signal` (GNU
+  coreutils 8.31 or later: its traps then work even where the tests inherit
+  an ignored HUP or INT), on stand-ins for `cargo` (except what
   `copyright.py` asks it) and `dpkg-deb`, so nothing is built or packaged;
   one test packages and unpacks with the real `/usr/bin/dpkg-deb`, and is
-  skipped, saying so, where it is not installed.
+  skipped, saying so, where it is not installed. Two tests also move
+  packages into a temporary directory in `/dev/shm`, where that is another
+  file system, and one into a temporary directory in the repository's
+  `target/` (a relative `--output`); they remove them.
 - Tests that rely on file permissions skip their check when run as root.
 - A test that fails intermittently is a bug: reproduce it under load
   (parallel runs, CPU load) before and after the fix.
