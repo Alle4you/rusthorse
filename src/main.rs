@@ -878,6 +878,8 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         // `rusthorse-broker` next to this program, with no fallback.
         broker_program: None,
         broker_ready_timeout: None,
+        // Each grant lasts as long as its profile says.
+        broker_lifetime: None,
     };
     let ui = DesktopUi {
         remember_for: args.remember,

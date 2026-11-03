@@ -314,9 +314,17 @@ pub enum ToBroker {
         /// Why.
         reason: AdmissionRefusal,
     },
-    /// End the grant: close every open request and stream, drop the
-    /// credential, answer [`FromBroker::Revoked`] within
+    /// End the grant: admit nothing more, close every open request and
+    /// stream, drop the credential, answer [`FromBroker::Revoked`] within
     /// [`REVOKE_CONFIRM_TIMEOUT`], and answer `403` from then on.
+    /// [`FromBroker::Revoked`] follows the answers to every
+    /// [`FromBroker::Admit`] sent before it, and the
+    /// [`FromBroker::Finished`] of every admitted request: an answer may
+    /// arrive after this message, and an [`ToBroker::Admitted`] that does is
+    /// not forwarded (its request finishes `revoked`). On a revocation the
+    /// agent answers at once every admission still waiting for its answer —
+    /// [`ToBroker::Refused`], `revoked` — without waiting for its audit
+    /// record, so that the confirmation never waits for the audit log.
     Revoke {
         /// Why the grant ends.
         reason: EndReason,

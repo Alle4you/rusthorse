@@ -125,6 +125,10 @@ pub struct AgentConfig {
     /// [`broker_protocol::READY_TIMEOUT`]. Tests shorten it, to see a broker
     /// that never answers fail quickly.
     pub broker_ready_timeout: Option<Duration>,
+    /// The longest a grant lasts. `None` in production: its profile's
+    /// maximum lifetime (`max_lifetime_minutes`), a minute at least. Tests
+    /// shorten it, to see grants expire; it never lengthens one.
+    pub broker_lifetime: Option<Duration>,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -267,8 +271,9 @@ impl session_lock::Locker for Agent {
     /// Lock as `rusthorse lock` does. The generation changes even when the
     /// vault is already locked, so that an unlock whose password is being
     /// typed now does nothing when it completes. The grants whose profile
-    /// says that the automatic locks end them end too, and the lock is done
-    /// once their brokers have confirmed (or were killed).
+    /// says that the automatic locks end them end too, and so does every
+    /// grant still starting; the lock is done once their brokers have
+    /// confirmed (or were killed).
     fn lock_for(&self, event: &str, source: &str) {
         let (reason, outcome) = if event == session_lock::SUSPEND {
             (EndReason::Suspend, "suspend")
@@ -278,7 +283,7 @@ impl session_lock::Locker for Agent {
         let mut state = self.state();
         let was_open = state.vault.is_some() || !state.remembered.is_empty();
         state.lock();
-        let ending = self.registry.decide(Which::EndOnAutomaticLocks, reason);
+        let ending = self.registry.decide(Which::AutomaticLock, reason);
         drop(state);
         ending.complete();
         if was_open {
@@ -425,7 +430,7 @@ impl Agent {
             state.lock();
             let ending = self
                 .registry
-                .decide(Which::EndOnAutomaticLocks, EndReason::IdleTimeout);
+                .decide(Which::AutomaticLock, EndReason::IdleTimeout);
             drop(state);
             ending.complete();
             let _ = self
@@ -617,6 +622,15 @@ impl Agent {
         }
     }
 
+    /// How long a grant of `profile` lasts: the profile's maximum lifetime,
+    /// or less where [`AgentConfig::broker_lifetime`] says so.
+    fn grant_lifetime(&self, profile: &BrokerProfile) -> Duration {
+        let longest = Duration::from_secs(u64::from(profile.max_lifetime_minutes) * 60);
+        self.config
+            .broker_lifetime
+            .map_or(longest, |shorter| shorter.min(longest))
+    }
+
     fn status(&self) -> StatusInfo {
         // Where the broker is, without running it (`doctor` checks it), and
         // without holding the state lock while the files are examined.
@@ -660,8 +674,9 @@ impl Agent {
             }),
             lock_triggers: self.lock_triggers.snapshot(),
             broker: Some(broker),
-            // Those not ended: revoked ones whose command still runs too.
-            grants: Some(self.registry.count()),
+            // Those that can still be used: not the revoked ones whose
+            // commands still run (`grants` lists those too).
+            grants: Some(self.registry.count_live()),
         }
     }
 
@@ -2101,15 +2116,9 @@ impl Agent {
                     ));
                 }
             };
-            let active = self.registry.count();
-            if active + brokered.len() > broker_protocol::MAX_GRANTS {
-                return Err(Failure::invalid(format!(
-                    "at most {} grants can be active at once; {active} are, and this run asks \
-                     for {} more; revoke some (`rusthorse grants`)",
-                    broker_protocol::MAX_GRANTS,
-                    brokered.len()
-                )));
-            }
+            self.registry
+                .room_for(brokered.len())
+                .map_err(Failure::invalid)?;
             Some(program)
         } else {
             None
@@ -2366,6 +2375,16 @@ impl Agent {
             event = event.detail(audited_env.join("; "));
         }
         self.approve(request, key, event)?;
+        // Every failure from here on, before the command starts, follows the
+        // approval's record with one that says why nothing ran (best effort).
+        let aborted = |failure: Failure| {
+            let _ = self.audit.record(
+                &run_record()
+                    .outcome("aborted")
+                    .detail(failure.message.clone()),
+            );
+            failure
+        };
 
         // The answer may have taken a while: make sure the program and the
         // directory were not replaced meanwhile...
@@ -2393,8 +2412,8 @@ impl Agent {
             Vec<SecretString>,
             Option<RunGrants>,
         );
-        let (secrets, credentials, mut run_grants): UnderLock =
-            self.with_vault_at(generation, |v| {
+        let (secrets, credentials, mut run_grants): UnderLock = self
+            .with_vault_at(generation, |v| {
                 let secrets = run
                     .bindings
                     .iter()
@@ -2433,9 +2452,7 @@ impl Agent {
                             profile: g.profile.clone(),
                             command: command_text.clone(),
                             requester: peer.describe(),
-                            lifetime: Duration::from_secs(
-                                u64::from(g.profile.max_lifetime_minutes) * 60,
-                            ),
+                            lifetime: self.grant_lifetime(&g.profile),
                         })
                         .collect();
                     Some(self.registry.enter(new).map_err(Failure::invalid)?)
@@ -2443,7 +2460,10 @@ impl Agent {
                     None
                 };
                 Ok((secrets, credentials, run_grants))
-            })?;
+            })
+            // Locked or changed meanwhile, an entry gone, or no room left
+            // for the grants (another run took it).
+            .map_err(aborted)?;
 
         // With grants, before the command starts: each grant's creation is
         // recorded, its broker started and ready, and all of them made
@@ -2460,11 +2480,7 @@ impl Agent {
         let (tokens, ports) = match prepared {
             Ok(prepared) => prepared,
             Err((failure, reason)) => {
-                let _ = self.audit.record(
-                    &run_record()
-                        .outcome("aborted")
-                        .detail(failure.message.clone()),
-                );
+                let failure = aborted(failure);
                 if let Some(run_grants) = run_grants.take() {
                     run_grants.finish(reason);
                 }
@@ -2523,22 +2539,18 @@ impl Agent {
         // Everything that can fail is prepared before the command starts: once
         // it has started, the only answer is its exit status (or, if waiting
         // for it fails, "outcome unknown").
-        let internal = |e: io::Error| Failure::new(ErrorCode::Internal, e.to_string());
+        // (On these failures a run's grants end as it is dropped.)
+        let internal = |e: io::Error| aborted(Failure::new(ErrorCode::Internal, e.to_string()));
         let writer = Arc::new(Mutex::new(stream.try_clone().map_err(internal)?));
         let watch_stream = stream.try_clone().map_err(internal)?;
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
-                let failure = Failure::new(
+                let failure = aborted(Failure::new(
                     ErrorCode::InvalidRequest,
                     format!("cannot start {}: {e}", program.canonical.display()),
-                );
+                ));
                 if let Some(run_grants) = run_grants.take() {
-                    let _ = self.audit.record(
-                        &run_record()
-                            .outcome("aborted")
-                            .detail(failure.message.clone()),
-                    );
                     run_grants.finish(EndReason::CommandEnded);
                 }
                 return Err(failure);
@@ -3683,6 +3695,7 @@ mod tests {
                 keyring: Default::default(),
                 broker_program: None,
                 broker_ready_timeout: None,
+                broker_lifetime: None,
             },
             Box::new(NoDialogs),
         );
@@ -3737,6 +3750,7 @@ mod tests {
                 keyring: Default::default(),
                 broker_program: None,
                 broker_ready_timeout: None,
+                broker_lifetime: None,
             },
             Box::new(NoDialogs),
         );
@@ -3781,6 +3795,269 @@ mod tests {
         assert!(records.contains(r#""reason":"save_failed""#), "{records}");
     }
 
+    /// An agent for these tests, in `dir`, with `ui` and a stand-in broker
+    /// program at `broker` (which they never run, unless something is
+    /// wrong).
+    fn agent_in(dir: &Path, broker: &Path, ui: Box<dyn Ui>) -> Arc<Agent> {
+        Agent::new(
+            AgentConfig {
+                vault: dir.join("vault.kdbx"),
+                socket: dir.join("agent.sock"),
+                audit_log: dir.join("audit.jsonl"),
+                idle_timeout: Duration::ZERO,
+                request_timeout: Duration::from_secs(10),
+                send_buffer: None,
+                session_lock: Default::default(),
+                new_vault_kdf: KdfParams::INSECURE_FOR_TESTS,
+                keyring: Default::default(),
+                broker_program: Some(broker.to_path_buf()),
+                broker_ready_timeout: Some(Duration::from_secs(2)),
+                broker_lifetime: None,
+            },
+            ui,
+        )
+    }
+
+    /// A stand-in broker program that leaves `marker` behind if it is ever
+    /// started.
+    fn stand_in_broker(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    fn anthropic_profile() -> BrokerProfile {
+        crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
+            .resolve()
+            .expect("profile")
+    }
+
+    /// A grant lasts its profile's maximum lifetime; the tests' override
+    /// shortens it and never lengthens it, so that a broker's install never
+    /// says more than its profile allows (`Install::validate` refuses that).
+    #[test]
+    fn a_grant_lasts_at_most_its_profiles_lifetime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let profile = crate::broker_profile::ProfileRequest {
+            max_lifetime_minutes: Some(30),
+            ..crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
+        }
+        .resolve()
+        .expect("profile");
+        let longest = Duration::from_secs(30 * 60);
+        let mut agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        assert_eq!(agent.grant_lifetime(&profile), longest);
+        for (asked, lasts) in [
+            (Duration::from_secs(2), Duration::from_secs(2)),
+            (Duration::from_secs(48 * 3600), longest),
+        ] {
+            Arc::get_mut(&mut agent)
+                .expect("only handle")
+                .config
+                .broker_lifetime = Some(asked);
+            assert_eq!(agent.grant_lifetime(&profile), lasts, "{asked:?}");
+        }
+    }
+
+    /// A grant whose creation cannot be recorded starts no broker, and its
+    /// run fails before anything runs (ADR 0013: `created`, before the
+    /// command starts; fail closed): no credential reaches a broker.
+    #[test]
+    fn a_grant_whose_creation_cannot_be_recorded_starts_no_broker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let marker = dir.path().join("broker-ran");
+        stand_in_broker(&broker, &marker);
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        // The audit log cannot be written: a directory is where it goes.
+        std::fs::create_dir_all(dir.path().join("audit.jsonl")).expect("block the audit log");
+        let id = broker_protocol::new_grant_id();
+        let mut run = agent
+            .registry
+            .enter(vec![NewGrant {
+                id: id.clone(),
+                entry_uuid: "uuid-of-key".into(),
+                entry: "KEY (uuid-of-)".into(),
+                var: "K".into(),
+                profile: anthropic_profile(),
+                command: "true".into(),
+                requester: "test".into(),
+                lifetime: Duration::from_secs(60),
+            }])
+            .expect("enter");
+        let grants = vec![Brokered {
+            uuid: "uuid-of-key".into(),
+            name: "KEY".into(),
+            identity: "KEY (uuid-of-)".into(),
+            var: "K".into(),
+            url_var: None,
+            profile: anthropic_profile(),
+        }];
+        let program = std::fs::canonicalize(&broker).expect("canonical");
+        let Err((failure, reason)) = agent.prepare_grants(
+            &Peer::agent(),
+            &mut run,
+            &program,
+            &grants,
+            std::slice::from_ref(&id),
+            vec![SecretString::new("sk-ant-test-0000000000000000".into())],
+        ) else {
+            panic!("the grant was prepared without its record");
+        };
+        assert_eq!(failure.code, ErrorCode::Internal);
+        assert!(
+            failure.message.contains("cannot write the audit log"),
+            "{}",
+            failure.message
+        );
+        assert!(!failure.message.contains("sk-ant-test"));
+        assert_eq!(reason, EndReason::AuditFailed);
+        run.finish(reason);
+        assert_eq!(agent.registry.count(), 0, "a grant was left");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "a broker was started");
+    }
+
+    /// The approver of [`a_run_refused_after_its_approval_says_why_on_record`]:
+    /// while the human decides, other runs take every grant an agent may
+    /// hold.
+    #[derive(Default)]
+    struct TakesTheRoom {
+        agent: Mutex<Weak<Agent>>,
+        taken: Mutex<Option<RunGrants>>,
+    }
+
+    struct TakesTheRoomUi(Arc<TakesTheRoom>);
+
+    impl Ui for TakesTheRoomUi {
+        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+            unreachable!("no password dialog expected")
+        }
+        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+            unreachable!("no value dialog expected")
+        }
+        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+            let agent = self.0.agent.lock().expect("lock").upgrade().expect("agent");
+            let all: Vec<NewGrant> = (0..broker_protocol::MAX_GRANTS)
+                .map(|i| NewGrant {
+                    id: broker_protocol::new_grant_id(),
+                    entry_uuid: format!("uuid-{i}"),
+                    entry: format!("OTHER{i} (uuid-{i})"),
+                    var: "K".into(),
+                    profile: anthropic_profile(),
+                    command: "true".into(),
+                    requester: "test".into(),
+                    lifetime: Duration::from_secs(60),
+                })
+                .collect();
+            *self.0.taken.lock().expect("lock") = Some(agent.registry.enter(all).expect("room"));
+            Ok(Decision::AllowOnce)
+        }
+    }
+
+    /// A run that fails after its approval — here because, while the human
+    /// decided, other runs took the last grants an agent may hold — follows
+    /// the approval's record with one that says why nothing ran.
+    #[test]
+    fn a_run_refused_after_its_approval_says_why_on_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let marker = dir.path().join("broker-ran");
+        stand_in_broker(&broker, &marker);
+        let approver = Arc::new(TakesTheRoom::default());
+        let agent = agent_in(
+            dir.path(),
+            &broker,
+            Box::new(TakesTheRoomUi(Arc::clone(&approver))),
+        );
+        *approver.agent.lock().expect("lock") = Arc::downgrade(&agent);
+        let mut vault = Vault::create(
+            &dir.path().join("vault.kdbx"),
+            SecretString::new("correct horse".into()),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("create");
+        let entry = NewEntry {
+            name: "KEY".into(),
+            ..NewEntry::default()
+        };
+        vault
+            .add(
+                &entry,
+                &SecretString::new("sk-ant-test-0000000000000000".into()),
+                false,
+            )
+            .expect("add");
+        let id = vault.find("KEY").expect("find");
+        let profile = EntryChanges {
+            broker: Some(crate::broker_profile::ProfileRequest::new(
+                crate::broker_profile::Preset::Anthropic,
+            )),
+            ..EntryChanges::default()
+        };
+        vault.edit(id, &profile, None).expect("profile");
+        agent.state().vault = Some(vault);
+        let run = RunRequest {
+            bindings: Vec::new(),
+            argv: vec!["true".into()],
+            cwd: dir.path().to_str().expect("utf8").into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            redact: true,
+            forward_stdin: false,
+        };
+        let brokered = vec![BrokerBinding {
+            var: "K".into(),
+            entry: "KEY".into(),
+            url_var: None,
+        }];
+        let (stream, _client) = UnixStream::pair().expect("pair");
+        let failure = agent
+            .run(&stream, &Peer::agent(), run, Some(brokered), Vec::new())
+            .expect_err("no room left");
+        assert_eq!(failure.code, ErrorCode::InvalidRequest);
+        assert!(
+            failure
+                .message
+                .contains("at most 16 grants can exist at once"),
+            "{}",
+            failure.message
+        );
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(dir.path().join("audit.jsonl"))
+                .expect("audit")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("json"))
+                .collect();
+        let runs: Vec<(&str, &str)> = records
+            .iter()
+            .filter(|r| r["action"] == "run")
+            .map(|r| {
+                (
+                    r["outcome"].as_str().unwrap_or_default(),
+                    r["detail"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(runs.len(), 2, "{records:?}");
+        assert_eq!(runs[0].0, "allowed_once");
+        assert_eq!(runs[1].0, "aborted");
+        assert!(runs[1].1.contains("at most 16 grants"), "{}", runs[1].1);
+        assert!(
+            !records.iter().any(|r| r["action"] == "grant"),
+            "{records:?}"
+        );
+        approver
+            .taken
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("taken")
+            .finish(EndReason::CommandEnded);
+        assert_eq!(agent.registry.count(), 0);
+        assert!(!marker.exists(), "a broker was started");
+    }
+
     #[test]
     fn a_session_lock_cancels_an_unlock_under_way_and_records_only_an_open_vault() {
         use crate::session_lock::{Locker, SCREEN_LOCK, SUSPEND};
@@ -3806,6 +4083,7 @@ mod tests {
                 keyring: Default::default(),
                 broker_program: None,
                 broker_ready_timeout: None,
+                broker_lifetime: None,
             },
             Box::new(NoDialogs),
         );

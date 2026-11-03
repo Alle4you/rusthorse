@@ -18,22 +18,29 @@
 //! becomes active again, and a grant that ended while it was starting never
 //! gets a broker.
 //!
-//! Each broker is read by a thread of its own; the audit records its
-//! requests need are written by a second thread per grant, so that a slow
-//! audit log never delays reading the broker (a revocation's confirmation
-//! above all). Every message the broker sends is checked against the
-//! conversation of [`crate::broker_protocol`]: anything else is a broken
-//! broker, which ends its grant (`broker_failed`) and is killed, and the
-//! message changes no counter.
+//! Each broker is read by a thread of its own, which checks every message
+//! against the conversation of [`crate::broker_protocol`] — anything else is
+//! a broken broker, which ends its grant (`broker_failed`) and is killed,
+//! and the message changes no counter — and answers at once each admission
+//! it refuses: a refusal needs no record. An admission it allows holds a use
+//! and a slot, and goes to a second thread per grant, which writes the audit
+//! records of the grant's requests in the order the broker sent them and
+//! answers that admission once its record is written.
 //!
 //! Revocation is decided in the registry first, so that nothing is admitted
-//! after that moment; the brokers concerned are then told at once, and
-//! waited for together: a broker that cannot be told within
+//! after that moment; the brokers concerned are then told at once, each with
+//! the refusal of every admission still waiting (for its record or for its
+//! turn), and waited for together: a broker that cannot be told within
 //! [`REVOKE_SEND_TIMEOUT`], or does not confirm within
-//! [`REVOKE_CONFIRM_TIMEOUT`] after that, is killed. Revocation never waits
-//! for the audit log; a grant's end record is best effort.
+//! [`REVOKE_CONFIRM_TIMEOUT`] after that, is killed. A broker confirms only
+//! once every admission it asked for is answered, so this is what keeps a
+//! slow audit log from delaying a confirmation: such a log delays only the
+//! admissions it records, never a refusal, a revocation or its
+//! confirmation. No thread that writes records waits for a broker's
+//! confirmation (only, at most [`ANSWER_TIMEOUT`], for it to take an
+//! answer), and a grant's end record is best effort.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{Ipv4Addr, Shutdown, TcpListener};
 use std::os::fd::{AsFd, OwnedFd};
@@ -213,12 +220,21 @@ struct Link {
 }
 
 impl Link {
-    /// Send one message, whole by `deadline`. The lock that orders the
-    /// writers is tried rather than waited for, until `deadline`: a writer
-    /// stuck on a broker that does not read holds up no other writer past
-    /// that writer's own deadline.
+    /// Send one message, whole by `deadline` (see [`Link::send_all`]).
     fn send(&self, message: &ToBroker, deadline: Instant) -> io::Result<()> {
-        let frame = broker_protocol::encode(message)?;
+        self.send_all(std::slice::from_ref(message), deadline)
+    }
+
+    /// Send messages in this order, whole by `deadline`, with no other
+    /// writer's message between them. The lock that orders the writers is
+    /// tried rather than waited for, until `deadline`: a writer stuck on a
+    /// broker that does not read holds up no other writer past that writer's
+    /// own deadline.
+    fn send_all(&self, messages: &[ToBroker], deadline: Instant) -> io::Result<()> {
+        let frames = messages
+            .iter()
+            .map(broker_protocol::encode)
+            .collect::<io::Result<Vec<_>>>()?;
         let _turn = loop {
             match self.send.try_lock() {
                 Ok(turn) => break turn,
@@ -234,7 +250,9 @@ impl Link {
                 }
             }
         };
-        write_all_by(&self.channel, &frame, deadline)
+        frames
+            .iter()
+            .try_for_each(|frame| write_all_by(&self.channel, frame, deadline))
     }
 
     /// End the conversation: the broker exits at once when its channel ends.
@@ -299,9 +317,10 @@ struct Grant {
     /// Requests the broker refused before asking, as its confirmation of a
     /// revocation reports them.
     broker_refused: Option<u64>,
-    /// Admissions being decided (their record being written): they hold a
-    /// use and a slot.
-    reserved: u32,
+    /// Admissions asked for and not answered yet, by number: each holds a
+    /// use and a slot. The audit thread answers each once its record is
+    /// written; a revocation answers those still waiting at once.
+    waiting: BTreeSet<u64>,
     /// Admitted requests whose end is not reported yet, by number: their
     /// route.
     open: BTreeMap<u64, String>,
@@ -326,11 +345,29 @@ struct Grant {
 impl Grant {
     /// Requests in flight: admitted and not finished, or being admitted.
     fn in_flight(&self) -> usize {
-        self.open.len() + self.reserved as usize
+        self.open.len() + self.waiting.len()
     }
 
-    /// Whether a new request may be admitted now, and why not.
+    /// Whether a new request may be admitted now, and why not: the grant is
+    /// still admitting ([`Grant::admitting`]), and the uses and slots that
+    /// the admitted and waiting requests hold leave one for it.
     fn admissible(&self, now: BootInstant) -> Result<(), AdmissionRefusal> {
+        self.admitting(now)?;
+        if let Some(limit) = self.profile.max_requests
+            && self.admitted + self.waiting.len() as u64 >= limit
+        {
+            return Err(AdmissionRefusal::Exhausted);
+        }
+        if self.in_flight() >= MAX_IN_FLIGHT as usize {
+            return Err(AdmissionRefusal::TooManyInFlight);
+        }
+        Ok(())
+    }
+
+    /// Whether the grant admits requests at all now: it is active and its
+    /// lifetime has not passed. A waiting admission, which holds its use and
+    /// slot already, is checked against this alone.
+    fn admitting(&self, now: BootInstant) -> Result<(), AdmissionRefusal> {
         match self.state {
             State::Active => {}
             State::Exhausted => return Err(AdmissionRefusal::Exhausted),
@@ -341,19 +378,12 @@ impl Grant {
         if now >= self.deadline {
             return Err(AdmissionRefusal::Expired);
         }
-        if let Some(limit) = self.profile.max_requests
-            && self.admitted + u64::from(self.reserved) >= limit
-        {
-            return Err(AdmissionRefusal::Exhausted);
-        }
-        if self.in_flight() >= MAX_IN_FLIGHT as usize {
-            return Err(AdmissionRefusal::TooManyInFlight);
-        }
         Ok(())
     }
 
     /// The end record, if one is due: once, for a grant whose creation was
-    /// recorded.
+    /// recorded. Admissions still waiting — their broker is gone — count as
+    /// refused.
     fn end_record(&mut self) -> Option<EndRecord> {
         if !self.created_recorded || self.end_recorded {
             return None;
@@ -365,7 +395,9 @@ impl Grant {
                 admitted: self.admitted,
                 finished: self.finished,
                 unknown: self.admitted.saturating_sub(self.finished),
-                refused: self.refused + self.broker_refused.unwrap_or(0),
+                refused: self.refused
+                    + self.waiting.len() as u64
+                    + self.broker_refused.unwrap_or(0),
             },
             detail: self.ended_by.clone(),
         })
@@ -383,7 +415,8 @@ struct EndRecord {
 /// Work for a grant's audit thread, in the order the broker's messages
 /// arrived.
 enum Job {
-    /// Decide on an admission (its record comes first) and answer it.
+    /// Record an admission the reader reserved, then decide on it and
+    /// answer it — unless a revocation answered it meanwhile.
     Admit { request: u64, route: String },
     /// Record the end of an admitted request.
     Finished {
@@ -402,13 +435,27 @@ enum Job {
     Confirmed,
 }
 
+/// What a grant's reader does with a message that keeps to the
+/// conversation, once it is counted.
+enum Next {
+    /// Hand it to the grant's audit thread.
+    Job(Job),
+    /// Send this answer now: a refused admission needs no record.
+    Answer(ToBroker),
+}
+
 /// Which grants an event ends.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Which<'a> {
     /// Every grant.
     All,
-    /// Those whose profile says that the automatic locks end them.
-    EndOnAutomaticLocks,
+    /// Those an automatic lock — the screen lock, a suspend, the idle
+    /// timeout — ends: those whose profile says that the automatic locks
+    /// end them, and every grant still starting, whatever its profile. A
+    /// run's grants are entered under the lock that reads its credentials,
+    /// so a lock comes either before (the run fails, nothing was read) or
+    /// after, and then ends them (ADR 0013, preparing a run's grants).
+    AutomaticLock,
     /// Those of one run.
     Run(u64),
     /// Those of these entries, by UUID.
@@ -423,7 +470,10 @@ impl Which<'_> {
     fn selects(&self, grant: &Grant) -> bool {
         match self {
             Which::All => true,
-            Which::EndOnAutomaticLocks => grant.profile.automatic_locks == AutomaticLocks::End,
+            Which::AutomaticLock => {
+                grant.state == State::Starting
+                    || grant.profile.automatic_locks == AutomaticLocks::End
+            }
             Which::Run(run) => grant.run == *run,
             Which::Entries(uuids) => uuids.iter().any(|uuid| *uuid == grant.meta.entry_uuid),
             Which::Grant(id) => grant.meta.id == *id,
@@ -437,6 +487,27 @@ struct Inner {
     grants: BTreeMap<String, Grant>,
     next_seq: u64,
     next_run: u64,
+}
+
+/// [`Registry::room_for`], under the registry's lock. The refusal says how
+/// many of the grants held are revoked: revoking frees no room, since a
+/// revoked grant keeps its broker and its port until its command ends.
+fn room(inner: &Inner, asked: usize) -> Result<(), String> {
+    let held = inner.grants.len();
+    if held + asked <= MAX_GRANTS {
+        return Ok(());
+    }
+    if asked > MAX_GRANTS {
+        return Err(format!(
+            "a run can have at most {MAX_GRANTS} grants; this one asks for {asked}"
+        ));
+    }
+    let revoked = inner.grants.values().filter(|g| !g.state.live()).count();
+    Err(format!(
+        "at most {MAX_GRANTS} grants can exist at once, and {held} do, {revoked} of them \
+         revoked: a grant is kept until its command ends, even once revoked; this run asks for \
+         {asked} more, so wait for some of those commands to end (`rusthorse grants` lists them)"
+    ))
 }
 
 /// The registry of grants: the one authority for their states, counters and
@@ -470,8 +541,27 @@ impl Registry {
 
     /// The grants that have not ended, revoked ones whose broker still runs
     /// included: each holds a broker and a port.
+    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.inner().grants.len()
+    }
+
+    /// The grants that can still be used — starting, active or exhausted —
+    /// as `status` counts them: not the revoked ones, whose brokers answer
+    /// `403` until their commands end.
+    pub(crate) fn count_live(&self) -> usize {
+        self.inner()
+            .grants
+            .values()
+            .filter(|g| g.state.live())
+            .count()
+    }
+
+    /// Whether `asked` more grants fit within [`MAX_GRANTS`], which counts
+    /// every grant that has not ended: a revoked one too holds a broker and
+    /// a port until its command ends. The refusal says how many are revoked.
+    pub(crate) fn room_for(&self, asked: usize) -> Result<(), String> {
+        room(&self.inner(), asked)
     }
 
     /// The grants of the entry with this UUID that a change to it would end
@@ -518,14 +608,7 @@ impl Registry {
     /// would then not have ended.
     pub(crate) fn enter(self: &Arc<Self>, grants: Vec<NewGrant>) -> Result<RunGrants, String> {
         let mut inner = self.inner();
-        let alive = inner.grants.len();
-        if alive + grants.len() > MAX_GRANTS {
-            return Err(format!(
-                "at most {MAX_GRANTS} grants can be active at once; {alive} are, and this run asks \
-                 for {} more; revoke some (`rusthorse grants`)",
-                grants.len()
-            ));
-        }
+        room(&inner, grants.len())?;
         let mut ids: Vec<&str> = grants.iter().map(|g| g.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -562,7 +645,7 @@ impl Registry {
                 finished: 0,
                 refused: 0,
                 broker_refused: None,
-                reserved: 0,
+                waiting: BTreeSet::new(),
                 open: BTreeMap::new(),
                 last_admit: 0,
                 link: None,
@@ -683,12 +766,14 @@ impl Registry {
     }
 
     /// Tell the brokers of `links` to revoke, each within
-    /// [`REVOKE_SEND_TIMEOUT`]. A broker that cannot be told — gone, or not
-    /// reading its channel — is killed.
+    /// [`REVOKE_SEND_TIMEOUT`], and refuse at once every admission each
+    /// still waits for: its broker confirms only once all are answered, and
+    /// they must not wait for their records. A broker that cannot be told —
+    /// gone, or not reading its channel — is killed.
     fn tell(&self, links: &[(String, Arc<Link>)], reason: EndReason) {
         for (id, link) in links {
             let now = Instant::now();
-            let due = {
+            let (due, messages) = {
                 let mut inner = self.inner();
                 let Some(grant) = inner.grants.get_mut(id) else {
                     continue;
@@ -697,10 +782,21 @@ impl Registry {
                     continue;
                 }
                 grant.told = true;
-                grant.revoke_due.unwrap_or(now)
+                // Answered here, so the audit thread answers none of them;
+                // one whose admission record is being written gets a second
+                // record saying that it was not forwarded.
+                let waiting = std::mem::take(&mut grant.waiting);
+                grant.refused += waiting.len() as u64;
+                let messages: Vec<ToBroker> = std::iter::once(ToBroker::Revoke { reason })
+                    .chain(waiting.into_iter().map(|request| ToBroker::Refused {
+                        request,
+                        reason: AdmissionRefusal::Revoked,
+                    }))
+                    .collect();
+                (grant.revoke_due.unwrap_or(now), messages)
             };
             let deadline = due.min(now + REVOKE_SEND_TIMEOUT);
-            if link.send(&ToBroker::Revoke { reason }, deadline).is_err() {
+            if link.send_all(&messages, deadline).is_err() {
                 self.kill(id, link);
             }
         }
@@ -857,10 +953,11 @@ impl Registry {
             thread::Builder::new()
                 .name("rusthorse-grant-audit".into())
                 .spawn(move || registry.record_jobs(&recorded, &recording, queue))?;
-            let (registry, grant) = (Arc::clone(self), id.to_string());
+            let (registry, grant, answering) =
+                (Arc::clone(self), id.to_string(), Arc::clone(&link));
             thread::Builder::new()
                 .name("rusthorse-grant".into())
-                .spawn(move || registry.read_broker(&grant, &reader, jobs))?;
+                .spawn(move || registry.read_broker(&grant, &reader, &answering, jobs))?;
             Ok(())
         })();
         if let Err(e) = started {
@@ -873,16 +970,29 @@ impl Registry {
         Ok(())
     }
 
-    /// Read a broker until its channel ends, checking every message.
-    fn read_broker(self: &Arc<Self>, id: &str, channel: &UnixStream, jobs: mpsc::SyncSender<Job>) {
+    /// Read a broker until its channel ends, checking every message, and
+    /// answer at once the admissions it refuses.
+    fn read_broker(
+        self: &Arc<Self>,
+        id: &str,
+        channel: &UnixStream,
+        link: &Link,
+        jobs: mpsc::SyncSender<Job>,
+    ) {
         loop {
             match broker_protocol::read_message::<FromBroker>(channel, None) {
                 // A broker never sends descriptors.
                 Ok((message, fds)) if fds.is_empty() => match self.on_message(id, message) {
-                    Ok(Some(job)) => {
+                    Ok(Next::Job(job)) => {
                         let _ = jobs.send(job);
                     }
-                    Ok(None) => {}
+                    Ok(Next::Answer(answer)) => {
+                        // A broker that does not take it is broken.
+                        if link.send(&answer, Instant::now() + ANSWER_TIMEOUT).is_err() {
+                            self.violation(id);
+                            break;
+                        }
+                    }
                     Err(()) => {
                         self.violation(id);
                         break;
@@ -908,8 +1018,10 @@ impl Registry {
     }
 
     /// Check one message of a grant's broker against the conversation, and
-    /// count it. `Err` is a violation: nothing was counted.
-    fn on_message(&self, id: &str, message: FromBroker) -> Result<Option<Job>, ()> {
+    /// count it. An admission is refused at once, or reserved — a use and a
+    /// slot — for the audit thread to record and answer. `Err` is a
+    /// violation: nothing was counted.
+    fn on_message(&self, id: &str, message: FromBroker) -> Result<Next, ()> {
         let mut inner = self.inner();
         let grant = inner.grants.get_mut(id).ok_or(())?;
         // Nothing comes after the confirmation of a revocation.
@@ -938,7 +1050,16 @@ impl Registry {
                     return Err(());
                 }
                 grant.last_admit = request;
-                Ok(Some(Job::Admit { request, route }))
+                match grant.admissible(BootInstant::now()) {
+                    Ok(()) => {
+                        grant.waiting.insert(request);
+                        Ok(Next::Job(Job::Admit { request, route }))
+                    }
+                    Err(reason) => {
+                        grant.refused += 1;
+                        Ok(Next::Answer(ToBroker::Refused { request, reason }))
+                    }
+                }
             }
             FromBroker::Finished {
                 request,
@@ -949,7 +1070,7 @@ impl Registry {
             } => {
                 let route = grant.open.remove(&request).ok_or(())?;
                 grant.finished += 1;
-                Ok(Some(Job::Finished {
+                Ok(Next::Job(Job::Finished {
                     request,
                     route,
                     outcome,
@@ -966,7 +1087,7 @@ impl Registry {
                 grant.broker_refused = Some(refused);
                 drop(inner);
                 self.changed.notify_all();
-                Ok(Some(Job::Confirmed))
+                Ok(Next::Job(Job::Confirmed))
             }
         }
     }
@@ -992,7 +1113,8 @@ impl Registry {
     }
 
     /// Write the records of a grant's requests and end, and decide its
-    /// admissions, in the order its broker sent them.
+    /// admissions, in the order its broker sent them. It never waits for a
+    /// broker's confirmation.
     fn record_jobs(self: &Arc<Self>, meta: &GrantMeta, link: &Link, queue: mpsc::Receiver<Job>) {
         for job in queue {
             match job {
@@ -1013,9 +1135,10 @@ impl Registry {
                     event.bytes_received = Some(bytes_received);
                     if self.audit.record(&event).is_err() {
                         // Without the records of its requests, the grant
-                        // admits nothing more.
+                        // admits nothing more: decided now, and its broker
+                        // told and waited for by another thread.
                         self.decide(Which::Grant(&meta.id), EndReason::AuditFailed)
-                            .complete();
+                            .complete_elsewhere();
                     }
                 }
                 Job::End(end) => self.record_end(meta, end),
@@ -1033,13 +1156,38 @@ impl Registry {
         }
     }
 
-    /// Decide on an admission and answer it: check that the grant is active
-    /// and within its limits and reserve a use and a slot; write the
-    /// admission record durably; check again that the grant is still
-    /// active; answer.
+    /// Decide on an admission the reader reserved, and answer it: check that
+    /// it is still waiting and the grant still admitting; write the
+    /// admission record durably; check both again; answer. A revocation may
+    /// answer it at any moment before the last check, and then nothing more
+    /// is sent.
     fn admit(&self, meta: &GrantMeta, link: &Link, request: u64, route: &str) {
-        let (answer, recorded) = self.admission(meta, request, route);
-        if recorded && !matches!(answer, ToBroker::Admitted { .. }) {
+        // Ended or expired since it was reserved: refused, and not recorded.
+        let early = {
+            let mut inner = self.inner();
+            let Some(grant) = inner.grants.get_mut(&meta.id) else {
+                return;
+            };
+            if !grant.waiting.contains(&request) {
+                // A revocation answered it already.
+                return;
+            }
+            grant.admitting(BootInstant::now()).err().map(|reason| {
+                grant.waiting.remove(&request);
+                grant.refused += 1;
+                ToBroker::Refused { request, reason }
+            })
+        };
+        if let Some(answer) = early {
+            self.answer(meta, link, &answer);
+            return;
+        }
+        let mut event = meta.event("broker_request", "admitted");
+        event.request = Some(request);
+        event.route = Some(route.to_string());
+        let recorded = self.audit.record(&event).is_ok();
+        let answer = self.admission(meta, request, route, recorded);
+        if recorded && !matches!(answer, Some(ToBroker::Admitted { .. })) {
             // Its admission was recorded, and then the grant ended: the
             // record of its end says that it was not forwarded.
             let mut event = meta
@@ -1049,48 +1197,36 @@ impl Registry {
             event.route = Some(route.to_string());
             let _ = self.audit.record(&event);
         }
-        if link.send(&answer, Instant::now() + ANSWER_TIMEOUT).is_err() {
-            self.violation(&meta.id);
+        if let Some(answer) = answer {
+            self.answer(meta, link, &answer);
         }
     }
 
-    /// The answer to an admission (see [`Registry::admit`]), and whether its
-    /// admission record was written.
-    fn admission(&self, meta: &GrantMeta, request: u64, route: &str) -> (ToBroker, bool) {
-        let refused = |reason| ToBroker::Refused { request, reason };
-        {
-            let mut inner = self.inner();
-            let Some(grant) = inner.grants.get_mut(&meta.id) else {
-                return (refused(AdmissionRefusal::Revoked), false);
-            };
-            if let Err(reason) = grant.admissible(BootInstant::now()) {
-                grant.refused += 1;
-                return (refused(reason), false);
-            }
-            grant.reserved += 1;
-        }
-        let mut event = meta.event("broker_request", "admitted");
-        event.request = Some(request);
-        event.route = Some(route.to_string());
-        let recorded = self.audit.record(&event).is_ok();
+    /// The answer to a waiting admission once its record was written, or
+    /// could not be (see [`Registry::admit`]); `None` when it has none to
+    /// get from here: a revocation answered it meanwhile, or its broker is
+    /// gone.
+    fn admission(
+        &self,
+        meta: &GrantMeta,
+        request: u64,
+        route: &str,
+        recorded: bool,
+    ) -> Option<ToBroker> {
         let mut inner = self.inner();
-        let Some(grant) = inner.grants.get_mut(&meta.id) else {
-            return (refused(AdmissionRefusal::Revoked), recorded);
-        };
-        grant.reserved -= 1;
+        let grant = inner.grants.get_mut(&meta.id)?;
+        if !grant.waiting.remove(&request) {
+            return None;
+        }
+        let refused = |reason| Some(ToBroker::Refused { request, reason });
         if !recorded {
             grant.refused += 1;
-            return (refused(AdmissionRefusal::AuditFailed), false);
+            return refused(AdmissionRefusal::AuditFailed);
         }
         // Ended while the record was written: refused, though recorded.
-        let still = match grant.state {
-            State::Active if BootInstant::now() >= grant.deadline => Err(AdmissionRefusal::Expired),
-            State::Active => Ok(()),
-            _ => Err(AdmissionRefusal::Revoked),
-        };
-        if let Err(reason) = still {
+        if let Err(reason) = grant.admitting(BootInstant::now()) {
             grant.refused += 1;
-            return (refused(reason), true);
+            return refused(reason);
         }
         grant.admitted += 1;
         grant.open.insert(request, route.to_string());
@@ -1101,7 +1237,15 @@ impl Registry {
         {
             grant.state = State::Exhausted;
         }
-        (ToBroker::Admitted { request }, true)
+        Some(ToBroker::Admitted { request })
+    }
+
+    /// Send the answer to an admission; a broker that does not take it is
+    /// broken.
+    fn answer(&self, meta: &GrantMeta, link: &Link, answer: &ToBroker) {
+        if link.send(answer, Instant::now() + ANSWER_TIMEOUT).is_err() {
+            self.violation(&meta.id);
+        }
     }
 
     /// Write a grant's end record (best effort).
@@ -1144,6 +1288,35 @@ impl Ending {
     /// [`REVOKE_CONFIRM_TIMEOUT`] after that.
     pub(crate) fn complete(mut self) {
         self.finish();
+    }
+
+    /// [`Ending::complete`] on a thread of its own, for a thread that must
+    /// never wait for a broker's confirmation: a grant's audit thread, which
+    /// may have to answer the admissions that the broker waits for before it
+    /// confirms. The grants have ended already, so nothing is admitted for
+    /// them meanwhile. Should no thread start, the brokers still to be told
+    /// are killed.
+    fn complete_elsewhere(mut self) {
+        self.done = true;
+        let tell = std::mem::take(&mut self.tell);
+        let wait = std::mem::take(&mut self.wait);
+        // Nothing to tell: each broker it concerns was told by an earlier
+        // ending, which waits for it.
+        if tell.is_empty() {
+            return;
+        }
+        let (registry, reason, telling) = (Arc::clone(&self.registry), self.reason, tell.clone());
+        let started = thread::Builder::new()
+            .name("rusthorse-revoke".into())
+            .spawn(move || {
+                registry.tell(&telling, reason);
+                registry.wait_confirmed(&wait);
+            });
+        if started.is_err() {
+            for (id, link) in &tell {
+                self.registry.kill(id, link);
+            }
+        }
     }
 
     fn finish(&mut self) {
@@ -1530,6 +1703,20 @@ mod tests {
         }
     }
 
+    /// Hold the next record of `outcome` inside `log`, as a slow disk
+    /// would, until the first returned end sends (or is dropped: then for at
+    /// most [`PATIENCE`]); the second end says when the record is held.
+    fn hold_next(log: &Log, outcome: &str) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (release, released) = mpsc::channel::<()>();
+        let (entered, held) = mpsc::channel::<()>();
+        *log.hook_on.lock().expect("lock") = Some(outcome.into());
+        *log.hook.lock().expect("lock") = Some(Box::new(move || {
+            let _ = entered.send(());
+            let _ = released.recv_timeout(PATIENCE);
+        }));
+        (release, held)
+    }
+
     /// Wait until `f` gives something, at most [`PATIENCE`].
     fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
         let until = Instant::now() + PATIENCE;
@@ -1561,34 +1748,105 @@ mod tests {
         }
     }
 
+    /// When a [`FakeBroker`] confirms a revocation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Confirm {
+        /// Never: it ignores revocations.
+        Never,
+        /// As soon as it is told.
+        AtOnce,
+        /// As `rusthorse-broker` does: once every admission it asked for is
+        /// answered, after reporting each request admitted and not finished
+        /// as closed by the revocation; and it asks for no admission once
+        /// told.
+        AfterAnswers,
+    }
+
+    /// What a [`FakeBroker`] knows of its conversation.
+    #[derive(Default)]
+    struct Book {
+        /// Admissions asked for and not answered yet.
+        asked: BTreeSet<u64>,
+        /// Requests admitted and not reported finished.
+        open: BTreeSet<u64>,
+        /// Told to revoke.
+        told: bool,
+        /// Confirmed the revocation.
+        confirmed: bool,
+    }
+
     /// The broker's side of a control channel, played by the test: a
-    /// thread reads what the agent sends, and confirms revocations when
-    /// `confirm` is set, reporting `refused` requests refused before
+    /// thread reads what the agent sends, and confirms revocations as
+    /// `confirm` says, reporting `refused` requests refused before
     /// admission.
     struct FakeBroker {
+        confirm: Confirm,
+        /// Taken before `writer` when both are.
+        book: Arc<Mutex<Book>>,
         writer: Arc<Mutex<UnixStream>>,
         received: mpsc::Receiver<ToBroker>,
         ended: Arc<AtomicBool>,
     }
 
     impl FakeBroker {
-        fn new(channel: UnixStream, confirm: bool, refused: u64) -> FakeBroker {
+        fn new(channel: UnixStream, confirm: Confirm, refused: u64) -> FakeBroker {
             let reader = channel.try_clone().expect("clone");
             let writer = Arc::new(Mutex::new(channel));
+            let book = Arc::new(Mutex::new(Book::default()));
             let (tx, received) = mpsc::channel();
             let ended = Arc::new(AtomicBool::new(false));
-            let (answer, done) = (Arc::clone(&writer), Arc::clone(&ended));
+            let (answer, kept, done) = (Arc::clone(&writer), Arc::clone(&book), Arc::clone(&ended));
             thread::spawn(move || {
                 while let Ok((message, _)) =
                     broker_protocol::read_message::<ToBroker>(&reader, None)
                 {
-                    if matches!(message, ToBroker::Revoke { .. }) && confirm {
-                        let writer = answer.lock().expect("lock");
-                        let _ = broker_protocol::write_message(
-                            &writer,
-                            &FromBroker::Revoked { refused },
-                            &[],
-                        );
+                    {
+                        let mut book = kept.lock().expect("lock");
+                        match &message {
+                            ToBroker::Admitted { request } => {
+                                book.asked.remove(request);
+                                book.open.insert(*request);
+                            }
+                            ToBroker::Refused { request, .. } => {
+                                book.asked.remove(request);
+                            }
+                            ToBroker::Revoke { .. } => book.told = true,
+                            ToBroker::Install(_) => {}
+                        }
+                        let now = match confirm {
+                            Confirm::Never => false,
+                            Confirm::AtOnce => matches!(message, ToBroker::Revoke { .. }),
+                            Confirm::AfterAnswers => {
+                                book.told && !book.confirmed && book.asked.is_empty()
+                            }
+                        };
+                        if now {
+                            book.confirmed = true;
+                            let closed = if confirm == Confirm::AfterAnswers {
+                                std::mem::take(&mut book.open)
+                            } else {
+                                BTreeSet::new()
+                            };
+                            let writer = answer.lock().expect("lock");
+                            for request in closed {
+                                let _ = broker_protocol::write_message(
+                                    &writer,
+                                    &FromBroker::Finished {
+                                        request,
+                                        outcome: RequestOutcome::Revoked,
+                                        status: None,
+                                        bytes_sent: 0,
+                                        bytes_received: 0,
+                                    },
+                                    &[],
+                                );
+                            }
+                            let _ = broker_protocol::write_message(
+                                &writer,
+                                &FromBroker::Revoked { refused },
+                                &[],
+                            );
+                        }
                     }
                     if tx.send(message).is_err() {
                         break;
@@ -1597,13 +1855,30 @@ mod tests {
                 done.store(true, Ordering::SeqCst);
             });
             FakeBroker {
+                confirm,
+                book,
                 writer,
                 received,
                 ended,
             }
         }
 
+        /// Send `message` — except, from a broker that confirms only once
+        /// answered, an admission asked for once it was told to revoke.
         fn send(&self, message: &FromBroker) {
+            let mut book = self.book.lock().expect("lock");
+            match message {
+                FromBroker::Admit { .. } if self.confirm == Confirm::AfterAnswers && book.told => {
+                    return;
+                }
+                FromBroker::Admit { request, .. } => {
+                    book.asked.insert(*request);
+                }
+                FromBroker::Finished { request, .. } => {
+                    book.open.remove(request);
+                }
+                _ => {}
+            }
             let writer = self.writer.lock().expect("lock");
             // The agent may have shut the channel down already.
             let _ = broker_protocol::write_message(&writer, message, &[]);
@@ -1661,7 +1936,7 @@ mod tests {
     fn setup_with(
         profile: BrokerProfile,
         lifetime: Duration,
-        confirm: bool,
+        confirm: Confirm,
         refused: u64,
     ) -> Setup {
         let log = Arc::new(Log::default());
@@ -1684,7 +1959,7 @@ mod tests {
     }
 
     fn setup() -> Setup {
-        setup_with(anthropic(), Duration::from_secs(3600), true, 0)
+        setup_with(anthropic(), Duration::from_secs(3600), Confirm::AtOnce, 0)
     }
 
     fn admitted(request: u64) -> String {
@@ -1802,7 +2077,7 @@ mod tests {
         }
         .resolve()
         .expect("profile");
-        let s = setup_with(profile, Duration::from_secs(3600), true, 4);
+        let s = setup_with(profile, Duration::from_secs(3600), Confirm::AtOnce, 4);
         let route = "POST /v1/messages/count_tokens";
         assert_eq!(format!("{:?}", s.broker.admit(1, route)), admitted(1));
         assert_eq!(info(&s.registry, &s.id).state, "active");
@@ -1955,7 +2230,7 @@ mod tests {
 
     #[test]
     fn nothing_may_follow_the_confirmation_of_a_revocation() {
-        let s = setup_with(anthropic(), Duration::from_secs(3600), true, 2);
+        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::AtOnce, 2);
         s.registry.decide(Which::All, EndReason::Locked).complete();
         assert!(matches!(
             s.broker.next(),
@@ -2008,7 +2283,12 @@ mod tests {
 
     #[test]
     fn an_end_that_cannot_be_recorded_revokes_the_grant() {
-        let s = setup();
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
         assert_eq!(
             format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
             admitted(1)
@@ -2030,7 +2310,12 @@ mod tests {
 
     #[test]
     fn a_revocation_does_not_need_the_audit_log() {
-        let s = setup();
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
         assert_eq!(
             format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
             admitted(1)
@@ -2060,7 +2345,12 @@ mod tests {
 
     #[test]
     fn an_admission_whose_grant_ends_while_it_is_recorded_is_refused() {
-        let s = setup();
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
         let registry = Arc::clone(&s.registry);
         *s.log.hook_on.lock().expect("lock") = Some("admitted".into());
         *s.log.hook.lock().expect("lock") = Some(Box::new(move || {
@@ -2082,6 +2372,9 @@ mod tests {
             format!("{:?}", s.broker.next()),
             refused(1, AdmissionRefusal::Revoked)
         );
+        // The revocation answered it, before its record was written; the
+        // grant's end is recorded after that record.
+        let end = s.log.end_of(&s.id);
         let outcomes: Vec<String> = s
             .log
             .of("broker_request")
@@ -2089,7 +2382,6 @@ mod tests {
             .map(|e| e.outcome)
             .collect();
         assert_eq!(outcomes, ["admitted", "not_forwarded"]);
-        let end = s.log.end_of(&s.id);
         assert_eq!(
             end.requests,
             Some(AuditRequestCounts {
@@ -2101,11 +2393,287 @@ mod tests {
         );
     }
 
+    /// An admission whose grant's lifetime passes while its record is being
+    /// written is refused once the record is written (`expired`), and that
+    /// record is followed by one that says it was not forwarded: nothing is
+    /// admitted after a grant's lifetime, even before the timer ends it.
+    #[test]
+    fn an_admission_whose_grant_expires_while_it_is_recorded_is_refused() {
+        let s = setup_with(
+            anthropic(),
+            Duration::from_millis(400),
+            Confirm::AfterAnswers,
+            0,
+        );
+        let (release, held) = hold_next(&s.log, "admitted");
+        s.broker.send(&FromBroker::Admit {
+            request: 1,
+            method: "POST".into(),
+            route: "POST /v1/messages".into(),
+        });
+        held.recv_timeout(PATIENCE).expect("the record");
+        thread::sleep(Duration::from_millis(500));
+        release.send(()).expect("release");
+        assert_eq!(
+            format!("{:?}", s.broker.next()),
+            refused(1, AdmissionRefusal::Expired)
+        );
+        let recorded: Vec<(Option<u64>, String)> = s
+            .log
+            .of("broker_request")
+            .into_iter()
+            .map(|e| (e.request, e.outcome))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (Some(1), "admitted".to_string()),
+                (Some(1), "not_forwarded".to_string())
+            ]
+        );
+        let now = info(&s.registry, &s.id);
+        assert_eq!((now.requests, now.in_flight), (0, 0));
+    }
+
+    /// A revocation answers at once every admission still waiting — for its
+    /// record, or behind it — without waiting for the audit log: a broker
+    /// that confirms only once every admission it asked for is answered, as
+    /// `rusthorse-broker` does, confirms in time and is not killed, and
+    /// nothing is admitted after the decision.
+    #[test]
+    fn a_revocation_answers_at_once_the_admissions_waiting_for_their_records() {
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
+        let (release, held) = hold_next(&s.log, "admitted");
+        for request in [1, 2] {
+            s.broker.send(&FromBroker::Admit {
+                request,
+                method: "POST".into(),
+                route: "POST /v1/messages".into(),
+            });
+        }
+        held.recv_timeout(PATIENCE).expect("the first record");
+        // Both hold a slot: the first waits for its record, the second for
+        // its turn.
+        wait_for(|| (info(&s.registry, &s.id).in_flight == 2).then_some(()));
+        let started = Instant::now();
+        s.registry
+            .decide(Which::Grant(&s.id), EndReason::Revoked)
+            .complete();
+        let took = started.elapsed();
+        assert!(took < REVOKE_CONFIRM_TIMEOUT, "{took:?}");
+        let told: Vec<String> = (0..3).map(|_| format!("{:?}", s.broker.next())).collect();
+        assert_eq!(
+            told,
+            [
+                format!(
+                    "{:?}",
+                    ToBroker::Revoke {
+                        reason: EndReason::Revoked
+                    }
+                ),
+                refused(1, AdmissionRefusal::Revoked),
+                refused(2, AdmissionRefusal::Revoked),
+            ]
+        );
+        // The first record is written at last: nothing more is sent, and
+        // it is followed by one that says it was not forwarded.
+        release.send(()).expect("release");
+        let end = s.log.end_of(&s.id);
+        assert_eq!(
+            end.requests,
+            Some(AuditRequestCounts {
+                admitted: 0,
+                finished: 0,
+                unknown: 0,
+                refused: 2,
+            })
+        );
+        assert!(
+            s.broker
+                .received
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "a second answer"
+        );
+        let recorded: Vec<(Option<u64>, String)> = s
+            .log
+            .of("broker_request")
+            .into_iter()
+            .map(|e| (e.request, e.outcome))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (Some(1), "admitted".to_string()),
+                (Some(1), "not_forwarded".to_string())
+            ]
+        );
+        assert!(!s.broker.ended.load(Ordering::SeqCst), "killed");
+        assert_eq!(info(&s.registry, &s.id).state, "revoked");
+    }
+
+    /// A finished request whose record cannot be written revokes its grant
+    /// (`audit_failed`) at once, and an admission asked for while that
+    /// record was being written is refused with the revocation: a broker
+    /// that confirms only once every admission it asked for is answered
+    /// confirms in time, and is not killed.
+    #[test]
+    fn an_end_that_cannot_be_recorded_holds_up_no_answer() {
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
+        assert_eq!(
+            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            admitted(1)
+        );
+        s.log.refuse("completed");
+        let (release, held) = hold_next(&s.log, "completed");
+        s.broker.finish(1, RequestOutcome::Completed);
+        held.recv_timeout(PATIENCE).expect("the record of the end");
+        s.broker.send(&FromBroker::Admit {
+            request: 2,
+            method: "POST".into(),
+            route: "POST /v1/messages".into(),
+        });
+        wait_for(|| (info(&s.registry, &s.id).in_flight == 1).then_some(()));
+        let started = Instant::now();
+        release.send(()).expect("release");
+        // In either order: the revocation is told by a thread of its own,
+        // and the audit thread may refuse that admission first.
+        let mut told = [
+            format!("{:?}", s.broker.next()),
+            format!("{:?}", s.broker.next()),
+        ];
+        told.sort();
+        let mut expected = [
+            format!(
+                "{:?}",
+                ToBroker::Revoke {
+                    reason: EndReason::AuditFailed
+                }
+            ),
+            refused(2, AdmissionRefusal::Revoked),
+        ];
+        expected.sort();
+        assert_eq!(told, expected);
+        let end = s.log.end_of(&s.id);
+        let took = started.elapsed();
+        assert!(took < REVOKE_CONFIRM_TIMEOUT, "{took:?}");
+        assert_eq!(end.reason.as_deref(), Some("audit_failed"));
+        assert_eq!(
+            end.requests,
+            Some(AuditRequestCounts {
+                admitted: 1,
+                finished: 1,
+                unknown: 0,
+                refused: 1,
+            })
+        );
+        assert!(!s.broker.ended.load(Ordering::SeqCst), "killed");
+        assert_eq!(info(&s.registry, &s.id).state, "revoked");
+    }
+
+    /// A grant's audit thread never waits for its broker's confirmation:
+    /// once a record that failed has revoked the grant, the next ones are
+    /// written at once, while the broker has still not confirmed; a broker
+    /// that never does is killed all the same.
+    #[test]
+    fn records_go_on_while_a_broker_is_revoked() {
+        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
+        for request in [1, 2] {
+            assert_eq!(
+                format!("{:?}", s.broker.admit(request, "POST /v1/messages")),
+                admitted(request)
+            );
+        }
+        s.log.refuse("completed");
+        let started = Instant::now();
+        s.broker.finish(1, RequestOutcome::Completed);
+        s.broker.finish(2, RequestOutcome::ClientClosed);
+        assert!(matches!(
+            s.broker.next(),
+            ToBroker::Revoke {
+                reason: EndReason::AuditFailed
+            }
+        ));
+        wait_for(|| {
+            s.log
+                .of("broker_request")
+                .into_iter()
+                .find(|e| e.outcome == "client_closed")
+        });
+        let took = started.elapsed();
+        assert!(took < REVOKE_CONFIRM_TIMEOUT / 2, "{took:?}");
+        assert!(!s.broker.ended.load(Ordering::SeqCst));
+        // Its confirmation overdue: killed.
+        assert!(s.broker.sees_the_end(), "not killed");
+        assert_eq!(s.log.end_of(&s.id).reason.as_deref(), Some("audit_failed"));
+    }
+
+    /// Refusals never wait for the audit log: while an admission's record
+    /// is being written, a request beyond the grant's limit is refused at
+    /// once — the uses held by the admissions still waiting count — and
+    /// only the admissions within the limit are recorded.
+    #[test]
+    fn a_request_beyond_the_limit_is_refused_while_earlier_ones_are_recorded() {
+        let profile = ProfileRequest {
+            max_requests: Some(2),
+            ..ProfileRequest::new(Preset::Anthropic)
+        }
+        .resolve()
+        .expect("profile");
+        let s = setup_with(profile, Duration::from_secs(3600), Confirm::AfterAnswers, 0);
+        let (release, held) = hold_next(&s.log, "admitted");
+        for request in 1..=3 {
+            s.broker.send(&FromBroker::Admit {
+                request,
+                method: "POST".into(),
+                route: "POST /v1/messages".into(),
+            });
+        }
+        held.recv_timeout(PATIENCE).expect("the first record");
+        let first = s
+            .broker
+            .received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("an answer while the record is held");
+        assert_eq!(
+            format!("{first:?}"),
+            refused(3, AdmissionRefusal::Exhausted)
+        );
+        release.send(()).expect("release");
+        assert_eq!(format!("{:?}", s.broker.next()), admitted(1));
+        assert_eq!(format!("{:?}", s.broker.next()), admitted(2));
+        let now = info(&s.registry, &s.id);
+        assert_eq!((now.state.as_str(), now.requests), ("exhausted", 2));
+        let recorded: Vec<Option<u64>> = s
+            .log
+            .of("broker_request")
+            .into_iter()
+            .map(|e| e.request)
+            .collect();
+        assert_eq!(recorded, [Some(1), Some(2)]);
+    }
+
     #[test]
     fn a_revocation_is_confirmed_or_the_broker_is_killed_within_the_deadline() {
         // Confirmed: done as soon as the broker says so, with its count of
-        // refused requests and who revoked it.
-        let s = setup_with(anthropic(), Duration::from_secs(3600), true, 3);
+        // refused requests and who revoked it; the request it closed is
+        // finished (`revoked`).
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            3,
+        );
         assert_eq!(
             format!("{:?}", s.broker.admit(1, "GET /v1/models")),
             admitted(1)
@@ -2134,8 +2702,8 @@ mod tests {
             end.requests,
             Some(AuditRequestCounts {
                 admitted: 1,
-                finished: 0,
-                unknown: 1,
+                finished: 1,
+                unknown: 0,
                 refused: 3,
             })
         );
@@ -2145,7 +2713,7 @@ mod tests {
         again.complete();
 
         // Not confirmed: killed once the confirmation is overdue.
-        let s = setup_with(anthropic(), Duration::from_secs(3600), false, 0);
+        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
         let started = Instant::now();
         s.registry.decide(Which::All, EndReason::Locked).complete();
         let took = started.elapsed();
@@ -2180,20 +2748,27 @@ mod tests {
         registry.attach(&id, agent_end, None).expect("attach");
         run.activate().expect("activate");
         // The broker asks and asks, and never reads the answers: the agent's
-        // thread that answers is soon stuck writing one, holding the lock
-        // that orders the writers, until it gives up on the broker.
-        for n in 1..=400u64 {
-            broker_protocol::write_message(
-                &broker_end,
-                &FromBroker::Admit {
-                    request: n,
-                    method: "POST".into(),
-                    route: "POST /v1/messages".into(),
-                },
-                &[],
-            )
-            .expect("ask");
-        }
+        // threads that answer are soon stuck writing one, the first holding
+        // the lock that orders the writers, until it gives up on the broker;
+        // the agent stops reading meanwhile, and then the broker's own
+        // writes wait too, until the agent ends the channel.
+        let asking = thread::spawn(move || {
+            for n in 1..=400u64 {
+                let asked = broker_protocol::write_message(
+                    &broker_end,
+                    &FromBroker::Admit {
+                        request: n,
+                        method: "POST".into(),
+                        route: "POST /v1/messages".into(),
+                    },
+                    &[],
+                );
+                if asked.is_err() {
+                    break;
+                }
+            }
+            broker_end
+        });
         thread::sleep(Duration::from_millis(100));
         // That broker is killed, by the writer or by a revocation that
         // cannot tell it, and the revocation is done within its bounds.
@@ -2205,6 +2780,7 @@ mod tests {
             "{took:?}"
         );
         wait_for(|| (registry.count() == 0).then_some(()));
+        drop(asking.join().expect("the broker's writes end"));
         drop(run);
     }
 
@@ -2240,7 +2816,12 @@ mod tests {
 
     #[test]
     fn a_grant_expires_and_admits_nothing_after_its_lifetime() {
-        let s = setup_with(anthropic(), Duration::from_millis(300), true, 0);
+        let s = setup_with(
+            anthropic(),
+            Duration::from_millis(300),
+            Confirm::AfterAnswers,
+            0,
+        );
         assert_eq!(
             format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
             admitted(1)
@@ -2276,14 +2857,19 @@ mod tests {
 
     #[test]
     fn the_lifetime_given_to_the_broker_is_what_is_left() {
-        let s = setup_with(anthropic(), Duration::from_secs(90), true, 0);
+        let s = setup_with(anthropic(), Duration::from_secs(90), Confirm::AtOnce, 0);
         let run = s.run.as_ref().expect("run");
         let left = run.lifetime_secs(&s.id);
         assert!((89..=90).contains(&left), "{left}");
         // Never more than the profile allows, never less than a second.
-        let t = setup_with(anthropic(), Duration::from_secs(720 * 60 + 500), true, 0);
+        let t = setup_with(
+            anthropic(),
+            Duration::from_secs(720 * 60 + 500),
+            Confirm::AtOnce,
+            0,
+        );
         assert_eq!(t.run.as_ref().expect("run").lifetime_secs(&t.id), 720 * 60);
-        let u = setup_with(anthropic(), Duration::ZERO, true, 0);
+        let u = setup_with(anthropic(), Duration::ZERO, Confirm::AtOnce, 0);
         assert_eq!(u.run.as_ref().expect("run").lifetime_secs(&u.id), 1);
     }
 
@@ -2313,10 +2899,30 @@ mod tests {
         };
         let err = registry.enter(one()).err().expect("one too many");
         assert!(err.contains("at most 16 grants"), "{err}");
-        // Revoked ones still hold a broker and a port until their run ends.
+        assert!(err.contains("16 do, 0 of them revoked"), "{err}");
+        // Revoked ones still hold a broker and a port until their run ends:
+        // the refusal says so, and `status` no longer counts them.
+        assert_eq!(registry.count_live(), MAX_GRANTS);
         registry.decide(Which::All, EndReason::Revoked).complete();
-        assert!(registry.enter(one()).is_err());
+        assert_eq!(registry.count_live(), 0);
+        let err = registry.enter(one()).err().expect("still too many");
+        assert!(err.contains("16 do, 16 of them revoked"), "{err}");
+        assert!(
+            err.contains("wait for some of those commands to end"),
+            "{err}"
+        );
+        assert_eq!(registry.room_for(1), Err(err));
+        // A run that asks for more than any agent serves is told so.
+        let all: Vec<NewGrant> = (0..=MAX_GRANTS).map(|_| one().remove(0)).collect();
         run.finish(EndReason::CommandEnded);
+        let err = registry
+            .enter(all)
+            .err()
+            .expect("more than any run may have");
+        assert_eq!(
+            err,
+            "a run can have at most 16 grants; this one asks for 17"
+        );
         assert_eq!(registry.count(), 0);
         let again = registry.enter(one()).expect("room again");
         // Two grants with the same ID are never entered.
@@ -2352,7 +2958,7 @@ mod tests {
         // The broker answers ready after that: it is not attached, and is
         // killed (its channel ends).
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
-        let broker = FakeBroker::new(broker_end, true, 0);
+        let broker = FakeBroker::new(broker_end, Confirm::AtOnce, 0);
         let err = registry.attach(&id, agent_end, None).expect_err("ended");
         assert!(err.contains("ended while its broker was starting"), "{err}");
         assert!(broker.sees_the_end());
@@ -2384,7 +2990,7 @@ mod tests {
             ])
             .expect("enter");
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
-        let broker_a = FakeBroker::new(broker_end, true, 0);
+        let broker_a = FakeBroker::new(broker_end, Confirm::AtOnce, 0);
         registry.attach(&a, agent_end, None).expect("attach");
         // B has no broker yet: neither becomes active.
         assert!(run.activate().is_err());
@@ -2403,6 +3009,67 @@ mod tests {
         assert!(log.of("grant").is_empty());
     }
 
+    /// A grant ended after its broker was attached and before its run was
+    /// made active — a lock, a revocation, a change to its entry while the
+    /// run's other brokers start — never becomes active: the run fails
+    /// whole.
+    #[test]
+    fn a_grant_ended_before_its_run_is_active_never_becomes_active() {
+        let log = Arc::new(Log::default());
+        let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
+        let id = broker_protocol::new_grant_id();
+        let run = registry
+            .enter(vec![new_grant(
+                &id,
+                "KEY",
+                anthropic(),
+                Duration::from_secs(60),
+            )])
+            .expect("enter");
+        run.mark_created(&id);
+        let (agent_end, broker_end) = UnixStream::pair().expect("pair");
+        let broker = FakeBroker::new(broker_end, Confirm::AfterAnswers, 0);
+        registry.attach(&id, agent_end, None).expect("attach");
+        registry.decide(Which::All, EndReason::Locked).complete();
+        assert!(matches!(
+            broker.next(),
+            ToBroker::Revoke {
+                reason: EndReason::Locked
+            }
+        ));
+        assert!(run.activate().is_err());
+        assert_eq!(info(&registry, &id).state, "revoked");
+        run.finish(EndReason::CommandEnded);
+        assert!(broker.sees_the_end());
+        assert_eq!(log.end_of(&id).reason.as_deref(), Some("locked"));
+    }
+
+    /// The timer ends a grant whose lifetime has passed, and tells its
+    /// broker, within about a second.
+    #[test]
+    fn the_timer_ends_the_grants_whose_lifetime_has_passed() {
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(1),
+            Confirm::AfterAnswers,
+            0,
+        );
+        let started = Instant::now();
+        s.registry.start_timer();
+        // Once: a second call starts no other timer.
+        s.registry.start_timer();
+        assert!(matches!(
+            s.broker.next(),
+            ToBroker::Revoke {
+                reason: EndReason::Expired
+            }
+        ));
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(info(&s.registry, &s.id).state, "revoked");
+        assert_eq!(s.log.end_of(&s.id).reason.as_deref(), Some("expired"));
+    }
+
     #[test]
     fn each_event_ends_the_grants_it_concerns() {
         let log = Arc::new(Log::default());
@@ -2413,7 +3080,9 @@ mod tests {
         }
         .resolve()
         .expect("profile");
-        let ids: Vec<String> = (0..4).map(|_| broker_protocol::new_grant_id()).collect();
+        let ids: Vec<String> = (0..6).map(|_| broker_protocol::new_grant_id()).collect();
+        // Two runs whose grants are active, and one whose grants are still
+        // starting.
         let first = registry
             .enter(vec![
                 new_grant(&ids[0], "A", anthropic(), Duration::from_secs(60)),
@@ -2423,18 +3092,37 @@ mod tests {
         let second = registry
             .enter(vec![
                 new_grant(&ids[2], "C", anthropic(), Duration::from_secs(60)),
-                new_grant(&ids[3], "A", ending, Duration::from_secs(60)),
+                new_grant(&ids[3], "A", ending.clone(), Duration::from_secs(60)),
+            ])
+            .expect("enter");
+        let mut brokers = Vec::new();
+        for (run, served) in [(&first, &ids[..2]), (&second, &ids[2..4])] {
+            for id in served {
+                let (agent_end, broker_end) = UnixStream::pair().expect("pair");
+                brokers.push(FakeBroker::new(broker_end, Confirm::AtOnce, 0));
+                registry.attach(id, agent_end, None).expect("attach");
+            }
+            run.activate().expect("activate");
+        }
+        let third = registry
+            .enter(vec![
+                new_grant(&ids[4], "D", anthropic(), Duration::from_secs(60)),
+                new_grant(&ids[5], "E", ending, Duration::from_secs(60)),
             ])
             .expect("enter");
         let state = |id: &str| info(&registry, id).state;
-        // The automatic locks: only the profiles that say so.
-        let e = registry.decide(Which::EndOnAutomaticLocks, EndReason::ScreenLocked);
-        assert_eq!(e.ended(), 2);
+        // The automatic locks: the profiles that say so, and every grant
+        // still starting, whatever its profile.
+        let e = registry.decide(Which::AutomaticLock, EndReason::ScreenLocked);
+        assert_eq!(e.ended(), 4);
         e.complete();
         assert_eq!(
             ids.iter().map(|id| state(id)).collect::<Vec<_>>(),
-            ["starting", "revoked", "starting", "revoked"]
+            [
+                "active", "revoked", "active", "revoked", "revoked", "revoked"
+            ]
         );
+        assert!(third.activate().is_err(), "a run that a lock ended starts");
         // An entry, by UUID: its grants in every run.
         assert_eq!(registry.count_for_entry("uuid-of-A"), 1);
         let uuids = ["uuid-of-A".to_string()];
@@ -2448,6 +3136,7 @@ mod tests {
         assert_eq!((e.matched(), e.ended()), (2, 1));
         e.complete();
         assert_eq!(state(&ids[2]), "revoked");
+        third.finish(EndReason::CommandEnded);
         // One grant by its ID, and an ID that names none.
         let e = registry.decide(Which::Grant("g0000000000000000"), EndReason::Revoked);
         assert_eq!(e.matched(), 0);
@@ -2460,7 +3149,12 @@ mod tests {
 
     #[test]
     fn stopping_ends_every_grant_and_its_broker() {
-        let s = setup();
+        let s = setup_with(
+            anthropic(),
+            Duration::from_secs(3600),
+            Confirm::AfterAnswers,
+            0,
+        );
         s.registry.stop_all(EndReason::AgentStopped);
         assert!(matches!(
             s.broker.next(),
@@ -2475,7 +3169,7 @@ mod tests {
 
     #[test]
     fn requests_closed_by_a_revocation_are_counted_as_their_broker_reports_them() {
-        let s = setup_with(anthropic(), Duration::from_secs(3600), false, 0);
+        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
         for n in 1..=3 {
             assert_eq!(
                 format!("{:?}", s.broker.admit(n, "POST /v1/messages")),

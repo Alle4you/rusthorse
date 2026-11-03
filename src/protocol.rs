@@ -782,9 +782,11 @@ pub struct GrantInfo {
     pub command: String,
     /// Who asked for it, as dialogs describe the requester (unverified).
     pub requester: String,
-    /// `active`; `exhausted` (its request limit is reached: no new request
-    /// is admitted, those admitted finish); or `revoked` (it has ended; its
-    /// broker answers `403` until the command ends).
+    /// `starting` (its run is being prepared: its broker is being started,
+    /// and no request is admitted yet); `active`; `exhausted` (its request
+    /// limit is reached: no new request is admitted, those admitted finish);
+    /// or `revoked` (it has ended; its broker answers `403` until the
+    /// command ends).
     pub state: String,
     /// When it was created: RFC 3339, local time with its offset, like the
     /// audit log's times.
@@ -855,8 +857,13 @@ pub struct StatusInfo {
     /// by agents that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker: Option<String>,
-    /// The number of active grants of the credential broker. Left out by
-    /// agents that predate it.
+    /// The number of grants of the credential broker that can still be
+    /// used: those `starting`, `active` or `exhausted`
+    /// ([`GrantInfo::state`]), not the `revoked` ones whose commands still
+    /// run, which [`Request::Grants`] lists too. The limit on the grants an
+    /// agent holds ([`MAX_GRANTS`](crate::broker_protocol::MAX_GRANTS))
+    /// counts the revoked ones as well: each keeps its broker and its port
+    /// until its command ends. Left out by agents that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<usize>,
 }

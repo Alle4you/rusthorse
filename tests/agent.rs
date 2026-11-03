@@ -135,6 +135,7 @@ impl Harness {
             rusthorse::session_lock::Settings::default(),
             no_keyring(),
             BROKER_READY_TIMEOUT,
+            None,
         )
     }
 
@@ -147,6 +148,20 @@ impl Harness {
             rusthorse::session_lock::Settings::default(),
             no_keyring(),
             ready,
+            None,
+        )
+    }
+
+    /// An agent whose grants last at most `lifetime`.
+    fn with_broker_lifetime(lifetime: Duration) -> Harness {
+        Harness::build(
+            Duration::ZERO,
+            Duration::from_secs(10),
+            None,
+            rusthorse::session_lock::Settings::default(),
+            no_keyring(),
+            BROKER_READY_TIMEOUT,
+            Some(lifetime),
         )
     }
 
@@ -159,6 +174,7 @@ impl Harness {
             settings,
             no_keyring(),
             BROKER_READY_TIMEOUT,
+            None,
         )
     }
 
@@ -176,6 +192,7 @@ impl Harness {
                 ..Default::default()
             },
             BROKER_READY_TIMEOUT,
+            None,
         )
     }
 
@@ -186,6 +203,7 @@ impl Harness {
         session_lock: rusthorse::session_lock::Settings,
         keyring: rusthorse::keyring::Settings,
         broker_ready_timeout: Duration,
+        broker_lifetime: Option<Duration>,
     ) -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
@@ -212,6 +230,7 @@ impl Harness {
             // stand-in (`fake_broker`).
             broker_program: Some(dir.path().join("rusthorse-broker")),
             broker_ready_timeout: Some(broker_ready_timeout),
+            broker_lifetime,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -3474,6 +3493,18 @@ fn locking_while_the_dialog_is_open_cancels_the_run() {
     assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("locked or changed"));
     assert!(!marker.exists());
+    // The approval is on record, and after it why nothing ran.
+    assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "aborted"]);
+    let aborted = audit_records(&h)
+        .into_iter()
+        .rfind(|r| r["action"] == "run")
+        .expect("the run's record");
+    assert!(
+        aborted["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("locked or changed")),
+        "{aborted}"
+    );
 }
 
 #[test]
@@ -3543,12 +3574,20 @@ fn descriptors_on_other_requests_are_rejected() {
 const FAKE_KEY: &str = "sk-ant-test-0000000000000000";
 
 /// Whether these tests can run a stand-in broker: it is a Python script.
+/// Without `/usr/bin/python3` they fail — a machine without Python must not
+/// lose every end-to-end test of the broker's side silently — unless
+/// `RUSTHORSE_TEST_WITHOUT_PYTHON` is set, which skips them, saying so.
 fn python3() -> bool {
-    let found = Path::new("/usr/bin/python3").exists();
-    if !found {
-        eprintln!("skipped: /usr/bin/python3 is needed for a stand-in broker");
+    if Path::new("/usr/bin/python3").exists() {
+        return true;
     }
-    found
+    assert!(
+        std::env::var_os("RUSTHORSE_TEST_WITHOUT_PYTHON").is_some(),
+        "/usr/bin/python3 is needed for the stand-in broker of this test; set \
+         RUSTHORSE_TEST_WITHOUT_PYTHON=1 to skip the tests that need it"
+    );
+    eprintln!("skipped: /usr/bin/python3 is needed for a stand-in broker");
+    false
 }
 
 /// Write an executable file that only its owner can change, from another
@@ -3583,6 +3622,11 @@ fn write_program(path: &Path, text: &str) {
 /// - `silent`: never answers;
 /// - `wrong_grant`, `old_version`: answers ready for another grant, or in
 ///   another version;
+/// - `first_serves`: the first of its brokers to read its install (which
+///   creates `LOG.first`) goes on; any other exits with status 5 without
+///   answering;
+/// - `held_ready`: answers ready only once the test has created
+///   `LOG.ready`;
 /// - anything else: answers ready; `bad_number` then asks for request 5
 ///   first, and `admit` for requests 1 and 2 (finishing 1 between them),
 ///   once the command has created `LOG.go`; `ignore_revoke` never confirms
@@ -3658,6 +3702,13 @@ if len(fds) == 1:
     entry["accepting"] = listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
 log(entry)
 
+if MODE == "first_serves":
+    try:
+        os.close(os.open(LOG + ".first", os.O_CREAT | os.O_EXCL))
+    except FileExistsError:
+        sys.exit(5)
+if MODE == "held_ready":
+    wait_for(LOG + ".ready")
 if MODE == "silent":
     while chan.recv(65536):
         pass
@@ -3710,6 +3761,18 @@ fn fake_broker(h: &Harness, mode: &str) -> PathBuf {
         .replace("@LOG@", log.to_str().expect("utf8"));
     write_program(&h.broker_program(), &script);
     log
+}
+
+/// Whether an install a stand-in broker logged is one the real broker would
+/// take: the checks of `Install::validate`, a lifetime of at most the
+/// profile's maximum among them.
+fn installs_validly(install: &serde_json::Value) -> Result<(), String> {
+    use rusthorse::broker_protocol::ToBroker;
+    match serde_json::from_value::<ToBroker>(install.clone()) {
+        Ok(ToBroker::Install(install)) => install.validate().map_err(str::to_string),
+        Ok(other) => Err(format!("not an install: {other:?}")),
+        Err(e) => Err(format!("not a message: {e}")),
+    }
 }
 
 /// What a stand-in broker logged so far.
@@ -4283,6 +4346,7 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     assert_eq!(install["max_connections"], 64);
     let lifetime = install["lifetime_secs"].as_u64().expect("lifetime");
     assert!((720 * 60 - 30..=720 * 60).contains(&lifetime), "{lifetime}");
+    assert_eq!(installs_validly(install), Ok(()));
 
     // The command: the token and the broker's address, never the key.
     assert_eq!(env["OPENAI_API_KEY"], token);
@@ -4624,6 +4688,136 @@ fn a_broker_that_does_not_start_serving_fails_the_run_and_leaves_nothing_behind(
     );
 }
 
+/// When one broker of a run with several grants cannot start serving, the
+/// whole run fails before anything runs: none of its grants remains, each
+/// broker it started is gone and each port it held is free, and the record
+/// of its approval is followed by one that says why nothing ran (ADR 0013,
+/// preparing a run's grants).
+#[test]
+fn a_run_whose_broker_fails_to_start_keeps_none_of_its_grants() {
+    use rusthorse::protocol::ErrorCode;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    // Two grants: a dialog that scrolls, as rusthorse-dialog's does.
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    seed(
+        &h,
+        &[
+            ("A", FAKE_KEY, Some(anthropic())),
+            ("B", "sk-ant-test-1111111111111111", Some(anthropic())),
+        ],
+    );
+    // One broker answers ready, the other exits without answering.
+    let log = fake_broker(&h, "first_serves");
+    h.decide(&[Decision::AllowOnce]);
+    let marker = h.dir.path().join("ran");
+    let request = broker_run_request(
+        &h,
+        vec![],
+        vec![brokered("KEY_A", "A", None), brokered("KEY_B", "B", None)],
+        &format!("touch {}", marker.display()),
+    );
+    let (code, message) = error_of(&broker_run(&h, request));
+    assert_eq!(code, ErrorCode::Internal, "{message}");
+    assert!(message.contains("could not serve a grant"), "{message}");
+    assert!(
+        message.contains("ended without answering (exit status 5)"),
+        "{message}"
+    );
+    assert!(message.contains("nothing was run"), "{message}");
+    assert!(!message.contains(FAKE_KEY), "{message}");
+    assert!(!marker.exists(), "the command ran");
+    assert!(grants(&h).is_empty(), "a grant was left");
+    let installs: Vec<serde_json::Value> = broker_log(&log)
+        .into_iter()
+        .filter(|e| e["event"] == "install")
+        .collect();
+    assert_eq!(installs.len(), 2, "{installs:?}");
+    for install in &installs {
+        let pid = install["pid"].as_u64().expect("pid");
+        assert!(process_gone(pid), "a broker was left running");
+        let port = install["listen"][1]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .expect("port");
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "port {port} still held"
+        );
+    }
+    let ends = grant_ends(&h);
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    for end in ends.values() {
+        assert_eq!(end["reason"], "broker_failed", "{end}");
+    }
+    assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "aborted"]);
+}
+
+/// A lock while a run's brokers start ends the run's grants, which were
+/// entered as starting — a screen lock too, whatever their profile says
+/// about the automatic locks, since nothing of the run has been used yet —
+/// and the run fails before anything runs: a broker that answers ready
+/// after that is killed, not attached (ADR 0013, preparing a run's grants).
+#[test]
+fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    use rusthorse::session_lock::{Locker, SCREEN_LOCK};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    // A profile whose grants outlive the automatic locks once active.
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let marker = h.dir.path().join("ran");
+    let script = format!("touch {}", marker.display());
+    for (lock, reason) in [("screen lock", "screen_locked"), ("lock", "locked")] {
+        let log = fake_broker(&h, "held_ready");
+        let ready = log.with_extension("jsonl.ready");
+        let _ = std::fs::remove_file(&ready);
+        h.decide(&[Decision::AllowOnce]);
+        let running = start(
+            &h,
+            broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+        );
+        let installed = logged(&log, "install");
+        let pid = installed["pid"].as_u64().expect("pid");
+        let id = installed["install"]["grant"]
+            .as_str()
+            .expect("grant")
+            .to_string();
+        // Its broker has its install and has not answered yet.
+        assert_eq!(grant_state(&h, &id).as_deref(), Some("starting"), "{lock}");
+        if lock == "screen lock" {
+            h.agent.lock_for(SCREEN_LOCK, "test");
+        } else {
+            match h.call(&Request::Lock) {
+                Response::Ok { .. } => {}
+                other => panic!("unexpected {}", other.kind()),
+            }
+        }
+        assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"), "{lock}");
+        // Its broker answers ready only now: too late.
+        std::fs::write(&ready, "").expect("ready");
+        let (code, message) = error_of(&running.wait());
+        assert_eq!(code, ErrorCode::Internal, "{lock}: {message}");
+        assert!(
+            message.contains("the grant ended while its broker was starting"),
+            "{lock}: {message}"
+        );
+        assert!(message.contains("nothing was run"), "{lock}: {message}");
+        assert!(!marker.exists(), "{lock}: the command ran");
+        assert!(process_gone(pid), "{lock}: the broker was left running");
+        assert!(grants(&h).is_empty(), "{lock}");
+        assert_eq!(ended_with(&h, &id), reason, "{lock}");
+    }
+    assert_eq!(
+        audit_outcomes(&h, "run"),
+        ["allowed_once", "aborted", "allowed_once", "aborted"]
+    );
+}
+
 /// `grants` and `revoke_grant` need neither an approval nor an unlocked
 /// vault (ADR 0013), and grants can outlive a lock: they are listed and
 /// revoked while it is locked. An ID that names no grant is `not_found`; a
@@ -4700,6 +4894,10 @@ fn grants_are_listed_and_revoked_without_a_dialog_locked_or_unlocked() {
     }
     assert_eq!(grant_state(&h, &ids[0]).as_deref(), Some("revoked"));
     assert_eq!(grant_state(&h, &ids[1]).as_deref(), Some("active"));
+    // `status` counts the grants that can still be used; the listing shows
+    // the revoked one too, until its command ends.
+    assert_eq!(status(&h).grants, Some(1));
+    assert_eq!(grants(&h).len(), 2);
     let revokes: Vec<String> = broker_log(&log)
         .into_iter()
         .filter(|e| e["event"] == "revoke")
@@ -4722,6 +4920,12 @@ fn grants_are_listed_and_revoked_without_a_dialog_locked_or_unlocked() {
         other => panic!("unexpected {}", other.kind()),
     }
     assert_eq!(grant_state(&h, &ids[1]).as_deref(), Some("revoked"));
+    assert_eq!(
+        status(&h).grants,
+        Some(0),
+        "revoked grants counted as usable"
+    );
+    assert_eq!(grants(&h).len(), 2);
     assert_eq!(
         h.ui.password_prompts.lock().unwrap().len(),
         prompts,
@@ -4862,6 +5066,48 @@ fn the_idle_lock_ends_only_the_grants_whose_profile_says_so() {
     assert!(matches!(running.wait(), Response::Exited { .. }));
     assert_eq!(ended_with(&h, &ends), "idle_timeout");
     assert_eq!(ended_with(&h, &stays), "command_ended");
+}
+
+/// A grant ends once its lifetime has passed, while its command still runs:
+/// the agent's timer revokes it (`expired`) and tells its broker, so that a
+/// stream open then ends too — refusing new requests is not enough (ADR
+/// 0013, limits). The broker's install says how long the grant has, never
+/// more than its profile allows. (Tests shorten the lifetime through
+/// `AgentConfig::broker_lifetime`.)
+#[test]
+fn a_grant_ends_when_its_lifetime_passes_while_its_command_runs() {
+    use rusthorse::protocol::Response;
+    if !python3() {
+        return;
+    }
+    let lifetime = Duration::from_secs(3);
+    let h = Harness::with_broker_lifetime(lifetime);
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let asked = Instant::now();
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], WAITS),
+    );
+    command_env(&h);
+    let installed = logged(&log, "install");
+    let install = &installed["install"];
+    let id = install["grant"].as_str().expect("grant").to_string();
+    let left = install["lifetime_secs"].as_u64().expect("lifetime");
+    assert!((1..=3).contains(&left), "{left}");
+    assert_eq!(installs_validly(install), Ok(()));
+    // The command runs on, and is not told: its grant ends under it.
+    let revoke = logged(&log, "revoke");
+    let took = asked.elapsed();
+    assert_eq!(revoke["message"]["reason"], "expired");
+    assert!(took >= lifetime, "{took:?}");
+    assert!(took < lifetime + Duration::from_secs(4), "{took:?}");
+    assert_eq!(grant_state(&h, &id).as_deref(), Some("revoked"));
+    assert!(running.answer.try_recv().is_err(), "the run ended");
+    go(&h);
+    assert!(matches!(running.wait(), Response::Exited { .. }));
+    assert_eq!(ended_with(&h, &id), "expired");
 }
 
 /// A change to the broker profile is a request of its own, `broker_edit`
@@ -5289,6 +5535,10 @@ fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
             .as_str()
             .expect("grant")
             .to_string();
+        let port = logged(&log, "install")["listen"][1]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .expect("port");
         if mode == "bad_number" {
             // It asks for request 5 first: killed, its grant gone.
             assert!(process_gone(pid), "not killed");
@@ -5308,11 +5558,22 @@ fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
             assert!(took < Duration::from_secs(4), "{took:?}");
             assert!(process_gone(pid), "not killed");
         }
+        // The broker is gone, the command still runs: the agent keeps its
+        // own copy of the listening socket until the command ends, so that
+        // no other program can take the port the command uses.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "{mode}: port {port} was let go while the command ran"
+        );
         go(&h);
         match running.wait() {
             Response::Exited { code, .. } => assert_eq!(code, Some(7), "{mode}"),
             other => panic!("unexpected {}", other.kind()),
         }
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "{mode}: port {port} still held after the run"
+        );
         let reason = ended_with(&h, &id);
         let expected = if mode == "bad_number" {
             "broker_failed"
