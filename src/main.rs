@@ -9,12 +9,14 @@ use anyhow::{Context, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use rusthorse::agent::{self, Agent, AgentConfig};
+use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
 use rusthorse::client::Client;
 use rusthorse::dialog_program::DesktopUi;
 use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
-    Binding, EntryChanges, EntryFields, EntryInfo, EntryKind, ErrorCode, Field, ImportSource,
-    NewEntry, Request, Response, RunRequest, SecretString, ValueChange,
+    Binding, BrokerBinding, BrokerRunRequest, EntryChanges, EntryFields, EntryInfo, EntryKind,
+    ErrorCode, Field, GrantInfo, ImportSource, NewEntry, Request, Response, RunRequest,
+    SecretString, StatusInfo, ValueChange,
 };
 use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
@@ -142,6 +144,10 @@ enum Command {
     Generate(GenerateArgs),
     /// Run a command with secrets in its environment (requires approval).
     Run(RunArgs),
+    /// List the grants of the credential broker (never a token), or end
+    /// them with `grants revoke`. Needs no approval.
+    #[command(args_conflicts_with_subcommands = true)]
+    Grants(GrantsArgs),
     /// Import secrets from other stores.
     #[command(subcommand)]
     Import(ImportCommand),
@@ -343,7 +349,7 @@ struct AddArgs {
     replace: bool,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ClearField {
     Username,
     Url,
@@ -351,6 +357,155 @@ enum ClearField {
     Port,
     Notes,
     Kind,
+    /// The broker profile: the entry can no longer be used with `run
+    /// --broker`, and its grants end.
+    Broker,
+}
+
+impl ClearField {
+    fn field(self) -> Field {
+        match self {
+            ClearField::Username => Field::Username,
+            ClearField::Url => Field::Url,
+            ClearField::Host => Field::Host,
+            ClearField::Port => Field::Port,
+            ClearField::Notes => Field::Notes,
+            ClearField::Kind => Field::Kind,
+            ClearField::Broker => Field::Broker,
+        }
+    }
+}
+
+/// A preset of the credential broker, as `edit --broker` names it: the
+/// presets this build knows ([`Preset::ALL`]), by their stored names.
+#[derive(Clone, Copy)]
+struct PresetArg(Preset);
+
+impl ValueEnum for PresetArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        const ALL: [PresetArg; Preset::ALL.len()] = {
+            let mut all = [PresetArg(Preset::ALL[0]); Preset::ALL.len()];
+            let mut i = 0;
+            while i < all.len() {
+                all[i] = PresetArg(Preset::ALL[i]);
+                i += 1;
+            }
+            all
+        };
+        &ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        let spec = rusthorse::broker_profile::latest(self.0);
+        let help = match spec.default_origin {
+            Some(origin) => format!(
+                "The {} API, at {origin}{} unless --broker-origin or --broker-base-path says \
+                 otherwise",
+                self.0.label(),
+                spec.default_base_path
+            ),
+            None => format!(
+                "An {} API, at the origin --broker-origin names (there is no default), with \
+                 the base path {} unless --broker-base-path says otherwise",
+                self.0.label(),
+                spec.default_base_path
+            ),
+        };
+        Some(clap::builder::PossibleValue::new(self.0.as_str()).help(help))
+    }
+}
+
+/// Whether the automatic locks end a grant, as `--broker-locks` names it
+/// ([`AutomaticLocks::ALL`]).
+#[derive(Clone, Copy)]
+struct LocksArg(AutomaticLocks);
+
+impl ValueEnum for LocksArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        const ALL: [LocksArg; AutomaticLocks::ALL.len()] = {
+            let mut all = [LocksArg(AutomaticLocks::ALL[0]); AutomaticLocks::ALL.len()];
+            let mut i = 0;
+            while i < all.len() {
+                all[i] = LocksArg(AutomaticLocks::ALL[i]);
+                i += 1;
+            }
+            all
+        };
+        &ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(
+            clap::builder::PossibleValue::new(self.0.as_str()).help(match self.0 {
+                AutomaticLocks::End => {
+                    "The screen locking, a suspend and the idle timeout end the grants"
+                }
+                AutomaticLocks::Continue => {
+                    "They do not: the grants go on while the screen is locked, although the \
+                     vault locks"
+                }
+            }),
+        )
+    }
+}
+
+/// The broker profile options of `edit` (ADR 0013).
+#[derive(Args)]
+struct BrokerOptions {
+    /// Give the entry a broker profile from this preset, so that `run
+    /// --broker` can use it: the API a grant reaches, the requests it allows
+    /// and when it ends. Options left out take the preset's defaults. It
+    /// replaces any profile, and ends the entry's grants.
+    #[arg(long = "broker", value_enum, value_name = "PRESET")]
+    preset: Option<PresetArg>,
+    /// The API's origin: https:// and a host name, with an optional port
+    /// (openai-compatible has no default).
+    #[arg(long = "broker-origin", requires = "preset", value_name = "URL")]
+    origin: Option<String>,
+    /// What the client's base URL adds after the origin, e.g. /v1; '' for
+    /// nothing.
+    #[arg(long = "broker-base-path", requires = "preset", value_name = "PATH")]
+    base_path: Option<String>,
+    /// Whether the screen locking, a suspend and the idle timeout end the
+    /// entry's grants (`rusthorse lock` always does). Unless given, the
+    /// preset's default: continue for the presets of this version.
+    #[arg(
+        long = "broker-locks",
+        requires = "preset",
+        value_enum,
+        value_name = "POLICY"
+    )]
+    locks: Option<LocksArg>,
+    /// The longest a grant lasts, in minutes (1–1440). Unless given, the
+    /// preset's default: 720 (12 hours) for the presets of this version.
+    #[arg(long = "broker-lifetime", requires = "preset", value_name = "MINUTES")]
+    lifetime: Option<u32>,
+    /// The most requests one grant admits (1–1000000); no limit unless given.
+    #[arg(long = "broker-requests", requires = "preset", value_name = "N")]
+    requests: Option<u64>,
+}
+
+impl BrokerOptions {
+    /// The profile request these options make, checked as the agent will
+    /// check it (the agent decides): only the options given, the agent
+    /// filling in the defaults of the preset's latest revision.
+    fn request(&self) -> anyhow::Result<Option<ProfileRequest>> {
+        let Some(PresetArg(preset)) = self.preset else {
+            return Ok(None);
+        };
+        let request = ProfileRequest {
+            preset,
+            origin: self.origin.clone(),
+            base_path: self.base_path.clone(),
+            automatic_locks: self.locks.map(|LocksArg(locks)| locks),
+            max_lifetime_minutes: self.lifetime,
+            max_requests: self.requests,
+        };
+        request
+            .resolve()
+            .map_err(|e| anyhow::anyhow!("broker profile: {e}"))?;
+        Ok(Some(request))
+    }
 }
 
 #[derive(Args)]
@@ -383,6 +538,8 @@ struct EditArgs {
     stdin: bool,
     #[command(flatten)]
     generate: GenerateOptions,
+    #[command(flatten)]
+    broker: BrokerOptions,
 }
 
 #[derive(Args)]
@@ -394,16 +551,51 @@ struct RunArgs {
     /// command reads /dev/null (with --no-redact it always gets stdin).
     #[arg(long)]
     stdin: bool,
-    /// Also put an entry's URL (an API's endpoint) in variable VAR. The URL
-    /// is not a secret: it is not redacted.
+    /// Use an entry through the credential broker (repeatable): VAR gets a
+    /// temporary token, never the entry's value, and the grant ends with
+    /// the command. ENTRY alone names the variable like the entry. The
+    /// entry needs a broker profile.
+    #[arg(long = "broker", value_name = "VAR=ENTRY")]
+    brokers: Vec<String>,
+    /// Also put an entry's URL (an API's endpoint) in variable VAR; for an
+    /// entry given with --broker, the broker's address instead. Not a secret:
+    /// it is not redacted.
     #[arg(long = "url", value_name = "VAR=ENTRY")]
     urls: Vec<String>,
     /// Secrets to expose: ENTRY (variable named like the entry) or VAR=ENTRY.
-    #[arg(required = true, value_name = "SECRET")]
+    /// At least one, unless --broker is given.
+    #[arg(required_unless_present = "brokers", value_name = "SECRET")]
     secrets: Vec<String>,
     /// The command, after `--`.
     #[arg(last = true, required = true, value_name = "COMMAND")]
     command: Vec<String>,
+}
+
+#[derive(Args)]
+struct GrantsArgs {
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
+    #[command(subcommand)]
+    command: Option<GrantsCommand>,
+}
+
+#[derive(Subcommand)]
+enum GrantsCommand {
+    /// End a grant now, or every grant: its requests are refused, open ones
+    /// closed. Needs no approval, like `lock`.
+    Revoke(RevokeArgs),
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct RevokeArgs {
+    /// The grant's ID, as `rusthorse grants` shows it.
+    #[arg(value_name = "ID")]
+    id: Option<String>,
+    /// End every grant.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -506,6 +698,10 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             // `run` checks inside its own error handling, so that a missing
             // or incompatible agent is reported as "did not run" (125).
             | Command::Run(_)
+            // These check after their arguments, so that a mistake in them
+            // sends nothing at all.
+            | Command::Edit(_)
+            | Command::Grants(_)
     );
     if talks_to_agent {
         client.check_compatible()?;
@@ -550,6 +746,7 @@ fn dispatch(command: Command, client: &Client) -> anyhow::Result<u8> {
             simple(client, &Request::Backup { path })
         }
         Command::Run(args) => run(client, args),
+        Command::Grants(args) => grants(client, args),
         Command::Import(cmd) => import_cmd(client, cmd),
         Command::Audit { lines, json } => show_audit(lines, json),
     }
@@ -940,6 +1137,13 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     if let Some(dialogs) = &info.dialogs {
         println!("dialogs:    {dialogs}");
     }
+    // The credential broker (ADR 0013), from agents that report it.
+    if let Some(broker) = &info.broker {
+        println!("broker:     {broker}");
+    }
+    if let Some(grants) = info.grants {
+        println!("grants:     {grants} active");
+    }
     for (i, line) in rusthorse::session_lock::summary(&info.lock_triggers)
         .iter()
         .enumerate()
@@ -1086,7 +1290,47 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
     line("protected:", Some(entry.protected_fields.join(", ")));
     line("fields:", Some(entry.other_fields.join(", ")));
     line("modified:", entry.modified.clone());
+    for (i, text) in profile_lines(&entry).iter().enumerate() {
+        println!("{:<11} {text}", if i == 0 { "broker:" } else { "" });
+    }
     Ok(0)
+}
+
+/// What `show` says of an entry's broker profile (ADR 0013): its preset and
+/// revision, then what an approval dialog says of it — the destination,
+/// every route, how a grant ends and its limits; or why the entry cannot be
+/// used with the broker. Nothing for an entry without a profile.
+fn profile_lines(entry: &EntryInfo) -> Vec<String> {
+    use rusthorse::vault::FIELD_BROKER;
+    if let Some(profile) = &entry.broker {
+        let mut lines = vec![format!(
+            "{} preset, revision {}",
+            profile.preset, profile.revision
+        )];
+        lines.extend(
+            profile
+                .describe()
+                .into_iter()
+                .map(|(label, value)| rusthorse::util::visible(&format!("{label}: {value}"))),
+        );
+        return lines;
+    }
+    if entry.protected_fields.iter().any(|f| f == FIELD_BROKER) {
+        return vec![
+            "withheld: the file marks the profile as protected, so the entry cannot be used \
+             with the broker"
+                .into(),
+        ];
+    }
+    if entry.other_fields.iter().any(|f| f == FIELD_BROKER) {
+        return vec![
+            "unusable: this Rusthorse does not read the stored profile, so the entry cannot be \
+             used with the broker (set a new one with `rusthorse edit NAME --broker PRESET`, or \
+             remove it with `--clear broker`)"
+                .into(),
+        ];
+    }
+    Vec::new()
 }
 
 fn read_stdin_value() -> anyhow::Result<SecretString> {
@@ -1134,6 +1378,13 @@ fn add(client: &Client, args: AddArgs) -> anyhow::Result<u8> {
 }
 
 fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
+    // The profile is checked before anything is sent, as the agent will
+    // check it: a mistake in it reaches no dialog.
+    let broker = args.broker.request()?;
+    if broker.is_some() && args.clear.contains(&ClearField::Broker) {
+        bail!("--broker sets a broker profile and --clear broker removes it: give one of them");
+    }
+    client.check_compatible()?;
     let value = if args.stdin {
         Some(ValueChange::Provided(read_stdin_value()?))
     } else if let Some(spec) = args.generate.spec() {
@@ -1143,18 +1394,7 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
     } else {
         None
     };
-    let mut clear: Vec<Field> = args
-        .clear
-        .into_iter()
-        .map(|f| match f {
-            ClearField::Username => Field::Username,
-            ClearField::Url => Field::Url,
-            ClearField::Host => Field::Host,
-            ClearField::Port => Field::Port,
-            ClearField::Notes => Field::Notes,
-            ClearField::Kind => Field::Kind,
-        })
-        .collect();
+    let mut clear: Vec<Field> = args.clear.into_iter().map(ClearField::field).collect();
     if args.fields.kind == Some(KindArg::Other) && !clear.contains(&Field::Kind) {
         clear.push(Field::Kind);
     }
@@ -1171,18 +1411,21 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
         add_tags: args.add_tags,
         remove_tags: args.remove_tags,
         value,
-        broker: None,
+        broker,
     };
     if changes.is_empty() {
         bail!("nothing to change (see `rusthorse edit --help`)");
     }
-    simple(
-        client,
-        &Request::Edit {
-            name: args.name,
-            changes,
-        },
-    )
+    // A change to the profile is a request of its own (protocol 8), which
+    // an older agent refuses whole rather than apply the rest of the edit
+    // without it; the agent refuses it as a plain edit.
+    let name = args.name;
+    let request = if changes.touches_broker() {
+        Request::BrokerEdit { name, changes }
+    } else {
+        Request::Edit { name, changes }
+    };
+    simple(client, &request)
 }
 
 fn reveal(client: &Client, name: String, notes: bool) -> anyhow::Result<u8> {
@@ -1215,41 +1458,159 @@ fn parse_binding(spec: &str) -> anyhow::Result<Binding> {
     })
 }
 
-/// The variables that `run --url VAR=ENTRY` adds: each entry's URL, read
-/// from its metadata. A URL is not a secret — `rusthorse show` prints it
-/// without approval — so it travels in the client's environment like any
-/// variable set in the shell: not redacted, and listed in the dialog only
-/// as such a variable would be (see `exec::destination`).
-fn endpoint_urls(
-    client: &Client,
-    specs: &[String],
-    secrets: &[Binding],
-) -> anyhow::Result<Vec<(String, String)>> {
-    // Every option is checked before any entry is read: reading one may make
-    // the agent ask for the master password.
-    let mut wanted: Vec<Binding> = Vec::new();
-    for spec in specs {
+/// Whether `var` changes how programs start (`LD_*`, `NODE_OPTIONS`, …): a
+/// variable `run` refuses to fill with a URL or a token.
+fn starts_programs(var: &str) -> bool {
+    var.starts_with(rusthorse::exec::LOADER_PREFIX) || rusthorse::exec::is_risky(var)
+}
+
+/// Whether the agent sets `var` itself in a run with broker bindings: it
+/// adds `127.0.0.1` to `NO_PROXY` and `no_proxy` (ADR 0013), so a token or
+/// the broker's address there would be mixed with it. Programs differ in
+/// how they read the name's case: every spelling is refused.
+fn set_by_the_agent(var: &str) -> bool {
+    var.eq_ignore_ascii_case("NO_PROXY")
+}
+
+/// What `run` is asked for, as its arguments say it, checked before anything
+/// is sent to the agent.
+#[derive(Debug, PartialEq, Eq)]
+struct RunPlan {
+    /// The secrets the command gets by value.
+    bindings: Vec<Binding>,
+    /// The entries the command uses through the credential broker (ADR
+    /// 0013), each with the variable of its token and, from a `--url` for
+    /// the same entry, the variable of the broker's address.
+    brokered: Vec<BrokerBinding>,
+    /// The other `--url VAR=ENTRY`: VAR gets the entry's own URL.
+    urls: Vec<Binding>,
+}
+
+/// Check the arguments of `run` and sort them out, before anything is sent:
+/// valid and distinct variables (a token or a URL never goes in one that
+/// changes how programs start, and a token or the broker's address never in
+/// `NO_PROXY`, which the agent sets), each brokered entry given once and not
+/// also by value (by its name here; the agent compares UUIDs), and at most
+/// one `--url` for a brokered entry, which then names the variable of the
+/// broker's address.
+fn plan_run(secrets: &[String], brokers: &[String], urls: &[String]) -> anyhow::Result<RunPlan> {
+    let bindings = secrets
+        .iter()
+        .map(|s| parse_binding(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut brokered: Vec<BrokerBinding> = Vec::new();
+    for spec in brokers {
+        let Binding { var, entry } =
+            parse_binding(spec).map_err(|e| anyhow::anyhow!("--broker: {e}"))?;
+        if starts_programs(&var) {
+            bail!(
+                "--broker {var}: this variable changes how programs start; it cannot carry a token"
+            );
+        }
+        if set_by_the_agent(&var) {
+            bail!(
+                "--broker {var}: the agent adds 127.0.0.1 to this variable; it cannot carry a token"
+            );
+        }
+        if bindings.iter().any(|b| b.var == var) || brokered.iter().any(|b| b.var == var) {
+            bail!("--broker {var}: the variable is already set by another binding");
+        }
+        if brokered.iter().any(|b| b.entry == entry) {
+            bail!("--broker {var}: {entry} is already given to --broker; an entry has one grant");
+        }
+        if bindings.iter().any(|b| b.entry == entry) {
+            bail!(
+                "--broker {var}: {entry} is also given by value; the command gets an entry's value \
+                 or a grant for it, never both"
+            );
+        }
+        brokered.push(BrokerBinding {
+            var,
+            entry,
+            url_var: None,
+        });
+    }
+    let mut plain: Vec<Binding> = Vec::new();
+    for spec in urls {
         if !spec.contains('=') {
             bail!("--url {spec:?}: write VAR=ENTRY, e.g. --url OPENAI_BASE_URL=OPENAI_API_KEY");
         }
-        let binding = parse_binding(spec)?;
-        let var = &binding.var;
-        if var.starts_with(rusthorse::exec::LOADER_PREFIX) || rusthorse::exec::is_risky(var) {
+        let Binding { var, entry } = parse_binding(spec)?;
+        if starts_programs(&var) {
             bail!("--url {var}: this variable changes how programs start; it cannot carry a URL");
         }
-        if secrets.iter().chain(&wanted).any(|b| b.var == *var) {
+        let taken = bindings.iter().chain(&plain).any(|b| b.var == var)
+            || brokered
+                .iter()
+                .any(|b| b.var == var || b.url_var.as_deref() == Some(var.as_str()));
+        if taken {
             bail!("--url {var}: the variable is already set by another binding");
         }
-        wanted.push(binding);
+        match brokered.iter_mut().find(|b| b.entry == entry) {
+            Some(binding) => {
+                if set_by_the_agent(&var) {
+                    bail!(
+                        "--url {var}: the agent adds 127.0.0.1 to this variable; it cannot carry \
+                         the broker's address"
+                    );
+                }
+                if let Some(other) = &binding.url_var {
+                    bail!(
+                        "--url {var}: {entry} already has --url {other}; the broker's address \
+                         goes in one variable"
+                    );
+                }
+                binding.url_var = Some(var);
+            }
+            None => plain.push(Binding { var, entry }),
+        }
     }
+    Ok(RunPlan {
+        bindings,
+        brokered,
+        urls: plain,
+    })
+}
+
+/// The names that lead to the entry `info` describes: its UUID, and its
+/// title and path unless the title is protected (such an entry is found by
+/// UUID only).
+fn entry_names(info: &EntryInfo) -> Vec<String> {
+    let mut names = vec![info.id.clone()];
+    if !info.protected_fields.iter().any(|f| f == "Title") {
+        if let Some(group) = &info.group {
+            names.push(format!("{group}/{}", info.name));
+        }
+        names.push(info.name.clone());
+    }
+    names
+}
+
+/// The variables that `run --url VAR=ENTRY` adds for entries not given with
+/// `--broker`: each entry's URL, read from its metadata. A URL is not a
+/// secret — `rusthorse show` prints it without approval — so it travels in
+/// the client's environment like any variable set in the shell: not
+/// redacted, and listed in the dialog only as such a variable would be (see
+/// `exec::destination`). A brokered entry under another name is refused: its
+/// own URL would send the token past the broker.
+fn endpoint_urls(client: &Client, plan: &RunPlan) -> anyhow::Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for Binding { var, entry } in wanted {
+    for Binding { var, entry } in &plan.urls {
         let Response::Entry { entry: info } = check(client.call(&Request::Show {
             name: entry.clone(),
         })?)?
         else {
             bail!("unexpected response");
         };
+        let names = entry_names(&info);
+        if let Some(brokered) = plan.brokered.iter().find(|b| names.contains(&b.entry)) {
+            bail!(
+                "--url {var}: {entry} is the entry of --broker {}={}; name it the same way in both, \
+                 and {var} gets the broker's address",
+                brokered.var,
+                brokered.entry
+            );
+        }
         let Some(url) = info.fields.url else {
             if info.protected_fields.iter().any(|f| f == "URL") {
                 bail!("--url {var}: the URL of {entry} is a protected field; it is not disclosed");
@@ -1258,19 +1619,17 @@ fn endpoint_urls(
                 "--url {var}: {entry} has no URL (add one with `rusthorse edit {entry} --url …`)"
             );
         };
-        out.push((var, url));
+        out.push((var.clone(), url));
     }
     Ok(out)
 }
 
 fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     let outcome = (|| -> anyhow::Result<u8> {
+        // Every argument is checked before anything is sent: a mistake asks
+        // nothing and runs nothing.
+        let plan = plan_run(&args.secrets, &args.brokers, &args.urls)?;
         client.check_compatible()?;
-        let bindings = args
-            .secrets
-            .iter()
-            .map(|s| parse_binding(s))
-            .collect::<anyhow::Result<Vec<_>>>()?;
         let cwd = std::env::current_dir().context("cannot determine the working directory")?;
         let cwd = cwd
             .to_str()
@@ -1282,10 +1641,22 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 env.push((k.to_string(), v.to_string()));
             }
         }
-        for (var, url) in endpoint_urls(client, &args.urls, &bindings)? {
+        // The token and the broker's address are the agent's to set: what
+        // this environment had in those variables is not sent (the agent
+        // drops it too).
+        env.retain(|(k, _)| {
+            !plan
+                .brokered
+                .iter()
+                .any(|b| b.var == *k || b.url_var.as_deref() == Some(k.as_str()))
+        });
+        for (var, url) in endpoint_urls(client, &plan)? {
             env.retain(|(k, _)| *k != var);
             env.push((var, url));
         }
+        let RunPlan {
+            bindings, brokered, ..
+        } = plan;
         let request = RunRequest {
             bindings,
             argv: args.command,
@@ -1294,7 +1665,18 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             redact: !args.no_redact,
             forward_stdin: args.stdin,
         };
-        match client.run(request)? {
+        // With broker bindings, a request of its own (protocol 8): an older
+        // agent refuses it whole instead of running the command without its
+        // grants. There is no fallback to the values.
+        let response = if brokered.is_empty() {
+            client.run(request)?
+        } else {
+            client.broker_run(BrokerRunRequest {
+                run: request,
+                brokered,
+            })?
+        };
+        match response {
             Response::Exited {
                 code: Some(code), ..
             } => Ok(code.clamp(0, 255) as u8),
@@ -1328,12 +1710,117 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             {
                 eprintln!("rusthorse: {e:#}; the command may or may not have run");
                 Ok(EXIT_UNKNOWN)
+            } else if e.downcast_ref::<Exit>().is_some() {
+                // The agent refused a request made before the run (`show`
+                // for `--url`), whose message `check` printed: the run was
+                // never sent.
+                Ok(EXIT_RUN_FAILURE)
             } else {
                 eprintln!("rusthorse: {e:#}");
                 Ok(EXIT_RUN_FAILURE)
             }
         }
     }
+}
+
+/// `rusthorse grants` and `grants revoke` (ADR 0013). Neither needs an
+/// approval: listing shows no secret, and revoking only takes away.
+fn grants(client: &Client, args: GrantsArgs) -> anyhow::Result<u8> {
+    if let Some(GrantsCommand::Revoke(revoke)) = args.command {
+        // Checked before anything is sent. (clap lets exactly one through.)
+        let id = match (revoke.id, revoke.all) {
+            (Some(id), false) => {
+                if !rusthorse::broker_protocol::is_well_formed_grant_id(&id) {
+                    bail!(
+                        "{id:?} is not a grant ID: an ID is g and 16 hexadecimal digits, as \
+                         `rusthorse grants` shows it"
+                    );
+                }
+                Some(id)
+            }
+            (None, true) => None,
+            _ => bail!("give the ID of one grant, or --all"),
+        };
+        client.check_compatible()?;
+        return simple(client, &Request::RevokeGrant { id });
+    }
+    client.check_compatible()?;
+    let Response::Grants { grants } = check(client.call(&Request::Grants)?)? else {
+        bail!("unexpected response");
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&grants)?);
+        return Ok(0);
+    }
+    if grants.is_empty() {
+        eprintln!("No grants.");
+        return Ok(0);
+    }
+    print!("{}", grants_table(&grants));
+    Ok(0)
+}
+
+/// The grants as `rusthorse grants` prints them: a table with a line per
+/// grant, its command last (the longest). Everything the agent reports is
+/// shown with control and invisible characters escaped
+/// ([`rusthorse::util::visible`]): a command line or a requester's process
+/// name chosen to rewrite the terminal cannot hide a grant. There is no
+/// token to show: the agent never reports one.
+fn grants_table(grants: &[GrantInfo]) -> String {
+    use rusthorse::util::visible;
+    const HEADERS: [&str; 11] = [
+        "ID",
+        "ENTRY",
+        "DESTINATION",
+        "STATE",
+        "STARTED",
+        "ENDS IN",
+        "REQUESTS",
+        "IN FLIGHT",
+        "AUTOMATIC LOCKS",
+        "REQUESTER",
+        "COMMAND",
+    ];
+    let rows: Vec<[String; 11]> = grants
+        .iter()
+        .map(|g| {
+            [
+                visible(&g.id),
+                visible(&g.entry),
+                visible(&g.destination),
+                visible(&g.state),
+                visible(&g.started),
+                format_duration(Duration::from_secs(g.ends_in_secs)),
+                match g.max_requests {
+                    Some(limit) => format!("{} of {limit}", g.requests),
+                    None => format!("{} (no limit)", g.requests),
+                },
+                g.in_flight.to_string(),
+                g.automatic_locks.as_str().to_string(),
+                visible(&g.requester),
+                visible(&g.command),
+            ]
+        })
+        .collect();
+    let mut widths = HEADERS.map(|h| h.chars().count());
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>| -> String {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect();
+        format!("{}\n", padded.join("  ").trim_end())
+    };
+    let mut out = line(HEADERS.to_vec());
+    for row in &rows {
+        out.push_str(&line(row.iter().map(String::as_str).collect()));
+    }
+    out
 }
 
 /// One entry of `rusthorse import`: its name, the keyring item it comes
@@ -1804,6 +2291,126 @@ fn dialog_check(info: &rusthorse::protocol::StatusInfo) -> Check {
     }
 }
 
+/// What doctor says when the credential broker cannot serve grants.
+const NO_GRANTS: &str = "no grant of the credential broker can be served (`rusthorse run --broker` \
+                         exits with 125 and runs nothing)";
+
+/// What doctor found of the credential broker's program: the line it
+/// prints, and whether the program is installed at all — anything but
+/// nothing at its place, so that a broken installation counts as one.
+struct BrokerProgram {
+    check: Check,
+    installed: bool,
+}
+
+/// The credential broker's program (ADR 0013), as the agent reports using it
+/// (it checked the program as it uses it), and whether it runs:
+/// `rusthorse-broker --check`, under supervision and a 5-second limit,
+/// reports its version and broker protocol, which must be this rusthorse's.
+/// When the agent reports that it cannot use the program, its reason is the
+/// error, unless nothing at all is next to the agent's program file: then
+/// the program is not installed. An agent that does not report it has its
+/// program file's directory looked at; without an agent, the directory of
+/// this rusthorse. Not installed is a warning, since everything else works
+/// without it; unusable, of another version or not running is an error.
+fn broker_check(info: Option<&StatusInfo>) -> BrokerProgram {
+    use rusthorse::broker_protocol::{PROGRAM, VERSION};
+    use rusthorse::helper_program::{Located, check_program, locate, locate_in};
+    let installed = |check: Check| BrokerProgram {
+        check,
+        installed: true,
+    };
+    let near_the_agent = |info: &StatusInfo| {
+        let exe = info.agent_executable.trim_end_matches(" (deleted)");
+        Path::new(exe)
+            .parent()
+            .filter(|_| !exe.is_empty())
+            .map(|dir| locate_in(dir, PROGRAM))
+    };
+    let located = match info {
+        Some(info) => match info.broker.as_deref() {
+            Some(reason) if reason.starts_with("none: ") => {
+                let why = &reason["none: ".len()..];
+                return match near_the_agent(info) {
+                    // Nothing there: the program is not installed.
+                    Some(Located::Absent(path)) => not_installed(&path),
+                    _ => installed(Check::Fail(format!("{NO_GRANTS}: {why}"))),
+                };
+            }
+            Some(path) => Located::Program(PathBuf::from(path)),
+            // An agent that predates the field.
+            None => match near_the_agent(info) {
+                Some(located) => located,
+                None => {
+                    return installed(Check::Warn(
+                        "cannot tell which broker program the agent uses".into(),
+                    ));
+                }
+            },
+        },
+        None => locate(PROGRAM),
+    };
+    let program = match located {
+        Located::Program(path) => path,
+        Located::Absent(path) => return not_installed(&path),
+        Located::Unusable(why) => return installed(Check::Fail(format!("{NO_GRANTS}: {why}"))),
+    };
+    let ours = env!("CARGO_PKG_VERSION");
+    installed(match check_program(&program, Duration::from_secs(5)) {
+        Ok((version, protocol)) if version == ours && protocol == VERSION => Check::Ok(format!(
+            "broker: {PROGRAM} {version} ({})",
+            program.display()
+        )),
+        Ok((version, protocol)) => Check::Fail(format!(
+            "{PROGRAM} {version} speaks broker protocol {protocol}, this rusthorse {ours} \
+             protocol {VERSION}: {NO_GRANTS}; install the same version of both, then restart the \
+             agent"
+        )),
+        Err(e) => Check::Fail(format!(
+            "{} does not run: {e:#}; {NO_GRANTS}",
+            program.display()
+        )),
+    })
+}
+
+/// The broker's program is not installed at `path`.
+fn not_installed(path: &Path) -> BrokerProgram {
+    BrokerProgram {
+        check: Check::Warn(format!(
+            "{} is not installed: {NO_GRANTS}; install it next to the agent (see \
+             docs/installation.md)",
+            path.display()
+        )),
+        installed: false,
+    }
+}
+
+/// The file of certificate authorities the credential broker trusts, as
+/// [`rusthorse::broker_protocol::open_ca_file`] opened and checked it — the
+/// same checks a broker makes. Without it no grant can be served: an error
+/// when the broker's program is installed, a warning when it is not either.
+fn ca_file_check(opened: Result<PathBuf, String>, broker_installed: bool) -> Check {
+    match opened {
+        Ok(path) => Check::Ok(format!(
+            "the broker trusts the certificate authorities in {}",
+            path.display()
+        )),
+        Err(why) => {
+            let text = format!(
+                "{why}: {NO_GRANTS}. The broker reads the first of {} that exists, which must be \
+                 a regular file owned by root, in directories owned by root, none of them \
+                 writable by group or others (the ca-certificates package installs one)",
+                rusthorse::broker_protocol::CA_FILES.join(", ")
+            );
+            if broker_installed {
+                Check::Fail(text)
+            } else {
+                Check::Warn(text)
+            }
+        }
+    }
+}
+
 /// Whether the agent still runs the program file it was started from, and
 /// whether that is the same file as this `rusthorse` — compared by the device
 /// and inode the agent reads through its own `/proc/self/exe`, never by name.
@@ -1858,7 +2465,7 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
     let mut audit = paths::audit_log();
     let mut where_from = "the default location (the agent is not reachable)";
     let mut dialog_program = false;
-    match client.call(&Request::Status) {
+    let broker_installed = match client.call(&Request::Status) {
         Ok(Response::Status(info)) => {
             vault = PathBuf::from(&info.vault);
             if !info.audit_log.is_empty() {
@@ -1886,6 +2493,8 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
             let dialogs = dialog_check(&info);
             dialog_program = matches!(dialogs, Check::Ok(_));
             checks.push(dialogs);
+            let broker = broker_check(Some(&info));
+            checks.push(broker.check);
             checks.extend(lock_trigger_checks(&info.lock_triggers));
             if !info.vault_exists {
                 checks.push(Check::Fail(format!(
@@ -1893,12 +2502,28 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
                     info.vault
                 )));
             }
+            broker.installed
         }
-        Ok(_) => checks.push(Check::Fail(
-            "the agent answered something unexpected".into(),
-        )),
-        Err(e) => checks.push(Check::Fail(format!("{e:#}"))),
-    }
+        Ok(_) => {
+            checks.push(Check::Fail(
+                "the agent answered something unexpected".into(),
+            ));
+            let broker = broker_check(None);
+            checks.push(broker.check);
+            broker.installed
+        }
+        Err(e) => {
+            checks.push(Check::Fail(format!("{e:#}")));
+            let broker = broker_check(None);
+            checks.push(broker.check);
+            broker.installed
+        }
+    };
+    // What the credential broker trusts, checked as a broker checks it.
+    checks.push(ca_file_check(
+        rusthorse::broker_protocol::open_ca_file().map(|ca| ca.path),
+        broker_installed,
+    ));
 
     // How the agent is started.
     let systemctl = |args: &[&str]| {
@@ -2027,7 +2652,10 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
 }
 
 /// One audit record as `rusthorse audit` prints it: the time, action and
-/// outcome, then what the record has — the entries, the command line, the
+/// outcome, then what the record has — the entries; for the credential
+/// broker (ADR 0013), the grant, the request's number and route, the
+/// destination's status and the bytes each way; the grants a run creates;
+/// the command line; why a grant ended and what became of its requests; the
 /// detail — and the requester. Control and invisible characters are escaped
 /// ([`rusthorse::util::visible`]): any program of the user can write the log
 /// (threat model L13), and a value written to rewrite the terminal, or to
@@ -2037,8 +2665,44 @@ fn audit_line(event: &audit::AuditEvent) -> String {
     if !event.entries.is_empty() {
         line.push_str(&format!(" [{}]", event.entries.join(", ")));
     }
+    if let Some(grant) = &event.grant {
+        line.push_str(&format!(" grant {grant}"));
+    }
+    if let Some(request) = event.request {
+        line.push_str(&format!(" #{request}"));
+    }
+    if let Some(route) = &event.route {
+        line.push_str(&format!(" {route}"));
+    }
+    if let Some(status) = event.status {
+        line.push_str(&format!(" status {status}"));
+    }
+    match (event.bytes_sent, event.bytes_received) {
+        (Some(sent), Some(received)) => {
+            line.push_str(&format!(" ({sent} bytes sent, {received} received)"));
+        }
+        (Some(sent), None) => line.push_str(&format!(" ({sent} bytes sent)")),
+        (None, Some(received)) => line.push_str(&format!(" ({received} bytes received)")),
+        (None, None) => {}
+    }
+    if let Some(grants) = &event.grants {
+        let grants: Vec<String> = grants
+            .iter()
+            .map(|g| format!("{} for {} to {}", g.id, g.entry, g.destination))
+            .collect();
+        line.push_str(&format!(" grants: {};", grants.join(", ")));
+    }
     if let Some(argv) = &event.argv {
         line.push_str(&format!(" $ {}", rusthorse::util::shell_join(argv)));
+    }
+    if let Some(reason) = &event.reason {
+        line.push_str(&format!(" reason: {reason}"));
+    }
+    if let Some(r) = event.requests {
+        line.push_str(&format!(
+            " requests: {} admitted ({} finished, {} unknown), {} refused",
+            r.admitted, r.finished, r.unknown, r.refused
+        ));
     }
     if let Some(detail) = &event.detail {
         line.push_str(&format!(" ({detail})"));
@@ -2235,6 +2899,503 @@ mod tests {
         ));
     }
 
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn binding(var: &str, entry: &str) -> Binding {
+        Binding {
+            var: var.into(),
+            entry: entry.into(),
+        }
+    }
+
+    #[test]
+    fn run_sorts_out_broker_bindings_and_the_variables_of_their_address() {
+        let plan = plan_run(
+            &strings(&["DB_PASSWORD=db"]),
+            &strings(&["ANTHROPIC_AUTH_TOKEN=AI/anthropic", "OPENAI_API_KEY"]),
+            &strings(&["DOCS_URL=docs", "ANTHROPIC_BASE_URL=AI/anthropic"]),
+        )
+        .expect("a valid run");
+        assert_eq!(plan.bindings, [binding("DB_PASSWORD", "db")]);
+        assert_eq!(
+            plan.brokered,
+            [
+                BrokerBinding {
+                    var: "ANTHROPIC_AUTH_TOKEN".into(),
+                    entry: "AI/anthropic".into(),
+                    url_var: Some("ANTHROPIC_BASE_URL".into()),
+                },
+                // ENTRY alone: the variable is named like the entry.
+                BrokerBinding {
+                    var: "OPENAI_API_KEY".into(),
+                    entry: "OPENAI_API_KEY".into(),
+                    url_var: None,
+                },
+            ]
+        );
+        // A --url for an entry not given with --broker reads its own URL.
+        assert_eq!(plan.urls, [binding("DOCS_URL", "docs")]);
+        // Without --broker, nothing changes.
+        let plain = plan_run(&strings(&["KEY"]), &[], &strings(&["KEY_URL=KEY"])).expect("plain");
+        assert_eq!(
+            plain,
+            RunPlan {
+                bindings: vec![binding("KEY", "KEY")],
+                brokered: vec![],
+                urls: vec![binding("KEY_URL", "KEY")],
+            }
+        );
+        // Through the broker only.
+        let only = plan_run(&[], &strings(&["T=k"]), &[]).expect("broker only");
+        assert!(only.bindings.is_empty() && only.urls.is_empty());
+        assert_eq!(only.brokered.len(), 1);
+        // The --url of another entry keeps its meaning, whatever its
+        // variable: only a token and the broker's address stay out of
+        // NO_PROXY.
+        let other = plan_run(&[], &strings(&["T=k"]), &strings(&["NO_PROXY=docs"])).expect("url");
+        assert_eq!(other.urls, [binding("NO_PROXY", "docs")]);
+    }
+
+    /// The secrets, `--broker` and `--url` options of a `run`, and what its
+    /// refusal says.
+    type Refusal = (
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static str,
+    );
+
+    #[test]
+    fn run_refuses_mistakes_in_broker_bindings_before_anything_is_sent() {
+        let cases: [Refusal; 21] = [
+            (
+                &[],
+                &["1BAD=x"],
+                &[],
+                "not a valid environment variable name",
+            ),
+            (&[], &["x-y"], &[], "not a valid environment variable name"),
+            (&[], &["K="], &[], "missing entry name"),
+            (&[], &["LD_PRELOAD=x"], &[], "cannot carry a token"),
+            (&[], &["NODE_OPTIONS=x"], &[], "cannot carry a token"),
+            (&[], &["BASH_FUNC_x=x"], &[], "cannot carry a token"),
+            // The agent adds 127.0.0.1 to NO_PROXY: neither a token nor the
+            // broker's address goes there, whatever the case.
+            (
+                &[],
+                &["NO_PROXY=x"],
+                &[],
+                "the agent adds 127.0.0.1 to this variable",
+            ),
+            (
+                &[],
+                &["no_proxy=x"],
+                &[],
+                "the agent adds 127.0.0.1 to this variable",
+            ),
+            (
+                &[],
+                &["K=x"],
+                &["NO_PROXY=x"],
+                "it cannot carry the broker's address",
+            ),
+            (
+                &[],
+                &["K=x"],
+                &["No_Proxy=x"],
+                "it cannot carry the broker's address",
+            ),
+            (
+                &["K=y"],
+                &["K=x"],
+                &[],
+                "the variable is already set by another binding",
+            ),
+            (
+                &[],
+                &["K=x", "K=y"],
+                &[],
+                "the variable is already set by another binding",
+            ),
+            (&[], &["K=x", "L=x"], &[], "x is already given to --broker"),
+            // The same entry both ways, by its name (the agent compares UUIDs).
+            (&["V=x"], &["K=x"], &[], "x is also given by value"),
+            (&[], &["K=x"], &["U=x", "V=x"], "x already has --url U"),
+            (
+                &[],
+                &["K=x"],
+                &["K=x"],
+                "the variable is already set by another binding",
+            ),
+            (
+                &[],
+                &["K=x", "L=y"],
+                &["U=x", "U=y"],
+                "the variable is already set by another binding",
+            ),
+            (
+                &["S=s"],
+                &["K=x"],
+                &["S=x"],
+                "the variable is already set by another binding",
+            ),
+            (&[], &["K=x"], &["LD_AUDIT=x"], "cannot carry a URL"),
+            (&[], &["K=x"], &["x"], "write VAR=ENTRY"),
+            (
+                &[],
+                &["K=x"],
+                &["1U=x"],
+                "not a valid environment variable name",
+            ),
+        ];
+        for (secrets, brokers, urls, expected) in cases {
+            let err = plan_run(&strings(secrets), &strings(brokers), &strings(urls))
+                .expect_err(expected)
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{secrets:?} {brokers:?} {urls:?}: {err}"
+            );
+        }
+    }
+
+    fn entry(id: &str, group: Option<&str>, name: &str) -> EntryInfo {
+        EntryInfo {
+            id: id.into(),
+            name: name.into(),
+            group: group.map(Into::into),
+            fields: EntryFields::default(),
+            protected_fields: vec![],
+            has_password: true,
+            has_notes: false,
+            other_fields: vec![],
+            modified: None,
+            broker: None,
+        }
+    }
+
+    #[test]
+    fn an_entry_is_known_by_every_name_that_leads_to_it() {
+        let id = "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12";
+        assert_eq!(
+            entry_names(&entry(id, Some("AI/Work"), "anthropic")),
+            [id, "AI/Work/anthropic", "anthropic"]
+        );
+        assert_eq!(
+            entry_names(&entry(id, None, "anthropic")),
+            [id, "anthropic"]
+        );
+        // A protected title is matched by UUID only.
+        let mut hidden = entry(id, Some("AI"), rusthorse::vault::PROTECTED_TITLE);
+        hidden.protected_fields = vec!["Title".into()];
+        assert_eq!(entry_names(&hidden), [id]);
+    }
+
+    #[test]
+    fn the_cli_names_every_preset_and_policy_as_profiles_store_them() {
+        let presets: Vec<Preset> = PresetArg::value_variants().iter().map(|p| p.0).collect();
+        assert_eq!(presets, Preset::ALL);
+        for preset in PresetArg::value_variants() {
+            let value = preset.to_possible_value().expect("a value");
+            assert_eq!(value.get_name(), preset.0.as_str());
+        }
+        let policies: Vec<AutomaticLocks> =
+            LocksArg::value_variants().iter().map(|l| l.0).collect();
+        assert_eq!(policies, AutomaticLocks::ALL);
+        for policy in LocksArg::value_variants() {
+            let value = policy.to_possible_value().expect("a value");
+            assert_eq!(value.get_name(), policy.0.as_str());
+        }
+        // The help of --broker-locks and --broker-lifetime, and docs/cli.md,
+        // give the presets' defaults: they hold for every preset.
+        for preset in Preset::ALL {
+            let spec = rusthorse::broker_profile::latest(preset);
+            assert_eq!(spec.default_automatic_locks, AutomaticLocks::Continue);
+            assert_eq!(spec.default_max_lifetime_minutes, 720);
+        }
+        let help = Cli::command()
+            .find_subcommand_mut("edit")
+            .expect("edit")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("continue for the presets of this version"),
+            "{help}"
+        );
+        assert!(
+            help.contains("720 (12 hours) for the presets of this version"),
+            "{help}"
+        );
+    }
+
+    /// The arguments of `rusthorse edit KEY ARGS…`.
+    fn edit_args(args: &[&str]) -> Result<EditArgs, clap::Error> {
+        let argv = ["rusthorse", "edit", "KEY"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Edit(args) => Ok(args),
+            _ => panic!("not an edit"),
+        }
+    }
+
+    #[test]
+    fn a_profile_edit_sends_only_the_options_given_once_they_check_out() {
+        let request = |args: &[&str]| {
+            edit_args(args)
+                .expect("parses")
+                .broker
+                .request()
+                .map(|request| request.map(|r| serde_json::to_value(r).expect("json")))
+        };
+        assert_eq!(request(&["--host", "h"]).expect("no profile"), None);
+        assert_eq!(
+            request(&["--broker", "anthropic"]).expect("defaults"),
+            Some(serde_json::json!({"preset": "anthropic"}))
+        );
+        assert_eq!(
+            request(&[
+                "--broker",
+                "openai-compatible",
+                "--broker-origin",
+                "https://api.deepseek.com",
+                "--broker-base-path",
+                "",
+                "--broker-locks",
+                "end",
+                "--broker-lifetime",
+                "90",
+                "--broker-requests",
+                "200",
+            ])
+            .expect("every option"),
+            Some(serde_json::json!({
+                "preset": "openai-compatible",
+                "origin": "https://api.deepseek.com",
+                "base_path": "",
+                "automatic_locks": "end",
+                "max_lifetime_minutes": 90,
+                "max_requests": 200,
+            }))
+        );
+        // Checked as the agent checks it: the foundation's messages.
+        let refused: [(&[&str], &str); 9] = [
+            (&["--broker", "openai-compatible"], "no default origin"),
+            (
+                &["--broker", "openai", "--broker-origin", "http://x.example"],
+                "must start with https://",
+            ),
+            (
+                &["--broker", "openai", "--broker-origin", "https://10.0.0.1"],
+                "not an IP address",
+            ),
+            (
+                &["--broker", "openai", "--broker-base-path", "/v1/"],
+                "the base path is not valid",
+            ),
+            (
+                &["--broker", "openai", "--broker-base-path", "/../x"],
+                "the base path is not valid",
+            ),
+            (
+                &["--broker", "anthropic", "--broker-lifetime", "0"],
+                "1 to 1440 minutes, not 0",
+            ),
+            (
+                &["--broker", "anthropic", "--broker-lifetime", "1441"],
+                "1 to 1440 minutes, not 1441",
+            ),
+            (
+                &["--broker", "anthropic", "--broker-requests", "0"],
+                "1 to 1000000, not 0",
+            ),
+            (
+                &["--broker", "anthropic", "--broker-requests", "1000001"],
+                "1 to 1000000, not 1000001",
+            ),
+        ];
+        for (args, expected) in refused {
+            let err = request(args).expect_err(expected).to_string();
+            assert!(err.starts_with("broker profile: "), "{args:?}: {err}");
+            assert!(err.contains(expected), "{args:?}: {err}");
+        }
+        // What clap refuses: an unknown preset or policy, a number that is
+        // not one, and the profile's options without --broker.
+        use clap::error::ErrorKind;
+        let by_clap: [(&[&str], ErrorKind); 8] = [
+            (&["--broker", "gemini"], ErrorKind::InvalidValue),
+            (
+                &["--broker", "anthropic", "--broker-locks", "never"],
+                ErrorKind::InvalidValue,
+            ),
+            (
+                &["--broker", "anthropic", "--broker-lifetime", "a day"],
+                ErrorKind::ValueValidation,
+            ),
+            (
+                &["--broker-origin", "https://x.example"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--broker-base-path", "/v1"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--broker-locks", "end"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--broker-lifetime", "5"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--broker-requests", "5"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+        ];
+        for (args, kind) in by_clap {
+            let err = edit_args(args).err().expect("refused");
+            assert_eq!(err.kind(), kind, "{args:?}: {err}");
+            assert_eq!(err.exit_code(), 2, "{args:?}");
+        }
+        assert!(matches!(
+            edit_args(&["--clear", "broker"]).expect("parses").clear[..],
+            [ClearField::Broker]
+        ));
+        assert_eq!(ClearField::Broker.field(), Field::Broker);
+    }
+
+    #[test]
+    fn show_says_what_a_profile_allows_or_why_the_entry_cannot_use_it() {
+        let id = "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12";
+        let mut info = entry(id, Some("AI"), "anthropic");
+        assert!(profile_lines(&info).is_empty());
+        let profile = ProfileRequest {
+            max_requests: Some(200),
+            ..ProfileRequest::new(Preset::Anthropic)
+        }
+        .resolve()
+        .expect("profile");
+        info.broker = Some(profile.clone());
+        let lines = profile_lines(&info);
+        assert_eq!(lines[0], "anthropic preset, revision 1");
+        let described: Vec<String> = profile
+            .describe()
+            .into_iter()
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect();
+        assert_eq!(lines[1..], described);
+        assert!(lines[1].starts_with("Destination: https://api.anthropic.com"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Requests: at most 200; at most 16 at a time")
+        );
+        // What the agent sends is shown escaped: a profile is not checked
+        // again here, and nothing in it may rewrite the terminal.
+        info.broker = Some(rusthorse::broker_profile::BrokerProfile {
+            base_path: "/v1\u{1b}[2J\n".into(),
+            ..profile.clone()
+        });
+        let lines = profile_lines(&info);
+        assert!(
+            lines.iter().all(|l| !l.contains(['\u{1b}', '\n'])),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&r"Destination: https://api.anthropic.com/v1\u{1b}[2J\u{a}".to_string()),
+            "{lines:?}"
+        );
+        // Protected, or not one this Rusthorse reads: why it cannot be used.
+        info.broker = None;
+        info.protected_fields = vec![rusthorse::vault::FIELD_BROKER.into()];
+        assert!(matches!(&profile_lines(&info)[..], [line] if line.starts_with("withheld:")));
+        info.protected_fields.clear();
+        info.other_fields = vec![rusthorse::vault::FIELD_BROKER.into()];
+        assert!(matches!(&profile_lines(&info)[..], [line] if line.starts_with("unusable:")));
+    }
+
+    fn grant() -> GrantInfo {
+        GrantInfo {
+            id: "g0123456789abcdef".into(),
+            entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
+            var: "ANTHROPIC_AUTH_TOKEN".into(),
+            destination: "https://api.anthropic.com".into(),
+            preset: Preset::Anthropic,
+            command: "claude".into(),
+            requester: "rusthorse[4300] ← bash[4242]".into(),
+            state: "active".into(),
+            started: "2026-11-02T18:00:00-03:00".into(),
+            ends_in_secs: 43_140,
+            requests: 3,
+            max_requests: None,
+            in_flight: 1,
+            automatic_locks: AutomaticLocks::Continue,
+        }
+    }
+
+    #[test]
+    fn the_grants_table_shows_every_grant_and_escapes_what_it_reports() {
+        let limited = GrantInfo {
+            id: "gfedcba9876543210".into(),
+            state: "exhausted".into(),
+            requests: 200,
+            max_requests: Some(200),
+            in_flight: 0,
+            automatic_locks: AutomaticLocks::End,
+            // Chosen to rewrite the terminal and forge a line of the table.
+            command: "sh -c 'x\u{1b}[2J\ng0000000000000000  fake'".into(),
+            requester: "\u{1b}[8mhidden".into(),
+            ..grant()
+        };
+        let table = grants_table(&[grant(), limited]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "{table}");
+        for header in [
+            "ID",
+            "ENTRY",
+            "DESTINATION",
+            "STATE",
+            "STARTED",
+            "ENDS IN",
+            "REQUESTS",
+            "IN FLIGHT",
+            "AUTOMATIC LOCKS",
+            "REQUESTER",
+            "COMMAND",
+        ] {
+            assert!(lines[0].contains(header), "{header}: {}", lines[0]);
+        }
+        for cell in [
+            "g0123456789abcdef",
+            "AI/ANTHROPIC_API_KEY (8d2f6c1e)",
+            "https://api.anthropic.com",
+            "active",
+            "2026-11-02T18:00:00-03:00",
+            "11h59m",
+            "3 (no limit)",
+            "continue",
+            "rusthorse[4300] ← bash[4242]",
+        ] {
+            assert!(lines[1].contains(cell), "{cell}: {}", lines[1]);
+        }
+        assert!(lines[1].ends_with("  claude"), "{}", lines[1]);
+        for cell in ["gfedcba9876543210", "exhausted", "200 of 200", "end"] {
+            assert!(lines[2].contains(cell), "{cell}: {}", lines[2]);
+        }
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+        assert!(
+            lines[2].contains(r"\u{1b}[2J\u{a}g0000000000000000"),
+            "{}",
+            lines[2]
+        );
+        assert!(lines[2].contains(r"\u{1b}[8mhidden"), "{}", lines[2]);
+        // The columns line up: every cell starts where its header does.
+        let at = |line: &str, text: &str| line.find(text).expect(text);
+        assert_eq!(at(lines[0], "STATE"), at(lines[1], "active"));
+        assert_eq!(at(lines[0], "STATE"), at(lines[2], "exhausted"));
+    }
+
     #[test]
     fn audit_lines_escape_what_any_program_can_write() {
         use rusthorse::audit::AuditEvent;
@@ -2276,6 +3437,242 @@ mod tests {
         for escaped in [r"\u{a}2026-11-02", r"\u{1b}[8mKEY", r"\u{202e}evil"] {
             assert!(line.contains(escaped), "{escaped}: {line}");
         }
+    }
+
+    #[test]
+    fn audit_lines_show_the_brokers_fields() {
+        use rusthorse::audit::{AuditEvent, AuditGrant, AuditRequestCounts};
+        use rusthorse::peer::Peer;
+        let event =
+            |action: &str, outcome: &str| AuditEvent::new(action, &Peer::agent()).outcome(outcome);
+        let grant_id = "g0123456789abcdef";
+        let mut run = event("run", "allowed_once").entries(vec!["AI/KEY (8d2f6c1e)".into()]);
+        run.argv = Some(strings(&["claude"]));
+        run.grants = Some(vec![AuditGrant {
+            id: grant_id.into(),
+            entry: "AI/KEY (8d2f6c1e)".into(),
+            destination: "https://api.anthropic.com".into(),
+        }]);
+        assert!(audit_line(&run).contains(
+            " [AI/KEY (8d2f6c1e)] grants: g0123456789abcdef for AI/KEY (8d2f6c1e) to \
+             https://api.anthropic.com; $ claude  by "
+        ));
+        let mut admitted = event("broker_request", "admitted");
+        admitted.grant = Some(grant_id.into());
+        admitted.request = Some(7);
+        admitted.route = Some("POST /v1/messages".into());
+        assert!(audit_line(&admitted).contains(
+            "broker_request admitted             grant g0123456789abcdef #7 POST /v1/messages  by "
+        ));
+        let mut finished = event("broker_request", "completed");
+        finished.grant = Some(grant_id.into());
+        finished.request = Some(7);
+        finished.status = Some(200);
+        finished.bytes_sent = Some(1234);
+        finished.bytes_received = Some(56_789);
+        assert!(audit_line(&finished).contains(
+            " grant g0123456789abcdef #7 status 200 (1234 bytes sent, 56789 received)  by "
+        ));
+        finished.bytes_received = None;
+        assert!(audit_line(&finished).contains(" status 200 (1234 bytes sent)  by "));
+        finished.bytes_sent = None;
+        finished.bytes_received = Some(9);
+        assert!(audit_line(&finished).contains(" status 200 (9 bytes received)  by "));
+        let mut ended = event("grant", "ended");
+        ended.grant = Some(grant_id.into());
+        ended.reason = Some("command_ended".into());
+        ended.requests = Some(AuditRequestCounts {
+            admitted: 3,
+            finished: 2,
+            unknown: 1,
+            refused: 4,
+        });
+        assert!(audit_line(&ended).contains(
+            "grant    ended                grant g0123456789abcdef reason: command_ended \
+             requests: 3 admitted (2 finished, 1 unknown), 4 refused  by "
+        ));
+        // The new fields are escaped like the others.
+        let mut forged = event("grant", "ended");
+        forged.route = Some("\u{1b}[2K".into());
+        forged.reason = Some("x\ny".into());
+        let line = audit_line(&forged);
+        assert!(!line.contains(['\n', '\u{1b}']), "{line:?}");
+        assert!(
+            line.contains(r"\u{1b}[2K") && line.contains(r"x\u{a}y"),
+            "{line}"
+        );
+    }
+
+    /// A status of an agent that reports `broker` (or not) and runs
+    /// `executable`.
+    fn status_with(broker: Option<&str>, executable: &str) -> StatusInfo {
+        StatusInfo {
+            protocol_version: rusthorse::protocol::PROTOCOL_VERSION,
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+            vault: "/nonexistent".into(),
+            vault_exists: false,
+            audit_log: String::new(),
+            locked: true,
+            idle_timeout_secs: 0,
+            locks_in_secs: None,
+            remembered_approvals: 0,
+            agent_executable: executable.into(),
+            agent_executable_id: None,
+            agent_executable_replaced: None,
+            dialogs: None,
+            lock_triggers: vec![],
+            broker: broker.map(Into::into),
+            grants: None,
+        }
+    }
+
+    /// `broker_check`, again while the program was just written: another
+    /// thread's child may hold it open for writing until its exec ("Text
+    /// file busy").
+    fn broker_check_of(info: &StatusInfo) -> BrokerProgram {
+        for _ in 0..50 {
+            match broker_check(Some(info)) {
+                BrokerProgram {
+                    check: Check::Fail(m),
+                    ..
+                } if m.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        panic!("the program stayed busy")
+    }
+
+    /// The text of a line of `doctor`.
+    fn check_text(check: &Check) -> &str {
+        match check {
+            Check::Ok(m) | Check::Warn(m) | Check::Fail(m) => m,
+        }
+    }
+
+    #[test]
+    fn doctor_checks_the_broker_program_the_agent_uses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join(rusthorse::broker_protocol::PROGRAM);
+        let path = program.to_str().expect("utf8").to_string();
+        let agent = dir
+            .path()
+            .join("rusthorse")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        let write = |version: &str, protocol: u32, mode: u32| {
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\necho '{{\"version\":\"{version}\",\"protocol\":{protocol}}}'\n"
+                ),
+            )
+            .expect("write");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        let ours = env!("CARGO_PKG_VERSION");
+        let protocol = rusthorse::broker_protocol::VERSION;
+
+        // Nothing next to an agent that does not report it, or that says it
+        // cannot use one: not installed, a warning.
+        for reported in [None, Some("none: it is not installed")] {
+            let found = broker_check_of(&status_with(reported, &agent));
+            assert!(!found.installed, "{reported:?}");
+            assert!(
+                matches!(&found.check, Check::Warn(m) if m.contains("is not installed") && m.contains(NO_GRANTS)),
+                "{reported:?}: {}",
+                check_text(&found.check)
+            );
+        }
+        // The program the agent reports, of this version and protocol.
+        write(ours, protocol, 0o700);
+        let found = broker_check_of(&status_with(Some(&path), ""));
+        assert!(found.installed);
+        assert!(
+            matches!(&found.check, Check::Ok(m) if m == &format!("broker: rusthorse-broker {ours} ({path})")),
+            "{}",
+            check_text(&found.check)
+        );
+        // Found next to an agent that predates the field.
+        let found = broker_check_of(&status_with(None, &format!("{agent} (deleted)")));
+        assert!(found.installed && matches!(found.check, Check::Ok(_)));
+        // Of another version, or another protocol: an error.
+        for (version, protocol) in [("0.0.0-other", protocol), (ours, protocol + 1)] {
+            write(version, protocol, 0o700);
+            let found = broker_check_of(&status_with(Some(&path), ""));
+            assert!(found.installed);
+            assert!(
+                matches!(&found.check, Check::Fail(m) if m.contains("install the same version of both") && m.contains(NO_GRANTS)),
+                "{version} {protocol}: {}",
+                check_text(&found.check)
+            );
+        }
+        // Unusable: what the agent says, or what is found next to it.
+        write(ours, protocol, 0o770);
+        let found = broker_check_of(&status_with(
+            Some("none: it can be modified by others"),
+            &agent,
+        ));
+        assert!(found.installed);
+        assert!(
+            matches!(&found.check, Check::Fail(m) if m == &format!("{NO_GRANTS}: it can be modified by others")),
+            "{}",
+            check_text(&found.check)
+        );
+        let found = broker_check_of(&status_with(None, &agent));
+        assert!(found.installed);
+        assert!(
+            matches!(&found.check, Check::Fail(m) if m.contains("can be modified by its group or by others")),
+            "{}",
+            check_text(&found.check)
+        );
+        // One that does not run.
+        std::fs::write(&program, "#!/bin/sh\nexit 3\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let found = broker_check_of(&status_with(Some(&path), ""));
+        assert!(found.installed);
+        assert!(
+            matches!(&found.check, Check::Fail(m) if m.contains("does not run") && m.contains(NO_GRANTS)),
+            "{}",
+            check_text(&found.check)
+        );
+        // An agent that does not say which program file it runs.
+        let found = broker_check(Some(&status_with(None, "")));
+        assert!(found.installed, "not known to be missing");
+        assert!(matches!(&found.check, Check::Warn(m) if m.contains("cannot tell")));
+    }
+
+    #[test]
+    fn doctor_says_which_certificate_file_the_broker_trusts_or_why_none() {
+        let path = "/etc/ssl/certs/ca-certificates.crt";
+        for installed in [true, false] {
+            assert!(matches!(
+                ca_file_check(Ok(PathBuf::from(path)), installed),
+                Check::Ok(m) if m == format!("the broker trusts the certificate authorities in {path}")
+            ));
+        }
+        for why in [
+            "none of the certificate authority files exists: /a, /b, /c",
+            "/etc/ssl/certs/ca-certificates.crt is not owned by root",
+            "/x/ca.crt is in /x, which can be modified by its group or by others",
+        ] {
+            let says = |m: &str| m.starts_with(why) && m.contains(NO_GRANTS) && m.contains(path);
+            // An error where the broker is installed; without its program,
+            // a warning: everything else works.
+            let check = ca_file_check(Err(why.into()), true);
+            assert!(matches!(&check, Check::Fail(m) if says(m)), "{why}");
+            let check = ca_file_check(Err(why.into()), false);
+            assert!(matches!(&check, Check::Warn(m) if says(m)), "{why}");
+        }
+        // This computer's, whatever it is: a check, never a panic.
+        let _ = ca_file_check(
+            rusthorse::broker_protocol::open_ca_file().map(|ca| ca.path),
+            true,
+        );
     }
 
     /// Where a command line of the AI guide is.

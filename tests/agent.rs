@@ -5541,3 +5541,1088 @@ mod import_from {
         }
     }
 }
+
+/// The CLI's side of the credential broker (ADR 0013): what `rusthorse`
+/// sends for `run --broker`, `edit --broker`, `grants`, and what it shows for
+/// `status`, `doctor` and `audit`. Against fake agents that record every
+/// request and answer as each test says; the real agent's grants are tested
+/// with the agent itself.
+mod broker_cli {
+    use super::*;
+    use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+    use rusthorse::protocol::{
+        EntryFields, EntryInfo, ErrorCode, GrantInfo, PROTOCOL_VERSION, Request, Response,
+        StatusInfo, recv_frame, send_frame,
+    };
+    use serde_json::{Value, json};
+    use std::sync::atomic::AtomicBool;
+
+    /// A fake agent on a socket of its own. It records every request — its
+    /// JSON, and how many descriptors came with it — answers `status` with
+    /// its status, and every other request with what `answer` returns
+    /// (`None`: the connection is closed without an answer). A panic in
+    /// `answer` (a request no test expects) fails the test when the agent
+    /// is dropped.
+    struct FakeAgent {
+        dir: tempfile::TempDir,
+        socket: PathBuf,
+        received: Arc<Mutex<Vec<(Value, usize)>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeAgent {
+        fn new(
+            status: StatusInfo,
+            answer: impl Fn(&Request) -> Option<Response> + Send + 'static,
+        ) -> FakeAgent {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("agent.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (received, stop) = (Arc::clone(&received), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(e) => panic!("accept: {e}"),
+                        };
+                        stream.set_nonblocking(false).expect("blocking");
+                        // A client that never sends stops nothing else.
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("timeout");
+                        let Ok((body, fds)) = recv_frame(&stream) else {
+                            continue;
+                        };
+                        let json: Value = serde_json::from_slice(&body).expect("json");
+                        received.lock().unwrap().push((json.clone(), fds.len()));
+                        let reply = match serde_json::from_value::<Request>(json) {
+                            Ok(Request::Status) => Some(Response::Status(status.clone())),
+                            Ok(request) => answer(&request),
+                            Err(e) => Some(Response::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: format!("malformed request: {e}"),
+                            }),
+                        };
+                        if let Some(reply) = reply {
+                            let _ = send_frame(&stream, &reply, &[]);
+                        }
+                    }
+                })
+            };
+            FakeAgent {
+                dir,
+                socket,
+                received,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// `rusthorse ARGS…` on this agent's socket, with the vault and the
+        /// audit log in its directory and no display (no dialog can show).
+        fn cmd(&self, args: &[&str]) -> Command {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_rusthorse"));
+            cmd.args(args)
+                .env("RUSTHORSE_SOCKET", &self.socket)
+                .env("RUSTHORSE_VAULT", self.dir.path().join("vault.kdbx"))
+                .env("RUSTHORSE_AUDIT_LOG", self.dir.path().join("audit.jsonl"))
+                .current_dir(self.dir.path())
+                .stdin(Stdio::null())
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY");
+            cmd
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            self.cmd(args).finish()
+        }
+
+        /// Every request received so far, `status` included.
+        fn requests(&self) -> Vec<Value> {
+            let received = self.received.lock().unwrap();
+            received.iter().map(|(json, _)| json.clone()).collect()
+        }
+
+        /// The requests received so far other than `status`, with the number
+        /// of descriptors each carried.
+        fn sent(&self) -> Vec<(Value, usize)> {
+            let received = self.received.lock().unwrap();
+            received
+                .iter()
+                .filter(|(json, _)| json["type"] != "status")
+                .cloned()
+                .collect()
+        }
+
+        /// The one request received other than `status`.
+        fn only_sent(&self) -> (Value, usize) {
+            match &self.sent()[..] {
+                [one] => one.clone(),
+                other => panic!("expected one request, got {other:?}"),
+            }
+        }
+    }
+
+    impl Drop for FakeAgent {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take()
+                && let Err(panic) = thread.join()
+                && !std::thread::panicking()
+            {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    /// The status of an agent of this protocol that reports `broker`.
+    fn status(broker: Option<&str>, agent_executable: &str) -> StatusInfo {
+        StatusInfo {
+            protocol_version: PROTOCOL_VERSION,
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+            vault: "/nonexistent".into(),
+            vault_exists: true,
+            audit_log: String::new(),
+            locked: false,
+            idle_timeout_secs: 0,
+            locks_in_secs: None,
+            remembered_approvals: 0,
+            agent_executable: agent_executable.into(),
+            agent_executable_id: None,
+            agent_executable_replaced: None,
+            dialogs: None,
+            lock_triggers: vec![],
+            broker: broker.map(Into::into),
+            grants: None,
+        }
+    }
+
+    fn plain_status() -> StatusInfo {
+        status(None, "")
+    }
+
+    fn exited(code: i32) -> Option<Response> {
+        Some(Response::Exited {
+            code: Some(code),
+            signal: None,
+        })
+    }
+
+    fn error(code: ErrorCode, message: &str) -> Option<Response> {
+        Some(Response::Error {
+            code,
+            message: message.into(),
+        })
+    }
+
+    fn ok(message: &str) -> Option<Response> {
+        Some(Response::Ok {
+            message: message.into(),
+        })
+    }
+
+    /// An entry as `show` returns it.
+    fn entry(id: &str, group: Option<&str>, name: &str, url: Option<&str>) -> EntryInfo {
+        EntryInfo {
+            id: id.into(),
+            name: name.into(),
+            group: group.map(Into::into),
+            fields: EntryFields {
+                url: url.map(Into::into),
+                ..EntryFields::default()
+            },
+            protected_fields: vec![],
+            has_password: true,
+            has_notes: false,
+            other_fields: vec![],
+            modified: None,
+            broker: Some(
+                ProfileRequest::new(Preset::Anthropic)
+                    .resolve()
+                    .expect("profile"),
+            ),
+        }
+    }
+
+    /// The value of variable `name` in the environment a run request sends.
+    fn env_var<'a>(request: &'a Value, name: &str) -> Option<&'a str> {
+        request["env"]
+            .as_array()
+            .expect("env")
+            .iter()
+            .rev()
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str().expect("a value"))
+    }
+
+    /// A run with a binding by value, two broker bindings — one with the
+    /// variable of the broker's address — and a `--url` of another entry,
+    /// which still reads that entry's URL.
+    const MIXED: &[&str] = &[
+        "run",
+        "DB_PASSWORD=db",
+        "--broker",
+        "ANTHROPIC_AUTH_TOKEN=AI/anthropic",
+        "--broker",
+        "OPENAI_API_KEY",
+        "--url",
+        "ANTHROPIC_BASE_URL=AI/anthropic",
+        "--url",
+        "DOCS_URL=docs",
+    ];
+
+    /// The fake agent of a run: `docs` has a URL, and the run request gets
+    /// `answer`.
+    fn run_agent(answer: impl Fn() -> Option<Response> + Send + 'static) -> FakeAgent {
+        FakeAgent::new(plain_status(), move |request| match request {
+            Request::Show { name } if name == "docs" => Some(Response::Entry {
+                entry: EntryInfo {
+                    broker: None,
+                    ..entry(
+                        "11111111-2222-4333-8444-555555555555",
+                        None,
+                        "docs",
+                        Some("https://docs.example.invalid/api"),
+                    )
+                },
+            }),
+            Request::Run(_) | Request::BrokerRun(_) => answer(),
+            other => panic!("unexpected {other:?}"),
+        })
+    }
+
+    #[test]
+    fn run_with_broker_bindings_sends_a_broker_run_with_them() {
+        let agent = run_agent(|| exited(7));
+        let mut args = MIXED.to_vec();
+        args.extend(["--", "sh", "-c", "exit 0"]);
+        // What this environment has in the broker's variables is not sent:
+        // they are the agent's to set.
+        let out = agent
+            .cmd(&args)
+            .env("ANTHROPIC_AUTH_TOKEN", "FAKE-stale-token-0000")
+            .env("ANTHROPIC_BASE_URL", "https://elsewhere.invalid")
+            .env("OPENAI_API_KEY", "FAKE-sk-test-0000")
+            .env("UNRELATED", "kept")
+            .finish();
+        // The command's own status, as the agent reports it.
+        assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+        let types: Vec<Value> = agent.requests().iter().map(|r| r["type"].clone()).collect();
+        assert_eq!(types, ["status", "show", "broker_run"]);
+        let (request, fds) = agent.sent().pop().expect("the run");
+        assert_eq!(fds, 0, "with redaction, no descriptor goes with it");
+        assert_eq!(
+            request["bindings"],
+            json!([{"var": "DB_PASSWORD", "entry": "db"}])
+        );
+        assert_eq!(
+            request["brokered"],
+            json!([
+                {"var": "ANTHROPIC_AUTH_TOKEN", "entry": "AI/anthropic", "url_var": "ANTHROPIC_BASE_URL"},
+                {"var": "OPENAI_API_KEY", "entry": "OPENAI_API_KEY"},
+            ])
+        );
+        assert_eq!(request["argv"], json!(["sh", "-c", "exit 0"]));
+        assert_eq!(request["redact"], true);
+        assert_eq!(request["forward_stdin"], false);
+        let cwd = std::fs::canonicalize(agent.dir.path()).expect("canonical");
+        assert_eq!(request["cwd"], cwd.to_str().expect("utf8"), "{request}");
+        // The other --url reads that entry's URL, as without the broker.
+        assert_eq!(
+            env_var(&request, "DOCS_URL"),
+            Some("https://docs.example.invalid/api")
+        );
+        assert_eq!(env_var(&request, "UNRELATED"), Some("kept"));
+        for var in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "OPENAI_API_KEY",
+        ] {
+            assert_eq!(env_var(&request, var), None, "{var}");
+        }
+        assert!(!request.to_string().contains("FAKE-"), "{request}");
+
+        // Without redaction, the three descriptors go with it, as with run;
+        // with --stdin, the input is forwarded.
+        for (option, redact, stdin, descriptors) in
+            [("--no-redact", false, false, 3), ("--stdin", true, true, 0)]
+        {
+            let agent = run_agent(|| exited(0));
+            let out = agent.run(&["run", option, "--broker", "T=k", "--", "true"]);
+            assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+            let (request, fds) = agent.only_sent();
+            assert_eq!(request["type"], "broker_run");
+            assert_eq!(request["bindings"], json!([]), "through the broker only");
+            assert_eq!(request["brokered"], json!([{"var": "T", "entry": "k"}]));
+            assert_eq!(
+                (
+                    request["redact"].clone(),
+                    request["forward_stdin"].clone(),
+                    fds
+                ),
+                (redact.into(), stdin.into(), descriptors),
+                "{option}"
+            );
+        }
+
+        // Without --broker, a plain run, as before.
+        let agent = run_agent(|| exited(0));
+        let out = agent.run(&["run", "KEY", "--url", "DOCS_URL=docs", "--", "true"]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let (request, _) = agent.sent().pop().expect("the run");
+        assert_eq!(request["type"], "run");
+        assert!(request.get("brokered").is_none(), "{request}");
+        assert_eq!(request["bindings"], json!([{"var": "KEY", "entry": "KEY"}]));
+        assert_eq!(
+            env_var(&request, "DOCS_URL"),
+            Some("https://docs.example.invalid/api")
+        );
+    }
+
+    /// What a fake agent answers a run with.
+    type RunAnswer = Box<dyn Fn() -> Option<Response> + Send>;
+
+    #[test]
+    fn a_broker_run_exits_as_run_does() {
+        let cases: Vec<(RunAnswer, i32, &str)> = vec![
+            // Refused or failed before the command started: no fallback.
+            (
+                Box::new(|| error(ErrorCode::InvalidRequest, "KEY has no broker profile")),
+                125,
+                "KEY has no broker profile",
+            ),
+            (
+                Box::new(|| error(ErrorCode::Internal, "the broker did not start")),
+                125,
+                "the broker did not start",
+            ),
+            (
+                Box::new(|| error(ErrorCode::Denied, "denied")),
+                125,
+                "denied",
+            ),
+            // The outcome is unknown.
+            (
+                Box::new(|| error(ErrorCode::OutcomeUnknown, "waiting failed")),
+                124,
+                "waiting failed",
+            ),
+            (Box::new(|| None), 124, "may or may not have run"),
+            (Box::new(|| ok("?")), 124, "may or may not have run"),
+            // The command's own status.
+            (
+                Box::new(|| {
+                    Some(Response::Exited {
+                        code: None,
+                        signal: Some(9),
+                    })
+                }),
+                137,
+                "",
+            ),
+            (Box::new(|| exited(3)), 3, ""),
+        ];
+        for (answer, expected, message) in cases {
+            let agent = run_agent(answer);
+            let out = agent.run(&["run", "--broker", "T=k", "--", "true"]);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(expected), "{stderr}");
+            assert!(stderr.contains(message), "{stderr}");
+            assert_eq!(agent.only_sent().0["type"], "broker_run");
+        }
+    }
+
+    #[test]
+    fn mistakes_in_broker_options_send_nothing() {
+        let agent = FakeAgent::new(plain_status(), |request| {
+            panic!("nothing should be sent, got {request:?}")
+        });
+        for (args, expected, message) in [
+            // `run`: did not run.
+            (
+                &[
+                    "run", "--broker", "K=x", "--url", "U=x", "--url", "V=x", "--", "true",
+                ][..],
+                125,
+                "x already has --url U",
+            ),
+            (
+                &["run", "--broker", "1K=x", "--", "true"][..],
+                125,
+                "not a valid environment variable name",
+            ),
+            (
+                &["run", "--broker", "K=", "--", "true"][..],
+                125,
+                "missing entry name",
+            ),
+            (
+                &["run", "X=x", "--broker", "K=x", "--", "true"][..],
+                125,
+                "also given by value",
+            ),
+            (
+                &["run", "--broker", "K=x", "--broker", "L=x", "--", "true"][..],
+                125,
+                "already given to --broker",
+            ),
+            (
+                &["run", "--broker", "LD_PRELOAD=x", "--", "true"][..],
+                125,
+                "cannot carry a token",
+            ),
+            (
+                &["run", "--broker", "NO_PROXY=x", "--", "true"][..],
+                125,
+                "the agent adds 127.0.0.1 to this variable",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "K=x",
+                    "--url",
+                    "no_proxy=x",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "it cannot carry the broker's address",
+            ),
+            (
+                &["run", "K=y", "--broker", "K=x", "--", "true"][..],
+                125,
+                "already set by another binding",
+            ),
+            // No secret and no --broker: a usage error.
+            (
+                &["run", "--", "true"][..],
+                2,
+                "required arguments were not provided",
+            ),
+            (
+                &["run", "--broker", "--", "true"][..],
+                2,
+                "a value is required",
+            ),
+            // `edit`: the profile's options need --broker, and a profile is
+            // checked as the agent checks it.
+            (
+                &["edit", "KEY", "--broker-origin", "https://x.example"][..],
+                2,
+                "--broker <PRESET>",
+            ),
+            (
+                &["edit", "KEY", "--broker-requests", "5"][..],
+                2,
+                "--broker <PRESET>",
+            ),
+            (
+                &["edit", "KEY", "--broker", "gemini"][..],
+                2,
+                "invalid value 'gemini'",
+            ),
+            (
+                &["edit", "KEY", "--broker", "anthropic", "--clear", "broker"][..],
+                1,
+                "give one of them",
+            ),
+            (
+                &["edit", "KEY", "--broker", "openai-compatible"][..],
+                1,
+                "no default origin",
+            ),
+            (
+                &[
+                    "edit",
+                    "KEY",
+                    "--broker",
+                    "openai",
+                    "--broker-origin",
+                    "https://127.0.0.1",
+                ][..],
+                1,
+                "not an IP address",
+            ),
+            (
+                &[
+                    "edit",
+                    "KEY",
+                    "--broker",
+                    "anthropic",
+                    "--broker-lifetime",
+                    "0",
+                ][..],
+                1,
+                "1 to 1440 minutes",
+            ),
+            // `grants revoke`: exactly one of an ID and --all, and an ID.
+            (&["grants", "revoke"][..], 2, "<ID|--all>"),
+            (
+                &["grants", "revoke", "g0123456789abcdef", "--all"][..],
+                2,
+                "cannot be used with",
+            ),
+            (
+                &["grants", "--json", "revoke", "--all"][..],
+                2,
+                "cannot be used with",
+            ),
+            (
+                &["grants", "revoke", "../g0123"][..],
+                1,
+                "is not a grant ID",
+            ),
+            (
+                &["grants", "revoke", "G0123456789ABCDEF"][..],
+                1,
+                "is not a grant ID",
+            ),
+        ] {
+            let out = agent.run(args);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(expected), "{args:?}: {stderr}");
+            assert!(stderr.contains(message), "{args:?}: {stderr}");
+        }
+        assert!(agent.requests().is_empty(), "{:?}", agent.requests());
+    }
+
+    #[test]
+    fn a_url_for_a_brokered_entry_under_another_name_is_refused() {
+        // `anthropic` and the UUID are the entry `AI/anthropic` names: its
+        // own URL would send the token straight to the provider, past the
+        // broker.
+        const ID: &str = "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12";
+        let agent = FakeAgent::new(plain_status(), |request| match request {
+            Request::Show { name } if name == "anthropic" || name == ID => Some(Response::Entry {
+                entry: entry(
+                    ID,
+                    Some("AI"),
+                    "anthropic",
+                    Some("https://api.anthropic.com"),
+                ),
+            }),
+            Request::Show { name } if name == "missing" => {
+                error(ErrorCode::NotFound, "no entry named missing")
+            }
+            other => panic!("unexpected {other:?}"),
+        });
+        let url_of = |url: &str| {
+            agent.run(&[
+                "run",
+                "--broker",
+                "ANTHROPIC_AUTH_TOKEN=AI/anthropic",
+                "--url",
+                url,
+                "--",
+                "true",
+            ])
+        };
+        for name in ["anthropic", ID] {
+            let out = url_of(&format!("ANTHROPIC_BASE_URL={name}"));
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(125), "{stderr}");
+            assert!(
+                stderr.contains("is the entry of --broker ANTHROPIC_AUTH_TOKEN=AI/anthropic"),
+                "{stderr}"
+            );
+        }
+        // An entry the agent does not know: its message, once, and nothing
+        // ran.
+        let out = url_of("DOCS_URL=missing");
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "{stderr}");
+        assert_eq!(stderr, "rusthorse: no entry named missing\n");
+        let types: Vec<Value> = agent.requests().iter().map(|r| r["type"].clone()).collect();
+        assert_eq!(
+            types,
+            ["status", "show", "status", "show", "status", "show"],
+            "no run was sent"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_touches_the_profile_is_a_broker_edit() {
+        let answers = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::clone(&answers);
+        let agent = FakeAgent::new(plain_status(), move |request| {
+            assert!(
+                matches!(request, Request::Edit { .. } | Request::BrokerEdit { .. }),
+                "{request:?}"
+            );
+            queue.lock().unwrap().pop_front().expect("an answer")
+        });
+        let edit = |args: &[&str], answer: Option<Response>| {
+            answers.lock().unwrap().push_back(answer);
+            let mut argv = vec!["edit", "KEY"];
+            argv.extend(args);
+            let out = agent.run(&argv);
+            (out, agent.sent().pop().expect("a request").0)
+        };
+
+        // A profile, with only the options given (the agent fills in the
+        // defaults), and another change beside it.
+        let (out, request) = edit(
+            &[
+                "--username",
+                "me",
+                "--broker",
+                "openai-compatible",
+                "--broker-origin",
+                "https://api.deepseek.com",
+                "--broker-requests",
+                "200",
+            ],
+            ok("changed KEY"),
+        );
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("changed KEY"));
+        assert_eq!(request["type"], "broker_edit");
+        assert_eq!(request["name"], "KEY");
+        assert_eq!(request["changes"]["username"], "me");
+        assert_eq!(
+            request["changes"]["broker"],
+            json!({"preset": "openai-compatible", "origin": "https://api.deepseek.com", "max_requests": 200})
+        );
+        // Every option.
+        let (out, request) = edit(
+            &[
+                "--broker",
+                "anthropic",
+                "--broker-origin",
+                "https://gateway.example.com:8443",
+                "--broker-base-path",
+                "",
+                "--broker-locks",
+                "end",
+                "--broker-lifetime",
+                "15",
+            ],
+            ok("changed KEY"),
+        );
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(
+            request["changes"]["broker"],
+            json!({
+                "preset": "anthropic",
+                "origin": "https://gateway.example.com:8443",
+                "base_path": "",
+                "automatic_locks": "end",
+                "max_lifetime_minutes": 15,
+            })
+        );
+        // Clearing it.
+        let (out, request) = edit(&["--clear", "broker", "--clear", "port"], ok("changed KEY"));
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(request["type"], "broker_edit");
+        assert_eq!(request["changes"]["clear"], json!(["broker", "port"]));
+        assert!(request["changes"].get("broker").is_none(), "{request}");
+        // Any other edit is a plain edit, as before.
+        let (out, request) = edit(&["--username", "me", "--clear", "kind"], ok("changed KEY"));
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(request["type"], "edit");
+        assert!(request["changes"].get("broker").is_none(), "{request}");
+        // Its answers mean what they mean for an edit.
+        for (answer, expected) in [
+            (error(ErrorCode::Denied, "denied"), 4),
+            (error(ErrorCode::Cancelled, "cancelled"), 4),
+            (error(ErrorCode::InvalidRequest, "broker profile: …"), 1),
+            (error(ErrorCode::OutcomeUnknown, "not durable"), 124),
+            (None, 124),
+        ] {
+            let (out, request) = edit(&["--broker", "anthropic"], answer);
+            assert_eq!(out.status.code(), Some(expected), "{}", text(&out.stderr));
+            assert_eq!(request["type"], "broker_edit");
+        }
+    }
+
+    fn grant(id: &str) -> GrantInfo {
+        GrantInfo {
+            id: id.into(),
+            entry: "AI/anthropic (8d2f6c1e)".into(),
+            var: "ANTHROPIC_AUTH_TOKEN".into(),
+            destination: "https://api.anthropic.com".into(),
+            preset: Preset::Anthropic,
+            command: "claude".into(),
+            requester: "rusthorse[4300] ← bash[4242]".into(),
+            state: "active".into(),
+            started: "2026-11-02T18:00:00-03:00".into(),
+            ends_in_secs: 3600,
+            requests: 3,
+            max_requests: Some(200),
+            in_flight: 1,
+            automatic_locks: AutomaticLocks::Continue,
+        }
+    }
+
+    #[test]
+    fn grants_are_listed_and_revoked_without_approval() {
+        let listed = vec![grant("g0123456789abcdef"), grant("gfedcba9876543210")];
+        let shown = listed.clone();
+        let agent = FakeAgent::new(plain_status(), move |request| match request {
+            Request::Grants => Some(Response::Grants {
+                grants: shown.clone(),
+            }),
+            Request::RevokeGrant { id: Some(id) } if id == "g0000000000000000" => {
+                error(ErrorCode::NotFound, "no grant g0000000000000000")
+            }
+            Request::RevokeGrant { id: Some(id) } => ok(&format!("revoked {id}")),
+            Request::RevokeGrant { id: None } => ok("revoked 2 grants"),
+            other => panic!("unexpected {other:?}"),
+        });
+        let out = agent.run(&["grants"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let table = text(&out.stdout);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "{table}");
+        assert!(
+            lines[0].starts_with("ID  ") && lines[0].ends_with("COMMAND"),
+            "{table}"
+        );
+        for cell in [
+            "g0123456789abcdef",
+            "AI/anthropic (8d2f6c1e)",
+            "https://api.anthropic.com",
+            "active",
+            "2026-11-02T18:00:00-03:00",
+            "1h",
+            "3 of 200",
+            "continue",
+            "rusthorse[4300] ← bash[4242]",
+        ] {
+            assert!(lines[1].contains(cell), "{cell}: {table}");
+        }
+        assert!(lines[2].starts_with("gfedcba9876543210"), "{table}");
+        // The JSON is the agent's list, as it reports it.
+        let out = agent.run(&["grants", "--json"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let back: Vec<GrantInfo> = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(back, listed);
+        // One, or all.
+        let out = agent.run(&["grants", "revoke", "g0123456789abcdef"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("revoked g0123456789abcdef"));
+        let out = agent.run(&["grants", "revoke", "--all"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        // An ID the agent does not know: an error.
+        let out = agent.run(&["grants", "revoke", "g0000000000000000"]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("no grant g0000000000000000"));
+        let sent: Vec<Value> = agent.sent().into_iter().map(|(json, _)| json).collect();
+        assert_eq!(
+            sent,
+            [
+                json!({"type": "grants"}),
+                json!({"type": "grants"}),
+                json!({"type": "revoke_grant", "id": "g0123456789abcdef"}),
+                json!({"type": "revoke_grant"}),
+                json!({"type": "revoke_grant", "id": "g0000000000000000"}),
+            ]
+        );
+
+        // No grant, and an agent that refuses to list them.
+        let agent = FakeAgent::new(plain_status(), |request| match request {
+            Request::Grants => Some(Response::Grants { grants: vec![] }),
+            other => panic!("unexpected {other:?}"),
+        });
+        let out = agent.run(&["grants"]);
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(text(&out.stderr).contains("No grants."));
+        assert_eq!(text(&agent.run(&["grants", "--json"]).stdout).trim(), "[]");
+        let agent = FakeAgent::new(plain_status(), |_| {
+            error(ErrorCode::InvalidRequest, "broker grants are not available")
+        });
+        let out = agent.run(&["grants"]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("broker grants are not available"));
+    }
+
+    #[test]
+    fn status_reports_the_broker_and_the_grants_when_the_agent_does() {
+        let mut reporting = status(Some("/opt/rusthorse/rusthorse-broker"), "");
+        reporting.grants = Some(2);
+        let agent = FakeAgent::new(reporting, |request| panic!("unexpected {request:?}"));
+        let out = agent.run(&["status"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        assert!(
+            shown.contains("broker:     /opt/rusthorse/rusthorse-broker\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("grants:     2 active\n"), "{shown}");
+        let out = agent.run(&["status", "--json"]);
+        let json: Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(json["broker"], "/opt/rusthorse/rusthorse-broker");
+        assert_eq!(json["grants"], 2);
+        // An agent that does not report them: nothing about them.
+        let agent = FakeAgent::new(plain_status(), |request| panic!("unexpected {request:?}"));
+        let shown = text(&agent.run(&["status"]).stdout);
+        assert!(
+            !shown.contains("broker:") && !shown.contains("grants:"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn list_and_show_carry_the_broker_profile() {
+        let with_profile = entry(
+            "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12",
+            Some("AI"),
+            "anthropic",
+            None,
+        );
+        let profile =
+            serde_json::to_value(with_profile.broker.as_ref().expect("a profile")).expect("json");
+        // How the agent reports a stored profile it cannot read.
+        let unusable = EntryInfo {
+            id: "11111111-2222-4333-8444-555555555555".into(),
+            name: "broken".into(),
+            other_fields: vec![rusthorse::vault::FIELD_BROKER.into()],
+            broker: None,
+            ..with_profile.clone()
+        };
+        let listed = vec![with_profile.clone(), unusable.clone()];
+        let agent = FakeAgent::new(plain_status(), move |request| match request {
+            Request::List => Some(Response::Entries {
+                entries: listed.clone(),
+            }),
+            Request::Show { name } if name == "anthropic" => Some(Response::Entry {
+                entry: with_profile.clone(),
+            }),
+            Request::Show { name } if name == "broken" => Some(Response::Entry {
+                entry: unusable.clone(),
+            }),
+            other => panic!("unexpected {other:?}"),
+        });
+        // The JSON carries the profile as the agent reports it.
+        let out = agent.run(&["list", "--json"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let json: Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(json[0]["broker"], profile);
+        assert!(json[1].get("broker").is_none(), "{json}");
+        assert_eq!(json[1]["other_fields"], json!(["Rusthorse.Broker"]));
+        let out = agent.run(&["show", "anthropic", "--json"]);
+        let json: Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(json["broker"], profile);
+        // The text says what a grant allows, or why there can be none.
+        let out = agent.run(&["show", "anthropic"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        assert!(
+            shown.contains(
+                "broker:     anthropic preset, revision 1\n            Destination: \
+                 https://api.anthropic.com\n            Allows: POST /v1/messages, "
+            ),
+            "{shown}"
+        );
+        let shown = text(&agent.run(&["show", "broken"]).stdout);
+        assert!(shown.contains("fields:     Rusthorse.Broker\n"), "{shown}");
+        assert!(shown.contains("broker:     unusable: "), "{shown}");
+    }
+
+    /// `rusthorse doctor` on `agent`, again while a program written for the
+    /// test is busy: another test's child may hold it open for writing until
+    /// its exec ("Text file busy").
+    fn doctor(agent: &FakeAgent) -> String {
+        for _ in 0..50 {
+            let report = text(&agent.run(&["doctor"]).stdout);
+            if !report.contains("Text file busy") {
+                return report;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the program stayed busy")
+    }
+
+    #[test]
+    fn doctor_checks_the_broker_program_and_the_certificate_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("rusthorse-broker");
+        let path = program.to_str().expect("utf8").to_string();
+        // The agent's program file is next to it, and in an empty directory.
+        let beside = dir
+            .path()
+            .join("rusthorse")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        let empty = tempfile::tempdir().expect("tempdir");
+        let alone = empty
+            .path()
+            .join("rusthorse")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        let write = |version: &str, mode: u32| {
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\necho '{{\"version\":\"{version}\",\"protocol\":{}}}'\n",
+                    rusthorse::broker_protocol::VERSION
+                ),
+            )
+            .expect("write");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        let ours = env!("CARGO_PKG_VERSION");
+        let report = |status: StatusInfo| {
+            doctor(&FakeAgent::new(status, |request| {
+                panic!("unexpected {request:?}")
+            }))
+        };
+
+        // The program the agent reports, of this version: fine.
+        write(ours, 0o700);
+        let shown = report(status(Some(&path), ""));
+        assert!(
+            shown.contains(&format!("  ok    broker: rusthorse-broker {ours} ({path})")),
+            "{shown}"
+        );
+        // Of another version: an error.
+        write("0.0.0-other", 0o700);
+        let shown = report(status(Some(&path), ""));
+        assert!(
+            shown.contains("  FAIL  rusthorse-broker 0.0.0-other speaks broker protocol"),
+            "{shown}"
+        );
+        assert!(shown.contains("no grant of the credential broker can be served"));
+        // Unusable: the agent says why.
+        write(ours, 0o770);
+        let shown = report(status(
+            Some("none: /x/rusthorse-broker can be modified by its group or by others"),
+            &beside,
+        ));
+        assert!(
+            shown.contains(
+                "  FAIL  no grant of the credential broker can be served (`rusthorse run \
+                 --broker` exits with 125 and runs nothing): /x/rusthorse-broker can be modified"
+            ),
+            "{shown}"
+        );
+        let installed = shown;
+        // Not installed: a warning, which says what it means.
+        let shown = report(status(Some("none: it is not installed"), &alone));
+        assert!(
+            shown.contains(&format!(
+                "  warn  {} is not installed: no grant of the credential broker can be served",
+                empty.path().join("rusthorse-broker").display()
+            )),
+            "{shown}"
+        );
+        let absent = shown;
+        // An agent that predates the field: looked for next to its program.
+        let shown = report(status(None, &alone));
+        assert!(shown.contains("is not installed"), "{shown}");
+        let shown = report(status(None, &beside));
+        assert!(
+            shown.contains("  FAIL  no grant of the credential broker"),
+            "{shown}"
+        );
+        // The certificate file, whatever this computer has: checked as a
+        // broker checks it; without it, an error where the broker's
+        // program is installed and a warning where it is not.
+        match rusthorse::broker_protocol::open_ca_file() {
+            Ok(ca) => {
+                let line = format!(
+                    "  ok    the broker trusts the certificate authorities in {}\n",
+                    ca.path.display()
+                );
+                assert!(installed.contains(&line), "{installed}");
+                assert!(absent.contains(&line), "{absent}");
+            }
+            Err(why) => {
+                assert!(
+                    installed.contains(&format!("  FAIL  {why}: no grant")),
+                    "{installed}"
+                );
+                assert!(
+                    absent.contains(&format!("  warn  {why}: no grant")),
+                    "{absent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_audit_log_shows_the_records_of_the_broker() {
+        use rusthorse::audit::{AuditEvent, AuditGrant, AuditRequestCounts};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("audit.jsonl");
+        let agent = rusthorse::peer::Peer::agent();
+        let id = "g0123456789abcdef";
+        let mut run = AuditEvent::new("run", &agent)
+            .outcome("allowed_once")
+            .entries(vec!["AI/anthropic (8d2f6c1e)".into()]);
+        run.argv = Some(vec!["claude".into()]);
+        run.grants = Some(vec![AuditGrant {
+            id: id.into(),
+            entry: "AI/anthropic (8d2f6c1e)".into(),
+            destination: "https://api.anthropic.com".into(),
+        }]);
+        let mut admitted = AuditEvent::new("broker_request", &agent).outcome("admitted");
+        admitted.grant = Some(id.into());
+        admitted.request = Some(1);
+        admitted.route = Some("POST /v1/messages".into());
+        let mut finished = AuditEvent::new("broker_request", &agent).outcome("completed");
+        finished.grant = Some(id.into());
+        finished.request = Some(1);
+        finished.status = Some(200);
+        finished.bytes_sent = Some(120);
+        finished.bytes_received = Some(4096);
+        let mut ended = AuditEvent::new("grant", &agent).outcome("ended");
+        ended.grant = Some(id.into());
+        ended.reason = Some("command_ended".into());
+        ended.requests = Some(AuditRequestCounts {
+            admitted: 1,
+            finished: 1,
+            unknown: 0,
+            refused: 2,
+        });
+        let records = [run, admitted, finished, ended];
+        let lines: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).expect("json") + "\n")
+            .collect();
+        std::fs::write(&log, &lines).expect("write");
+        let audit = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+                .args(args)
+                .env("RUSTHORSE_AUDIT_LOG", &log)
+                .env("RUSTHORSE_SOCKET", dir.path().join("nobody.sock"))
+                .stdin(Stdio::null())
+                .finish()
+        };
+        let out = audit(&["audit", "-n", "10"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        for part in [
+            " grants: g0123456789abcdef for AI/anthropic (8d2f6c1e) to https://api.anthropic.com; $ claude",
+            "broker_request admitted",
+            " grant g0123456789abcdef #1 POST /v1/messages  by ",
+            " grant g0123456789abcdef #1 status 200 (120 bytes sent, 4096 received)  by ",
+            " reason: command_ended requests: 1 admitted (1 finished, 0 unknown), 2 refused",
+        ] {
+            assert!(shown.contains(part), "{part}: {shown}");
+        }
+        // The JSON is the records as they are.
+        let out = audit(&["audit", "-n", "10", "--json"]);
+        assert_eq!(text(&out.stdout), lines);
+    }
+}
