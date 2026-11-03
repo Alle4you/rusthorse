@@ -1175,6 +1175,31 @@ fn a_refused_run_deletes_its_packages_whatever_their_names_and_nothing_else() {
         ),
     );
     assert!(!deb.exists() && !unreadable_deb.exists() && unreadable_pkg.exists());
+
+    // One that cannot be written to, and so cannot be emptied, is deleted
+    // all the same when no other hard link would keep it, and named when
+    // one would.
+    let read_only = package(&at("read-only.pkg"), &for_tests);
+    let shared = package(&at("shared.pkg"), &release);
+    let shared_link = at("elsewhere/shared-link");
+    fs::hard_link(&shared, &shared_link).expect("ln");
+    for file in [&read_only, &shared] {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o444)).expect("chmod");
+    }
+    let shared_before = fs::read(&shared).expect("shared");
+    let out = check_packages(&path, &[&read_only, &shared], &scratch);
+    assert_refused(
+        &out,
+        &format!(
+            "{}deleted {}; not deleted: {} (Permission denied to empty it, and another hard \
+             link would keep it: delete them by hand). A package must",
+            refused(&read_only),
+            read_only.display(),
+            shared.display()
+        ),
+    );
+    assert!(!read_only.exists());
+    assert_eq!(fs::read(&shared_link).expect("shared link"), shared_before);
 }
 
 /// packaging/check-broker.py's deletion of PATH, where another program puts
