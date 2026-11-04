@@ -222,12 +222,15 @@ rusthorse run --broker DEEPSEEK_API_KEY=deepseek@https://api.deepseek.com --brok
 
 This recipe follows what Claude Code's documentation says. Tried with Claude
 Code 2.1.317 and an earlier version of the broker (with profiles), its
-requests went through the broker, but no answer from Claude Code through it
-has been seen yet, and this version has not been tried with it: the account used answered `400`
-("credit balance is too low") to every request tried that carried Claude
-Code's beta `claude-code-20250219` — Claude Code's own, through the broker,
-and SDK requests, with the key by value as through the broker — while other
-requests with the same key worked. If Claude Code shows
+requests went through the broker, but no answer came back: the account used
+answered `400` ("credit balance is too low") to every request tried that
+carried Claude Code's beta `claude-code-20250219` — Claude Code's own,
+through the broker, and SDK requests, with the key by value as through the
+broker — while other requests with the same key worked. Claude Code
+2.1.318, run in print mode (`claude -p`) with a home directory of its own,
+and so no login, then answered through this version of the broker, in one
+request; its interactive mode, as below, has not been tried through it. If
+Claude Code shows
 `Credit balance is too low`, tell the human that the account refused the
 request, not the broker. If it does not work, tell the human: never fall
 back to the key, and do not try another key or other betas on your own.

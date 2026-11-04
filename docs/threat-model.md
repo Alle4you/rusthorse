@@ -616,10 +616,11 @@ with a real key (2026-11-04) and phase 1's broker, the Anthropic Python SDK
 2.4.0 worked through the broker for the requests tried; Claude Code's
 requests went through it, and the API answered them `400`, as it answered
 SDK requests with some of Claude Code's parameters sent with the key by
-value, so no Claude Code answer through the broker has been seen yet. The
-broker without profiles was then tried by hand with `curl` (a GET and a
-POST answered, a token in the URL refused by the broker) and with the
-Anthropic Python SDK 2.4.0 (a message and two streams). A program works
+value, so no Claude Code answer came through it. The broker without
+profiles was then tried by hand with `curl` (a GET and a POST answered, a
+token in the URL refused by the broker), with the Anthropic Python SDK
+2.4.0 (a message and two streams) and with Claude Code 2.1.318 in print
+mode (`claude -p`), which answered. A program works
 through it only if it presents the token literally in a header: one that
 encodes the token or derives its credential from it, and an API that signs
 requests with the key or takes it in the URL or the body, cannot use it.

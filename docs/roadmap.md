@@ -43,8 +43,9 @@ answered `200`, as the audit recorded with the method's label only, and a
 `POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
 token in its URL was refused by the broker itself, and nothing was sent.
 The Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
-worked through it for a message and two streams. Claude Code has not been
-tried through it yet.
+worked through it for a message and two streams, and Claude Code 2.1.318,
+run in print mode (`claude -p`) with a home directory of its own, answered
+through it; its interactive mode has not been tried through it.
 No client version is claimed supported yet.
 
 ### Why
@@ -181,7 +182,8 @@ identity. Phase 1 was implemented and reviewed; in its manual check the
 Python SDK worked, and Claude Code's check was left for later. The broker
 without profiles or presets (above) replaced it; tried by hand with `curl`
 and the Anthropic Python SDK, it served a GET, POSTs and streams and refused
-a misplaced token, and a check of it with Claude Code remains. Nothing else is planned for the broker.
+a misplaced token, and Claude Code answered through it in print mode; its
+interactive mode remains to be tried. Nothing else is planned for the broker.
 
 ## Desktop and usability
 

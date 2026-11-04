@@ -135,21 +135,23 @@ The manual check with a real key (ADR 0013, answer 9) began on 2026-11-04,
 with phase 1's broker: the Anthropic Python SDK 2.4.0 worked through the
 broker for the requests tried; Claude Code's requests went through it, and
 the API answered them `400`, as it answered SDK requests with some of Claude
-Code's parameters sent with the key by value, so no Claude Code answer
-through the broker has been seen yet. The maintainer then tried the broker
-without profiles by hand, with a real key and `curl` through
+Code's parameters sent with the key by value, so no Claude Code answer came
+through phase 1's broker. The maintainer then tried the broker without
+profiles by hand, with a real key and `curl` through
 `https://api.anthropic.com`, the token in `x-api-key`: a `GET /v1/models`
 was answered `200`, as the audit recorded with the method's label only, and
 a `POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
-token in its URL was refused by the broker itself, and nothing was sent.
-The Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
-worked through it for a message and two streams. Claude Code has not been
-tried through it yet. If Claude Code shows `Credit balance is too low`
-while other requests with the same key work, the account refuses Claude
-Code's requests (with the key used in that
-test, its beta `claude-code-20250219` alone drew that answer, with or
-without the broker): check the account, not Rusthorse. No client version is
-called supported yet. You approve each use; the automated tests use fake
+token in its URL was refused by the broker itself, and nothing was sent. The
+Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
+worked through it for a message and two streams. Claude Code 2.1.318, run in
+print mode (`claude -p`) with a home directory of its own, and so no login,
+answered through it, in one request; its interactive mode, as the recipe
+runs it, has not been tried through it. If Claude Code shows
+`Credit balance is too low` while other requests with the same key work, the
+account refuses Claude Code's requests (with the key used in that test, its
+beta `claude-code-20250219` alone drew that answer, with or without the
+broker): check the account, not Rusthorse. No client version is called
+supported yet. You approve each use; the automated tests use fake
 destinations and keys only.
 
 A grant is approved once, with no `--remember`. Each admitted request,

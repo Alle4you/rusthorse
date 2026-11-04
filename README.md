@@ -308,12 +308,13 @@ streamed responses, and the CLI and the manager list and revoke its grants.
 Phase 1, with profiles and presets, was reviewed READY, and so was the
 broker without them (2026-11-04); in phase 1's manual test with a real key,
 the Python SDK worked through the broker, and Claude Code's check was left
-for later. The broker without profiles was then tried by hand with `curl`
-(a GET and a POST answered, a misplaced token refused) and the Python SDK
-(a message and two streams); Claude Code has not been tried through it yet. Screen-lock and suspend locking are
-implemented too. No other connector is planned: `rusthorse run` serves
-databases, devices and SSH. Published packages remain planned. See
-[docs/roadmap.md](docs/roadmap.md).
+for later. The broker without profiles was then tried by hand with `curl` (a
+GET and a POST answered, a misplaced token refused) and the Python SDK (a
+message and two streams), and Claude Code answered through it in print mode
+(`claude -p`); its interactive mode has not been tried through it.
+Screen-lock and suspend locking are implemented too. No other connector is
+planned: `rusthorse run` serves databases, devices and SSH. Published
+packages remain planned. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
 
