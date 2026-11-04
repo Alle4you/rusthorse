@@ -31,8 +31,8 @@ and the later phases. The manual check with the maintainer's credentials
 began on 2026-11-04: the Anthropic Python SDK worked through the broker
 for the requests tried; Claude Code's requests went through it, and the
 API answered them `400`, as it answered SDK requests with some of Claude
-Code's parameters sent with the key by value, so its check is still
-pending. No client version is claimed supported yet.
+Code's parameters sent with the key by value; the maintainer left its
+check for later. No client version is claimed supported yet.
 
 ### Why
 
@@ -93,7 +93,7 @@ connectors remain planned; phase 1 implements HTTP only.
 
 | Connector | How it works | Phase/status |
 |---|---|---|
-| **HTTP APIs** | The client's base URL points to the loopback broker and its API key is the token. The broker constructs authentication, Host and SNI for the profile's fixed origin, connects over verified TLS, follows no redirects and permits only the preset's exact routes. Literal copies of the credential in response bodies are redacted; credential-bearing response header values are dropped. Anthropic, OpenAI and OpenAI-compatible presets, with SSE. | 1 — implemented, reviewed; manual check under way (Python SDK worked; Claude Code pending) |
+| **HTTP APIs** | The client's base URL points to the loopback broker and its API key is the token. The broker constructs authentication, Host and SNI for the profile's fixed origin, connects over verified TLS, follows no redirects and permits only the preset's exact routes. Literal copies of the credential in response bodies are redacted; credential-bearing response header values are dropped. Anthropic, OpenAI and OpenAI-compatible presets, with SSE. | 1 — implemented, reviewed; manual check: the Python SDK worked; Claude Code's check left for later |
 | **Device and generic HTTP profiles** | Pinned TLS for private devices such as FortiGate; Basic authentication, custom routes, Gemini and Hugging Face presets, narrow administrative operations for Palo Alto/Panorama. Profile editing in the manager. | 2 — planned |
 | **SSH agent** | Rusthorse speaks the `ssh-agent` protocol (`SSH_AUTH_SOCK`). Private keys stay in the vault; each signature or session is approved, with OpenSSH destination constraints. KeePassXC SSH-key storage compatibility where practical. | 3 — planned |
 | **PostgreSQL, then MySQL** | A local listener verifies the grant token, authenticates to the real server (SCRAM for PostgreSQL) over TLS and relays the session, with the database fixed. The token is the password of the local hop only. | 4 — planned |
@@ -149,8 +149,8 @@ the approved command.
 ADR 0013 answers phase 1's original questions: revocation cuts open streams;
 the agent serializes counted admissions; routing and DNS are constrained; and
 the local hop authenticates a token, not a process identity. Phase 1 is
-implemented and reviewed; its manual check is under way (Claude Code
-pending). Next are phase
+implemented and reviewed; in its manual check the Python SDK worked, and
+Claude Code's check was left for later. Next are phase
 2's device/generic HTTP profiles, phase 3's SSH agent and phase 4's database
 connectors. Each needs its own design, review and tests, including its
 session-revocation and destination-binding rules before implementation.

@@ -106,7 +106,11 @@ separate recipe and settings checks. The manual check with a real key (ADR
 through the broker for the requests tried; Claude Code's requests went
 through it, and the API answered them `400`, as it answered SDK requests
 with some of Claude Code's parameters sent with the key by value, so no
-Claude Code answer through the broker has been seen yet. No client version
+Claude Code answer through the broker has been seen yet. If Claude Code
+shows `Credit balance is too low` while other requests with the same key
+work, the account refuses Claude Code's requests (with the key used in
+that test, its beta `claude-code-20250219` alone drew that answer, with or
+without the broker): check the account, not Rusthorse. No client version
 is called supported yet. You approve each use; the automated
 tests use fake destinations and keys only.
 

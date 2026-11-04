@@ -53,6 +53,11 @@ also works as `NAME`. Fields without a value are left out. A field named in
 `protected_fields` is withheld like a secret. An entry with `broker` has a
 broker profile: use it through the broker (below).
 
+The text output (`list` and `show` without `--json`) shows control and
+invisible characters in what the vault holds as `\u{…}` escapes, so that a
+name another program wrote cannot rewrite the terminal. `--json` gives the
+exact values: read a name from it before you pass it back to Rusthorse.
+
 Use the metadata before you ask the human anything. An entry often already
 has the address, port and username you need (a router's IP address, an SSH
 user). For an API key, `url` is the API's endpoint.
@@ -183,8 +188,9 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
   the token.
 - `rusthorse grants` lists the grants, each with its state, never a token:
   their ID, entry, destination, command, requester, requests and when they
-  end. A revoked grant can stay in the list until its command ends.
-  `rusthorse grants revoke ID` ends one.
+  end. A revoked grant can stay in the list until its command ends. Under
+  the table, a note names each grant whose destination answered `401`, as
+  after a run. `rusthorse grants revoke ID` ends one.
 
 Setting a profile is the human's decision, in a dialog that shows the whole
 profile: suggest one of these, and do not run it unasked.
@@ -200,11 +206,15 @@ rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.d
 ### Claude Code through the broker
 
 This recipe follows what Claude Code's documentation says. Tried with Claude
-Code 2.1.317, its requests went through the broker, and the API answered
-them `400` ("credit balance is too low"), as it answered SDK requests with
-some of Claude Code's parameters sent with the key by value; no answer from
-Claude Code through the broker has been seen yet. If it does not work, tell
-the human: never fall back to the key.
+Code 2.1.317, its requests went through the broker, but no answer from
+Claude Code through it has been seen yet: the account used answered `400`
+("credit balance is too low") to every request tried that carried Claude
+Code's beta `claude-code-20250219` — Claude Code's own, through the broker,
+and SDK requests, with the key by value as through the broker — while other
+requests with the same key worked. If Claude Code shows
+`Credit balance is too low`, tell the human that the account refused the
+request, not the broker. If it does not work, tell the human: never fall
+back to the key, and do not try another key or other betas on your own.
 
 ```sh
 env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \

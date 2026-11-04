@@ -781,7 +781,9 @@ second review's corrections are folded in):
    key the beta `claude-code-20250219` alone drew it; they were not full
    reproductions of Claude Code's requests. No answer from Claude Code
    through the broker has been seen yet, and no version is called
-   supported yet.)
+   supported yet; the maintainer left Claude Code's check for later, since
+   the account, with or without the broker, refuses requests that carry
+   that beta.)
 10. **Can one grant cover several entries?** No: one grant, token, broker
     and port per entry; one run may hold several, approved in one dialog
     and prepared together before the command starts. They end together
