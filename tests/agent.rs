@@ -2686,7 +2686,10 @@ fn open_hands_only_http_links_to_the_browser() {
     let fake = bin.join("xdg-open");
     std::fs::write(
         &fake,
-        format!("#!/bin/sh\necho \"$1\" > {}\n", opened.display()),
+        format!(
+            "#!/bin/sh\necho \"$1\" > {}\n",
+            rusthorse::util::shell_quote(&opened.to_string_lossy())
+        ),
     )
     .expect("write");
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -2730,7 +2733,10 @@ fn open_shows_a_url_written_elsewhere_escaped() {
     let fake = bin.join("xdg-open");
     std::fs::write(
         &fake,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n", opened.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n",
+            rusthorse::util::shell_quote(&opened.to_string_lossy())
+        ),
     )
     .expect("write");
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
