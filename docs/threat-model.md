@@ -673,6 +673,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
 | 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
 | 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
+| 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `d8f2eb9` and `e86e6bd`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `7a1d63b`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2338,3 +2339,60 @@ newline, accepted and refused runs, links and files in DIR left as they
 were); the injected `EIO` against the mutation; the copy fallback after
 `EPERM`; `git diff --check`. The maintainer's agent then ran the 25
 packaging tests, clippy and the MSRV check on `3ca5ebb`.
+
+**2026-11-03 — Test hygiene and behaviour under load at `e86e6bd`.**
+
+The maintainer asked for the old tests that left files behind to be fixed.
+The maintainer's agent ran the end-to-end suite in four parallel copies next
+to eight CPU burners, each copy with a `TMPDIR` of its own, and then every
+test binary alone in a `TMPDIR` of its own. Every loaded run of the suite
+left directories behind, and 7 of 56 failed. Five problems were found, all
+in the tests: T01–T04 were fixed in `d8f2eb9` and T05 in `e86e6bd`.
+
+Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
+maintainer to verify those fixes: whether they prevent late writes and
+load-dependent failures without hiding a product defect or weakening the
+intended checks. The reviewed range was `99bda92..e86e6bd`. No medium or
+higher finding, or product defect behind the reported failures, was
+identified.
+
+| Finding | Disposition |
+|---|---|
+| T01 — Tests returned before the agent recorded a disconnected run's end, allowing the audit log to recreate the removed temporary directory. | **Fixed in `d8f2eb9` for the reported cases:** `wait_for_run_end` shares three existing waits and is added to nine further tests. The prior process and cancellation assertions remain. Removing the `exited` outcome makes all 13 callers, including T04, fail. Other asynchronous records still needed synchronization: U02 and U03 below. |
+| T02 — An immediate port check could observe a descriptor inherited by another test's child between fork and exec. | **Partly fixed in `d8f2eb9`:** two checks retry for up to five seconds; both still fail with a leaked listener. Source review confirms `RunGrants::stop` clears its listeners before the run answers. A third immediate check remained: U01 below. |
+| T03 — The watcher-stop test required less than three seconds although shutdown deliberately waits up to three seconds for its threads. | **Fixed in `d8f2eb9`:** the assertion allows five seconds, matching the companion test's scheduling margin, and still checks the inhibitor's release. An injected six-second delay is rejected. This no longer detects a regression that merely makes every stop consume the allowed three-second wait; it does not establish that normal stops are prompt. |
+| T04 — A requester-disconnection test inspected the run outcome after the grants disappeared but before `run/exited` was recorded. | **Fixed in `d8f2eb9`:** it waits for the run's end record before inspecting that outcome, retaining its revocation-order and broker-exit assertions. |
+| T05 — GTK widget tests activated desktop services that outlived them, and Xvfb could write Mesa's cache after cleanup. | **Fixed in `e86e6bd`:** the tests use private D-Bus sessions without service activation, disable GVfs, the settings portal and Mesa's shader cache, and use GTK's test accessibility backend. Accessible properties and relations, clipboard access through xclip and dialog assertions remain checked. The dialog skips with a diagnostic when required tools are absent; the manager requires them. CI installs dbus-daemon, which supplies dbus-run-session. |
+| Low — U01: the successful broker-run test still checked port release with an immediate bind. | **Fixed in `7a1d63b`:** it uses `port_released`, and keeps the broker-exit assertion. |
+| Low — U02: some tests inspected grant-end records or removed their directory before asynchronous grant auditing finished; one also required an unnecessary global created/ended alternation across grants. | **Fixed in `7a1d63b`:** the tests wait for each grant's end record by ID and check the order per grant. Where the audit log is a FIFO that fails every record, they wait until the end record has been written into it before they put the log back, without requiring a successful record. The same probe found a fourth test that returned before a grant's end record. |
+| Low — U03: the read-only polling test returned when status became locked, before the idle-lock audit record necessarily finished. | **Fixed in `7a1d63b`:** it waits for `lock/idle_timeout` before it returns. |
+
+Codex's checks used an isolated export with its own target directory and
+short TMPDIRs. Four concurrent runs of the 158 agent tests, alongside eight
+CPU burners, passed and left their TMPDIRs empty. The dialog's four unit
+tests and five Xvfb tests, and the manager's 38 tests, passed without
+residue. A direct activation request on the private test bus returned
+ServiceUnknown.
+
+Independent mutation checks reproduced all three reported detections:
+13 failures without `exited`, two failures with a leaked listener, and
+one failure with a six-second watcher-stop delay. Scheduling probes with
+500 ms pauses before grant-end and idle-lock records exposed U02/U03:
+two tests failed and six temporary directories were recreated. A narrower
+probe also confirmed residue from tests that passed. These probes changed
+only the temporary copy.
+
+The maintainer's supplied results additionally record 32 successful loaded
+runs and the complete AGENTS.md checks. Those complete checks were not
+repeated by Codex. The range's diff check and formatting check passed.
+No repository file was changed by this review.
+
+The maintainer's agent then fixed U01–U03 in `7a1d63b` and checked the
+fix with the same probe, in a copy with its own target directory: with
+the pauses, each run of the suite had failed two tests and left six
+directories; after the fix, two runs passed and left nothing. Without the
+agent's grant end records, the six tests that now wait for them fail,
+each with its message; without the idle lock's record, the polling test
+fails. Twelve loaded runs (four copies next to eight CPU burners) passed
+with nothing left; formatting, both clippy runs, the end-to-end tests
+without default features and the MSRV checks passed.
