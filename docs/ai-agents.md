@@ -117,7 +117,8 @@ read like a problem with its token. `rusthorse run` then says, after the
 command, which entry's key the destination refused and how to replace it
 (`rusthorse edit NAME --value`, where you type the new key in a dialog);
 `rusthorse grants` and the Grants page show the count while the command runs.
-The broker's own errors start with `rusthorse-broker:`.
+The JSON errors the broker writes itself start their message with
+`rusthorse-broker:`.
 
 Inspect `rusthorse grants` or the manager's Grants page, and end one with
 `rusthorse grants revoke ID` or all with `rusthorse grants revoke --all`.

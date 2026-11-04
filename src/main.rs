@@ -768,11 +768,20 @@ fn guide(topic: GuideTopic) -> anyhow::Result<u8> {
     }
 }
 
+/// What the agent says — the message of an answer or of an error — as the
+/// CLI prints it: with control and invisible characters escaped
+/// ([`rusthorse::util::visible`]). The agent names entries by their title,
+/// which another KeePass program can have written with terminal controls
+/// in it (threat model L9).
+fn agent_says(message: &str) -> String {
+    rusthorse::util::visible(message)
+}
+
 /// Turn an error response into an error (with the right exit status).
 fn check(response: Response) -> anyhow::Result<Response> {
     match response {
         Response::Error { code, message } => {
-            eprintln!("rusthorse: {message}");
+            eprintln!("rusthorse: {}", agent_says(&message));
             let status = match code {
                 ErrorCode::Denied | ErrorCode::Cancelled => EXIT_DENIED,
                 ErrorCode::OutcomeUnknown => EXIT_UNKNOWN,
@@ -787,7 +796,7 @@ fn check(response: Response) -> anyhow::Result<Response> {
 fn simple(client: &Client, request: &Request) -> anyhow::Result<u8> {
     match check(client.call(request)?)? {
         Response::Ok { message } => {
-            eprintln!("{message}");
+            eprintln!("{}", agent_says(&message));
             Ok(0)
         }
         // An answer that makes no sense says nothing about what happened.
@@ -1726,11 +1735,11 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 code: ErrorCode::OutcomeUnknown,
                 message,
             } => {
-                eprintln!("rusthorse: {message}");
+                eprintln!("rusthorse: {}", agent_says(&message));
                 Ok(EXIT_UNKNOWN)
             }
             Response::Error { message, .. } => {
-                eprintln!("rusthorse: {message}");
+                eprintln!("rusthorse: {}", agent_says(&message));
                 Ok(EXIT_RUN_FAILURE)
             }
             other => Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
@@ -1818,6 +1827,15 @@ fn requests_count(requests: u64) -> String {
 fn unauthorized_note(grant: &UnauthorizedGrant, name: Option<&str>) -> String {
     use rusthorse::util::{shell_quote, visible};
     let (entry, fix) = match name {
+        // A name that starts with `-` would be read as an option: after
+        // `--`, it is not.
+        Some(name) if name.starts_with('-') => (
+            visible(name),
+            format!(
+                "replace it: rusthorse edit --value -- {}",
+                visible(&shell_quote(name))
+            ),
+        ),
         Some(name) => (
             visible(name),
             format!(
@@ -2136,16 +2154,16 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             Err(Exit(EXIT_UNKNOWN).into())
         };
         match answer {
-            Ok(Response::Ok { message }) => eprintln!("{message}"),
+            Ok(Response::Ok { message }) => eprintln!("{}", agent_says(&message)),
             // Every error except `outcome_unknown` means nothing was saved
             // (docs/protocol.md, "Errors").
             Ok(Response::Error { code, message }) if code != ErrorCode::OutcomeUnknown => {
-                eprintln!("rusthorse: {message}");
+                eprintln!("rusthorse: {}", agent_says(&message));
                 let denied = matches!(code, ErrorCode::Denied | ErrorCode::Cancelled);
                 return not_imported(if denied { EXIT_DENIED } else { 1 });
             }
             Ok(Response::Error { message, .. }) => {
-                eprintln!("rusthorse: {message}");
+                eprintln!("rusthorse: {}", agent_says(&message));
                 return unsure("could not confirm");
             }
             Ok(other) => {
@@ -3251,6 +3269,48 @@ mod tests {
             help.contains("720 (12 hours) for the presets of this version"),
             "{help}"
         );
+    }
+
+    /// The command that a run's note suggests for a key the destination
+    /// refused edits the entry it names, with a dialog for the new value —
+    /// also when the name starts with `-`, which `--` keeps from being read
+    /// as an option.
+    #[test]
+    fn the_command_a_note_suggests_edits_the_entry_it_names() {
+        let grant = UnauthorizedGrant {
+            var: "T".into(),
+            entry: "KEY (8d2f6c1e)".into(),
+            destination: "https://api.anthropic.com".into(),
+            requests: 1,
+        };
+        for (name, shown, argv) in [
+            ("KEY", "rusthorse edit KEY --value", vec!["KEY", "--value"]),
+            (
+                "AI/my key",
+                "rusthorse edit 'AI/my key' --value",
+                vec!["AI/my key", "--value"],
+            ),
+            (
+                "-k",
+                "rusthorse edit --value -- -k",
+                vec!["--value", "--", "-k"],
+            ),
+            (
+                "--help",
+                "rusthorse edit --value -- --help",
+                vec!["--value", "--", "--help"],
+            ),
+        ] {
+            let note = unauthorized_note(&grant, Some(name));
+            assert!(note.ends_with(&format!("replace it: {shown}")), "{note}");
+            let parsed = Cli::try_parse_from(["rusthorse", "edit"].into_iter().chain(argv))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let Command::Edit(args) = parsed.command else {
+                panic!("{name}: not an edit")
+            };
+            assert_eq!(args.name, name);
+            assert!(args.value, "{name}");
+        }
     }
 
     /// The arguments of `rusthorse edit KEY ARGS…`.

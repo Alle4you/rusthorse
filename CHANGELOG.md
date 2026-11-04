@@ -34,8 +34,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   its exit status unchanged; `grants` (a note under the table, and
   `unauthorized` in `--json`) and the manager's Grants page show the count
   while the command runs. Status only, never the body: the same for every
-  destination. The broker's own errors now start with `rusthorse-broker:`,
-  and that of a grant that has ended says to run the command again.
+  destination. The JSON errors the broker writes itself now start their
+  message with `rusthorse-broker:`, and that of a grant that has ended says
+  to run the command again.
 - **Manager broker controls**: a Grants page lists and revokes one or all
   grants, also while locked. Ended rows retain their place while the page is
   shown. Entry details show profiles read-only and offer broker command

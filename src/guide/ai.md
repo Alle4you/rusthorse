@@ -165,8 +165,9 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
   and never try another entry or the key by value.
 - The broker's own errors have the type `rusthorse_broker` and a message
   that starts with `rusthorse-broker:` (a missing or wrong token, a route the
-  profile does not allow, a grant that has ended: `403`). Any other error
-  comes from the destination.
+  profile does not allow, a grant that has ended: `403`). An error in the
+  destination's own form comes from the destination. A `400` or `431` with
+  an empty body is the broker's answer to a malformed request.
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).

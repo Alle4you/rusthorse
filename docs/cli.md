@@ -631,12 +631,15 @@ runs, [`rusthorse grants`](#rusthorse-grants) shows the same count.
 
 The broker's own answers — a missing or wrong token, a route the profile
 does not allow, a grant that has ended — are short JSON errors of type
-`rusthorse_broker`, whose message starts with `rusthorse-broker:`; any other
-error comes from the destination, passed on as it came. A grant that has
-ended answers `403`, with a message that says to run the command again with
-`rusthorse run`. A program that shows only the message still says who
-answered: Claude Code showed the broker's message after its own
-`Please run /login · API Error: 403`, and its `/login` does not apply here.
+`rusthorse_broker`, whose message starts with `rusthorse-broker:`; an error
+in the destination's own form comes from the destination, passed on as it
+came. Two exceptions: the broker's HTTP parser answers a malformed request
+itself, with `400` or `431` and an empty body, and a connection can close
+with no answer at all. A grant that has ended answers `403`, with a message
+that says to run the command again with `rusthorse run`. A program that
+shows only the message still says who answered: Claude Code showed the
+broker's message after its own `Please run /login · API Error: 403`, and its
+`/login` does not apply here.
 
 With redaction (the default), the tokens are redacted from the output like
 the values. `--no-redact` is allowed, and the dialog warns about it: the

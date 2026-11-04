@@ -744,6 +744,26 @@ fn import_dotenv_edit_and_remove() {
     assert!(listing.contains("A_KEY") && !listing.contains("B_KEY"));
 }
 
+/// What the agent says is printed with control and invisible characters
+/// escaped: an entry's title written by another KeePass client can hold
+/// terminal controls, and an edit or a removal that names the entry by its
+/// UUID (as the manager does) answers with that title.
+#[test]
+fn a_title_written_elsewhere_is_printed_escaped() {
+    use keepass::db::fields;
+    let h = Harness::new();
+    let uuids = seed(&h, &[("PLAIN", "value-1234", None)]);
+    set_field_elsewhere(&h, "PLAIN", fields::TITLE, "SAFE\u{1b}[2J\rFORGED", false);
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", &uuids["PLAIN"], "--add-tag", "by-uuid"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "SAFE\\u{1b}[2J\\u{d}FORGED updated\n");
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["remove", &uuids["PLAIN"]]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "SAFE\\u{1b}[2J\\u{d}FORGED deleted\n");
+}
+
 /// The group of entry `name` as `list --json` shows it (`None`: the top
 /// level).
 fn listed_group(h: &Harness, name: &str) -> Option<String> {
@@ -8980,6 +9000,42 @@ mod broker_cli {
         let out = agent.run(&["grants"]);
         assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
         assert!(text(&out.stderr).contains("broker grants are not available"));
+    }
+
+    /// Whatever the agent says — an answer, an error, the error of a run —
+    /// is printed with control and invisible characters escaped.
+    #[test]
+    fn what_the_agent_says_is_printed_escaped() {
+        let agent = FakeAgent::new(plain_status(), |request| match request {
+            Request::RevokeGrant { id: Some(_) } => ok("revoked \u{1b}[2J\rX"),
+            Request::RevokeGrant { id: None } => {
+                error(ErrorCode::NotFound, "no \u{1b}]0;title\u{7}grant")
+            }
+            Request::BrokerRun(_) => error(ErrorCode::InvalidRequest, "K\u{202e} has no profile"),
+            other => panic!("unexpected {other:?}"),
+        });
+        for (args, status, says) in [
+            (
+                &["grants", "revoke", "g0123456789abcdef"][..],
+                0,
+                "revoked \\u{1b}[2J\\u{d}X",
+            ),
+            (
+                &["grants", "revoke", "--all"][..],
+                1,
+                "rusthorse: no \\u{1b}]0;title\\u{7}grant",
+            ),
+            (
+                &["run", "--broker", "T=k", "--", "true"][..],
+                125,
+                "rusthorse: K\\u{202e} has no profile",
+            ),
+        ] {
+            let out = agent.run(args);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(status), "{stderr}");
+            assert_eq!(stderr.trim_end(), says);
+        }
     }
 
     /// `rusthorse grants` keeps its table, and says under it, on standard
