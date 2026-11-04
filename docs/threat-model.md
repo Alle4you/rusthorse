@@ -682,6 +682,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `c0aebc0` and `4fefa4c`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; W01 and W02 fixed in `2fafe05`, W03 partly, completed in `f51391c` (X02). The count of 401 answers held under every probe. |
 | 2026-11-04 | Confirmation of `2fafe05` and its history at `db0af0e` (Codex, AI-assisted). | Not ready: W01 and W02 confirmed resolved, W03 partly; X01 medium (older than this work: `list` and `show` printed what the vault holds unescaped), X02 and X03 low; X02 and X03 fixed in `f51391c`, X01 partly, completed in `f20d7d0` (Y01, Y02). |
 | 2026-11-04 | Confirmation of `f51391c` and its history at `5dd639a` (Codex, AI-assisted). | Not ready: X02 and X03 confirmed resolved, X01 partly; Y01 medium (`open` printed a URL from the vault unescaped) and Y02 low, both older than this work, fixed in `f20d7d0`. |
+| 2026-11-04 | Confirmation of `f20d7d0` and its history at `df52e23`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `2a4549d`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2556,3 +2557,29 @@ that cannot be read (Y02), both of which passed with the fix applied in
 its copy; formatting and `git diff --check`. The maintainer's agent then
 checked `f20d7d0` with all of AGENTS.md's checks, and reverting either fix
 failed its test.
+
+**2026-11-04 — Confirmation of the fixes at `df52e23`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `f20d7d0` and
+of the history above, in `df52e23`. Y01 and Y02 were confirmed resolved:
+`open`'s notice is escaped and a stand-in browser gets the stored URL; an
+import's errors are escaped, with `124` for an answer that cannot be read
+after the request was sent and `1` for a failure before it. A sweep of
+every place where `src/main.rs`, and what it calls, prints — `list`,
+`show`, `status`, `doctor`, `grants`, the audit log, imports, answers,
+errors, help and prompts — found no other text from the vault, the agent
+or a keyring shown unescaped; the messages that create the vault or start
+the agent print paths of the local configuration. `--json`, `reveal`, a
+command's output and the URL given to the browser keep the values as they
+are. The history entries above were found consistent with the commits.
+
+| Finding | Disposition |
+|---|---|
+| Low — Z01: the stand-in for `xdg-open` in `open_shows_a_url_written_elsewhere_escaped` wrote to a path it did not quote, so with a TMPDIR holding a space the script failed (`xdg-open failed (exit status: 2)`) though the product was right; `open_hands_only_http_links_to_the_browser`, older, had the same script. | **Fixed in `2a4549d`:** both scripts quote the path (`util::shell_quote`). With a TMPDIR holding a space, both tests failed before and pass after; with an ordinary one, they pass. |
+
+Codex's checks: the escaping tests (six), the binary's tests, the CLI
+tests of the broker and the tests of an import's batches; its own probes
+of the output and its contracts and of both of an import's errors; the
+mutations that remove Y01's and Y02's fixes, each caught; the `open` test
+with a TMPDIR holding a space (Z01); formatting and `git diff --check`.
+The maintainer's agent then checked `2a4549d` with all of AGENTS.md's checks.
