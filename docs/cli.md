@@ -657,12 +657,16 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
 ```
 
 The last one runs Claude Code through the broker, as Claude Code's
-documentation describes it; it has not been tried with Claude Code itself
-yet. `ANTHROPIC_AUTH_TOKEN` makes it send the token as
-`Authorization: Bearer`; `env -u ANTHROPIC_API_KEY` keeps a key your
-environment may hold out of the command (Claude Code may send it with the
-token or instead of it, and the broker refuses a request that presents
-anything but the token in `x-api-key` or `Authorization`); and
+documentation describes it. Tried on 2026-11-04 with Claude Code 2.1.317,
+its requests went through the broker to the API, but the account used
+refused them (`400`, "credit balance is too low"), as it refused the same
+requests sent with the key by value: no answer from Claude Code through the
+broker has been seen yet. The Anthropic Python SDK 2.4.0 worked through the
+broker, for requests and streams alike. `ANTHROPIC_AUTH_TOKEN` makes Claude
+Code send the token as `Authorization: Bearer`; `env -u ANTHROPIC_API_KEY`
+keeps a key your environment may hold out of the command (Claude Code may
+send it with the token or instead of it, and the broker refuses a request
+that presents anything but the token in `x-api-key` or `Authorization`); and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, set in the environment that
 `rusthorse run` passes on, turns off its non-essential requests, some of
 which would go straight to `api.anthropic.com`. An `env` block in Claude

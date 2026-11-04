@@ -197,9 +197,11 @@ rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.d
 
 ### Claude Code through the broker
 
-This recipe follows what Claude Code's documentation says; it has not been
-tried with Claude Code itself yet. If it does not work, tell the human:
-never fall back to the key.
+This recipe follows what Claude Code's documentation says. Tried with Claude
+Code 2.1.317, its requests went through the broker, but the account used
+refused them, as it refused them with the key by value; no answer from
+Claude Code through the broker has been seen yet. If it does not work, tell
+the human: never fall back to the key.
 
 ```sh
 env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \

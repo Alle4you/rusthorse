@@ -28,7 +28,8 @@
   key: `run` names the grants whose destination answered `401
   Unauthorized`, `grants` and the manager show the count, and the broker's
   own answers say that they are its own
-  ([2026-11-04 amendments](#implementation-amendments-2026-11-04)).
+  ([2026-11-04 amendments](#implementation-amendments-2026-11-04)); answer 9
+  records the manual test so far.
 
 ## Context
 
@@ -768,7 +769,16 @@ second review's corrections are folded in):
    form the Anthropic and OpenAI SDKs and Claude Code send; Claude Code
    2.1.316 and the Python SDKs are tried by hand with the maintainer before
    any version is called supported. The guide recommends turning the SDKs'
-   retries off.
+   retries off. (Amended 2026-11-04: the manual check began, with the
+   maintainer's key and approval. The Anthropic Python SDK 2.4.0 worked
+   through the broker — create and streaming requests to Sonnet 5.5 and
+   Haiku 5.5 — as it did with the key by value. Claude Code 2.1.317's
+   requests went through the broker to the API, but the account refused
+   them with `400` "credit balance is too low", as it refused the same
+   requests sent with the key by value; with that key, the beta
+   `claude-code-20250219` alone drew that answer. No answer from Claude
+   Code through the broker has been seen yet, and no version is called
+   supported yet.)
 10. **Can one grant cover several entries?** No: one grant, token, broker
     and port per entry; one run may hold several, approved in one dialog
     and prepared together before the command starts. They end together
@@ -889,5 +899,8 @@ the broker's message after its own `Please run /login · API Error: 403`.
 | `grants`, `status` and the manager | `GrantInfo.unauthorized` (optional; a current agent always reports it, `0` included). `rusthorse grants` keeps its table and adds a note on standard error; the manager shows a fact for it. A grant leaves the list when its command ends, so after a short command only `run`'s note and the audit log show it. |
 | Local answers | Their message starts with `rusthorse-broker:`, so that a program that shows only an error's message (Claude Code) still says that the broker answered, and the `403` of a grant that has ended says to run the command again with `rusthorse run`. Statuses, headers and the JSON shape are unchanged. This holds for the JSON errors the broker writes: its HTTP parser still answers a malformed request with an empty `400` or `431`, as before. |
 
-Answer 9's manual check with Claude Code and the SDKs is still pending: a key
-the destination refused does not show that a client works through the broker.
+The manual check of answer 9 then went on: the Anthropic Python SDK worked
+through the broker, and Claude Code's requests went through it to an account
+that refused them, with or without the broker (see answer 9). A key the
+destination refused shows nothing about whether a client works through the
+broker.

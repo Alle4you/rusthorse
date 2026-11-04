@@ -101,9 +101,12 @@ ordinary value binding after a broker refusal.
 
 Claude Code is interactive and uses the terminal through `--no-redact`; the
 [built-in guide](../src/guide/ai.md#claude-code-through-the-broker) gives its
-separate recipe and settings checks. The recipe and real SDKs still await
-manual compatibility validation with a real key before a client version is
-called supported (ADR 0013, answer 9). You approve each use; the automated
+separate recipe and settings checks. The manual check with a real key (ADR
+0013, answer 9) began on 2026-11-04: the Anthropic Python SDK 2.4.0 worked
+through the broker; Claude Code's requests went through it, but the account
+used refused them, with or without the broker, so no Claude Code answer
+through the broker has been seen yet. No client version is called supported
+yet. You approve each use; the automated
 tests use fake destinations and keys only.
 
 A grant is approved once, with no `--remember`. Each admitted request,

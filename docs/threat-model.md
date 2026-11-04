@@ -587,10 +587,13 @@ broker cannot reject that spelling, but never forwards the fragment and still
 checks the resulting path. Hyper-generated malformed/framing errors can also
 precede the broker's JSON errors and retry hints.
 
-The fake HTTPS tests cover the protocol, not every SDK's behaviour. The Claude
-Code recipe has not yet been tried by hand with a real key. SDK configuration
-can override environment variables or send both Anthropic token headers; both
-must match. With zenity, a run requesting two or more grants may exceed the
+The fake HTTPS tests cover the protocol, not every SDK's behaviour. By hand,
+with a real key (2026-11-04), the Anthropic Python SDK 2.4.0 worked through
+the broker; Claude Code's requests went through it, but the account used
+refused them, with or without the broker, so no Claude Code answer through
+the broker has been seen yet. SDK configuration can override environment
+variables or send both Anthropic token headers; both must match. With
+zenity, a run requesting two or more grants may exceed the
 dialog height estimate and be refused before asking. `rusthorse-dialog`
 scrolls long approvals; character limits still apply, and no approval is
 truncated.
@@ -675,6 +678,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
 | 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `d8f2eb9` and `e86e6bd`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `7a1d63b`. |
 | 2026-11-04 | Confirmation of `7a1d63b` and its history at `4ef519f` (Codex, AI-assisted). | Ready: U01–U03 confirmed resolved and the history accurate; V01 low and V02 low, fixed in `49bf590`. |
+| 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `c0aebc0` and `4fefa4c`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; all three fixed in `2fafe05`. The count of 401 answers held under every probe. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2426,3 +2430,65 @@ left nothing; with TMPDIRs of 19, 41 and 75 characters, and three more
 shell levels in the process chain, the suite passed; eight loaded runs
 passed with nothing left; both clippy runs, the end-to-end tests without
 default features and the MSRV checks passed.
+
+**2026-11-04 — A key the destination refused, and the manual test so far.**
+
+The maintainer's first manual test with a real key (ADR 0013, answer 9)
+found four things. First, the key stored in the entry was one the
+destination did not accept: `run --broker` passed on its `401`
+(`authentication_error`, `invalid x-api-key`), which reads as the token's
+fault, and only the audit log's `status 401` said otherwise. Second, Claude
+Code's requests went through the broker, and the API answered two
+`POST /v1/messages` with `400` "credit balance is too low"; after
+`rusthorse grants revoke --all`, Claude Code showed
+`Please run /login · API Error: 403 the grant has ended`. Third, after a
+change of the entry's value, the manager's message named the entry's UUID.
+Fourth, at the maintainer's request and with the maintainer's approval of
+each run, the maintainer's agent compared the Anthropic Python SDK 2.4.0
+with the key by value and through the broker: create and streaming
+requests to Sonnet 5.5 and Haiku 5.5 gave the same answers, usage,
+rate-limit values and similar times, and the broker relayed 16–17 of the
+API's 29–30 response headers, as its list allows. Requests with Claude
+Code's parameters got the same `400` both ways, and with this key the beta
+`claude-code-20250219` alone drew it. So the Python SDK works through the
+broker for these requests, and Claude Code's requests go through it, but no
+answer from Claude Code through the broker has been seen yet.
+
+`4fefa4c` names the entry in an edit's answer (its title, or the new name
+after a rename). `c0aebc0` counts per grant the requests whose destination
+answered `401`, once the report matches an open request; reports the count
+in `grants`, and in `exited` once the run's grants are gone, from which
+`rusthorse run` prints a note after the command with its status unchanged;
+adds the manager's **Key refused** fact; and starts the message of the JSON
+errors the broker writes with `rusthorse-broker:`, that of a grant that has
+ended saying to run the command again. The feedback comes from the status
+alone, never from a provider's body, so it is the same for every
+destination.
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `4fefa4c`
+and `c0aebc0` against `4c7e2eb`. No defect was found in the count: two
+grants kept separate counts, the report of a command that ended at once
+after its last request stayed complete with a 500 ms pause before the audit
+thread's records, and the broker's own `401` was never counted.
+
+| Finding | Disposition |
+|---|---|
+| Medium — W01: since `4fefa4c`, an edit's answer names the entry by the title stored in the vault, which another KeePass program can write with terminal controls in it, and the CLI printed the agent's messages as they came: editing by UUID an entry titled `SAFE\u{1b}[2J\rFORGED` sent ESC and CR to the terminal. | **Fixed in `2fafe05`:** the CLI prints everything the agent says — answers, errors, a run's errors, an import's results — with control and invisible characters escaped, as it already printed the grants; the vault keeps the title as it is. Tested with such a title written into the file, then edited and removed by UUID, and with a fake agent's answer, error and run error; without the escaping, both tests fail. |
+| Low — W02: the command the note suggests, `rusthorse edit NAME --value`, reads a name that starts with `-` as an option (for `--help`, it shows the help). | **Fixed in `2fafe05`:** for such a name the note suggests `rusthorse edit --value -- NAME`; a test parses the suggested command for `KEY`, a name the shell would split, `-k` and `--help`, and fails without the fix. |
+| Low — W03: the CLI's documentation and the guide said that every error without the broker's prefix comes from the destination, but the broker's HTTP parser answers a malformed request itself, with `400` or `431` and an empty body, and a connection can close with no answer. | **Fixed in `2fafe05`:** `docs/cli.md`, the guide, `docs/ai-agents.md`, the ADR's amendment and the CHANGELOG limit the prefix to the JSON errors the broker writes, and name these exceptions. |
+
+Codex's checks: an isolated export with offline builds and fake
+credentials; targeted tests of the destination's and the broker's `401`, a
+grant's removal, duplicate or invalid end reports, the protocol's defaults
+and omissions, the CLI's statuses and output, the broker's messages, and
+the manager's model and widgets on their own Xvfb display; probes of two
+grants and of a command that ends at once, with a 500 ms pause before the
+audit thread's records; formatting and `git diff --check`. The maintainer's
+agent had checked `c0aebc0` with all of AGENTS.md's checks and with twelve
+mutations, each failing a test — no count, every status counted, a
+violation counted, the count made late by the audit thread, no listing, no
+run note, a note on an unknown outcome, the agent's identity for the typed
+name, no grants note, the edit's answer echoing the request's name, no
+prefix, no hint — and three of the manager's (a fact that always says *No*,
+the warning never added, never removed); then `2fafe05` with all of the checks
+again and the mutations of W01 and W02, each failing its test.

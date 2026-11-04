@@ -27,7 +27,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   `grants revoke ID|--all`. `show` displays profiles; `status` reports the
   broker and live grant count; `doctor` checks the broker and the CA file;
   `audit` shows grant and request records. `rusthorse guide ai` includes SDK
-  recipes and a Claude Code recipe awaiting a manual compatibility test.
+  recipes and a Claude Code recipe; in the manual test with a real key, the
+  Python SDK worked through the broker, and Claude Code has not answered
+  through it yet.
 - **A key the destination refused is named**: when a grant's destination
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
