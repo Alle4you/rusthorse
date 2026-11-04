@@ -6,8 +6,9 @@ document and the code, that is a bug; please report it
 ([SECURITY.md](../SECURITY.md)).
 
 - Applies to: Rusthorse 0.1.x
-- Last reviewed: 2026-11-03 (broker phase 1 implementation and documentation;
-  see [review history](#11-review-history))
+- Last reviewed: 2026-11-04 (the feedback for a key the destination refused,
+  escaped output, the scope amendment; see
+  [review history](#11-review-history))
 
 ## 1. Scope and the exact guarantee
 
@@ -637,11 +638,12 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 ## 10. Planned improvements
 
-- **Broker phase 2**: pinned TLS and private devices, Basic authentication,
-  generic profiles, narrow administrative operations and more presets. Phase
-  1's Anthropic/OpenAI-compatible HTTP broker is implemented.
-- **SSH agent**, then database connectors: see
-  [ADR 0013](adr/0013-credential-broker.md) for their scope.
+- **A generic HTTP profile** for the broker: any HTTP API, by its
+  destination and how the key is presented, without route lists. Phase 1's
+  Anthropic/OpenAI-compatible HTTP broker is implemented. Other connectors
+  (`ssh-agent`, databases, private devices with pinned TLS) are not
+  planned: `run` serves those uses, with L3–L5
+  ([ADR 0013, scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 - **Isolation support** (§8): uid allow-list on the socket and documentation
   for running agents as a separate user.
 - **One cgroup per approved command** (L17), with resource limits.

@@ -26,8 +26,9 @@ features not yet implemented.
 ## Credential broker: secrets that never enter the client
 
 **Phase 1 implemented, tested and reviewed READY (2026-11-03), unreleased.**
-[ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker
-and the later phases. The manual check with the maintainer's credentials
+[ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker;
+its scope amendment of 2026-11-04 replaces the later phases with one
+generic HTTP profile. The manual check with the maintainer's credentials
 began on 2026-11-04: the Anthropic Python SDK worked through the broker
 for the requests tried; Claude Code's requests went through it, and the
 API answered them `400`, as it answered SDK requests with some of Claude
@@ -84,21 +85,31 @@ credential on the command's behalf.
    vault is locked. Profiles are edited through an approved CLI request; there
    is no fallback to the real key when a grant cannot start.
 
-### Connectors
+### Next: one profile for any HTTP API
 
-Authentication usually happens at the start of a connection: the broker
-performs that part with the real credential, then relays bytes. HTTP carries a
-credential with each request, so its connector checks every request. The later
-connectors remain planned; phase 1 implements HTTP only.
+Rusthorse controls who uses a credential, when, for how long and how often;
+what a credential can do at its destination is scoped where it is issued (a
+read-only key, a key dedicated to production). So the broker's next step is
+a single **generic HTTP profile**: the destination (origin and base path)
+and how the broker presents the key (an `Authorization` scheme or a named
+header), for any HTTP API whose client can take another base URL — Gemini,
+Deepgram, Hugging Face and the rest, with no preset of their own. Profiles
+stop listing routes; the presets' route lists go too, and the presets
+become shortcuts for a destination and a header. A stored profile is never
+widened by an upgrade: dropping its routes takes an approved edit. It gets
+its own design and review before any code
+([ADR 0013, scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 
-| Connector | How it works | Phase/status |
-|---|---|---|
-| **HTTP APIs** | The client's base URL points to the loopback broker and its API key is the token. The broker constructs authentication, Host and SNI for the profile's fixed origin, connects over verified TLS, follows no redirects and permits only the preset's exact routes. Literal copies of the credential in response bodies are redacted; credential-bearing response header values are dropped. Anthropic, OpenAI and OpenAI-compatible presets, with SSE. | 1 — implemented, reviewed; manual check: the Python SDK worked; Claude Code's check left for later |
-| **Device and generic HTTP profiles** | Pinned TLS for private devices such as FortiGate; Basic authentication, custom routes, Gemini and Hugging Face presets, narrow administrative operations for Palo Alto/Panorama. Profile editing in the manager. | 2 — planned |
-| **SSH agent** | Rusthorse speaks the `ssh-agent` protocol (`SSH_AUTH_SOCK`). Private keys stay in the vault; each signature or session is approved, with OpenSSH destination constraints. KeePassXC SSH-key storage compatibility where practical. | 3 — planned |
-| **PostgreSQL, then MySQL** | A local listener verifies the grant token, authenticates to the real server (SCRAM for PostgreSQL) over TLS and relays the session, with the database fixed. The token is the password of the local hop only. | 4 — planned |
-| **Signed requests (AWS SigV4 and similar)** | The secret signs each request instead of travelling in it; the broker signs with the real key. Provider-issued short-lived credentials (STS) can complement it. | Later, on concrete demand |
-| **WebSocket, Unix socket listener, sandboxed clients** | Streaming protocols and transports beyond phase 1; grants usable by clients that stay in their own sandbox. | Later, on concrete demand |
+### Not planned
+
+Operations narrowed for administration APIs, presets per provider, private
+devices with pinned TLS, and connectors for other protocols (`ssh-agent`,
+PostgreSQL, MySQL, WebSocket, request signing, a Unix socket listener,
+grants for sandboxed clients). Ordinary `rusthorse run` already serves
+databases, devices, SSH and web logins: the approved command gets the value,
+its output is redacted, and the use is approved and recorded, with the
+limits the [threat model](threat-model.md) states (L3–L5). Any of these can
+be proposed again on a concrete need, with an ADR of its own.
 
 ### Prior art: Secretless Broker
 
@@ -125,18 +136,16 @@ the approved command.
   misuse of permitted operations during the window. Keep scopes narrow,
   lifetimes short and provider-side spending limits in place: a request count
   is not a spending limit.
-- **The client must be redirectable**: a configurable base URL, an
-  `SSH_AUTH_SOCK` or a database host, depending on the connector. Phase 1 is a
-  reverse HTTP proxy, not a generic forward proxy. Intercepting TLS with a
+- **The client must be redirectable**: a configurable base URL. The broker
+  is a reverse HTTP proxy, not a generic forward proxy. Intercepting TLS with a
   local certificate authority stays out of scope: fragile and invasive.
 - **Secrets used locally** — decrypting a file, a password typed into a
   program, a signing key used offline — still need ordinary `run`, with its
   existing limits. It remains available; it is never an automatic fallback
   after a broker refusal.
-- **SSH with a password cannot be brokered**: the password is what `ssh`
-  sends, so whoever runs `ssh` must have it. Devices reached by SSH should use
-  keys, which the planned `ssh-agent` connector keeps in the vault; until
-  then, password SSH goes through `run` with its limits (L3–L5).
+- **Only HTTP is brokered.** SSH, databases, device logins and every other
+  use go through ordinary `run`, with its limits (L3–L5): the approved
+  command gets the value.
 - **A broker is not a sandbox.** Commands and brokers run as the user, outside
   the requester's sandbox. One process per grant limits which vault credential
   is in that process's memory, not arbitrary code execution there. Bodies are
@@ -150,10 +159,9 @@ ADR 0013 answers phase 1's original questions: revocation cuts open streams;
 the agent serializes counted admissions; routing and DNS are constrained; and
 the local hop authenticates a token, not a process identity. Phase 1 is
 implemented and reviewed; in its manual check the Python SDK worked, and
-Claude Code's check was left for later. Next are phase
-2's device/generic HTTP profiles, phase 3's SSH agent and phase 4's database
-connectors. Each needs its own design, review and tests, including its
-session-revocation and destination-binding rules before implementation.
+Claude Code's check was left for later. Next is the generic HTTP profile
+(above), designed and reviewed before any code; nothing else is planned for
+the broker.
 
 ## Desktop and usability
 

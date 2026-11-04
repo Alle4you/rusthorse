@@ -22,7 +22,7 @@ awaiting an independent review: try it with fake entries first.
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
 | The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
-| Import from GNOME Keyring or a `.env` file; the agent reads the values | Editing broker profiles ([ADR 0013](adr/0013-credential-broker.md), phase 2) |
+| Import from GNOME Keyring or a `.env` file; the agent reads the values | Editing broker profiles: in a terminal, with `rusthorse edit` ([ADR 0013](adr/0013-credential-broker.md)) |
 | Verified backup of the vault; change of the master password | |
 | An entry's broker profile, read-only, and the command that gives a program a temporary token instead of the value (`rusthorse run --broker`) | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
@@ -294,8 +294,8 @@ under **Credential broker**, read-only: the preset and the revision of it
 you approved, then the profile as the agent's approval dialogs describe it —
 **Destination**, **Allows** (every route), **Ends** and **Requests**.
 
-Profiles are set, changed and removed in a terminal, never in the manager
-(that comes with phase 2): `rusthorse edit ENTRY --broker PRESET`, with
+Profiles are set, changed and removed in a terminal, never in the manager:
+`rusthorse edit ENTRY --broker PRESET`, with
 `--broker-origin`, `--broker-base-path`, `--broker-locks`,
 `--broker-lifetime` and `--broker-requests` for what differs from the
 preset's defaults, or `rusthorse edit ENTRY --clear broker`; the agent shows

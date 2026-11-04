@@ -5,6 +5,10 @@ Rusthorse was built for one situation in particular: an AI coding agent
 needs a credential to do its job. This guide shows how to set that up and how
 to approve requests safely.
 
+Rusthorse decides who uses a credential, when and how often; what the
+credential can do is set where it is issued. Give an AI agent the narrowest
+key that does the job, and keep production on keys of its own.
+
 ## The idea in one picture
 
 ```mermaid

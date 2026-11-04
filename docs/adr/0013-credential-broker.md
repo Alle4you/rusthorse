@@ -1,8 +1,8 @@
 # 0013. A credential broker: approved programs get a grant, not the secret
 
 - Status: Proposed
-- Implementation: phase 1 implemented and reviewed ready, unreleased; later
-  phases planned
+- Implementation: phase 1 implemented and reviewed ready, unreleased; a
+  generic HTTP profile planned; the other phases dropped ([scope amendment](#scope-amendment-2026-11-04))
 - Date: 2026-11-02
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).
 - Preceded by: an independent design analysis (Codex, AI-assisted,
@@ -30,6 +30,11 @@
   own answers say that they are its own
   ([2026-11-04 amendments](#implementation-amendments-2026-11-04)); answer 9
   records the manual test so far.
+
+- Amended: 2026-11-04, by the maintainer's decision on the product's scope:
+  Rusthorse controls who uses a credential, not what it can do. Phase 2
+  becomes a generic HTTP profile without route lists, and the other phases
+  are dropped ([scope amendment](#scope-amendment-2026-11-04)).
 
 ## Context
 
@@ -99,10 +104,13 @@ threat model and the maintainer's real uses concluded:
   (OpenAI, DeepSeek, Experiential Labs) accept another base URL; Claude
   Code documents LLM gateways. Streaming (server-sent events) is needed from
   the start. WebSocket (Deepgram's streaming) comes later.
-- **Private devices need pinned TLS.** The FortiGate's REST API on the LAN
+- **Private devices need pinned TLS** (superseded: not planned, see the
+  [scope amendment](#scope-amendment-2026-11-04)). The FortiGate's REST API on the LAN
   has a self-signed certificate: the broker must trust that certificate (or
   its public key) explicitly, per profile, never skip verification.
-- **Administration APIs need narrow operations.** A Palo Alto `/api` call
+- **Administration APIs need narrow operations** (superseded: what a
+  credential can do is scoped where it is issued, see the
+  [scope amendment](#scope-amendment-2026-11-04)). A Palo Alto `/api` call
   can commit configuration or export keys depending on its parameters, and
   Panorama's `target` selects another firewall; "GET on `/api`" is not
   read-only. An organisation key (Experiential Labs) may administer the
@@ -246,7 +254,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    screen lock, suspend, idle timeout — end its grants (`end`) or not
    (`continue`). The built-in AI presets default to `continue` and 12 hours: a
    long session of an AI agent survives the screen locking. Device profiles
-   (phase 2) will default to `end` and 15 minutes. Reaching the request limit
+   (phase 2) will default to `end` and 15 minutes (superseded: device
+   profiles are not planned). Reaching the request limit
    stops new requests and lets those already admitted finish. Ending a grant
    refuses new requests at once **and closes the open ones** (a stream in
    progress ends); a request already sent to the destination may still take
@@ -265,7 +274,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    value, a query or a body. The agent writes every record: the broker asks
    it, and waits for the answer.
 
-10. **Phases.** Each phase gets its own review and tests:
+10. **Phases.** Each phase gets its own review and tests (superseded on
+    2026-11-04: phase 2 is a generic HTTP profile, and the other phases and
+    the "Later" row are dropped — see the [scope amendment](#scope-amendment-2026-11-04)):
 
     | Phase | What | Notes |
     |---|---|---|
@@ -276,7 +287,7 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
     | Later | WebSocket (Deepgram streaming); AWS SigV4 or short-lived STS credentials; a Unix socket listener; grants for clients that run in their own sandbox | Only on concrete demand. |
     | Not planned | Connector plugins; credential providers other than the vault | Fixed connectors keep the code reviewable; the vault is the provider (imports cover keyrings and `.env` files). |
 
-    With phases 1 to 4, Rusthorse covers what Secretless offers — HTTP,
+    (Superseded with the table.) With phases 1 to 4, Rusthorse covers what Secretless offers — HTTP,
     PostgreSQL, MySQL, SSH keys and `ssh-agent` — and adds client
     authentication, approval, scope, lifetime, revocation and audit.
 
@@ -740,7 +751,9 @@ second review's corrections are folded in):
    until it ends; each retry by the client's SDK is another request;
    requests refused before admission do not count. An admitted request is
    never given back, whatever its outcome.
-2. **Who edits profiles, and which changes end grants?** The human, through
+2. **Who edits profiles, and which changes end grants?** (Amended
+   2026-11-04: editing profiles in the manager is not planned; the CLI
+   edits them.) The human, through
    an approved `edit` (the CLI in phase 1, the manager in phase 2). Any
    change to the entry — value, user name, URL, profile, group, replacement,
    removal — ends its grants.
@@ -759,7 +772,8 @@ second review's corrections are folded in):
    audit log, as outcome `unknown`; the client sees an error or a stream
    cut short; `run`'s exit status stays the command's (125 only before the
    command starts).
-7. **Certificates of private devices?** Not in phase 1. Phase 2: enrolled by
+7. **Certificates of private devices?** (Superseded 2026-11-04: private
+   devices are not planned.) Not in phase 1. Phase 2: enrolled by
    fingerprint, approved by the human after checking it through another
    channel; a changed certificate fails closed until a new approval.
 8. **Which endpoints are refused for every grant?** Everything that is not
@@ -808,7 +822,8 @@ second review's corrections are folded in):
   proxy in the data path — and a complement to the broker, not a
   replacement: few providers offer them, and they cannot be revoked by a
   lock (a WebSocket can outlive a Deepgram token).
-- **Specific operations instead of a generic proxy** ("show the firewall's
+- **Specific operations instead of a generic proxy** (superseded: not
+  planned, see the [scope amendment](#scope-amendment-2026-11-04)) ("show the firewall's
   interfaces"). The right shape for administration APIs; it enters through
   phase 2's narrow operations rather than as a separate mechanism.
 - **Running the AI agent as another user.** The answer to a hostile agent
@@ -909,3 +924,44 @@ through the broker for the requests tried, and Claude Code's requests went
 through it to an API that answered them `400` (see answer 9). A key the
 destination refused shows nothing about whether a client works through the
 broker.
+
+## Scope amendment (2026-11-04)
+
+After phase 1's manual test, the maintainer stated the product's scope.
+Rusthorse is a credential vault prepared for AI agents: it stores
+credentials — keys, passwords, logins, certificates — so that an AI agent
+can use them without seeing them, and it controls who uses a credential,
+when, for how long and how often, and records each use. What a credential
+can do at its destination is not Rusthorse's concern: that is scoped where
+the credential is issued — a read-only key, a key dedicated to production,
+a device's administrator profile. A credential taken out of the vault, to
+run something elsewhere, is the human's choice and outside what Rusthorse
+protects.
+
+What changes in this ADR:
+
+- **Phase 1 stays as it is implemented**, presets and routes included,
+  until phase 2 replaces them.
+- **Phase 2 is one item: a generic HTTP profile.** It names the
+  destination (origin and base path) and how the broker presents the key
+  (an `Authorization` scheme or a named header), so that any HTTP API whose
+  client can take another base URL can be used through the broker.
+  Profiles no longer list routes: the presets' route lists go too, and the
+  presets become shortcuts for a destination and a header. A stored
+  profile is never widened by an upgrade, so dropping a stored profile's
+  routes takes an approved edit. It gets its own design and review before
+  any code.
+- **Not planned:** operations narrowed for administration APIs; presets
+  per provider (the generic profile covers Gemini, Hugging Face and the
+  others); private devices with pinned TLS; the connectors of phases 3 and
+  4 and of the "Later" row (`ssh-agent`, PostgreSQL, MySQL, WebSocket,
+  request signing, a Unix socket listener, grants for sandboxed clients);
+  editing profiles in the manager. Ordinary `rusthorse run` already serves
+  databases, devices, SSH and web logins by giving the approved command the
+  value, with its documented limits (threat model L3–L5). Any of them can
+  be proposed again on a concrete need, with an ADR of its own.
+
+Decision 10's table, answers 2 and 7, the context's notes on private devices
+and administration APIs, the device profiles' defaults in decision 8 and the
+alternative "Specific operations instead of a generic proxy" are superseded
+where they say otherwise.

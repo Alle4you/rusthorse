@@ -16,7 +16,10 @@ rules in short form.
   that contain sensitive command lines.
 - **Features:** open an issue describing the problem first. For anything that
   changes the policy, the protocol or the storage format, expect to write or
-  discuss an [ADR](docs/adr/README.md).
+  discuss an [ADR](docs/adr/README.md). Rusthorse is a credential vault
+  prepared for AI agents: it controls who uses a credential, when and how
+  often, not what the credential can do at its destination (see the
+  [README](README.md)); features outside that are not taken up.
 
 ## Development setup
 

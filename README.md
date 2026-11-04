@@ -16,6 +16,13 @@ command a temporary token: a separate broker adds the real key only to the
 profile's destination and routes. The caller gets the result, never the
 secret. Neither mode sandboxes the command.
 
+**What it is, and is not.** Rusthorse is a credential vault prepared for AI
+agents: it stores keys, passwords, logins and certificates so that an agent
+can use them without seeing them, and it decides who uses a credential,
+when, for how long and how often, and records each use. What a credential
+can do at its destination is set where it is issued: give an agent the
+narrowest key that does the job, and production its own key.
+
 ```console
 $ rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
 OPENAI_API_KEY added                       # you typed the value in a dialog
@@ -268,11 +275,13 @@ assumption and limitation.
 
 The HTTP **credential broker's phase 1 is implemented and reviewed READY**
 (unreleased): Anthropic, OpenAI and OpenAI-compatible presets, streaming,
-profiles and grant revocation in the CLI and manager. A manual check with
-Claude Code and real credentials remains pending. Screen-lock and suspend
-locking are implemented too. Next are private-device HTTP profiles and pinned
-TLS, then `ssh-agent` and database connectors; published packages remain
-planned. See [docs/roadmap.md](docs/roadmap.md).
+profiles and grant revocation in the CLI and manager. In the manual test
+with a real key, the Python SDK worked through the broker; Claude Code's
+check was left for later. Screen-lock and suspend locking are implemented
+too. Next is one generic HTTP profile, so that any HTTP API key can be used
+through the broker; no other connector is planned, since `rusthorse run`
+serves databases, devices and SSH. Published packages remain planned. See
+[docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
 
