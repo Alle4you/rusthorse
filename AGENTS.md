@@ -202,7 +202,14 @@ not guaranteed.
   zenity.
 - **Fake agents** that must refuse a later connection remove their socket
   file before their last answer: a child forked by another test keeps a copy
-  of the listener until its exec.
+  of the listener until its exec. For the same reason a test that checks
+  that the agent let go of a port waits a moment for it (`port_released`).
+- **Tests leave nothing behind.** A test whose run ends in the agent after
+  the client is done with it — the client killed, the connection closed or
+  broken off — waits for the run's end record (`wait_for_run_end`) before
+  it returns: written later, that record would make the test's removed
+  directory again in `TMPDIR`. The CI runs the tests with a `TMPDIR` of
+  their own and fails if anything is left in it.
 - **The broker's tests** (`broker/tests/`) run the real `rusthorse-broker`,
   driven by a fake agent (`broker.rs`) or the real agent (`system.rs`), in
   front of a fake HTTPS destination in the test process, with a certificate

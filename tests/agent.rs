@@ -1074,6 +1074,8 @@ fn client_disconnect_kills_the_command() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The agent records the end just after it reaps the command.
+    wait_for_run_end(&h, "the run did not end after its client left");
 }
 
 #[test]
@@ -1814,14 +1816,7 @@ fn a_client_that_stops_reading_releases_the_request_when_it_leaves() {
     );
     client.kill().expect("kill client");
     let _ = client.wait();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !h.audit_text().contains("\"outcome\":\"exited\"") {
-        assert!(
-            Instant::now() < deadline,
-            "the request stayed blocked after the client left"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_run_end(&h, "the request stayed blocked after the client left");
     drop(reader);
 }
 
@@ -1891,6 +1886,7 @@ fn a_process_whose_main_thread_exited_is_still_terminated() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    wait_for_run_end(&h, "the run did not end after its client left");
 }
 
 #[test]
@@ -1961,6 +1957,7 @@ fn a_closed_stdout_stops_the_command_like_sigpipe() {
         assert!(Instant::now() < deadline, "the command kept running");
         std::thread::sleep(Duration::from_millis(50));
     }
+    wait_for_run_end(&h, "the run did not end after its output was closed");
 }
 
 fn raw_run(h: &Harness, argv: &[&str], forward_stdin: bool) -> std::os::unix::net::UnixStream {
@@ -1979,6 +1976,20 @@ fn raw_run(h: &Harness, argv: &[&str], forward_stdin: bool) -> std::os::unix::ne
     });
     send_frame(&stream, &request, &[]).expect("send");
     stream
+}
+
+/// Wait until the agent has recorded the end of a run (`exited`), within ten
+/// seconds, or fail with `what`. A run whose client went away — killed,
+/// half-closed, broken off — ends in the agent a moment later: a test that
+/// returned first would have its directory removed while the agent still
+/// writes to it, and that record would make the directory again (the audit
+/// log creates its missing parents), left behind in `TMPDIR`.
+fn wait_for_run_end(h: &Harness, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.audit_text().contains("\"outcome\":\"exited\"") {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_until_dead(pid: u32, what: &str) {
@@ -2002,14 +2013,7 @@ fn a_protocol_violation_cancels_even_a_blocked_run() {
     std::thread::sleep(Duration::from_millis(500));
     rusthorse::protocol::send_data(&stream, 7, b"what is this").expect("send garbage");
     wait_until_dead(pid, "the command survived a protocol violation");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !h.audit_text().contains("\"outcome\":\"exited\"") {
-        assert!(
-            Instant::now() < deadline,
-            "the request stayed blocked after cancelling"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_run_end(&h, "the request stayed blocked after cancelling");
     drop(stream);
 }
 
@@ -2032,6 +2036,7 @@ fn a_half_closed_connection_cancels_even_with_input_pending() {
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
     wait_until_dead(pid, "a half-closed connection was not noticed");
+    wait_for_run_end(&h, "the run did not end after the half-close");
     drop(stream);
 }
 
@@ -2072,6 +2077,7 @@ fn stderr_keeps_flowing_while_stdout_is_stuck() {
     assert!(seen.contains("READY"), "stderr was held back: {seen:?}");
     let _ = client.kill();
     let _ = client.wait();
+    wait_for_run_end(&h, "the run did not end after its client left");
 }
 
 #[test]
@@ -2218,6 +2224,7 @@ fn a_violation_behind_pending_input_still_cancels() {
         pid,
         "a protocol violation behind pending input was not noticed",
     );
+    wait_for_run_end(&h, "the run did not end after the violation");
     drop(stream);
 }
 
@@ -2268,6 +2275,9 @@ fn a_failing_destination_cancels_without_waiting_for_input() {
         ),
         "{response:?}"
     );
+    // The client answered once it had closed the connection; the agent
+    // ends the run after that.
+    wait_for_run_end(&h, "the run did not end after its client left");
 }
 
 #[test]
@@ -2314,6 +2324,7 @@ fn a_stuck_destination_does_not_hold_back_a_broken_pipe() {
         ),
         "{response:?}"
     );
+    wait_for_run_end(&h, "the run did not end after its client left");
 }
 
 #[test]
@@ -2744,6 +2755,7 @@ fn a_client_that_never_reads_acknowledgements_can_still_cancel() {
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
     wait_until_dead(pid, "the agent stopped watching the connection");
+    wait_for_run_end(&h, "the run did not end after the half-close");
     drop(stream);
 }
 
@@ -3075,14 +3087,7 @@ fn unread_acknowledgements_do_not_pin_a_finished_command() {
     stream
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !h.audit_text().contains("\"outcome\":\"exited\"") {
-        assert!(
-            Instant::now() < deadline,
-            "the request stayed pinned by unread acknowledgements"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_run_end(&h, "the request stayed pinned by unread acknowledgements");
     drop(stream);
 }
 
@@ -3897,6 +3902,25 @@ fn process_gone(pid: u64) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     false
+}
+
+/// Whether the port `port` of 127.0.0.1 can be listened on again, within a
+/// few seconds. A process forked meanwhile by another test holds a copy of
+/// every descriptor of this process — the agent's listening sockets among
+/// them — until it executes its program, which under load can take a
+/// moment after the agent closed its own; a socket still held after a few
+/// seconds was not let go.
+fn port_released(port: u16) -> bool {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Write entries into the vault file before the agent opens it — name,
@@ -4816,10 +4840,7 @@ fn a_run_whose_broker_fails_to_start_keeps_none_of_its_grants() {
             .as_u64()
             .and_then(|port| u16::try_from(port).ok())
             .expect("port");
-        assert!(
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-            "port {port} still held"
-        );
+        assert!(port_released(port), "port {port} still held");
     }
     let ends = grant_ends(&h);
     assert_eq!(ends.len(), 2, "{ends:?}");
@@ -5830,7 +5851,7 @@ fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
             other => panic!("unexpected {}", other.kind()),
         }
         assert!(
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            port_released(port),
             "{mode}: port {port} still held after the run"
         );
         let reason = ended_with(&h, &id);
@@ -5992,6 +6013,9 @@ fn a_requester_that_goes_away_ends_its_runs_grants() {
     eventually("the end of the run", || grants(&h).is_empty().then_some(()));
     assert!(process_gone(pid), "the broker outlived its run");
     assert_eq!(ended_with(&h, &id), "command_ended");
+    // The run is recorded as ended once its grants are gone, a moment
+    // later: nobody is left to answer.
+    wait_for_run_end(&h, "the run did not end after its requester left");
     assert_eq!(
         audit_outcomes(&h, "run").last().map(String::as_str),
         Some("exited")
@@ -7143,8 +7167,12 @@ mod session_lock {
         wait_for("the inhibitor", || inhibitors.lock().unwrap().len() == 1);
         let started = Instant::now();
         drop(watchers);
+        // Stopping waits at most three seconds for the threads, and leaves
+        // one still connecting to a bus to end on its own; under load a
+        // thread can take that long. More than that, with a margin, would
+        // be a stop that hangs.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "stopping took too long"
         );
         wait_for("its release", || released(&inhibitors.lock().unwrap()[0]));

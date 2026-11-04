@@ -54,10 +54,29 @@ jobs:
       # with its default features.
       - name: Clippy as released
         run: cargo clippy --all-targets
+      # Each run of the tests has a TMPDIR of its own, which must be empty
+      # afterwards: a test that returned before the agent ended its run had
+      # the run's last audit record make the test's directory again there.
       - name: Tests
-        run: cargo test --all-features
+        run: |
+          cargo test --all-features --no-run
+          export TMPDIR=$(mktemp -d)
+          cargo test --all-features
+          if [ -n "$(ls -A "$TMPDIR")" ]; then
+            echo "::error::the tests left files in TMPDIR"
+            find "$TMPDIR" | head -50
+            exit 1
+          fi
       - name: Tests without default features
-        run: cargo test --no-default-features
+        run: |
+          cargo test --no-default-features --no-run
+          export TMPDIR=$(mktemp -d)
+          cargo test --no-default-features
+          if [ -n "$(ls -A "$TMPDIR")" ]; then
+            echo "::error::the tests left files in TMPDIR"
+            find "$TMPDIR" | head -50
+            exit 1
+          fi
       - name: Documentation
         run: cargo doc --no-deps
         env:
