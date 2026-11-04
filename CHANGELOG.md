@@ -93,9 +93,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   value** in the entry's toolbar). Typing a new value used to be hidden in
   **Edit**, behind a drop-down that kept the current value.
 - **`rusthorse guide ai`** prints a guide for AI agents, built into the
-  binary: the rules, how to find entries and use `run`, what each exit
-  status means and what to do, and how to store secrets without seeing
-  them. A test checks every command and option it names. The instructions
+  binary: the rules, how to find entries and use `run` (SSH included, with
+  `sshpass`), what each exit status means and what to do, and how to store
+  secrets without seeing them. A test checks every command and option it names. The instructions
   for `CLAUDE.md` or `AGENTS.md` in the README and
   [ai-agents.md](docs/ai-agents.md) now point to it, and `rusthorse --help`
   ends with a pointer for AI agents.

@@ -125,6 +125,29 @@ not a secret and is not redacted.
   script, and every file the command reads, as they are when the command
   reads them. Do not change them while a request is waiting or running.
 
+### SSH
+
+ssh reads no password from the environment: `sshpass -e` passes it the one
+in `SSHPASS`. Take the username and the host from
+`rusthorse show NAME --json`.
+
+```sh
+rusthorse run SSHPASS=NAME -- sshpass -e ssh -o PubkeyAuthentication=no USER@HOST 'uptime'
+```
+
+- With redaction the command has no terminal, so ssh cannot ask whether to
+  trust an unknown host key, and the connection fails. Check first with
+  `ssh-keygen -F HOST`. If the host is unknown, ask the human to connect
+  once and check its fingerprint. Never turn host key checking off.
+- To see whether a host answers, without a secret:
+  `ssh -o BatchMode=yes -o ConnectTimeout=5 USER@HOST true`. A
+  `Permission denied` means that it answers. Do not wait for a banner on a
+  bare TCP connection: some SSH servers speak only after the client.
+- If `sshpass` is not installed, tell the human; do not install it.
+- If the password is refused, stop and tell the human: a device's web and
+  SSH passwords may differ, and repeated failures can lock the account.
+- An interactive session is the human's to start, with `--no-redact`.
+
 ## Using an API key through the broker: `run --broker`
 
 For an HTTPS API that takes its key in a request header, prefer `--broker`

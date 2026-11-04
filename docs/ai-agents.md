@@ -282,4 +282,8 @@ broker-specific limits.
 - Prefer tools that read credentials from environment variables
   (`GH_TOKEN`, `PGPASSWORD`, `AWS_*`, `OPENAI_API_KEY`) over ones that need
   them on the command line: command lines are visible to other processes.
+  ssh reads no password from the environment: with `sshpass -e`, it takes
+  the one `run` puts in `SSHPASS` (`rusthorse run SSHPASS=NAME -- sshpass -e
+  ssh USER@HOST …`). The built-in guide covers unknown host keys and
+  refused passwords.
 - Review `rusthorse audit` now and then.
