@@ -683,6 +683,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-04 | Confirmation of `2fafe05` and its history at `db0af0e` (Codex, AI-assisted). | Not ready: W01 and W02 confirmed resolved, W03 partly; X01 medium (older than this work: `list` and `show` printed what the vault holds unescaped), X02 and X03 low; X02 and X03 fixed in `f51391c`, X01 partly, completed in `f20d7d0` (Y01, Y02). |
 | 2026-11-04 | Confirmation of `f51391c` and its history at `5dd639a` (Codex, AI-assisted). | Not ready: X02 and X03 confirmed resolved, X01 partly; Y01 medium (`open` printed a URL from the vault unescaped) and Y02 low, both older than this work, fixed in `f20d7d0`. |
 | 2026-11-04 | Confirmation of `f20d7d0` and its history at `df52e23`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `2a4549d`. |
+| 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `013262d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
 
 Findings of the 2026-10-31 review and what was done:
 
