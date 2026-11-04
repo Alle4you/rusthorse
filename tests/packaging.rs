@@ -2053,6 +2053,79 @@ fn a_check_stopped_otherwise_still_removes_what_cargo_deb_wrote() {
     assert!(run.staging_left().is_empty(), "{:?}", run.staging_left());
 }
 
+/// A copy to another file system whose flush to disk fails — its fsync
+/// reports an error, as a write that fails late does — publishes nothing:
+/// the file already at the package's name in DEST stays as it was, the
+/// copy's new file is deleted, and so is the staging directory.
+#[test]
+fn a_copy_whose_flush_to_disk_fails_publishes_nothing() {
+    if !python3() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let here = fs::metadata(dir.path()).expect("tempdir").dev();
+    let Some(other) = tempfile::tempdir_in("/dev/shm")
+        .ok()
+        .filter(|other| fs::metadata(other.path()).expect("/dev/shm").dev() != here)
+    else {
+        eprintln!("skipped: no other file system in /dev/shm");
+        return;
+    };
+    let bin = dpkg_deb_stand_in(dir.path());
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).expect("mkdir");
+    let staging = dir.path().join("staging");
+    fs::create_dir(&staging).expect("mkdir");
+    pack_brokers(
+        &dir.path().join("tree"),
+        &staging.join("rusthorse.deb"),
+        &[("usr/bin/rusthorse-broker", &release_answer())],
+    );
+    let dest = other.path().join("dest");
+    fs::create_dir(&dest).expect("mkdir");
+    let earlier = "the package of an earlier run";
+    fs::write(dest.join("rusthorse.deb"), earlier).expect("write");
+    // check-broker.py --staged, run with an fsync that fails.
+    let out = Command::new("/usr/bin/python3")
+        .args(["-I", "-B", "-c"])
+        .arg(
+            "import errno, os, runpy, sys\n\
+             def fsync(fd):\n    raise OSError(errno.EIO, os.strerror(errno.EIO))\n\
+             os.fsync = fsync\n\
+             sys.argv = sys.argv[1:]\n\
+             runpy.run_path(sys.argv[0], run_name='__main__')\n",
+        )
+        .arg(root().join("packaging/check-broker.py"))
+        .arg("--staged")
+        .arg(env!("CARGO_PKG_VERSION"))
+        .arg(&scratch)
+        .arg(&staging)
+        .arg(&dest)
+        .env("PATH", &path)
+        .current_dir(root())
+        .output()
+        .expect("run check-broker.py");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(
+        said.contains(&format!(
+            "check-broker.py: the packages could not all be checked and moved; {}\n",
+            nothing_moved(&dest)
+        )),
+        "{said}"
+    );
+    assert!(said.contains("Input/output error"), "{said}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(names(&dest), set(&["rusthorse.deb"]));
+    assert_eq!(
+        fs::read_to_string(dest.join("rusthorse.deb")).expect("read"),
+        earlier
+    );
+    assert!(!staging.exists());
+    assert!(names(&scratch).is_empty());
+}
+
 /// The copyright file, written by packaging/copyright.py as build-deb.sh
 /// runs it.
 fn copyright_file() -> String {
