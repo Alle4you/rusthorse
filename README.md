@@ -17,10 +17,10 @@ profile's destination and routes. The caller gets the result, never the
 secret. Neither mode sandboxes the command.
 
 **What it is.** Rusthorse is a credential vault prepared for AI agents. The
-only secret in an entry is its value — a key, a password, a token, a
-certificate. Everything else an entry holds (URL, username, host, port,
-tags, notes) is context, for you and for an AI agent to understand what the
-credential is for. When an agent needs a credential, it asks Rusthorse to
+secret in an entry is its value — a key, a password, a token, a
+certificate. Its URL, username, host, port and tags are context, for you
+and for an AI agent to understand what the credential is for; its notes,
+and any field KeePass marks protected, are withheld like the value. When an agent needs a credential, it asks Rusthorse to
 use it and says where: the command it will run and, for an API key through
 the broker, the destination the key goes to. You see that in a dialog and
 allow it or not; that approval is the control. The agent itself never sees

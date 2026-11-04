@@ -17,7 +17,7 @@ rules in short form.
 - **Features:** open an issue describing the problem first. For anything that
   changes the policy, the protocol or the storage format, expect to write or
   discuss an [ADR](docs/adr/README.md). Rusthorse is a credential vault
-  prepared for AI agents: the only secret is a credential's value, an agent
+  prepared for AI agents: a credential's secret is its value, an agent
   says where it will use it, and you approve that (see "What it is" in the
   [README](README.md)). Features that add controls beyond that — over what a
   credential does, or knowledge of particular APIs — are not taken up.

@@ -159,3 +159,6 @@ rusthorse run OPENAI_API_KEY=<uuid> \
 - The endpoint stored with an API key is what the planned
   [credential broker](../roadmap.md#credential-broker-secrets-that-never-enter-the-client)
   could check a destination against; that use needs its own design.
+  (Amended 2026-11-04: an entry's endpoint is context, not a destination
+  policy: the planned broker takes each grant's destination from the run,
+  for the human to approve, and the stored endpoint gives no default.)

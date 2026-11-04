@@ -86,7 +86,7 @@ credential on the command's behalf.
 
 ### Next: no profiles, no presets
 
-The only secret in an entry is its value; the rest is context. An agent that
+The secret in an entry is its value; its other fields are context. An agent that
 uses an API key through the broker says where it will use it, and the human
 approves that in the dialog. So the broker loses what phase 1 stores and
 knows: entries no longer carry a broker profile, and the code no longer
@@ -192,7 +192,7 @@ From the [threat model](threat-model.md#10-planned-improvements):
 | Isolation support: uid allow-list on the socket, documentation for running AI agents as a separate user | Planned | §8 |
 | One cgroup per approved command, with resource limits | Planned | L17 |
 | Bounded KDF parameters checked before unlocking | Planned | L12 |
-| Per-entry policies: restrict an entry to listed programs or hosts | Planned | L3, L4 |
+| Per-entry policies: restrict an entry to listed programs or hosts | Not planned: outside the product's scope | L3 and L4 remain limits |
 | List the variables that redirect a program's requests (`*_BASE_URL`, `*_API_BASE`, `HTTPS_PROXY`, …) in the run dialog (a remembered approval already requires the same environment) | Done | L4 |
 | Key files and hardware keys (YubiKey challenge-response) | Later | Compatibility with KeePassXC vaults |
 

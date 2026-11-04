@@ -12,9 +12,10 @@ a human approves each use in a dialog. Status: 0.1.0, pre-release, not
 published.
 
 **Scope — the product is defined; do not add to it.** Rusthorse is a
-credential vault prepared for AI agents (README, "What it is"). The only
-secret in an entry is its value; everything else is context for the human
-and the agent. An agent says where it will use a credential — the command,
+credential vault prepared for AI agents (README, "What it is"). The secret
+in an entry is its value; its other fields say what it is for, for the
+human and the agent (notes and fields KeePass marks protected stay
+withheld, like the value). An agent says where it will use a credential — the command,
 and through the broker the destination — and the human sees it in a dialog
 and approves; that approval is the control, and Rusthorse records it. With
 `run` the approved command gets the value; through the broker it gets a

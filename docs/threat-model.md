@@ -649,12 +649,14 @@ a small extension (an allow-list of uids) that is on the roadmap.
   for running agents as a separate user.
 - **One cgroup per approved command** (L17), with resource limits.
 - **Bounded KDF parameters** before unlocking (L12).
-- **Per-entry policies**: restrict an entry to listed programs or hosts.
 - **Remembered-approval management**: the manager already lists and revokes
   broker grants; remembered approvals remain separate.
 - **A "waiting for your answer" hint** in the terminal while a dialog is
   open, driven by an explicit event from the agent.
 - Signed release artifacts.
+
+Per-entry policies that restrict an entry to listed programs or hosts are
+outside the product's scope and not planned; L3 and L4 remain limits.
 
 ## 11. Review history
 

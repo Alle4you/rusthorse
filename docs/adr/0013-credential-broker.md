@@ -33,7 +33,7 @@
   records the manual test so far.
 
 - Amended: 2026-11-04, by the maintainer's definition of the product: the
-  only secret is a credential's value, the agent says where it uses it and
+  secret is a credential's value, the agent says where it uses it and
   the human approves. The broker loses its profiles and presets — the
   destination is named in the run and approved in the dialog, and the
   broker puts the key where the program put the token — and the other
@@ -283,8 +283,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    it, and waits for the answer.
 
 10. **Phases.** Each phase gets its own review and tests (superseded on
-    2026-11-04: phase 2 is a generic HTTP profile, and the other phases and
-    the "Later" row are dropped — see the [scope amendment](#scope-amendment-2026-11-04)):
+    2026-11-04: the next broker has no profiles or presets, and the other
+    phases and the "Later" row are dropped — see the
+    [scope amendment](#scope-amendment-2026-11-04)):
 
     | Phase | What | Notes |
     |---|---|---|
@@ -663,7 +664,8 @@ Framed like the dialog protocol (a 4-byte big-endian length, then JSON,
 unknown fields refused), with its own version number, frames of at most 64 KiB
 and the listening socket passed as file-descriptor data. Agent to broker:
 `install` (version, grant ID, token, credential, profile snapshot, limits;
-amended 2026-11-04: the destination instead of a profile),
+amended 2026-11-04: the destination instead of a profile, and an
+admission carries the method's label instead of the route),
 `admitted` and `refused` (request number), `revoke`. Broker to agent: `ready`,
 `admit` (request number, method, route), `finished` (request number, outcome,
 status, sizes), `revoked`, with a count of the requests it refused before
@@ -681,7 +683,7 @@ Nothing else crosses: no vault, no master password, no requester environment.
 |---|---|---|
 | `run` | the approval, as today | the grants it creates, by ID, entry and destination |
 | `grant` | created (before the command starts; fail closed), ended (best effort) | grant ID; at the end: the reason (`command_ended`, `locked`, `screen_locked`, `suspend`, `idle_timeout`, `revoked`, `entry_changed`, `vault_changed`, `expired`, `broker_failed`, `save_failed`, `agent_stopped`, `audit_failed`), requests admitted, finished and unknown, requests refused before admission |
-| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, route template including the method (`POST /v1/messages`); amended 2026-11-04: the method and the path, without the query |
+| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, route template including the method (`POST /v1/messages`); amended 2026-11-04: the method's label only (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OTHER`), never the path |
 | `broker_request` | finished (best effort) | grant ID, request number, outcome (`completed`, `not_forwarded`, `client_closed`, `revoked`, `unknown`), status, bytes each way |
 
 Refused requests are counted, not recorded one by one, so a client cannot
@@ -833,6 +835,8 @@ second review's corrections are folded in):
 - **Only `run`, with per-entry policies** (allowed programs and hosts).
   Cheap, and still worth having against mistakes, but the program still
   receives the secret: it does not stop exfiltration after the approval.
+  (Superseded 2026-11-04: per-entry policies are outside the product's
+  scope and not planned; ordinary `run` keeps the limits L3–L5.)
 - **Secretless Broker itself.** No client authentication, and credentials
   from a configuration file or a provider rather than the vault; wrapping it
   with approval, tokens and revocation would be most of the work, plus a
@@ -951,9 +955,10 @@ broker.
 ## Scope amendment (2026-11-04)
 
 After phase 1's manual test the maintainer defined the product. Rusthorse is
-a credential vault prepared for AI agents. The only secret in an entry is
-its value — a key, a password, a token, a certificate; everything else an
-entry holds is context, for the human and the agent. An agent that uses a
+a credential vault prepared for AI agents. The secret in an entry is its
+value — a key, a password, a token, a certificate. Its URL, username,
+host, port and tags are context, for the human and the agent; its notes
+and the fields KeePass marks protected stay withheld, like the value. An agent that uses a
 credential says where: the command it runs and, through the broker, the
 destination the key goes to. The human sees that in a dialog and approves;
 that approval is the control, and Rusthorse records it. With ordinary `run`
@@ -978,46 +983,72 @@ code, and phase 1 stays as it is until it is built.
   phase 1 stays in its entry as an ordinary custom field, which Rusthorse
   ignores: no profile is read, migrated or widened.
 - **The destination is named in the run.** `rusthorse run --broker
-  VAR=ENTRY@URL` names each grant's destination: `https://`, a host name
-  with an optional port, and an optional base path, under phase 1's rules
-  for an origin and a base path. `--url URLVAR=ENTRY` gives the program the
-  broker's address with that base path, as before. Options of the run set
-  its grants' request limit, lifetime and automatic locks, with phase 1's
-  defaults (no limit, 12 hours, `continue`). There is no default
-  destination: the agent says where.
-- **The dialog shows it**: the entry, the destination, the lifetime, the
-  request limit and the automatic locks; that the command gets a temporary
-  token, not the key; and phase 1's warnings — the command can spend
-  credit, a request count is not a spending limit, the bodies are not
-  inspected. The human allows or denies.
+  VAR=ENTRY@URL` names each grant's destination. The variable ends at the
+  first `=` and the URL starts after the last `@`, so an entry's name may
+  hold `@` or a group path. The URL is `https://`, a host name with an
+  optional port, and an optional base path, under phase 1's rules for an
+  origin and a base path: no user information, query or fragment. There is
+  no default destination and no fallback to the entry's URL: the agent
+  says where. `--url URLVAR=ENTRY` gives the program the broker's address
+  with that base path, as before. Options of the run set its grants'
+  request limit, lifetime and automatic locks, with phase 1's defaults (no
+  limit, 12 hours, `continue`).
+- **Approval covers the whole origin** — scheme, host and port. The base
+  path only sets up the program's base URL; it limits nothing. The broker
+  connects to the approved origin only, and takes the TLS server name and
+  `Host` from it; no request target or header can change it.
+- **The dialog shows it**: the entry; the approved origin, and the base
+  path apart from it, with "The key may be sent to any path at this
+  origin; the base path is not a limit"; the lifetime, the request limit
+  and the automatic locks; that the command gets a temporary token, not
+  the key; and phase 1's warnings — the command can spend credit, a
+  request count is not a spending limit, the bodies are not inspected. The
+  human allows or denies.
 - **The token stands for the key where the program puts it.** The program
-  presents the token wherever it would present the key — in any request
-  header, with any prefix (`Authorization: Bearer TOKEN`,
+  presents the token literally wherever it would present the key — in a
+  request header, with any prefix (`Authorization: Bearer TOKEN`,
   `Authorization: Token TOKEN`, `x-api-key: TOKEN`,
-  `x-goog-api-key: TOKEN`). The broker replaces each occurrence of the
-  grant's token in the request's header values with the key, and changes
-  nothing else. A request is refused (`401`, nothing forwarded) when no
-  header value holds the token; when a header name, the request target or
-  another grant's token holds it; or when the key itself appears in it. An
-  API that signs its requests with the key, or takes the key in the URL or
-  the body, cannot be used through the broker: `run` serves it.
-- **Any request goes to the approved destination**, under phase 1's
-  framing, body, admission and forwarding rules — HTTP/1.1; no `CONNECT`,
-  `TRACE`, `OPTIONS`, upgrades or `Origin`; bodies within 16 MiB; verified
-  TLS against the system's certificate authorities; public addresses only;
-  no redirect followed; no compressed response — and without its route
-  check: the path and query go as the program sent them. Request headers
-  are forwarded except the hop-by-hop ones and `Host`, `Content-Length` and
-  `Accept-Encoding`, which the broker sets; response headers are relayed
-  except the hop-by-hop ones and any that carries the key or a token; and
-  literal copies of the key in a response body are redacted.
+  `x-goog-api-key: TOKEN`). Only the header values the broker forwards
+  count. The broker replaces each exact occurrence of the grant's token in
+  them with the key, in one pass, inside larger values too, without
+  decoding the values, folding their case or scanning what it inserted,
+  and changes nothing else. A request is refused (`401`, before admission,
+  nothing forwarded) when no forwarded header value holds the token; when
+  the method, a header name, the request target or a header the broker
+  drops or rebuilds holds it (ASCII case ignored); when a token-shaped
+  string other than this grant's token appears anywhere in the request
+  head; when the key itself appears in it; or when the header block, once
+  the key is in, exceeds phase 1's limit. A program that encodes the token
+  or derives its credential from it, an API that signs its requests with
+  the key, or takes the key in the URL or the body, cannot be used through
+  the broker: `run` serves them. The value must still be 8 to 4096 visible
+  ASCII characters, without spaces or controls.
+- **Any request goes to the approved origin**, under phase 1's framing,
+  admission and forwarding rules — HTTP/1.1; no `CONNECT`, `TRACE`,
+  `OPTIONS`, upgrades or `Origin`; verified TLS against the system's
+  certificate authorities; public addresses only; no redirect followed; no
+  compressed response; no cookie jar — without its route check, and
+  without its rule that only `POST` has a body: a body, within 16 MiB and
+  with one unambiguous `Content-Length`, is allowed on any accepted method,
+  under the existing room, timeout and admission rules. The origin-form
+  path and query go as the program sent them. Request headers are
+  forwarded except the hop-by-hop ones and `Host`, `Content-Length` and
+  `Accept-Encoding`, which the broker sets. Response headers are relayed
+  except the hop-by-hop ones, `Content-Length` and `Transfer-Encoding` —
+  the broker frames the body itself, chunked where HTTP allows a body,
+  since redaction changes its length — and any header whose name or value
+  carries the key or a token; literal copies of the key in a response body
+  are redacted.
 - **Audit**: an admitted request is recorded, before it is forwarded, with
-  its method and its path without the query (phase 1 recorded the route).
+  the grant ID, its number and its method's label — `GET`, `HEAD`, `POST`,
+  `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method — and its end
+  with the outcome, the status and the bytes each way. No raw method, path,
+  query, header or body is recorded or sent to the agent.
 - **Protocol**: the client protocol becomes 9 (a broker binding carries its
   destination and the run its grants' limits; `broker_edit` and the
   entry's profile go; a grant has no preset). The control channel becomes
   2 (the install carries the destination instead of a profile; an
-  admission carries the path).
+  admission carries the method's label, no route or path).
 - **Kept from phase 1**: one broker process per grant; tokens and grant
   IDs; revocation, expiry and the locks; the request and in-flight limits;
   the audit; `grants` and the manager's grants page; the note after a run

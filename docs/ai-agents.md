@@ -5,8 +5,9 @@ Rusthorse was built for one situation in particular: an AI coding agent
 needs a credential to do its job. This guide shows how to set that up and how
 to approve requests safely.
 
-The only secret in an entry is its value; the rest is context, for you and
-for the agent. The agent says where it will use a credential — the command,
+The secret in an entry is its value; its URL, username, host, port and tags
+are context, for you and for the agent (notes and protected fields stay
+withheld, like the value). The agent says where it will use a credential — the command,
 and through the broker the destination — and you approve that in a dialog:
 read it before you allow it. With `run` the approved command gets the
 value for as long as it runs; through the broker it gets a token that
