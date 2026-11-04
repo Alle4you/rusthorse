@@ -692,6 +692,7 @@ outside the product's scope and not planned; L3 and L4 remain limits.
 | 2026-11-04 | The product's scope and the broker's dropped phases, at `443be7c` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `ccf7f5b`, on the documents as `19bce15` and `3e349c9` had rewritten them. |
 | 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `443be7c..de88005` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low. D01–D04, D06 and D07 were fixed in `14bfe0c`; D05 was partly fixed there, and completed by E02 (below). These are design and documentation changes; the code is unchanged. |
 | 2026-11-04 | Confirmation of the broker design at `8813b19` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `3a6af38`, with D05 completed by E02. Design and documents only. |
+| 2026-11-04 | Confirmation of E01–E04 at `3b38924` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
 
 Findings of the 2026-10-31 review and what was done:
 
