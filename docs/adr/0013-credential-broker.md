@@ -981,7 +981,8 @@ code, and phase 1 stays as it is until it is built.
   preset, route or header of any API. `rusthorse edit --broker`,
   `--clear broker` and the `broker_edit` request go. A profile stored by
   phase 1 stays in its entry as an ordinary custom field, which Rusthorse
-  ignores: no profile is read, migrated or widened.
+  ignores: kept as it is, shown by name only, never interpreted, read,
+  migrated or widened; a field that cannot be read stops no grant.
 - **The destination is named in the run.** `rusthorse run --broker
   VAR=ENTRY@URL` names each grant's destination. The variable ends at the
   first `=` and the URL starts after the last `@`, so an entry's name may
@@ -1018,7 +1019,13 @@ code, and phase 1 stays as it is until it is built.
   drops or rebuilds holds it (ASCII case ignored); when a token-shaped
   string other than this grant's token appears anywhere in the request
   head; when the key itself appears in it; or when the header block, once
-  the key is in, exceeds phase 1's limit. A program that encodes the token
+  the key is in, exceeds phase 1's limit. A token-shaped string is `rh_`
+  followed by 64 hexadecimal digits, prefix and digits recognised without
+  regard to ASCII case, at any byte position, without word boundaries, in
+  the method, the request target, the header names and every header
+  value, duplicates included. Each one must equal this grant's token byte
+  for byte; a case variant of it is refused, not replaced. No other
+  grant's token is looked up for this check. A program that encodes the token
   or derives its credential from it, an API that signs its requests with
   the key, or takes the key in the URL or the body, cannot be used through
   the broker: `run` serves them. The value must still be 8 to 4096 visible
@@ -1044,11 +1051,34 @@ code, and phase 1 stays as it is until it is built.
   `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method — and its end
   with the outcome, the status and the bytes each way. No raw method, path,
   query, header or body is recorded or sent to the agent.
-- **Protocol**: the client protocol becomes 9 (a broker binding carries its
-  destination and the run its grants' limits; `broker_edit` and the
-  entry's profile go; a grant has no preset). The control channel becomes
-  2 (the install carries the destination instead of a profile; an
-  admission carries the method's label, no route or path).
+- **Protocol**: the client protocol becomes 9. A run through the broker is
+  a new request, `broker_run_v2`; it does not extend protocol 8's
+  `broker_run`, which an agent of protocol 8 would accept while ignoring
+  the destination and the limits. Each of its broker bindings needs a
+  destination; unknown fields, invalid destinations and invalid limits are
+  refused before the dialog. An agent of protocol 9 refuses `broker_run`
+  and `broker_edit` before any approval, and a client never retries a
+  refused request with an older type or as an ordinary `run`, so an agent
+  of protocol 8 met after the client's version check, on the next
+  connection, refuses the new request instead of running it. A refusal
+  before the command starts exits 125; an answer lost after sending, 124.
+  The entry's profile goes from `show` and `list`, and a grant has no
+  preset. The control channel becomes 2, still checked strictly before a
+  grant is served: the install carries the destination instead of a
+  profile, and an admission carries the method's label, no route or path.
+- **Listings and notes**: in `grants`, in the manager and in the note after
+  a run whose destination answered `401`, the destination is the approved
+  origin only, labelled as such; a base path, when there is one, is shown
+  apart, as setup of the program's base URL and not a limit (in protocol 9,
+  `GrantInfo.destination` and `UnauthorizedGrant.destination` hold the
+  origin, and `GrantInfo` has an optional `base_path`, left out when
+  empty).
+- **The manager** offers two command templates for an entry, each labelled:
+  one gives the value to the command (`run`), the other goes through the
+  broker and leaves the destination, the token's variable and the base
+  URL's variable for the user to fill in. Nothing is inferred from the
+  entry's kind, its URL or a phase 1 profile, a template left unfilled is
+  not a valid command, and no template is stored with the entry.
 - **Kept from phase 1**: one broker process per grant; tokens and grant
   IDs; revocation, expiry and the locks; the request and in-flight limits;
   the audit; `grants` and the manager's grants page; the note after a run
