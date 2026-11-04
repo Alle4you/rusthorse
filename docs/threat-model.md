@@ -745,6 +745,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-04 | Confirmation of E01–E04 at `3b38924` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
 | 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `2df51fd` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `d84f014`. |
 | 2026-11-04 | Confirmation of G01 and G02 and their record, `2df51fd..4f8c00b` (Codex, AI-assisted). | Ready: G01 and G02 confirmed resolved, no new finding; `2df51fd`'s tree is the one reviewed as `9c069d4`, and the record is accurate. |
+| 2026-11-04 | Saving a vault that KeePassXC wrote as KDBX 4.0, `6a8d394` (Codex, AI-assisted). | Ready: no finding. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2785,3 +2786,29 @@ temporary directories: `cargo test --all-features` (170 tests of the agent,
 and four mutations, each fix removed in turn, which failed the unit and
 integration tests of G01 and the protocol and end-to-end tests of G02 by
 their assertions.
+
+**2026-11-04 — Saving a vault that KeePassXC wrote as KDBX 4.0, `6a8d394`.**
+
+Noted by the end-to-end tests' implementer during the review of the broker
+without profiles, and older than that work: KeePassXC 2.7 writes KDBX 4.0
+when nothing in a file needs 4.1, and `keepass` 0.17 writes 4.1 only, so
+every change to such a vault failed with an unexplained error. `6a8d394`
+writes a 4.0 file back as 4.1 and refuses, saying why, to write a newer
+KDBX 4; a fixture saved by `keepassxc-cli` 2.7.6 as 4.0 tests it, and both
+mutations of the fix fail its tests.
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of the commit:
+only 4.0 is promoted, and a newer minor version is refused before a
+temporary file is made or the file or its `.bak` changes; the library reads
+4.0 and 4.1 alike, and the fix changes only the version it writes. On the
+fixture and on a sample with custom data, a protected field, history and
+an attachment, under Argon2id and AES-KDF, the conversion kept the content
+and the key derivation parameters, and KeePassXC 2.7.6 reopened the
+results. The `.bak` stayed identical; the fingerprint after the save matched
+the reopened file's; a save failed before the replacement left the file and
+the fingerprint as they were, and the next one worked; a failed save still
+locks the vault, and the error contract and the unlock barrier are
+unchanged. Codex's checks, offline in an isolated copy: `cargo test
+--all-features` and `--no-default-features`, the ignored KeePassXC test,
+`cargo fmt --all --check`, `git diff --check`, a temporary probe, and the
+two mutations, which failed by their assertions.
