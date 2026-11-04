@@ -1,8 +1,9 @@
 # 0013. A credential broker: approved programs get a grant, not the secret
 
 - Status: Proposed
-- Implementation: phase 1 implemented and reviewed ready, unreleased; a
-  generic HTTP profile planned; the other phases dropped ([scope amendment](#scope-amendment-2026-11-04))
+- Implementation: phase 1 implemented and reviewed ready, unreleased; the
+  broker without profiles or presets planned; the other phases dropped
+  ([scope amendment](#scope-amendment-2026-11-04))
 - Date: 2026-11-02
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).
 - Preceded by: an independent design analysis (Codex, AI-assisted,
@@ -31,10 +32,12 @@
   ([2026-11-04 amendments](#implementation-amendments-2026-11-04)); answer 9
   records the manual test so far.
 
-- Amended: 2026-11-04, by the maintainer's decision on the product's scope:
-  Rusthorse controls who uses a credential, not what it can do. Phase 2
-  becomes a generic HTTP profile without route lists, and the other phases
-  are dropped ([scope amendment](#scope-amendment-2026-11-04)).
+- Amended: 2026-11-04, by the maintainer's definition of the product: the
+  only secret is a credential's value, the agent says where it uses it and
+  the human approves. The broker loses its profiles and presets — the
+  destination is named in the run and approved in the dialog, and the
+  broker puts the key where the program put the token — and the other
+  phases are dropped ([scope amendment](#scope-amendment-2026-11-04)).
 
 ## Context
 
@@ -186,7 +189,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    command's output when output redaction is on (the default; decision 6
    says when it is off).
 
-3. **Profiles fix the destination.** A profile belongs to an entry and is
+3. **Profiles fix the destination.** (Superseded 2026-11-04: there are no
+   profiles; the destination is named in the run and approved in the
+   dialog — see the [scope amendment](#scope-amendment-2026-11-04).) A profile belongs to an entry and is
    set only by the human, through an approved edit: a preset (the routes,
    how the client presents the token, how the credential is presented to
    the destination) with its revision, the destination's origin and base
@@ -210,8 +215,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
 
 5. **The HTTP connector (phase 1)** is a reverse proxy with a fixed origin
    per profile, listening on a loopback TCP port (`127.0.0.1`) that still
-   requires the token. It checks the token, the route, the framing and the
-   limits; builds the request to the destination from the parts it
+   requires the token. It checks the token, the route (superseded
+   2026-11-04: no routes), the framing and the limits; builds the request to the destination from the parts it
    accepted, with the credential added; connects over TLS only; and relays
    the response, server-sent events included, unbuffered. No `CONNECT`, no
    generic forward proxy, no upgrades, no automatic retries (a lost answer
@@ -233,7 +238,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    `run` without `--broker` stays as it is, with its documented limits.
 
 7. **The dialog says what the grant allows**, from the profile and the
-   request: the entry, the destination, every route, how and when the grant
+   request: the entry, the destination, every route (superseded 2026-11-04:
+   no routes), how and when the grant
    ends, the request limit (or that there is none) and the number of requests
    at a time, that the command receives a temporary token and not the key,
    which other variables receive real values in a mixed run, that the command
@@ -378,6 +384,8 @@ phase 1 value; changing it changes this ADR.
 
 ### Profiles
 
+(Superseded 2026-11-04 with the presets below: see the [scope amendment](#scope-amendment-2026-11-04).)
+
 A profile is stored in the entry's custom string field
 `Rusthorse.Broker`, unprotected, as one line of JSON:
 
@@ -418,6 +426,9 @@ Rules:
   unlock, which then ends the grants that survived the lock (below).
 
 ### Presets
+
+(Superseded 2026-11-04: no presets, routes or header lists; see the
+[scope amendment](#scope-amendment-2026-11-04).)
 
 | Preset (revision 1) | Default origin, base path | Client presents the token as | Credential sent to the destination as | Routes (after the base path) |
 |---|---|---|---|---|
@@ -465,7 +476,8 @@ request, in order:
    `431`. The whole header block must arrive within 30 seconds of the
    connection being opened or of the previous response on it.
 2. **Token**: missing or wrong → `401`.
-3. **Route**: the path must be in the exact form above, without `%` escapes,
+3. **Route** (superseded 2026-11-04: no route check; the path and query go
+   as the program sent them): the path must be in the exact form above, without `%` escapes,
    empty segments or segments made only of dots, `;`, `\` or `#` in the target
    seen by the broker, and match a route of the preset after the base path,
    with only the allowed query parameters (each at most once); otherwise
@@ -646,7 +658,8 @@ errors precede this logic: they can have an empty body and no retry hint
 Framed like the dialog protocol (a 4-byte big-endian length, then JSON,
 unknown fields refused), with its own version number, frames of at most 64 KiB
 and the listening socket passed as file-descriptor data. Agent to broker:
-`install` (version, grant ID, token, credential, profile snapshot, limits),
+`install` (version, grant ID, token, credential, profile snapshot, limits;
+amended 2026-11-04: the destination instead of a profile),
 `admitted` and `refused` (request number), `revoke`. Broker to agent: `ready`,
 `admit` (request number, method, route), `finished` (request number, outcome,
 status, sizes), `revoked`, with a count of the requests it refused before
@@ -664,7 +677,7 @@ Nothing else crosses: no vault, no master password, no requester environment.
 |---|---|---|
 | `run` | the approval, as today | the grants it creates, by ID, entry and destination |
 | `grant` | created (before the command starts; fail closed), ended (best effort) | grant ID; at the end: the reason (`command_ended`, `locked`, `screen_locked`, `suspend`, `idle_timeout`, `revoked`, `entry_changed`, `vault_changed`, `expired`, `broker_failed`, `save_failed`, `agent_stopped`, `audit_failed`), requests admitted, finished and unknown, requests refused before admission |
-| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, route template including the method (`POST /v1/messages`) |
+| `broker_request` | admitted (before forwarding; fail closed) | grant ID, request number, route template including the method (`POST /v1/messages`); amended 2026-11-04: the method and the path, without the query |
 | `broker_request` | finished (best effort) | grant ID, request number, outcome (`completed`, `not_forwarded`, `client_closed`, `revoked`, `unknown`), status, bytes each way |
 
 Refused requests are counted, not recorded one by one, so a client cannot
@@ -672,6 +685,10 @@ flood the log. If a `finished` record cannot be written, the grant admits
 nothing more (it is revoked with reason `audit_failed`).
 
 ### `run`, `grants` and the protocol
+
+(Amended 2026-11-04: no profiles, `edit --broker` or `broker_edit`; the
+destination and the limits come with the run, and the protocol becomes 9 —
+see the [scope amendment](#scope-amendment-2026-11-04).)
 
 - `rusthorse run --broker VAR=ENTRY` (repeatable) and `--url URLVAR=ENTRY` as
   in decision 6. The agent checks that the variables are valid and distinct,
@@ -719,7 +736,8 @@ destination, command, start, end and requests (amended 2026-11-04: and the
 requests their destination answered with `401`), and revokes one or all — also
 while the vault is locked, which the page says, since grants can outlive a
 lock. It shows an entry's profile, read-only. Editing a profile stays in the
-CLI until phase 2.
+CLI until phase 2. (Amended 2026-11-04: there are no profiles to show or
+edit.)
 
 ### Tests before real credentials
 
@@ -751,9 +769,9 @@ second review's corrections are folded in):
    until it ends; each retry by the client's SDK is another request;
    requests refused before admission do not count. An admitted request is
    never given back, whatever its outcome.
-2. **Who edits profiles, and which changes end grants?** (Amended
-   2026-11-04: editing profiles in the manager is not planned; the CLI
-   edits them.) The human, through
+2. **Who edits profiles, and which changes end grants?** (Superseded
+   2026-11-04: there are no profiles; any change to an entry still ends its
+   grants.) The human, through
    an approved `edit` (the CLI in phase 1, the manager in phase 2). Any
    change to the entry — value, user name, URL, profile, group, replacement,
    removal — ends its grants.
@@ -927,41 +945,87 @@ broker.
 
 ## Scope amendment (2026-11-04)
 
-After phase 1's manual test, the maintainer stated the product's scope.
-Rusthorse is a credential vault prepared for AI agents: it stores
-credentials — keys, passwords, logins, certificates — so that an AI agent
-can use them without seeing them, and it controls who uses a credential,
-when, for how long and how often, and records each use. What a credential
-can do at its destination is not Rusthorse's concern: that is scoped where
-the credential is issued — a read-only key, a key dedicated to production,
-a device's administrator profile. A credential taken out of the vault, to
-run something elsewhere, is the human's choice and outside what Rusthorse
-protects.
+After phase 1's manual test the maintainer defined the product. Rusthorse is
+a credential vault prepared for AI agents. The only secret in an entry is
+its value — a key, a password, a token, a certificate; everything else an
+entry holds is context, for the human and the agent. An agent that uses a
+credential says where: the command it runs and, through the broker, the
+destination the key goes to. The human sees that in a dialog and approves;
+that approval is the control. Rusthorse controls who uses a credential,
+when, for how long and how often, and records each use. It does not control
+what a credential can do — that is scoped where the credential is issued —
+and it knows nothing about APIs or providers. A credential taken out of the
+vault to run something elsewhere is the human's choice, outside what
+Rusthorse protects. No further controls are planned.
 
-What changes in this ADR:
+### The broker without profiles or presets
 
-- **Phase 1 stays as it is implemented**, presets and routes included,
-  until phase 2 replaces them.
-- **Phase 2 is one item: a generic HTTP profile.** It names the
-  destination (origin and base path) and how the broker presents the key
-  (an `Authorization` scheme or a named header), so that any HTTP API whose
-  client can take another base URL can be used through the broker.
-  Profiles no longer list routes: the presets' route lists go too, and the
-  presets become shortcuts for a destination and a header. A stored
-  profile is never widened by an upgrade, so dropping a stored profile's
-  routes takes an approved edit. It gets its own design and review before
-  any code.
-- **Not planned:** operations narrowed for administration APIs; presets
-  per provider (the generic profile covers Gemini, Hugging Face and the
-  others); private devices with pinned TLS; the connectors of phases 3 and
-  4 and of the "Later" row (`ssh-agent`, PostgreSQL, MySQL, WebSocket,
-  request signing, a Unix socket listener, grants for sandboxed clients);
-  editing profiles in the manager. Ordinary `rusthorse run` already serves
-  databases, devices, SSH and web logins by giving the approved command the
-  value, with its documented limits (threat model L3–L5). Any of them can
-  be proposed again on a concrete need, with an ADR of its own.
+This replaces phase 1's profiles and presets. It is reviewed before any
+code, and phase 1 stays as it is until it is built.
 
-Decision 10's table, answers 2 and 7, the context's notes on private devices
-and administration APIs, the device profiles' defaults in decision 8 and the
-alternative "Specific operations instead of a generic proxy" are superseded
-where they say otherwise.
+- **No profile.** An entry carries no broker profile, and the code knows no
+  preset, route or header of any API. `rusthorse edit --broker`,
+  `--clear broker` and the `broker_edit` request go. A profile stored by
+  phase 1 stays in its entry as an ordinary custom field, which Rusthorse
+  ignores: no profile is read, migrated or widened.
+- **The destination is named in the run.** `rusthorse run --broker
+  VAR=ENTRY@URL` names each grant's destination: `https://`, a host name
+  with an optional port, and an optional base path, under phase 1's rules
+  for an origin and a base path. `--url URLVAR=ENTRY` gives the program the
+  broker's address with that base path, as before. Options of the run set
+  its grants' request limit, lifetime and automatic locks, with phase 1's
+  defaults (no limit, 12 hours, `continue`). There is no default
+  destination: the agent says where.
+- **The dialog shows it**: the entry, the destination, the lifetime, the
+  request limit and the automatic locks; that the command gets a temporary
+  token, not the key; and phase 1's warnings — the command can spend
+  credit, a request count is not a spending limit, the bodies are not
+  inspected. The human allows or denies.
+- **The token stands for the key where the program puts it.** The program
+  presents the token wherever it would present the key — in any request
+  header, with any prefix (`Authorization: Bearer TOKEN`,
+  `Authorization: Token TOKEN`, `x-api-key: TOKEN`,
+  `x-goog-api-key: TOKEN`). The broker replaces each occurrence of the
+  grant's token in the request's header values with the key, and changes
+  nothing else. A request is refused (`401`, nothing forwarded) when no
+  header value holds the token; when a header name, the request target or
+  another grant's token holds it; or when the key itself appears in it.
+- **Any request goes to the approved destination**, under phase 1's
+  framing, body, admission and forwarding rules — HTTP/1.1; no `CONNECT`,
+  `TRACE`, `OPTIONS`, upgrades or `Origin`; bodies within 16 MiB; verified
+  TLS against the system's certificate authorities; public addresses only;
+  no redirect followed; no compressed response — and without its route
+  check: the path and query go as the program sent them. Request headers
+  are forwarded except the hop-by-hop ones and `Host`, `Content-Length` and
+  `Accept-Encoding`, which the broker sets; response headers are relayed
+  except the hop-by-hop ones and any that carries the key or a token; and
+  literal copies of the key in a response body are redacted.
+- **Audit**: an admitted request is recorded, before it is forwarded, with
+  its method and its path without the query (phase 1 recorded the route).
+- **Protocol**: the client protocol becomes 9 (a broker binding carries its
+  destination and the run its grants' limits; `broker_edit` and the
+  entry's profile go; a grant has no preset). The control channel becomes
+  2 (the install carries the destination instead of a profile; an
+  admission carries the path).
+- **Kept from phase 1**: one broker process per grant; tokens and grant
+  IDs; revocation, expiry and the locks; the request and in-flight limits;
+  the audit; `grants` and the manager's grants page; the note after a run
+  whose destination answered `401`; and no fallback to the key.
+
+**Not planned:** operations narrowed for administration APIs; presets per
+provider; destinations or policies stored with an entry; configuration of
+how a key is presented; private devices with pinned TLS; the connectors of
+phases 3 and 4 and of the "Later" row (`ssh-agent`, PostgreSQL, MySQL,
+WebSocket, request signing, a Unix socket listener, grants for sandboxed
+clients); profile editing in the manager. Ordinary `rusthorse run` serves
+databases, devices, SSH and web logins, with its documented limits (threat
+model L3–L5). Any of these can be proposed again on a concrete need, with
+an ADR of its own.
+
+Superseded where they say otherwise: decisions 3, 5 and 7 (profiles and
+routes), decision 8's device defaults, decision 10's table, answers 2 and
+7, the context's notes on private devices and administration APIs, the
+alternative "Specific operations instead of a generic proxy", and the phase
+1 specification's profiles, presets, route check, header lists, profile
+snapshot, route template, `edit --broker`, `broker_edit` and the manager's
+profile view.
