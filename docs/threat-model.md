@@ -690,6 +690,7 @@ outside the product's scope and not planned; L3 and L4 remain limits.
 | 2026-11-04 | Confirmation of `f20d7d0` and its history at `df52e23`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `2a4549d`. |
 | 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `013262d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
 | 2026-11-04 | The product's scope and the broker's dropped phases, at `443be7c` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `ccf7f5b`, on the documents as `19bce15` and `3e349c9` had rewritten them. |
+| 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `443be7c..de88005` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low, all fixed in `14bfe0c` (design and documents; the code is unchanged). |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2616,3 +2617,30 @@ requester, `git diff --check`, and the summary of all of AGENTS.md's
 checks on that tree. The maintainer's agent then checked `ccf7f5b`: the
 documents only changed, the formatting check and the packaging tests (the
 links of the packaged documents) passed.
+
+**2026-11-04 — The design of the broker without profiles, at `de88005`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `19bce15`,
+`3e349c9`, `ccf7f5b` and `de88005`: the maintainer's definition of the
+product, the fixes of S01–S04, and the design that replaces phase 1's
+profiles and presets (ADR 0013's scope amendment), before any code. S01–S04
+were confirmed resolved. The findings concern the design and the documents;
+none adds a control beyond what protects the key and the approval.
+
+| Finding | Disposition |
+|---|---|
+| Medium — D01: a token-shaped HTTP method passes the inherited framing (a probe confirmed it), and the design would have recorded it; raw paths can carry data (as F19 found). | **Fixed in `14bfe0c`:** the token is refused in the method too, and an admitted request is recorded with its method's label only (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OTHER`), never a raw method, path, query, header or body. |
+| Medium — D02: the design relayed the destination's `Content-Length`, which no longer matches a body that redaction changed (a probe showed the length change). | **Fixed in `14bfe0c`:** `Content-Length` and `Transfer-Encoding` are never relayed; the broker frames the body itself, chunked where HTTP allows a body. |
+| Medium — D03: the dialog would show a base path as if it limited the requests, which go to any path of the origin. | **Fixed in `14bfe0c`:** the approval covers the whole origin; the base path only sets up the program's base URL; the dialog shows them apart and says that the key may be sent to any path at the origin. |
+| Medium — D04: phase 1's framing allows a body only on `POST` (a probe confirmed a refused `PATCH`), an assumption about APIs. | **Fixed in `14bfe0c`:** a body is allowed on any accepted method, within the existing size, room, timeout and admission rules. |
+| Low — D05: a token in a header the broker drops or rebuilds would have satisfied the check without the key reaching the destination; the replacement, duplicates and other grants' tokens were not specified. | **Fixed in `14bfe0c`:** only forwarded header values count; the replacement is exact, in one pass, without decoding or case folding; a token in a dropped or rebuilt header, or another token-shaped string, is refused; the header block's limit holds after the key is in; the value's 8–4096 visible ASCII rule stays. |
+| Medium — D06: per-entry policies (programs or hosts) were still planned in the roadmap and the threat model; ADR 0013 kept a stale mark and called them worth having; ADR 0008 said a stored endpoint could check a destination. | **Fixed in `14bfe0c`:** they are outside the scope and not planned; the marks are corrected; ADR 0008 says the endpoint is context and gives the broker no default. |
+| Low — D07: the definition called notes context, but notes and the fields KeePass marks protected are withheld like the value. | **Fixed in `14bfe0c`:** the definition says that the URL, username, host, port and tags are context and that notes and protected fields stay withheld. |
+
+Codex's checks: the diff and the 106 tracked text files; the design against
+phase 1's framing, forwarding, validation, storage and protocol code; the
+guide's tests; three probes in an isolated copy (a token-shaped method
+accepted by the framing, a refused `PATCH` body, a length change after
+redaction), which test phase 1, not a broker without profiles; `git diff
+--check`. The maintainer's agent then ran all of AGENTS.md's checks on
+`14bfe0c`; the code is unchanged.
