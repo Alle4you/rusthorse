@@ -1612,9 +1612,11 @@ impl Agent {
             let id = v.find(&current.id)?;
             v.edit(id, &changes, new_value.as_ref())?;
             changed.push(current.id.clone());
+            // The entry's name, as `add` and `remove` answer: the request
+            // may name it by its UUID or path (the manager sends the UUID).
             Ok(ok(format!(
                 "{} updated",
-                changes.rename.as_deref().unwrap_or(name)
+                changes.rename.as_deref().unwrap_or(&current.name)
             )))
         })
         .map(|(response, _)| response)

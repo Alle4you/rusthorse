@@ -726,6 +726,17 @@ fn import_dotenv_edit_and_remove() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let shown = text(&h.run(&["show", "A_KEY", "--json"]).stdout);
     assert!(shown.contains("https://api.example.com") && shown.contains("prod"));
+    assert_eq!(text(&out.stderr).trim(), "A_KEY updated");
+    // Named by its UUID, as the manager names it: the answer still names
+    // the entry, not the UUID.
+    let id = serde_json::from_str::<serde_json::Value>(&shown).expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", &id, "--add-tag", "by-uuid"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr).trim(), "A_KEY updated");
 
     h.decide(&[Decision::AllowOnce]);
     assert!(h.run(&["remove", "B_KEY"]).status.success());

@@ -184,6 +184,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - **Protocol 8**: separate `broker_run` and `broker_edit` requests prevent an
   older agent from silently ignoring broker bindings or profile edits. Added
   `grants`, `revoke_grant` and optional profile/status fields.
+- An edit's answer names the entry (`NAME updated`) even when the request
+  names it by its UUID, as the manager does: the manager showed the UUID.
 - Human-readable `audit` output escapes control and invisible characters
   throughout each record. JSON output remains machine-readable.
 - The manager's entry form shows how the value is made as one row per
