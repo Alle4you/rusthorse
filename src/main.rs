@@ -656,16 +656,21 @@ fn main() -> ExitCode {
             if let Some(Exit(code)) = e.downcast_ref::<Exit>() {
                 return ExitCode::from(*code);
             }
-            if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
-                .is_some()
-            {
-                eprintln!("rusthorse: {e:#}; it may or may not have taken effect");
+            let is_outcome_unknown = e
+                .downcast_ref::<rusthorse::client::OutcomeUnknown>()
+                .is_some();
+            let is_local_unknown = e.downcast_ref::<LocalOutcomeUnknown>().is_some();
+            // An error can quote a name from the vault, the keyring or the
+            // agent: shown escaped, like everything they supply.
+            let e = printable(&format!("{e:#}"));
+            if is_outcome_unknown {
+                eprintln!("rusthorse: {e}; it may or may not have taken effect");
                 ExitCode::from(EXIT_UNKNOWN)
-            } else if e.downcast_ref::<LocalOutcomeUnknown>().is_some() {
-                eprintln!("rusthorse: {e:#}");
+            } else if is_local_unknown {
+                eprintln!("rusthorse: {e}");
                 ExitCode::from(EXIT_UNKNOWN)
             } else {
-                eprintln!("rusthorse: {e:#}");
+                eprintln!("rusthorse: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -768,20 +773,21 @@ fn guide(topic: GuideTopic) -> anyhow::Result<u8> {
     }
 }
 
-/// What the agent says — the message of an answer or of an error — as the
-/// CLI prints it: with control and invisible characters escaped
-/// ([`rusthorse::util::visible`]). The agent names entries by their title,
-/// which another KeePass program can have written with terminal controls
-/// in it (threat model L9).
-fn agent_says(message: &str) -> String {
-    rusthorse::util::visible(message)
+/// Text that the agent, the vault or a keyring supplies — a message, an
+/// error, a name, a field, a path — as the CLI shows it to people: with
+/// control and invisible characters escaped ([`rusthorse::util::visible`]).
+/// A title or a label that another program wrote can hold terminal
+/// controls (threat model L9). `--json` output and what `reveal` prints
+/// are data, not shown this way.
+fn printable(text: &str) -> String {
+    rusthorse::util::visible(text)
 }
 
 /// Turn an error response into an error (with the right exit status).
 fn check(response: Response) -> anyhow::Result<Response> {
     match response {
         Response::Error { code, message } => {
-            eprintln!("rusthorse: {}", agent_says(&message));
+            eprintln!("rusthorse: {}", printable(&message));
             let status = match code {
                 ErrorCode::Denied | ErrorCode::Cancelled => EXIT_DENIED,
                 ErrorCode::OutcomeUnknown => EXIT_UNKNOWN,
@@ -796,7 +802,7 @@ fn check(response: Response) -> anyhow::Result<Response> {
 fn simple(client: &Client, request: &Request) -> anyhow::Result<u8> {
     match check(client.call(request)?)? {
         Response::Ok { message } => {
-            eprintln!("{}", agent_says(&message));
+            eprintln!("{}", printable(&message));
             Ok(0)
         }
         // An answer that makes no sense says nothing about what happened.
@@ -1128,11 +1134,12 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     }
     println!(
         "agent:      running (version {}, protocol {})",
-        info.agent_version, info.protocol_version
+        printable(&info.agent_version),
+        info.protocol_version
     );
     println!(
         "vault:      {}{}",
-        info.vault,
+        printable(&info.vault),
         if info.vault_exists {
             ""
         } else {
@@ -1149,14 +1156,14 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
     }
     println!("remembered: {} approval(s)", info.remembered_approvals);
     if let Some(dialogs) = &info.dialogs {
-        println!("dialogs:    {dialogs}");
+        println!("dialogs:    {}", printable(dialogs));
     }
     // The credential broker (ADR 0013), from agents that report it. The
     // count is the agent's, which may include grants that are no longer
     // active (a revoked grant whose command still runs): it is not called
     // "active" here, and `rusthorse grants` says what each one is.
     if let Some(broker) = &info.broker {
-        println!("broker:     {broker}");
+        println!("broker:     {}", printable(broker));
     }
     match info.grants {
         Some(0) => println!("grants:     none"),
@@ -1167,12 +1174,16 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
         .iter()
         .enumerate()
     {
-        println!("{:<11} {line}", if i == 0 { "locks on:" } else { "" });
+        println!(
+            "{:<11} {}",
+            if i == 0 { "locks on:" } else { "" },
+            printable(line)
+        );
     }
     if !info.agent_executable.is_empty() {
         println!(
             "program:    {}{}",
-            info.agent_executable,
+            printable(&info.agent_executable),
             if info.agent_executable_replaced == Some(true) {
                 " (replaced since the agent started — restart it)"
             } else {
@@ -1241,11 +1252,13 @@ fn list(
                 Some(g) => format!("{g}/{}", e.name),
                 None => e.name.clone(),
             };
+            // From the vault, which another KeePass program may have
+            // written: escaped, before the widths are measured.
             [
-                name,
-                e.fields.username.clone().unwrap_or_default(),
-                endpoint(e),
-                e.fields.tags.join(","),
+                printable(&name),
+                printable(e.fields.username.as_deref().unwrap_or_default()),
+                printable(&endpoint(e)),
+                printable(&e.fields.tags.join(",")),
             ]
         })
         .collect();
@@ -1282,7 +1295,7 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
     let f = &entry.fields;
     let line = |label: &str, value: Option<String>| {
         if let Some(v) = value.filter(|v| !v.is_empty()) {
-            println!("{label:<11} {v}");
+            println!("{label:<11} {}", printable(&v));
         }
     };
     line("name:", Some(entry.name.clone()));
@@ -1735,11 +1748,11 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 code: ErrorCode::OutcomeUnknown,
                 message,
             } => {
-                eprintln!("rusthorse: {}", agent_says(&message));
+                eprintln!("rusthorse: {}", printable(&message));
                 Ok(EXIT_UNKNOWN)
             }
             Response::Error { message, .. } => {
-                eprintln!("rusthorse: {}", agent_says(&message));
+                eprintln!("rusthorse: {}", printable(&message));
                 Ok(EXIT_RUN_FAILURE)
             }
             other => Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
@@ -1753,7 +1766,10 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
                 .is_some()
             {
-                eprintln!("rusthorse: {e:#}; the command may or may not have run");
+                eprintln!(
+                    "rusthorse: {}; the command may or may not have run",
+                    printable(&format!("{e:#}"))
+                );
                 Ok(EXIT_UNKNOWN)
             } else if e.downcast_ref::<Exit>().is_some() {
                 // The agent refused a request made before the run (`show`
@@ -1761,7 +1777,7 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
                 // never sent.
                 Ok(EXIT_RUN_FAILURE)
             } else {
-                eprintln!("rusthorse: {e:#}");
+                eprintln!("rusthorse: {}", printable(&format!("{e:#}")));
                 Ok(EXIT_RUN_FAILURE)
             }
         }
@@ -1990,7 +2006,7 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             if !empty.is_empty() {
                 eprintln!(
                     "not imported, because they have no value: {}",
-                    empty.join(", ")
+                    printable(&empty.join(", "))
                 );
             }
             if dry_run {
@@ -2154,16 +2170,16 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
             Err(Exit(EXIT_UNKNOWN).into())
         };
         match answer {
-            Ok(Response::Ok { message }) => eprintln!("{}", agent_says(&message)),
+            Ok(Response::Ok { message }) => eprintln!("{}", printable(&message)),
             // Every error except `outcome_unknown` means nothing was saved
             // (docs/protocol.md, "Errors").
             Ok(Response::Error { code, message }) if code != ErrorCode::OutcomeUnknown => {
-                eprintln!("rusthorse: {}", agent_says(&message));
+                eprintln!("rusthorse: {}", printable(&message));
                 let denied = matches!(code, ErrorCode::Denied | ErrorCode::Cancelled);
                 return not_imported(if denied { EXIT_DENIED } else { 1 });
             }
             Ok(Response::Error { message, .. }) => {
-                eprintln!("rusthorse: {}", agent_says(&message));
+                eprintln!("rusthorse: {}", printable(&message));
                 return unsure("could not confirm");
             }
             Ok(other) => {
@@ -2223,7 +2239,8 @@ fn import_preview(client: &Client, names: Vec<String>, replace: bool) -> anyhow:
             ("new", "")
         };
         println!(
-            "{mark:<8} {name}{}",
+            "{mark:<8} {}{}",
+            printable(name),
             if note.is_empty() {
                 String::new()
             } else {
@@ -2740,18 +2757,24 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
         }
     }
 
-    let mut failed = false;
     for check in &checks {
-        match check {
-            Check::Ok(text) => println!("  ok    {text}"),
-            Check::Warn(text) => println!("  warn  {text}"),
-            Check::Fail(text) => {
-                failed = true;
-                println!("  FAIL  {text}");
-            }
-        }
+        println!("{}", check_line(check));
     }
-    Ok(if failed { 1 } else { 0 })
+    Ok(if checks.iter().any(|c| matches!(c, Check::Fail(_))) {
+        1
+    } else {
+        0
+    })
+}
+
+/// A line of `rusthorse doctor`, its text escaped: it can quote what the
+/// agent reports (paths, its version, the sources of its locks).
+fn check_line(check: &Check) -> String {
+    match check {
+        Check::Ok(text) => format!("  ok    {}", printable(text)),
+        Check::Warn(text) => format!("  warn  {}", printable(text)),
+        Check::Fail(text) => format!("  FAIL  {}", printable(text)),
+    }
 }
 
 fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
@@ -3268,6 +3291,23 @@ mod tests {
         assert!(
             help.contains("720 (12 hours) for the presets of this version"),
             "{help}"
+        );
+    }
+
+    /// A line of `rusthorse doctor` shows what it quotes escaped.
+    #[test]
+    fn doctor_lines_show_what_they_quote_escaped() {
+        assert_eq!(
+            check_line(&Check::Ok("vault /tmp/v\u{1b}[2J".into())),
+            "  ok    vault /tmp/v\\u{1b}[2J"
+        );
+        assert_eq!(
+            check_line(&Check::Warn("source x\u{202e}".into())),
+            "  warn  source x\\u{202e}"
+        );
+        assert_eq!(
+            check_line(&Check::Fail("program\r".into())),
+            "  FAIL  program\\u{d}"
         );
     }
 

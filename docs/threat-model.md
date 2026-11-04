@@ -589,11 +589,12 @@ precede the broker's JSON errors and retry hints.
 
 The fake HTTPS tests cover the protocol, not every SDK's behaviour. By hand,
 with a real key (2026-11-04), the Anthropic Python SDK 2.4.0 worked through
-the broker; Claude Code's requests went through it, but the account used
-refused them, with or without the broker, so no Claude Code answer through
-the broker has been seen yet. SDK configuration can override environment
-variables or send both Anthropic token headers; both must match. With
-zenity, a run requesting two or more grants may exceed the
+the broker for the requests tried; Claude Code's requests went through it,
+and the API answered them `400`, as it answered SDK requests with some of
+Claude Code's parameters sent with the key by value, so no Claude Code
+answer through the broker has been seen yet. SDK configuration can
+override environment variables or send both Anthropic token headers; both
+must match. With zenity, a run requesting two or more grants may exceed the
 dialog height estimate and be refused before asking. `rusthorse-dialog`
 scrolls long approvals; character limits still apply, and no approval is
 truncated.

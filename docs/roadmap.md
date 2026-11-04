@@ -28,10 +28,11 @@ features not yet implemented.
 **Phase 1 implemented, tested and reviewed READY (2026-11-03), unreleased.**
 [ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker
 and the later phases. The manual check with the maintainer's credentials
-began on 2026-11-04: the Anthropic Python SDK worked through the broker;
-Claude Code's requests went through it, but the account used refused them,
-with or without the broker, so its check is still pending. No client
-version is claimed supported yet.
+began on 2026-11-04: the Anthropic Python SDK worked through the broker
+for the requests tried; Claude Code's requests went through it, and the
+API answered them `400`, as it answered SDK requests with some of Claude
+Code's parameters sent with the key by value, so its check is still
+pending. No client version is claimed supported yet.
 
 ### Why
 

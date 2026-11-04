@@ -37,6 +37,10 @@ standard output. For `run`, a message that starts with `rusthorse:` comes with
 `124` or `125` and says what went wrong — except a note that starts with
 `rusthorse: note:`, which comes only after a command that ran, whose exit
 status is then its own ([`--broker`](#through-the-credential-broker---broker)).
+Text that the vault, the agent or a keyring supplies — names, fields,
+paths, messages — is shown with control and invisible characters escaped
+(`\u{…}`), so that a title another program wrote cannot rewrite your
+terminal; `--json` gives the values as they are.
 
 ## Entry names
 
@@ -634,8 +638,8 @@ does not allow, a grant that has ended — are short JSON errors of type
 `rusthorse_broker`, whose message starts with `rusthorse-broker:`; an error
 in the destination's own form comes from the destination, passed on as it
 came. Two exceptions: the broker's HTTP parser answers a malformed request
-itself, with `400` or `431` and an empty body, and a connection can close
-with no answer at all. A grant that has ended answers `403`, with a message
+itself, with `400` or `431` and an empty body — which a destination can
+send too — and a connection can close with no answer at all. A grant that has ended answers `403`, with a message
 that says to run the command again with `rusthorse run`. A program that
 shows only the message still says who answered: Claude Code showed the
 broker's message after its own `Please run /login · API Error: 403`, and its
@@ -658,11 +662,12 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
 
 The last one runs Claude Code through the broker, as Claude Code's
 documentation describes it. Tried on 2026-11-04 with Claude Code 2.1.317,
-its requests went through the broker to the API, but the account used
-refused them (`400`, "credit balance is too low"), as it refused the same
-requests sent with the key by value: no answer from Claude Code through the
-broker has been seen yet. The Anthropic Python SDK 2.4.0 worked through the
-broker, for requests and streams alike. `ANTHROPIC_AUTH_TOKEN` makes Claude
+its requests went through the broker to the API, which answered `400`
+("credit balance is too low"); SDK requests with some of Claude Code's
+parameters drew the same answer with the key by value as through the
+broker. No answer from Claude Code through the broker has been seen yet.
+The Anthropic Python SDK 2.4.0 worked through the broker, for the requests
+and streams tried. `ANTHROPIC_AUTH_TOKEN` makes Claude
 Code send the token as `Authorization: Bearer`; `env -u ANTHROPIC_API_KEY`
 keeps a key your environment may hold out of the command (Claude Code may
 send it with the token or instead of it, and the broker refuses a request

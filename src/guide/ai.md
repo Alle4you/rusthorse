@@ -166,8 +166,10 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
 - The broker's own errors have the type `rusthorse_broker` and a message
   that starts with `rusthorse-broker:` (a missing or wrong token, a route the
   profile does not allow, a grant that has ended: `403`). An error in the
-  destination's own form comes from the destination. A `400` or `431` with
-  an empty body is the broker's answer to a malformed request.
+  destination's own form comes from the destination. The broker's HTTP
+  parser can answer a malformed request with an empty `400` or `431`; a
+  destination can answer so too, so such an answer alone does not say who
+  answered.
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
@@ -198,8 +200,9 @@ rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.d
 ### Claude Code through the broker
 
 This recipe follows what Claude Code's documentation says. Tried with Claude
-Code 2.1.317, its requests went through the broker, but the account used
-refused them, as it refused them with the key by value; no answer from
+Code 2.1.317, its requests went through the broker, and the API answered
+them `400` ("credit balance is too low"), as it answered SDK requests with
+some of Claude Code's parameters sent with the key by value; no answer from
 Claude Code through the broker has been seen yet. If it does not work, tell
 the human: never fall back to the key.
 

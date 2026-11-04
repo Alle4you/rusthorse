@@ -744,16 +744,33 @@ fn import_dotenv_edit_and_remove() {
     assert!(listing.contains("A_KEY") && !listing.contains("B_KEY"));
 }
 
-/// What the agent says is printed with control and invisible characters
-/// escaped: an entry's title written by another KeePass client can hold
-/// terminal controls, and an edit or a removal that names the entry by its
-/// UUID (as the manager does) answers with that title.
+/// What the vault holds is shown with control and invisible characters
+/// escaped: an entry's title and username written by another KeePass
+/// client can hold terminal controls. `list` and `show` show them escaped,
+/// `--json` gives them as they are, and an edit or a removal that names the
+/// entry by its UUID (as the manager does) answers with the escaped title.
 #[test]
 fn a_title_written_elsewhere_is_printed_escaped() {
     use keepass::db::fields;
     let h = Harness::new();
     let uuids = seed(&h, &[("PLAIN", "value-1234", None)]);
+    set_field_elsewhere(&h, "PLAIN", fields::USERNAME, "user\u{202e}gpj.exe", false);
     set_field_elsewhere(&h, "PLAIN", fields::TITLE, "SAFE\u{1b}[2J\rFORGED", false);
+    let raw = |out: &str| out.contains('\u{1b}') || out.contains('\r') || out.contains('\u{202e}');
+    for args in [&["list"][..], &["show", &uuids["PLAIN"]][..]] {
+        let out = h.run(args);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        assert!(!raw(&shown), "{args:?}: {shown:?}");
+        assert!(
+            shown.contains("SAFE\\u{1b}[2J\\u{d}FORGED"),
+            "{args:?}: {shown}"
+        );
+        assert!(shown.contains("user\\u{202e}gpj.exe"), "{args:?}: {shown}");
+    }
+    let json = text(&h.run(&["show", &uuids["PLAIN"], "--json"]).stdout);
+    let entry: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(entry["name"], "SAFE\u{1b}[2J\rFORGED");
     h.decide(&[Decision::AllowOnce]);
     let out = h.run(&["edit", &uuids["PLAIN"], "--add-tag", "by-uuid"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -7769,6 +7786,41 @@ mod import_from {
             )
         }
 
+        /// Names from the keyring are shown escaped: in a dry run's list,
+        /// and in the error that refuses names given twice.
+        #[test]
+        fn keyring_names_are_shown_escaped() {
+            let Some((bus, _service)) = keyring(vec![
+                segredo("FAKE\u{1b}[2J", "fake-value-1"),
+                segredo("TWICE\u{1b}]0;x\u{7}", "fake-value-2"),
+                segredo("TWICE\u{1b}]0;x\u{7}", "fake-value-3"),
+            ]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            assert!(h.run(&["unlock"]).status.success());
+            h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+            let import = [
+                "import",
+                "secret-service",
+                "-a",
+                "aplicacao=segredo",
+                "--name-from",
+                "nome",
+            ];
+            let raw = |out: &str| out.contains('\u{1b}') || out.contains('\u{7}');
+            let out = h.run(&[&import[..], &["--dry-run"]].concat());
+            assert!(out.status.success(), "{}", text(&out.stderr));
+            let shown = text(&out.stdout);
+            assert!(!raw(&shown), "{shown:?}");
+            assert!(shown.contains("FAKE\\u{1b}[2J"), "{shown}");
+            let out = h.run(&import);
+            assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+            let stderr = text(&out.stderr);
+            assert!(!raw(&stderr), "{stderr:?}");
+            assert!(stderr.contains("TWICE\\u{1b}]0;x\\u{7}"), "{stderr}");
+        }
+
         #[test]
         fn the_cli_imports_keyring_items_that_the_agent_reads() {
             let Some((bus, _service)) = keyring(vec![
@@ -9000,6 +9052,30 @@ mod broker_cli {
         let out = agent.run(&["grants"]);
         assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
         assert!(text(&out.stderr).contains("broker grants are not available"));
+    }
+
+    /// What the agent reports in its status is shown escaped.
+    #[test]
+    fn the_status_is_shown_escaped() {
+        let mut info = plain_status();
+        info.vault = "/tmp/vault\u{1b}[2J.kdbx".into();
+        info.dialogs = Some("rusthorse-dialog\u{7}".into());
+        info.agent_executable = "/usr/bin/rusthorse\u{202e}".into();
+        let agent = FakeAgent::new(info, |request| panic!("unexpected {request:?}"));
+        let out = agent.run(&["status"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let shown = text(&out.stdout);
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}') && !shown.contains('\u{202e}'),
+            "{shown:?}"
+        );
+        for escaped in [
+            "/tmp/vault\\u{1b}[2J.kdbx",
+            "rusthorse-dialog\\u{7}",
+            "/usr/bin/rusthorse\\u{202e}",
+        ] {
+            assert!(shown.contains(escaped), "{escaped}: {shown}");
+        }
     }
 
     /// Whatever the agent says — an answer, an error, the error of a run —

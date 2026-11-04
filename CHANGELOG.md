@@ -28,8 +28,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   broker and live grant count; `doctor` checks the broker and the CA file;
   `audit` shows grant and request records. `rusthorse guide ai` includes SDK
   recipes and a Claude Code recipe; in the manual test with a real key, the
-  Python SDK worked through the broker, and Claude Code has not answered
-  through it yet.
+  Python SDK worked through the broker for the requests tried, and Claude
+  Code has not answered through it yet.
 - **A key the destination refused is named**: when a grant's destination
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
@@ -198,6 +198,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   optional `GrantInfo.unauthorized` and `exited.unauthorized`.
 - An edit's answer names the entry (`NAME updated`) even when the request
   names it by its UUID, as the manager does: the manager showed the UUID.
+- The CLI shows what the vault, the agent or a keyring supplies with control
+  and invisible characters escaped everywhere it shows text to people
+  (`list`, `show`, `status`, `doctor`, import previews, messages and
+  errors), so that a title another program wrote cannot rewrite the
+  terminal; `--json` is unchanged.
 - Human-readable `audit` output escapes control and invisible characters
   throughout each record. JSON output remains machine-readable.
 - The manager's entry form shows how the value is made as one row per
