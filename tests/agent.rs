@@ -3836,6 +3836,8 @@ fn logged_within(log: &Path, event: &str, limit: Duration) -> Option<serde_json:
 struct BlockedAudit {
     path: PathBuf,
     reader: Option<std::fs::File>,
+    /// What the records written into the FIFO put there, as read so far.
+    taken: Vec<u8>,
 }
 
 impl BlockedAudit {
@@ -3843,7 +3845,54 @@ impl BlockedAudit {
         let path = h.audit.clone();
         let _ = std::fs::remove_file(&path);
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
-        BlockedAudit { path, reader: None }
+        BlockedAudit {
+            path,
+            reader: None,
+            taken: Vec::new(),
+        }
+    }
+
+    /// Once released, wait until the end record of the grant `id` has been
+    /// written into the FIFO, where it fails. A grant's end is recorded by
+    /// another thread of the agent, once its broker confirms: a test that
+    /// put the log back first could have it written in the log instead,
+    /// possibly after the test, into a directory already removed.
+    fn wait_for_end_of(&mut self, id: &str) {
+        use std::io::Read;
+        let reader = self.reader.as_mut().expect("released first");
+        nix::fcntl::fcntl(
+            &*reader,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("non-blocking");
+        let until = Instant::now() + TEST_LIMIT;
+        loop {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => self.taken.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("cannot read the FIFO: {e}"),
+                }
+            }
+            let ended = String::from_utf8_lossy(&self.taken).lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                    record["action"] == "grant"
+                        && record["outcome"] == "ended"
+                        && record["grant"] == id
+                })
+            });
+            if ended {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "the end of grant {id} was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Let the records waiting for the log go on, to fail.
@@ -4517,7 +4566,10 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     assert_eq!(revoke["message"]["reason"], "command_ended");
     let pid = installed["pid"].as_u64().expect("pid");
     assert!(process_gone(pid), "the broker outlived its run");
-    assert!(std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok());
+    assert!(port_released(port as u16), "port {port} still held");
+    // The grant's end is recorded once its broker confirms, possibly after
+    // the run's answer.
+    assert_eq!(ended_with(&h, &id), "command_ended");
 
     // The dialog said what the grant allows.
     let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
@@ -4695,10 +4747,27 @@ fn a_broker_run_is_never_remembered_and_warns_when_its_output_is_not_filtered() 
         asked.facts
     );
     assert!(grants(&h).is_empty());
-    // Two grants, created and ended; the denied run made none.
-    eventually("the grants' records", || {
-        (audit_outcomes(&h, "grant") == ["created", "ended", "created", "ended"]).then_some(())
+    // Two grants, each created and then ended; the denied run made none.
+    // Each end is recorded once its broker confirms, so the first one's may
+    // come after the second's creation.
+    let records = eventually("the grants' end records", || {
+        let records: Vec<serde_json::Value> = audit_records(&h)
+            .into_iter()
+            .filter(|r| r["action"] == "grant")
+            .collect();
+        (records.iter().filter(|r| r["outcome"] == "ended").count() == 2).then_some(records)
     });
+    let ids: std::collections::BTreeSet<&str> =
+        records.iter().filter_map(|r| r["grant"].as_str()).collect();
+    assert_eq!(ids.len(), 2, "{records:?}");
+    for id in ids {
+        let outcomes: Vec<&str> = records
+            .iter()
+            .filter(|r| r["grant"] == id)
+            .filter_map(|r| r["outcome"].as_str())
+            .collect();
+        assert_eq!(outcomes, ["created", "ended"], "{id}: {records:?}");
+    }
 }
 
 /// A broker that exits at once, never answers, or answers for another grant
@@ -4887,6 +4956,11 @@ fn a_run_whose_command_cannot_start_ends_its_grants_before_it_waits_for_the_audi
     assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
     assert!(message.contains("cannot start"), "{message}");
     assert!(process_gone(pid), "the broker was left running");
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    audit.wait_for_end_of(&id);
     drop(audit);
     assert!(grants(&h).is_empty(), "a grant was left");
 }
@@ -5679,6 +5753,7 @@ fn the_unlock_barrier_tells_the_brokers_before_it_waits_for_the_audit_log() {
     assert_eq!(code, ErrorCode::Internal, "{message}");
     assert!(message.contains("cannot write the audit log"), "{message}");
     assert!(status(&h).locked);
+    audit.wait_for_end_of(&id);
     drop(audit);
     // With the log back, the vault unlocks; the grant had ended already.
     match h.call(&Request::List) {
@@ -5744,9 +5819,12 @@ fn a_lock_does_not_wait_for_the_record_of_an_unlock() {
     // The unlock's record fails: it does not take effect.
     let (code, message) = error_of(&answer(unlocked));
     assert_eq!(code, ErrorCode::Internal, "{message}");
-    // The lock was done before its own record, which fails too. (So did
-    // the grant's end record: the broker's answer is what tells.)
+    // The lock was done before its own record, which fails too. So does
+    // the grant's end record, once its broker confirms (the broker's answer
+    // is what tells): waited for, so that it is not written once the log is
+    // back.
     let _ = answer(locked);
+    audit.wait_for_end_of(&id);
     drop(audit);
     assert!(status(&h).locked);
     go(&h);
@@ -5977,6 +6055,13 @@ fn the_end_of_the_command_revokes_its_grants_before_its_output_is_drained() {
     );
     let revoke = logged(&log, "revoke");
     assert_eq!(revoke["message"]["reason"], "command_ended");
+    // Its end is recorded once its broker confirms, possibly after the
+    // run's answer.
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    assert_eq!(ended_with(&h, &id), "command_ended");
 }
 
 /// A requester that goes away ends the run: its grants first, then its
@@ -6036,6 +6121,13 @@ fn read_only_requests_do_not_keep_the_vault_unlocked() {
         let status = h.run(&["status", "--json"]);
         let status: serde_json::Value = serde_json::from_slice(&status.stdout).expect("json");
         if status["locked"] == true {
+            // The idle lock records itself just after it locks.
+            eventually("the idle lock's record", || {
+                audit_outcomes(&h, "lock")
+                    .iter()
+                    .any(|o| o == "idle_timeout")
+                    .then_some(())
+            });
             return;
         }
     }
