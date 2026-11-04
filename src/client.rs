@@ -178,14 +178,14 @@ impl Client {
     }
 
     /// [`Client::run`] for a run with broker bindings
-    /// ([`Request::BrokerRun`]); a run without any is a [`RunRequest`].
+    /// ([`Request::BrokerRunV2`]); a run without any is a [`RunRequest`].
     pub fn broker_run(&self, request: BrokerRunRequest) -> anyhow::Result<Response> {
         let (redact, forward_stdin) = (request.run.redact, request.run.forward_stdin);
-        self.run_here(Request::BrokerRun(request), redact, forward_stdin)
+        self.run_here(Request::BrokerRunV2(request), redact, forward_stdin)
     }
 
     /// [`Client::run`] for `request`, a [`Request::Run`] or a
-    /// [`Request::BrokerRun`] whose run has these `redact` and
+    /// [`Request::BrokerRunV2`] whose run has these `redact` and
     /// `forward_stdin`.
     fn run_here(
         &self,
@@ -247,7 +247,7 @@ impl Client {
     }
 
     /// [`Client::run_with`] for a run with broker bindings
-    /// ([`Request::BrokerRun`]); a run without any is a [`RunRequest`].
+    /// ([`Request::BrokerRunV2`]); a run without any is a [`RunRequest`].
     pub fn broker_run_with(
         &self,
         request: BrokerRunRequest,
@@ -260,10 +260,10 @@ impl Client {
             );
         }
         let forward = request.run.forward_stdin;
-        self.relay(Request::BrokerRun(request), forward, io)
+        self.relay(Request::BrokerRunV2(request), forward, io)
     }
 
-    /// Send `request`, a [`Request::Run`] or a [`Request::BrokerRun`] with
+    /// Send `request`, a [`Request::Run`] or a [`Request::BrokerRunV2`] with
     /// redaction, and relay its output and (with `forward`) its input, as
     /// [`Client::run_with`] says.
     fn relay(&self, request: Request, forward: bool, io: RunIo) -> anyhow::Result<Response> {

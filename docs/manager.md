@@ -21,17 +21,15 @@ awaiting an independent review: try it with fake entries first.
 | Create, edit, rename, move and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
-| The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
+| Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
 | Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
-| An entry's broker profile, read-only, and the command that gives a program a temporary token instead of the value (`rusthorse run --broker`) | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
 
 Pages for the later features are in the window already; they say what is
-missing and what to do meanwhile. Broker profiles are set in a terminal
-(`rusthorse edit`), never in the manager, and they are to be removed: in
-the planned broker, the destination is named in the run and approved in
-the dialog ([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
+missing and what to do meanwhile. An entry has no broker profile: the run
+names where a key goes, and you approve it in the agent's dialog
+([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 
 ## Before you start
 
@@ -67,8 +65,8 @@ the details, which take any extra width. It fits a screen 1024 pixels wide
   the two ways to change the value: **Change the value…** and **Replace
   with a random value…**), the
   **Details** (login, URL, host, port, tags, the names of other fields, the
-  UUID), the entry's **Credential broker** profile when it has one (see
-  [The broker profile](#the-broker-profile)) and the command to use it.
+  UUID), and the two commands that use it (see
+  [Give a secret to a program](#give-a-secret-to-a-program)).
   Each row has its name on the left and
   its content on the right (screen readers name the row by it); the details
   can be selected and copied, since none of them is secret. No hyphen is
@@ -114,7 +112,8 @@ the manager does **not** lock the vault. The agent itself also locks it when
 the screen locks or the computer suspends, whether the manager is open or
 not; the Status page shows what it watches ("Also locks on"), see
 [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md). Those automatic
-locks end only the grants whose profile says so.
+locks end a grant only if its run asked for it
+(`rusthorse run --broker-locks end`).
 
 If the vault is locked by something else — the agent's idle timer,
 `rusthorse lock` — the manager notices at its next check (every five
@@ -183,6 +182,8 @@ other changes, the agent asks for your approval of all of them first, then,
 for a typed value, for the value; **Type a new value** alone opens the
 agent's dialog for the value at once, like **Change the value…**. Choosing
 another **Group** moves the entry (see [Choose a group](#choose-a-group)).
+Any change to an entry — its value, name, group or fields — ends its grants
+of the credential broker, if it has any; the **Edit** form says so.
 **Delete** removes the entry and its history from the vault — it does not
 revoke the credential at its provider.
 
@@ -216,112 +217,88 @@ whole UUID, or what it creates, `/home/firewalls (creates firewalls in /home,
 group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)` — or `/ (the top level)`. A
 path through two groups of the same name side by side is refused, since
 which one is meant cannot be told. A move keeps the entry's UUID, so the
-command of **Use it from a command**, which names the entry by UUID, still
-works; a command that names it by its old `Group/Name` path no longer finds
-it. The agent refuses to move an entry into the recycle bin; use **Delete**
-to remove it.
+commands of the details ([Give a secret to a program](#give-a-secret-to-a-program)),
+which name the entry by UUID, still work; a command that names it by its
+old `Group/Name` path no longer finds it. The agent refuses to move an entry
+into the recycle bin; use **Delete** to remove it.
 
 ### Give a secret to a program
 
-The **Use it from a command** card holds a ready command, for example:
+The details of an entry end with two commands, each in a card of its own
+with its **Copy** button. Both name the entry by its UUID, so a rename or a
+duplicate title elsewhere cannot make them point to another entry, and
+neither holds a secret: copying them is safe. Nothing in them comes from the
+entry's kind, its URL or its other fields, and nothing is stored with the
+entry.
+
+**Give the value to a command** gives the program the value:
 
 ```sh
 rusthorse run OPENAI_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f -- your-command
 ```
 
-For an API key with an endpoint, it also passes the endpoint:
+Replace `your-command`. After your approval the program receives the value
+in that environment variable and its output is redacted. The variable takes
+the entry's name when that is a valid variable name, `SECRET` otherwise. If
+your program also needs the entry's URL, add `--url VAR=ENTRY` yourself (see
+the [CLI reference](cli.md)); the URL is not a secret, and it is not
+redacted. **This is the way to give an AI agent a secret** when the broker
+cannot serve it: the agent never sees the value, though the program it runs
+does.
 
-```sh
-rusthorse run OPENAI_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
-  --url OPENAI_BASE_URL=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
-  -- your-command
-```
-
-The endpoint's variable is named after the key's (`OPENAI_API_KEY` →
-`OPENAI_BASE_URL`, which the OpenAI and Anthropic libraries read; otherwise
-`NAME_URL`); rename it if your program reads another one. The URL is not a
-secret: it is not redacted from the output.
-
-Replace `your-command`. After your approval the program receives the value in
-that environment variable and its output is redacted. The entry is named by
-its UUID, so a rename or a duplicate title elsewhere cannot make it point to
-another entry; the variable takes the entry's name when that is a valid
-variable name, `SECRET` otherwise. **This is the way to give an AI agent a
-secret**: it never sees the value. The snippet holds no secret; copying it is
-safe.
-
-For an entry with a usable broker profile ([below](#the-broker-profile)),
-the card holds the command that goes through the credential broker
-([ADR 0013](adr/0013-credential-broker.md)) instead:
+**Give a token to a command, through the broker** is a template for the
+credential broker ([ADR 0013](adr/0013-credential-broker.md)):
 
 ```sh
 rusthorse run \
-  --broker ANTHROPIC_API_KEY=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
-  --url ANTHROPIC_BASE_URL=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
+  --broker TOKEN_VAR=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f@https://HOST/BASE_PATH \
+  --url BASE_URL_VAR=8d2f6c1e-3b0a-4f7e-9c55-0a1b2c3d4e5f \
   -- your-command
 ```
 
+Fill it in before you run it:
+
+- `HOST`: the host of the destination, the API your program talks to, in
+  lowercase, with `:PORT` if it needs one. `BASE_PATH`: the path your
+  program's base URL needs after the host, such as `v1`; or remove
+  `/BASE_PATH`. (A `BASE_PATH` left in place is taken as that path.)
+- `TOKEN_VAR`: the variable your program reads its key from;
+  `BASE_URL_VAR`: the one it reads its base URL from.
+- `your-command`: the program.
+
+Until its destination is filled in, `rusthorse run` refuses the command:
+`https://HOST/BASE_PATH` is no destination, since a host name is written in
+lowercase.
+
 After your approval the program gets a temporary token in the first
 variable — never the key — and the broker's local address
-(`http://127.0.0.1:PORT` and the profile's base path) in the second; the
-broker adds the key to the program's requests, only to the profile's
-destination and only for the routes it allows. The token stops working when
-the command ends; meanwhile its grant is on the [Grants
-page](#grants-of-the-credential-broker). The variables are those the
-preset's libraries read, as `rusthorse guide ai` binds them, whatever the
-entry is called: `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` for
-`anthropic`, `OPENAI_API_KEY` and `OPENAI_BASE_URL` for `openai` and
-`openai-compatible`. With the token in `ANTHROPIC_API_KEY`, the variable the
-Anthropic libraries take their key from, `run` replaces any key your
-environment holds in that variable; the `anthropic` preset takes the token
-whether a library sends it as `x-api-key` or as `Authorization: Bearer`. If
-your environment also sets `ANTHROPIC_AUTH_TOKEN`, unset it
-(`env -u ANTHROPIC_AUTH_TOKEN`): a library that sends it as well presents
-something other than the token, and the broker refuses the request. The card
-of an `anthropic` entry says so.
+(`http://127.0.0.1:PORT` and the base path) in the second; its output is
+redacted. The program presents the token as it would present the key, in a
+request header (`Authorization: Bearer TOKEN`, `x-api-key: TOKEN`, …), and
+the broker puts the key in its place, only in requests to the destination's
+origin — its scheme, host and port — at any path there. That origin is what
+the agent's dialog shows you to approve; the base path only sets up the
+program's base URL and is not a limit. The token stops working when the
+command ends; meanwhile its grant is on the [Grants
+page](#grants-of-the-credential-broker). A program that encodes the token
+or derives its credential from it, or an API that signs its requests with
+the key or takes it in the URL or the body, cannot be used through the
+broker: give the program the value with the first command. Options of
+`run` set the grant's request limit, lifetime and automatic locks;
+`rusthorse guide ai` and the [CLI reference](cli.md) say more.
 
-Claude Code has a recipe of its own in `rusthorse guide ai`, which that card
-points to too: the token in `ANTHROPIC_AUTH_TOKEN`, with `ANTHROPIC_API_KEY`
-unset (`env -u ANTHROPIC_API_KEY`), and `--no-redact`, which an interactive
-program needs; the approval dialog then warns that the output is not
-filtered, so the token can reach whoever reads it. `rusthorse guide ai` and
-the [CLI reference](cli.md) say more. An entry whose profile cannot be used
-keeps the command that gives the value, and the card says so.
-
-### The broker profile
-
-An entry's broker profile says what a grant of the credential broker allows
-for it: the destination, the routes, when a grant ends and how many requests
-it admits ([ADR 0013](adr/0013-credential-broker.md)). The details show it
-under **Credential broker**, read-only: the preset and the revision of it
-you approved, then the profile as the agent's approval dialogs describe it —
-**Destination**, **Allows** (every route), **Ends** and **Requests**.
-
-Profiles are set, changed and removed in a terminal, never in the manager:
-`rusthorse edit ENTRY --broker PRESET`, with
-`--broker-origin`, `--broker-base-path`, `--broker-locks`,
-`--broker-lifetime` and `--broker-requests` for what differs from the
-preset's defaults, or `rusthorse edit ENTRY --clear broker`; the agent shows
-the whole new profile and asks you. Any change to an entry — its value,
-name, group, fields or profile — ends its grants; the **Edit** form of an
-entry with a usable profile says so.
-
-The details also say when a profile cannot be used:
-
-- **Withheld**: the KeePass file marks it as protected, so it is treated
-  like a secret, and the broker cannot use it.
-- **Unusable**: this version of Rusthorse cannot read it — another program
-  wrote it, or a newer version — and nothing guesses.
-
-In both cases the command card gives the value instead, and says why. An API
-key without a profile shows how to give it one; other entries without one
-show nothing about it.
+An entry that phase 1 of the broker gave a profile keeps it, as a custom
+field named `Rusthorse.Broker`: the details list it by name among the other
+fields, like any other, and Rusthorse never interprets it.
 
 ### Grants of the credential broker
 
 The **Grants** page lists the grants in use: one for each entry that a command
 started with `rusthorse run --broker` uses through the broker. For each, under
-its ID: the entry, the destination and preset, the command, who asked for it
+its ID: the entry; its **Approved origin**, the scheme, host and port the run
+named and you approved, where the broker may send the key at any path; apart
+from it, its **Base path** when the run named one, which sets up the
+program's base URL and is not a limit; the command, who asked for it
 (process names, which any program chooses: unverified, as in the agent's
 dialogs), the variable that holds its token, its state, when it started, when
 it ends at the latest (its maximum lifetime, in whole minutes rounded up), the
@@ -383,10 +360,11 @@ you, and one revocation at a time: the buttons are off until the agent
 answers. The agent's answer appears at the bottom of the window, as for
 other actions, and the page lists the grants again.
 
-The page works while the vault is locked, and then says so: a grant whose
-profile continues after the automatic locks — the screen locking, suspend,
-the idle timeout — keeps working while the vault is locked, until it ends.
-**Lock now** ends every grant.
+The page works while the vault is locked, and then says so: unless its run
+asked otherwise (`rusthorse run --broker-locks end`), a grant is not ended by
+the automatic locks — the screen locking, suspend, the idle timeout — and
+keeps working while the vault is locked, until it ends. **Lock now** ends
+every grant.
 
 When the grants cannot be listed, the page says why in place of the list,
 and **Revoke all** stays available: it may work all the same, and it only
@@ -462,9 +440,8 @@ names; the window then lists them, with what each would become:
 - **A .env file**: the variable names, and an optional **Prefix**.
 - For both: a **Tag** for the new entries (`imported` unless you change it),
   and **Replace entries that already exist** (off: they are skipped).
-  Replacing an entry removes its broker profile, which ends its grants (a
-  profile is set only by an edit you approve; see
-  [The broker profile](#the-broker-profile)). Each
+  Replacing an entry ends its grants of the credential broker, if it has
+  any; its other fields stay, as other KeePass clients keep them. Each
   ticked name is marked new, existing, not allowed or repeated; **Import**
   stays off while a ticked one cannot be imported.
 
@@ -518,10 +495,11 @@ the new password in its own dialogs. The manager never receives them.
 - Show and Copy are for you at the desktop. An AI agent uses
   `rusthorse run`, which keeps the value inside the approved command — or,
   better, `rusthorse run --broker`, which gives the command a token instead.
-- The Grants page and the broker profile hold no secret: the agent sends
-  neither a token nor a value with them. What a requester chose — the
-  command, the process names — is drawn as plain text, through the same
-  character filter as the agent's dialogs.
+- The Grants page and the two commands of an entry hold no secret: the
+  agent sends neither a token nor a value with the grants, and the commands
+  name the entry by its UUID. What a requester chose — the command, the
+  process names — is drawn as plain text, through the same character filter
+  as the agent's dialogs.
 - The full analysis is in [threat model L14](threat-model.md#l14--some-flows-move-values-through-the-client)
   and [ADR 0007](adr/0007-visual-manager.md#2-show-copy-and-memory).
 
@@ -537,10 +515,10 @@ real agent in the test process, on a fake vault, socket and audit log, with
 scripted dialogs; it drives the window, reads the clipboard with `xclip` as
 another program would, and focuses windows with `xdotool`. Missing tools
 (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather than
-pass untested. The Grants page and the broker profile in the details are
-tested against a fake agent in the test process instead, since a test agent
-cannot start a broker: it answers from a script, records every request, and
-can hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
+pass untested. The Grants page and an entry's two commands are tested
+against a fake agent in the test process instead, since a test agent cannot
+start a broker: it answers from a script, records every request, and can
+hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
 screenshots of the window in the light and dark styles, of the Show window,
 of the Grants page (also with a grant that ended while it was shown, and
-with a key the destination refused) and of a profile in the details.
+with a key the destination refused) and of an entry's two commands.

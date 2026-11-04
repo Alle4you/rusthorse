@@ -11,10 +11,11 @@ holds the unlocked vault. When a program — or an AI coding agent such as
 Claude Code or Codex — needs a secret, it asks the agent; **you approve the
 exact request in a dialog**, and the agent runs the command with the secret in
 its environment and redacts literal copies from the output by default. For
-HTTP API entries with a broker profile, `run --broker` instead gives the
-command a temporary token: a separate broker adds the real key only to the
-profile's destination and routes. The caller gets the result, never the
-secret. Neither mode sandboxes the command.
+an HTTP API that takes its key in a request header, `run --broker` instead
+gives the command a temporary token: the agent names the API's origin, you
+approve it, and a separate broker puts the real key where the program put
+the token, in requests to that origin only. The caller gets the result,
+never the secret. Neither mode sandboxes the command.
 
 **What it is.** Rusthorse is a credential vault prepared for AI agents. The
 secret in an entry is its value — a key, a password, a token, a
@@ -39,7 +40,7 @@ secret. A credential you take out of the vault to run something elsewhere is
 your choice, outside what it protects. No other controls are planned: no
 authorization of routes or operations, no knowledge of providers, no
 destinations or policies stored with an entry, no connectors for other
-protocols. (Phase 1's broker profiles and presets are being removed for this
+protocols. (Phase 1's broker profiles and presets were removed for this
 reason; see the [roadmap](docs/roadmap.md).)
 
 ```console
@@ -101,7 +102,8 @@ and keeps the value out of the agent's reach in the common case.
 - **Approval for every use.** Running a command with a secret, revealing a
   value, editing or deleting an entry all require your approval in a dialog
   shown by the agent — not in the terminal, where a program could answer. A
-  broker grant permits repeated API calls within its routes and limits.
+  broker grant permits repeated API calls to its approved origin, at any path
+  there, within its limits.
 - **The command you approve is the command that starts.** The agent itself
   resolves the program to an absolute path, removes dynamic-loader variables
   (`LD_PRELOAD`, …), warns about variables that can inject code
@@ -219,14 +221,14 @@ requester is an AI.
 | `agent` | Run the agent (normally via systemd) | — |
 | `status` | Agent and lock state | — |
 | `unlock` / `lock` | Unlock (master password dialog) / lock now | — |
-| `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags, broker profile | — |
+| `list`, `show NAME` | Metadata only: name, username, URL, host, port, tags | — |
 | `add NAME` | New entry; you type the value in a dialog | the dialog itself |
 | `add NAME --stdin` | New entry with a value from standard input | yes |
 | `add NAME --generate` | New entry with a random value nobody sees | yes |
-| `edit NAME …` | Change fields, tags, name, group, value or broker profile | yes |
+| `edit NAME …` | Change fields, tags, name, group or value | yes |
 | `remove NAME` | Delete an entry | yes |
 | `run SECRET… -- CMD` | Run `CMD` with secrets in its environment | yes (remembering is opt-in) |
-| `run --broker VAR=NAME… -- CMD` | Run `CMD` with a temporary token instead of an API key; Rusthorse adds the key to the requests its profile allows | yes (never remembered) |
+| `run --broker VAR=NAME@URL… -- CMD` | Run `CMD` with a temporary token instead of an API key; Rusthorse puts the key in its place in requests to the URL's origin, which you approve | yes (never remembered) |
 | `grants`, `grants revoke ID` | List the broker's grants (never a token), end one or all | — |
 | `reveal NAME [--notes]` | Print a value or the notes (for humans; avoid in automation) | yes (never remembered) |
 | `backup DEST` | Copy the encrypted vault and verify the copy opens | — |
@@ -244,18 +246,23 @@ See [docs/cli.md](docs/cli.md) for every option and the exit statuses.
 
 ## HTTP APIs through the broker
 
-After the human sets a profile with
-`rusthorse edit OPENAI_API_KEY --broker openai`, an SDK can use it without
-receiving the source key:
+An SDK can use an API key without receiving it. The run names where the key
+may go, after the `@`:
 
 ```sh
-rusthorse run --broker OPENAI_API_KEY=OPENAI_API_KEY \
+rusthorse run --broker OPENAI_API_KEY=OPENAI_API_KEY@https://api.openai.com/v1 \
   --url OPENAI_BASE_URL=OPENAI_API_KEY -- python summarize.py
 ```
 
-The approval shows the destination, routes and limits. `rusthorse grants` and
-the manager's **Grants** page list and revoke grants; `rusthorse lock` ends
-all of them. Always pair the broker token with its local base URL. See
+The approval shows the approved origin (`https://api.openai.com`), the base
+path apart from it (`/v1`, which only sets up the program's base URL and is
+not a limit: the key may go to any path at that origin) and the grant's
+limits. Nothing fills the destination in: not the entry's URL, not a
+default. The program presents the token where it would present the key, in
+a request header, and the broker puts the key in its place. `rusthorse
+grants` and the manager's **Grants** page list and revoke grants;
+`rusthorse lock` ends all of them. Always pair the broker token with its
+local base URL. See
 [the CLI reference](docs/cli.md#through-the-credential-broker---broker) and
 `rusthorse guide ai` for client-specific recipes and limitations.
 
@@ -266,8 +273,9 @@ requester — the common case with AI agents — values do not appear in the
 caller's process, output, logs or the AI's context, and every use is a
 decision you make with the exact command in front of you. For a broker
 binding, the command gets a token instead of the credential: the approval
-creates a grant, and its token permits calls within that grant's routes and
-limits while it lasts. Those calls can spend credit without another dialog.
+creates a grant, and its token permits calls to the approved origin — any
+path, any operation the key allows there — within the grant's limits while
+it lasts. Those calls can spend credit without another dialog.
 Ordinary bindings still give their values to the approved command; default
 redaction filters literal copies on stdout/stderr. It does **not** resist a
 requester that deliberately attacks it from your own user account and desktop
@@ -292,16 +300,16 @@ assumption and limitation.
 
 ## Roadmap
 
-The HTTP **credential broker's phase 1 is implemented and reviewed READY**
-(unreleased): Anthropic, OpenAI and OpenAI-compatible presets, streaming,
-profiles and grant revocation in the CLI and manager. In the manual test
-with a real key, the Python SDK worked through the broker; Claude Code's
-check was left for later. Screen-lock and suspend locking are implemented
-too. Next, the broker drops its stored profiles and presets: the agent names
-the destination in the `run`, you approve it in the dialog, and the broker
-puts the key in the request header where the program put the token,
-knowing nothing about the API. No other connector is planned: `rusthorse run` serves databases,
-devices and SSH. Published packages remain planned. See
+The HTTP **credential broker** (unreleased) has no stored profiles or
+presets: the agent names the destination in the `run`, you approve its
+origin in the dialog, and the broker puts the key in the request header
+where the program put the token, knowing nothing about the API. It relays
+streamed responses, and the CLI and the manager list and revoke its grants.
+Phase 1, with profiles and presets, was reviewed READY; in its manual test
+with a real key, the Python SDK worked through the broker, and Claude
+Code's check was left for later. Screen-lock and suspend locking are
+implemented too. No other connector is planned: `rusthorse run` serves
+databases, devices and SSH. Published packages remain planned. See
 [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing

@@ -11,7 +11,8 @@
 //! A grant's conversation:
 //!
 //! 1. The agent sends [`ToBroker::Install`] — the version, grant ID, token,
-//!    credential, profile snapshot and limits — with the listening socket.
+//!    credential, the approved origin and the limits — with the listening
+//!    socket.
 //!    The broker checks it ([`Install::validate`]) and answers
 //!    [`FromBroker::Ready`].
 //! 2. For each request that passes its own checks, the broker sends
@@ -46,11 +47,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::broker_profile::{BrokerProfile, MAX_LIFETIME_MINUTES_RANGE, is_valid_credential};
+use crate::broker_grant::{
+    MAX_LIFETIME_MINUTES_RANGE, MethodLabel, check_origin, is_valid_credential,
+};
 use crate::protocol::{self, SecretString};
 
 /// Version of this protocol. Both sides refuse any other.
-pub const VERSION: u32 = 1;
+///
+/// 2: the broker without profiles or presets (ADR 0013, scope amendment):
+/// [`Install`] carries the approved origin instead of a profile, and
+/// [`FromBroker::Admit`] the method's label instead of the method and the
+/// route.
+pub const VERSION: u32 = 2;
 
 /// File name of the broker program, which the agent looks for next to its
 /// own executable ([`helper_program::locate`](crate::helper_program::locate)).
@@ -358,13 +366,16 @@ pub struct Install {
     /// The entry's value: the credential the broker presents to the
     /// destination.
     pub credential: SecretString,
-    /// The entry's profile, as it was when the grant was created.
-    pub profile: BrokerProfile,
+    /// The approved origin: `https://`, a host name and an optional port
+    /// ([`Destination::origin`](crate::broker_grant::Destination::origin)).
+    /// The broker connects there and nowhere else, with the TLS server name
+    /// and the `Host` header taken from it.
+    pub origin: String,
     /// Most requests in flight at once ([`MAX_IN_FLIGHT`] at most).
     pub max_in_flight: u32,
     /// Most open client connections ([`MAX_CONNECTIONS`] at most).
     pub max_connections: u32,
-    /// Seconds the grant has left: at most the profile's maximum lifetime.
+    /// Seconds the grant has left: at most the run's maximum lifetime.
     /// The agent ends it then; the broker stops serving then too, should
     /// the agent's word not come.
     pub lifetime_secs: u64,
@@ -377,7 +388,7 @@ impl fmt::Debug for Install {
             .field("grant", &self.grant)
             .field("token", &"<hidden>")
             .field("credential", &"<hidden>")
-            .field("profile", &self.profile)
+            .field("origin", &self.origin)
             .field("max_in_flight", &self.max_in_flight)
             .field("max_connections", &self.max_connections)
             .field("lifetime_secs", &self.lifetime_secs)
@@ -389,9 +400,8 @@ impl Install {
     /// Check what a broker must check before serving: this protocol's
     /// version, the forms of the grant ID and of the token, a credential
     /// that can be sent in a header ([`is_valid_credential`]), a valid
-    /// profile, limits within phase 1's, and a lifetime of at most the
-    /// profile's maximum (and so at most a day). The reason never contains a
-    /// secret.
+    /// origin, limits within phase 1's, and a lifetime of at most a day. The
+    /// reason never contains a secret.
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != VERSION {
             return Err("another version of the control protocol");
@@ -405,8 +415,8 @@ impl Install {
         if !is_valid_credential(&self.credential) {
             return Err("a credential that cannot be sent in a header");
         }
-        if self.profile.validate().is_err() {
-            return Err("an unusable profile");
+        if check_origin(&self.origin).is_err() {
+            return Err("an invalid origin");
         }
         if !(1..=MAX_IN_FLIGHT).contains(&self.max_in_flight) {
             return Err("a limit of requests in flight out of range");
@@ -417,9 +427,6 @@ impl Install {
         let longest = u64::from(*MAX_LIFETIME_MINUTES_RANGE.end()) * 60;
         if !(1..=longest).contains(&self.lifetime_secs) {
             return Err("a lifetime out of range");
-        }
-        if self.lifetime_secs > u64::from(self.profile.max_lifetime_minutes) * 60 {
-            return Err("a lifetime longer than the profile allows");
         }
         Ok(())
     }
@@ -438,7 +445,7 @@ pub enum FromBroker {
         grant: String,
     },
     /// Ask to forward a request that passed the broker's own checks: its
-    /// framing, its token, its route, and its declared body length, which
+    /// framing, its token, and its declared body length, which
     /// fits [`MAX_REQUEST_BODY_BYTES`] and is already reserved from
     /// [`REQUEST_BODY_BUDGET_BYTES`]. The body itself is read only after
     /// [`ToBroker::Admitted`]; nothing is forwarded before it.
@@ -446,12 +453,9 @@ pub enum FromBroker {
         /// A number the broker gives the request, counting from 1; distinct
         /// within the grant.
         request: u64,
-        /// The request's method (`POST`).
-        method: String,
-        /// The route it matched, as
-        /// [`MatchedRoute::template`](crate::broker_profile::MatchedRoute::template)
-        /// writes it (`POST /v1/messages`): never the raw path.
-        route: String,
+        /// The label of the request's method ([`MethodLabel::of`]): never
+        /// the raw method, the path or the query.
+        method: MethodLabel,
     },
     /// An admitted request ended.
     Finished {
@@ -549,7 +553,7 @@ pub enum EndReason {
     CommandEnded,
     /// `rusthorse lock`.
     Locked,
-    /// The screen locked (a profile with automatic locks `end`).
+    /// The screen locked (a run with automatic locks `end`).
     ScreenLocked,
     /// The computer is about to suspend (automatic locks `end`).
     Suspend,
@@ -788,7 +792,6 @@ pub fn is_well_formed_grant_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker_profile::{Preset, ProfileRequest};
     use std::io::Read;
     use std::os::fd::AsFd;
 
@@ -800,9 +803,7 @@ mod tests {
             grant: new_grant_id(),
             token: new_token(),
             credential: SecretString::new(FAKE_CREDENTIAL.into()),
-            profile: ProfileRequest::new(Preset::Anthropic)
-                .resolve()
-                .expect("profile"),
+            origin: "https://api.example.com".into(),
             max_in_flight: MAX_IN_FLIGHT,
             max_connections: MAX_CONNECTIONS,
             lifetime_secs: 720 * 60,
@@ -817,8 +818,11 @@ mod tests {
             },
             FromBroker::Admit {
                 request: 1,
-                method: "POST".into(),
-                route: "POST /v1/messages".into(),
+                method: MethodLabel::Post,
+            },
+            FromBroker::Admit {
+                request: 2,
+                method: MethodLabel::Other,
             },
             FromBroker::Finished {
                 request: 1,
@@ -859,7 +863,7 @@ mod tests {
         assert_eq!(got.grant, sent.grant);
         assert_eq!(got.token.as_str(), sent.token.as_str());
         assert_eq!(got.credential.as_str(), FAKE_CREDENTIAL);
-        assert_eq!(got.profile, sent.profile);
+        assert_eq!(got.origin, sent.origin);
         assert_eq!(got.validate(), Ok(()));
         assert!(matches!(
             round_trip(&ToBroker::Admitted { request: 3 }),
@@ -891,7 +895,7 @@ mod tests {
             grant: install.grant.clone(),
             token: install.token.clone(),
             credential: install.credential.clone(),
-            profile: install.profile.clone(),
+            origin: install.origin.clone(),
             max_in_flight: install.max_in_flight,
             max_connections: install.max_connections,
             lifetime_secs: install.lifetime_secs,
@@ -902,8 +906,7 @@ mod tests {
     fn the_wire_form_is_tagged_json() {
         let frame = encode(&FromBroker::Admit {
             request: 9,
-            method: "GET".into(),
-            route: "GET /v1/models".into(),
+            method: MethodLabel::Get,
         })
         .expect("encode");
         let body = &frame[4..];
@@ -913,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(body).expect("json"),
-            serde_json::json!({"type": "admit", "request": 9, "method": "GET", "route": "GET /v1/models"})
+            serde_json::json!({"type": "admit", "request": 9, "method": "GET"})
         );
         let finished = serde_json::to_value(FromBroker::Finished {
             request: 1,
@@ -927,7 +930,8 @@ mod tests {
         assert_eq!(finished["outcome"], "client_closed");
         let install = serde_json::to_value(ToBroker::Install(install())).expect("json");
         assert_eq!(install["type"], "install");
-        assert_eq!(install["profile"]["preset"], "anthropic");
+        assert_eq!(install["origin"], "https://api.example.com");
+        assert_eq!(install["version"], 2);
     }
 
     #[test]
@@ -977,19 +981,18 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(!err.to_string().contains("kkkk"), "{err}");
         // The largest body that fits does.
-        let route = "x".repeat(MAX_FRAME - 100);
-        let mut fits = FromBroker::Admit {
-            request: 1,
-            method: "POST".into(),
-            route,
-        };
-        let len = serde_json::to_vec(&fits).expect("json").len();
-        if let FromBroker::Admit { route, .. } = &mut fits {
-            route.push_str(&"x".repeat(MAX_FRAME - len));
-        }
-        let frame = encode(&fits).expect("exactly the limit");
+        let mut fits = install();
+        fits.credential = SecretString::default();
+        let len = serde_json::to_vec(&ToBroker::Install(install_copy(&fits)))
+            .expect("json")
+            .len();
+        fits.credential = SecretString::new("k".repeat(MAX_FRAME - len));
+        let frame = encode(&ToBroker::Install(install_copy(&fits))).expect("exactly the limit");
         assert_eq!(frame.len(), 4 + MAX_FRAME);
-        assert_eq!(round_trip(&fits), fits);
+        let ToBroker::Install(back) = round_trip(&ToBroker::Install(fits)) else {
+            panic!("not an install")
+        };
+        assert_eq!(back.credential.len(), MAX_FRAME - len);
 
         // Too large to receive: refused from the header alone, before the
         // body is read (none is sent here, and reading does not wait).
@@ -1058,8 +1061,9 @@ mod tests {
         let mut extra = good.clone();
         extra["surprise"] = serde_json::json!(1);
         assert!(serde_json::from_value::<ToBroker>(extra).is_err());
+        // Version 1's profile is no field of an install.
         let mut profile = good.clone();
-        profile["profile"]["routes"] = serde_json::json!(["POST /v1/files"]);
+        profile["profile"] = serde_json::json!({"preset": "anthropic"});
         assert!(serde_json::from_value::<ToBroker>(profile).is_err());
         let mut missing = good;
         missing
@@ -1088,7 +1092,9 @@ mod tests {
         }
         for bad in [
             &br#"{"type":"ready","version":1,"grant":"g1","extra":1}"#[..],
-            br#"{"type":"admit","request":1,"method":"POST","route":"POST /v1/messages","path":"/v1/messages"}"#,
+            br#"{"type":"admit","request":1,"method":"POST","route":"POST /v1/messages"}"#,
+            br#"{"type":"admit","request":1,"method":"PROPFIND"}"#,
+            br#"{"type":"admit","request":1,"method":"post"}"#,
             br#"{"type":"finished","request":1,"outcome":"done","bytes_sent":0,"bytes_received":0}"#,
             br#"{"type":"finished","request":1,"outcome":"completed","status":70000,"bytes_sent":0,"bytes_received":0}"#,
             br#"{"type":"finished","request":1,"outcome":"completed","bytes_sent":0}"#,
@@ -1152,8 +1158,14 @@ mod tests {
             ("line break", |i| {
                 i.credential = SecretString::new("sk-1234\r\nb".into())
             }),
-            ("profile", |i| i.profile.max_lifetime_minutes = 0),
-            ("revision", |i| i.profile.revision = 99),
+            ("http origin", |i| {
+                i.origin = "http://api.example.com".into()
+            }),
+            ("origin with a path", |i| {
+                i.origin = "https://api.example.com/v1".into()
+            }),
+            ("address", |i| i.origin = "https://127.0.0.1".into()),
+            ("no origin", |i| i.origin = String::new()),
             ("none in flight", |i| i.max_in_flight = 0),
             ("too many in flight", |i| {
                 i.max_in_flight = MAX_IN_FLIGHT + 1
@@ -1162,13 +1174,6 @@ mod tests {
             ("too many connections", |i| i.max_connections = 65),
             ("no lifetime", |i| i.lifetime_secs = 0),
             ("more than a day", |i| i.lifetime_secs = 24 * 3600 + 1),
-            ("longer than the profile", |i| {
-                i.lifetime_secs = u64::from(i.profile.max_lifetime_minutes) * 60 + 1
-            }),
-            ("a day, with a shorter profile", |i| {
-                i.profile.max_lifetime_minutes = 60;
-                i.lifetime_secs = 24 * 3600;
-            }),
         ];
         for (what, spoil) in cases {
             let mut install = install();

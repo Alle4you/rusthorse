@@ -50,20 +50,26 @@ pub enum Refusal {
     Origin,
     /// A `Connection` header naming anything but `close` or `keep-alive`.
     Connection,
-    /// A body on a route without one.
-    BodyNotAllowed,
-    // Step 2.
-    /// No token, or not this grant's.
+    // Step 2, the token.
+    /// No header value the broker forwards holds this grant's token.
     Token,
-    // Step 3.
-    /// Not exactly a route of the preset.
-    Route,
-    // Step 4.
+    /// A token-shaped string in the method, the target, a header name, or a
+    /// header the broker drops or rebuilds.
+    TokenMisplaced,
+    /// A token-shaped string in a header value that is not this grant's
+    /// token byte for byte.
+    ForeignToken,
+    /// The header block, the key in place of the token, larger than
+    /// `MAX_REQUEST_HEADER_BYTES`.
+    HeadTooLarge,
+    /// The key itself in the request's head.
+    KeyInRequest,
+    // Step 3, room for the body.
     /// A body larger than `MAX_REQUEST_BODY_BYTES`.
     BodyTooLarge,
     /// No room for the body in the broker's budget.
     NoRoom,
-    // Step 5.
+    // Step 4, the admission.
     /// The grant was revoked (by the agent, or it is being revoked).
     Revoked,
     /// The grant's lifetime has passed.
@@ -74,13 +80,13 @@ pub enum Refusal {
     TooManyInFlight,
     /// The admission could not be recorded.
     AuditFailed,
-    // Step 6.
+    // Step 5.
     /// The admitted request's body did not arrive in time.
     BodyTimeout,
-    // Step 7.
+    // Step 6.
     /// Resolving, connecting or the TLS handshake failed: nothing was sent.
     Unreachable,
-    // Step 8, and failures after the request may have been sent.
+    // Step 7, and failures after the request may have been sent.
     /// The destination answered with a redirect.
     Redirect,
     /// The destination's response has a content or transfer coding the
@@ -100,10 +106,12 @@ impl Refusal {
         use Refusal::*;
         match self {
             Version => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
-            Method | Target | Host | TransferEncoding | Upgrade | Origin | Connection
-            | BodyNotAllowed => StatusCode::BAD_REQUEST,
-            Token => StatusCode::UNAUTHORIZED,
-            Route => StatusCode::NOT_FOUND,
+            Method | Target | Host | TransferEncoding | Upgrade | Origin | Connection => {
+                StatusCode::BAD_REQUEST
+            }
+            Token | TokenMisplaced | ForeignToken | HeadTooLarge | KeyInRequest => {
+                StatusCode::UNAUTHORIZED
+            }
             BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             NoRoom | AuditFailed => StatusCode::SERVICE_UNAVAILABLE,
             Revoked | Expired | Exhausted => StatusCode::FORBIDDEN,
@@ -130,9 +138,11 @@ impl Refusal {
             Upgrade => "protocol upgrades are not served",
             Origin => "requests with an Origin header are not served",
             Connection => "the Connection header may only name close or keep-alive",
-            BodyNotAllowed => "this route takes no request body",
-            Token => "the request does not present this grant's token",
-            Route => "this route is not allowed by the grant",
+            Token => "the request does not present this grant's token in a header value",
+            TokenMisplaced => "a token may only be in the value of a header the broker forwards",
+            ForeignToken => "the request holds a token that is not this grant's, byte for byte",
+            HeadTooLarge => "the request's headers are larger than 32 KiB with the key in them",
+            KeyInRequest => "the request holds the key itself; present the grant's token instead",
             BodyTooLarge => "the request body is larger than 16 MiB",
             NoRoom => "the broker holds too many request bodies; retry later",
             Revoked => {
@@ -195,7 +205,6 @@ impl Refusal {
                 | Upgrade
                 | Origin
                 | Connection
-                | BodyNotAllowed
                 | BodyTooLarge
                 | BodyTimeout
         )
@@ -358,7 +367,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
-    const ALL: [Refusal; 25] = [
+    const ALL: [Refusal; 27] = [
         Refusal::Version,
         Refusal::Method,
         Refusal::Target,
@@ -367,9 +376,11 @@ mod tests {
         Refusal::Upgrade,
         Refusal::Origin,
         Refusal::Connection,
-        Refusal::BodyNotAllowed,
         Refusal::Token,
-        Refusal::Route,
+        Refusal::TokenMisplaced,
+        Refusal::ForeignToken,
+        Refusal::HeadTooLarge,
+        Refusal::KeyInRequest,
         Refusal::BodyTooLarge,
         Refusal::NoRoom,
         Refusal::Revoked,
@@ -397,13 +408,20 @@ mod tests {
             Refusal::Upgrade,
             Refusal::Origin,
             Refusal::Connection,
-            Refusal::BodyNotAllowed,
         ] {
             assert_eq!(status(framing), 400, "{framing:?}");
         }
         assert_eq!(status(Refusal::Version), 505);
-        assert_eq!(status(Refusal::Token), 401);
-        assert_eq!(status(Refusal::Route), 404);
+        for token in [
+            Refusal::Token,
+            Refusal::TokenMisplaced,
+            Refusal::ForeignToken,
+            Refusal::HeadTooLarge,
+            Refusal::KeyInRequest,
+        ] {
+            assert_eq!(status(token), 401, "{token:?}");
+            assert!(!token.closes(), "{token:?}");
+        }
         assert_eq!(status(Refusal::BodyTooLarge), 413);
         assert_eq!(status(Refusal::NoRoom), 503);
         for ended in [Refusal::Revoked, Refusal::Expired, Refusal::Exhausted] {

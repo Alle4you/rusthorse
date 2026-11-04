@@ -25,14 +25,18 @@ features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
 
-**Phase 1 implemented, tested and reviewed READY (2026-11-03), unreleased.**
-[ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker;
-its later phases are dropped, and the broker is next made simpler (below). The manual check with the maintainer's credentials
-began on 2026-11-04: the Anthropic Python SDK worked through the broker
-for the requests tried; Claude Code's requests went through it, and the
-API answered them `400`, as it answered SDK requests with some of Claude
-Code's parameters sent with the key by value; the maintainer left its
-check for later. No client version is claimed supported yet.
+**Done, unreleased.** Phase 1 was reviewed READY on 2026-11-03.
+[ADR 0013](adr/0013-credential-broker.md) defines the HTTP broker; its later
+phases are dropped, and its
+[scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)
+(2026-11-04) replaced phase 1's profiles and presets with a destination named
+in each run (below). The manual check with the maintainer's credentials began on
+2026-11-04, with phase 1's broker: the Anthropic Python SDK worked through
+the broker for the requests tried; Claude Code's requests went through it,
+and the API answered them `400`, as it answered SDK requests with some of
+Claude Code's parameters sent with the key by value; the maintainer left
+its check for later. The broker without profiles has not been tried by
+hand yet. No client version is claimed supported yet.
 
 ### Why
 
@@ -43,63 +47,66 @@ to a file or send it anywhere (threat model [L3, L4 and L5](threat-model.md)).
 Redaction only catches the literal value in the output, and approval only
 helps if the human reads the command.
 
-For a broker binding, phase 1 removes the secret from the approved command:
-the command receives a **temporary token** that no provider accepts — it works
-only through the Rusthorse broker, within its scope and while it is valid (a
-stolen token still works there until then) — and the broker uses the real
-credential on the command's behalf.
+For a broker binding, the broker removes the secret from the approved
+command: the command receives a **temporary token** that no provider
+accepts — it works only through the Rusthorse broker, at the approved origin
+and while it is valid (a stolen token still works there until then) — and
+the broker uses the real credential on the command's behalf.
 
 ### Design
 
-1. **Approval mints a capability token.** In phase 1,
-   `rusthorse run --broker VAR=ENTRY --url URLVAR=ENTRY -- command` gives the
-   approved command a random token (`rh_…`, 256 bits) in the variable where
-   the secret would have gone, and the broker's address. The token is bound to
-   one entry, a snapshot of its stored profile (HTTPS origin, base path and
-   exact preset routes), a maximum lifetime and an optional request count. One
-   `rusthorse-broker` process serves each grant. Command end always revokes
-   its grants; no grant outlives that run.
-2. **The broker checks the token on every request** and refuses anything
-   outside its scope. `rusthorse lock` revokes every grant at once. Automatic
-   locks follow the profile (`continue`, 12 hours by default for AI presets),
-   except that every lock ends grants still being prepared. Revocation ends
-   open streams as well as new admissions; requests already sent can still
-   take effect at the destination.
+1. **Approval mints a capability token.**
+   `rusthorse run --broker VAR=ENTRY@URL --url URLVAR=ENTRY -- command` gives
+   the approved command a random token (`rh_…`, 256 bits) in the variable
+   where the secret would have gone, and the broker's address with the URL's
+   base path. The token is bound to one entry, the URL's origin as the human
+   approved it, a maximum lifetime and an optional request count, which the
+   run sets (`--broker-lifetime`, `--broker-requests`, `--broker-locks`; no
+   limit, 12 hours and `continue` unless it says otherwise). Nothing is
+   stored with the entry, and nothing fills the destination in: there is no
+   default and no fallback to the entry's URL. One `rusthorse-broker` process
+   serves each grant. Command end always revokes its grants; no grant
+   outlives that run.
+2. **The broker checks the token on every request.** The program presents
+   it where it would present the key, in a request header; the broker puts
+   the key in its place and forwards the request to the approved origin,
+   at any path there, over verified TLS, and redacts the key from what comes
+   back. It refuses a request without the token in a header it forwards,
+   with the token anywhere else in the head, with another token or with the
+   key itself. It knows nothing about the API: no presets, routes or header
+   lists. An API that signs its requests with the key, or takes it in the
+   URL or the body, is used with `run` instead. `rusthorse lock` revokes
+   every grant at once. Automatic locks follow the run's policy, except that
+   every lock ends grants still being prepared. Revocation ends open streams
+   as well as new admissions; requests already sent can still take effect at
+   the destination.
 3. **The broker listens on loopback TCP (`127.0.0.1`)**, requiring the token.
    The supported clients can select a base URL but not a Unix socket from
    their environment. TCP carries no peer credentials; a same-user process can
    steal a command's token and use it while valid. A Unix socket listener is
    not planned.
 4. **Every admitted request is audited** under the grant's public ID, before
-   forwarding — never the token itself. The record contains the method and
-   route template, not a raw path, query or body. The agent serializes
-   admission so concurrent requests cannot exceed the request limit; exhausted
-   grants let admitted requests finish. Phase 1 allows 16 requests in flight
-   per grant and at most 16 grants in the registry. Refusals are counted;
-   completion/end records are best effort.
-5. **The dialog says what the token allows**: destination, every route,
-   lifetime, automatic-lock policy, request count and concurrency, with the
-   exact command. It warns that allowed calls can spend credit and bodies are
-   not inspected. The CLI and manager list and revoke grants even while the
-   vault is locked. Profiles are edited through an approved CLI request; there
-   is no fallback to the real key when a grant cannot start.
+   forwarding — never the token itself. The record contains the method's
+   label (`GET`, `POST`, …, `OTHER`), not the raw method, path, query or
+   body. The agent serializes admission so concurrent requests cannot exceed
+   the request limit; exhausted grants let admitted requests finish. 16
+   requests may be in flight per grant and at most 16 grants in the
+   registry. Refusals are counted; completion/end records are best effort.
+5. **The dialog says what the token allows**: the approved origin, the base
+   path apart from it (not a limit: the key may go to any path at the
+   origin), lifetime, automatic-lock policy, request count and concurrency,
+   with the exact command. It warns that allowed calls can spend credit and
+   bodies are not inspected. The CLI and manager list and revoke grants even
+   while the vault is locked. There is no fallback to the real key when a
+   grant cannot start.
 
-### Next: no profiles, no presets
-
-The secret in an entry is its value; its other fields are context. An agent that
-uses an API key through the broker says where it will use it, and the human
-approves that in the dialog. So the broker loses what phase 1 stores and
-knows: entries no longer carry a broker profile, and the code no longer
-knows presets, routes or headers. The agent names the destination in
-`run --broker`, with the request limit and lifetime it wants (within
-defaults); the dialog shows them; the program presents the token in the
-request header where it would present the key, and the broker puts the key
-in its place and forwards the request to the approved destination, over
-verified TLS, redacting the key from what comes back. An API that signs its
-requests with the key, or takes it in the URL or the body, is used with
-`run` instead. Phase 1's stored profiles stop being used — a profile is
-never widened without an approval — and nothing replaces them. This is
-specified in ADR 0013's scope amendment and reviewed before any code.
+Phase 1's broker had per-entry profiles and built-in presets (routes and
+header lists for Anthropic, OpenAI and OpenAI-compatible APIs). The
+[scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)
+removed them: the secret in an entry is its value, its other fields are
+context, and the agent says where it will use a key, which the human
+approves. A profile phase 1 stored in an entry (`Rusthorse.Broker`) stays
+there as an ordinary custom field, never read, migrated or widened.
 
 ### Not planned
 
@@ -133,12 +140,12 @@ the approved command.
 
 ### Limits
 
-- **A token is usable while it is valid.** Whoever holds it can call the
-  allowed destination within its scope and lifetime. The broker removes direct
-  delivery of the credential and fixes its destination; it does not prevent
-  misuse of permitted operations during the window. Keep scopes narrow,
-  lifetimes short and provider-side spending limits in place: a request count
-  is not a spending limit.
+- **A token is usable while it is valid.** Whoever holds it can call any
+  path at the approved origin within its limits and lifetime. The broker
+  removes direct delivery of the credential and fixes its destination to the
+  approved origin; it does not narrow what the key can do there (threat
+  model L25). Keep keys narrow, lifetimes short and provider-side spending
+  limits in place: a request count is not a spending limit.
 - **The client must be redirectable**: a configurable base URL. The broker
   is a reverse HTTP proxy, not a generic forward proxy. Intercepting TLS with a
   local certificate authority stays out of scope: fragile and invasive.
@@ -159,12 +166,12 @@ the approved command.
 ### Decisions and next steps
 
 ADR 0013 answers phase 1's original questions: revocation cuts open streams;
-the agent serializes counted admissions; routing and DNS are constrained; and
-the local hop authenticates a token, not a process identity. Phase 1 is
-implemented and reviewed; in its manual check the Python SDK worked, and
-Claude Code's check was left for later. Next is the broker without
-profiles or presets (above), designed and reviewed before any code; nothing
-else is planned for the broker.
+the agent serializes counted admissions; the destination and DNS are
+constrained; and the local hop authenticates a token, not a process
+identity. Phase 1 was implemented and reviewed; in its manual check the
+Python SDK worked, and Claude Code's check was left for later. The broker
+without profiles or presets (above) replaced it; a manual check of it with
+real clients remains. Nothing else is planned for the broker.
 
 ## Desktop and usability
 

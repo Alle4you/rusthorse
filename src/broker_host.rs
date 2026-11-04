@@ -69,7 +69,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::audit::{AuditEvent, AuditRequestCounts};
-use crate::broker_profile::{AutomaticLocks, BrokerProfile};
+use crate::broker_grant::{self, AutomaticLocks, Destination, GrantLimits, MethodLabel};
 use crate::broker_protocol::{
     self, AdmissionRefusal, EXIT_KILL_DELAY, EndReason, FromBroker, Install, MAX_GRANTS,
     MAX_IN_FLIGHT, REVOKE_CONFIRM_TIMEOUT, RequestOutcome, ToBroker,
@@ -193,13 +193,16 @@ pub(crate) struct NewGrant {
     pub(crate) entry: String,
     /// The variable that holds the token in the command.
     pub(crate) var: String,
-    /// The entry's profile, as it was when the grant was created.
-    pub(crate) profile: BrokerProfile,
+    /// Where it sends the key: the approved origin, and the base path of
+    /// the command's base URL.
+    pub(crate) destination: Destination,
+    /// Its run's limits.
+    pub(crate) limits: GrantLimits,
     /// The command, as a shell would read it.
     pub(crate) command: String,
     /// Who asked for it, as dialogs describe the requester.
     pub(crate) requester: String,
-    /// How long it may last: the profile's maximum lifetime (shorter only in
+    /// How long it may last: the run's maximum lifetime (shorter only in
     /// tests).
     pub(crate) lifetime: Duration,
 }
@@ -425,7 +428,8 @@ struct Grant {
     /// The run it belongs to.
     run: u64,
     var: String,
-    profile: BrokerProfile,
+    destination: Destination,
+    limits: GrantLimits,
     command: String,
     /// When it was created, RFC 3339, local time.
     started: String,
@@ -454,9 +458,9 @@ struct Grant {
     /// use and a slot. The audit thread answers each once its record is
     /// written; a revocation answers those still waiting at once.
     waiting: BTreeSet<u64>,
-    /// Admitted requests whose end is not reported yet, by number: their
-    /// route.
-    open: BTreeMap<u64, String>,
+    /// Admitted requests whose end is not reported yet, by number: the
+    /// label of their method.
+    open: BTreeMap<u64, MethodLabel>,
     /// The number of the last request the broker asked to admit.
     last_admit: u64,
     /// Its broker, from the moment its process exists: entered, and sent its
@@ -494,7 +498,7 @@ impl Grant {
     /// the admitted and waiting requests hold leave one for it.
     fn admissible(&self, now: BootInstant) -> Result<(), AdmissionRefusal> {
         self.admitting(now)?;
-        if let Some(limit) = self.profile.max_requests
+        if let Some(limit) = self.limits.max_requests
             && self.admitted + self.waiting.len() as u64 >= limit
         {
             return Err(AdmissionRefusal::Exhausted);
@@ -558,11 +562,11 @@ struct EndRecord {
 enum Job {
     /// Record an admission the reader reserved, then decide on it and
     /// answer it — unless a revocation answered it meanwhile.
-    Admit { request: u64, route: String },
+    Admit { request: u64, method: MethodLabel },
     /// Record the end of an admitted request.
     Finished {
         request: u64,
-        route: String,
+        method: MethodLabel,
         outcome: RequestOutcome,
         status: Option<u16>,
         bytes_sent: u64,
@@ -591,8 +595,8 @@ pub(crate) enum Which<'a> {
     /// Every grant.
     All,
     /// Those an automatic lock — the screen lock, a suspend, the idle
-    /// timeout — ends: those whose profile says that the automatic locks
-    /// end them, and every grant still starting, whatever its profile. A
+    /// timeout — ends: those whose run says that the automatic locks
+    /// end them, and every grant still starting, whatever its run says. A
     /// run's grants are entered under the lock that reads its credentials,
     /// so a lock comes either before (the run fails, nothing was read) or
     /// after, and then ends them (ADR 0013, preparing a run's grants).
@@ -613,7 +617,7 @@ impl Which<'_> {
             Which::All => true,
             Which::AutomaticLock => {
                 grant.state == State::Starting
-                    || grant.profile.automatic_locks == AutomaticLocks::End
+                    || grant.limits.automatic_locks == AutomaticLocks::End
             }
             Which::Run(run) => grant.run == *run,
             Which::Entries(uuids) => uuids.iter().any(|uuid| *uuid == grant.meta.entry_uuid),
@@ -771,18 +775,19 @@ impl Registry {
                 id: g.meta.id.clone(),
                 entry: g.meta.entry.clone(),
                 var: g.var.clone(),
-                destination: g.profile.destination(),
-                preset: g.profile.preset,
+                destination: g.destination.origin.clone(),
+                base_path: (!g.destination.base_path.is_empty())
+                    .then(|| g.destination.base_path.clone()),
                 command: g.command.clone(),
                 requester: g.meta.requester.clone(),
                 state: g.state.as_str().to_string(),
                 started: g.started.clone(),
                 ends_in_secs: now.until(g.deadline).as_secs(),
                 requests: g.admitted,
-                max_requests: g.profile.max_requests,
+                max_requests: g.limits.max_requests,
                 in_flight: u32::try_from(g.in_flight()).unwrap_or(u32::MAX),
                 unauthorized: Some(g.unauthorized.load(Ordering::Relaxed)),
-                automatic_locks: g.profile.automatic_locks,
+                automatic_locks: g.limits.automatic_locks,
             })
             .collect()
     }
@@ -816,7 +821,7 @@ impl Registry {
             reports.push(GrantReport {
                 var: new.var.clone(),
                 entry: new.entry.clone(),
-                destination: new.profile.destination(),
+                destination: new.destination.origin.clone(),
                 unauthorized: Arc::clone(&unauthorized),
             });
             let grant = Grant {
@@ -829,7 +834,8 @@ impl Registry {
                 seq,
                 run,
                 var: new.var,
-                profile: new.profile,
+                destination: new.destination,
+                limits: new.limits,
                 command: new.command,
                 started: started.clone(),
                 deadline: now.after(new.lifetime),
@@ -1317,29 +1323,15 @@ impl Registry {
         match message {
             // The first was the answer to the install.
             FromBroker::Ready { .. } => Err(()),
-            FromBroker::Admit {
-                request,
-                method,
-                route,
-            } => {
+            FromBroker::Admit { request, method } => {
                 if Some(request) != grant.last_admit.checked_add(1) {
-                    return Err(());
-                }
-                // Only a route of the grant's own profile, written as audit
-                // records write it: never a raw path.
-                let known = grant
-                    .profile
-                    .spec()
-                    .route(&route)
-                    .is_some_and(|r| r.method == method);
-                if !known {
                     return Err(());
                 }
                 grant.last_admit = request;
                 match grant.admissible(BootInstant::now()) {
                     Ok(()) => {
                         grant.waiting.insert(request);
-                        Ok(Next::Job(Job::Admit { request, route }))
+                        Ok(Next::Job(Job::Admit { request, method }))
                     }
                     Err(reason) => {
                         grant.refused += 1;
@@ -1354,7 +1346,7 @@ impl Registry {
                 bytes_sent,
                 bytes_received,
             } => {
-                let route = grant.open.remove(&request).ok_or(())?;
+                let method = grant.open.remove(&request).ok_or(())?;
                 grant.finished += 1;
                 // The destination's answer, whatever became of the request
                 // after its head arrived: the broker's own statuses are 408,
@@ -1365,7 +1357,7 @@ impl Registry {
                 }
                 Ok(Next::Job(Job::Finished {
                     request,
-                    route,
+                    method,
                     outcome,
                     status,
                     bytes_sent,
@@ -1411,10 +1403,10 @@ impl Registry {
     fn record_jobs(self: &Arc<Self>, meta: &GrantMeta, link: &Link, queue: mpsc::Receiver<Job>) {
         for job in queue {
             match job {
-                Job::Admit { request, route } => self.admit(meta, link, request, &route),
+                Job::Admit { request, method } => self.admit(meta, link, request, method),
                 Job::Finished {
                     request,
-                    route,
+                    method,
                     outcome,
                     status,
                     bytes_sent,
@@ -1422,7 +1414,7 @@ impl Registry {
                 } => {
                     let mut event = meta.event("broker_request", outcome.as_str());
                     event.request = Some(request);
-                    event.route = Some(route);
+                    event.method = Some(method.as_str().into());
                     event.status = status;
                     event.bytes_sent = Some(bytes_sent);
                     event.bytes_received = Some(bytes_received);
@@ -1454,7 +1446,7 @@ impl Registry {
     /// admission record durably; check both again; answer. A revocation may
     /// answer it at any moment before the last check, and then nothing more
     /// is sent.
-    fn admit(&self, meta: &GrantMeta, link: &Link, request: u64, route: &str) {
+    fn admit(&self, meta: &GrantMeta, link: &Link, request: u64, method: MethodLabel) {
         // Ended or expired since it was reserved: refused, and not recorded.
         let early = {
             let mut inner = self.inner();
@@ -1477,9 +1469,9 @@ impl Registry {
         }
         let mut event = meta.event("broker_request", "admitted");
         event.request = Some(request);
-        event.route = Some(route.to_string());
+        event.method = Some(method.as_str().into());
         let recorded = self.audit.record(&event).is_ok();
-        let answer = self.admission(meta, request, route, recorded);
+        let answer = self.admission(meta, request, method, recorded);
         if recorded && !matches!(answer, Some(ToBroker::Admitted { .. })) {
             // Its admission was recorded, and then the grant ended: the
             // record of its end says that it was not forwarded.
@@ -1487,7 +1479,7 @@ impl Registry {
                 .event("broker_request", RequestOutcome::NotForwarded.as_str())
                 .detail("refused: the grant ended while its admission was being recorded");
             event.request = Some(request);
-            event.route = Some(route.to_string());
+            event.method = Some(method.as_str().into());
             let _ = self.audit.record(&event);
         }
         if let Some(answer) = answer {
@@ -1503,7 +1495,7 @@ impl Registry {
         &self,
         meta: &GrantMeta,
         request: u64,
-        route: &str,
+        method: MethodLabel,
         recorded: bool,
     ) -> Option<ToBroker> {
         let mut inner = self.inner();
@@ -1522,9 +1514,9 @@ impl Registry {
             return refused(reason);
         }
         grant.admitted += 1;
-        grant.open.insert(request, route.to_string());
+        grant.open.insert(request, method);
         if grant
-            .profile
+            .limits
             .max_requests
             .is_some_and(|limit| grant.admitted >= limit)
         {
@@ -1693,7 +1685,7 @@ impl RunGrants {
     }
 
     /// The seconds the grant `id` has left, for its install: at least 1, at
-    /// most its profile's maximum lifetime.
+    /// most its run's maximum lifetime.
     pub(crate) fn lifetime_secs(&self, id: &str) -> u64 {
         let inner = self.registry.inner();
         let Some(grant) = inner.grants.get(id) else {
@@ -1701,7 +1693,11 @@ impl RunGrants {
         };
         let left = BootInstant::now().until(grant.deadline);
         let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-        secs.clamp(1, u64::from(grant.profile.max_lifetime_minutes) * 60)
+        // At least a second either way, whatever the limits say.
+        secs.clamp(
+            1,
+            (u64::from(grant.limits.max_lifetime_minutes) * 60).max(1),
+        )
     }
 
     /// Start a broker for each of `installs` (one per grant of the run, in
@@ -1948,29 +1944,39 @@ fn await_ready(link: &Link, grant: &str, deadline: Instant) -> Result<(), String
     }
 }
 
-/// What a broker run's approval dialog shows for one grant (ADR 0013,
-/// decision 7): which variables get the token and the broker's address, for
-/// which entry, then the whole profile ([`BrokerProfile::describe`]).
+/// What a broker run's approval dialog shows for one grant (ADR 0013, scope
+/// amendment): which variables get the token and the broker's address, for
+/// which entry, then where the key may go and the run's limits
+/// ([`broker_grant::describe`]).
 pub(crate) fn grant_details(
     var: &str,
     url_var: Option<&str>,
     entry: &str,
-    profile: &BrokerProfile,
+    destination: &Destination,
+    limits: &GrantLimits,
 ) -> Vec<(String, String)> {
     let mut receives = format!("{var} ← a token for {entry}");
     if let Some(url_var) = url_var {
         receives.push_str(&format!("; {url_var} ← the broker's address"));
     }
     let mut details = vec![("Grant".to_string(), receives)];
-    details.extend(profile.describe());
+    details.extend(broker_grant::describe(destination, limits));
     details
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker_profile::{Preset, ProfileRequest};
     use std::os::fd::AsFd;
+
+    /// Write `message` on the broker's side of the channel as it is, framed:
+    /// what a broken broker might send.
+    fn send_raw(broker: &FakeBroker, message: serde_json::Value) {
+        use std::io::Write;
+        let frame = broker_protocol::encode(&message).expect("encode");
+        let writer = broker.writer.lock().expect("lock");
+        let _ = (&*writer).write_all(&frame);
+    }
 
     /// How long a test waits for something that should happen at once.
     const PATIENCE: Duration = Duration::from_secs(10);
@@ -2066,19 +2072,19 @@ mod tests {
         }
     }
 
-    fn anthropic() -> BrokerProfile {
-        ProfileRequest::new(Preset::Anthropic)
-            .resolve()
-            .expect("profile")
+    /// Where the grants of these tests send their key.
+    fn destination() -> Destination {
+        Destination::parse("https://api.example.com/v1").expect("destination")
     }
 
-    fn new_grant(id: &str, entry: &str, profile: BrokerProfile, lifetime: Duration) -> NewGrant {
+    fn new_grant(id: &str, entry: &str, limits: GrantLimits, lifetime: Duration) -> NewGrant {
         NewGrant {
             id: id.into(),
             entry_uuid: format!("uuid-of-{entry}"),
             entry: format!("{entry} (uuid-of-)"),
             var: "ANTHROPIC_API_KEY".into(),
-            profile,
+            destination: destination(),
+            limits,
             command: "claude".into(),
             requester: "rusthorse[1] ← bash[2]".into(),
             lifetime,
@@ -2226,13 +2232,8 @@ mod tests {
             self.received.recv_timeout(PATIENCE).expect("a message")
         }
 
-        fn admit(&self, request: u64, route: &str) -> ToBroker {
-            let method = route.split(' ').next().unwrap_or_default().to_string();
-            self.send(&FromBroker::Admit {
-                request,
-                method,
-                route: route.into(),
-            });
+        fn admit(&self, request: u64, method: MethodLabel) -> ToBroker {
+            self.send(&FromBroker::Admit { request, method });
             self.next()
         }
 
@@ -2264,7 +2265,7 @@ mod tests {
         }
     }
 
-    /// A registry with one active grant of `profile`, whose broker the
+    /// A registry with one active grant with `limits`, whose broker the
     /// returned [`FakeBroker`] plays.
     struct Setup {
         log: Arc<Log>,
@@ -2275,7 +2276,7 @@ mod tests {
     }
 
     fn setup_with(
-        profile: BrokerProfile,
+        limits: GrantLimits,
         lifetime: Duration,
         confirm: Confirm,
         refused: u64,
@@ -2284,7 +2285,7 @@ mod tests {
         let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
         let id = broker_protocol::new_grant_id();
         let run = registry
-            .enter(vec![new_grant(&id, "KEY", profile, lifetime)])
+            .enter(vec![new_grant(&id, "KEY", limits, lifetime)])
             .expect("enter");
         run.mark_created(&id);
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
@@ -2300,7 +2301,12 @@ mod tests {
     }
 
     fn setup() -> Setup {
-        setup_with(anthropic(), Duration::from_secs(3600), Confirm::AtOnce, 0)
+        setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(3600),
+            Confirm::AtOnce,
+            0,
+        )
     }
 
     fn admitted(request: u64) -> String {
@@ -2327,9 +2333,9 @@ mod tests {
     #[test]
     fn the_destinations_401_answers_are_counted_and_reported_by_the_run() {
         let s = setup();
-        let route = "POST /v1/messages";
+        let method = MethodLabel::Post;
         for n in 1..=5 {
-            assert_eq!(format!("{:?}", s.broker.admit(n, route)), admitted(n));
+            assert_eq!(format!("{:?}", s.broker.admit(n, method)), admitted(n));
         }
         assert_eq!(info(&s.registry, &s.id).unauthorized, Some(0));
         s.broker
@@ -2362,13 +2368,14 @@ mod tests {
             [UnauthorizedGrant {
                 var: "ANTHROPIC_API_KEY".into(),
                 entry: "KEY (uuid-of-)".into(),
-                destination: "https://api.anthropic.com".into(),
+                // The approved origin, without the base path.
+                destination: "https://api.example.com".into(),
                 requests: 3,
             }]
         );
         // A run whose destination answered no 401 reports nothing.
         let s = setup();
-        assert_eq!(format!("{:?}", s.broker.admit(1, route)), admitted(1));
+        assert_eq!(format!("{:?}", s.broker.admit(1, method)), admitted(1));
         s.broker.finish(1, RequestOutcome::Completed);
         wait_for(|| (info(&s.registry, &s.id).in_flight == 0).then_some(()));
         let Setup { mut run, .. } = s;
@@ -2383,9 +2390,9 @@ mod tests {
     #[test]
     fn requests_are_admitted_in_order_within_the_limit_in_flight() {
         let s = setup();
-        let route = "POST /v1/messages";
+        let method = MethodLabel::Post;
         for n in 1..=u64::from(MAX_IN_FLIGHT) {
-            assert_eq!(format!("{:?}", s.broker.admit(n, route)), admitted(n));
+            assert_eq!(format!("{:?}", s.broker.admit(n, method)), admitted(n));
         }
         let info_now = info(&s.registry, &s.id);
         assert_eq!(info_now.in_flight, MAX_IN_FLIGHT);
@@ -2393,7 +2400,7 @@ mod tests {
         // One more is refused, and costs nothing.
         let next = u64::from(MAX_IN_FLIGHT) + 1;
         assert_eq!(
-            format!("{:?}", s.broker.admit(next, route)),
+            format!("{:?}", s.broker.admit(next, method)),
             refused(next, AdmissionRefusal::TooManyInFlight)
         );
         assert_eq!(info(&s.registry, &s.id).requests, u64::from(MAX_IN_FLIGHT));
@@ -2404,7 +2411,7 @@ mod tests {
         wait_for(|| (info(&s.registry, &s.id).in_flight == MAX_IN_FLIGHT - 4).then_some(()));
         // The numbering goes on from the refused one.
         assert_eq!(
-            format!("{:?}", s.broker.admit(next + 1, "GET /v1/models")),
+            format!("{:?}", s.broker.admit(next + 1, MethodLabel::Get)),
             admitted(next + 1)
         );
         assert_eq!(info(&s.registry, &s.id).in_flight, MAX_IN_FLIGHT - 3);
@@ -2463,7 +2470,7 @@ mod tests {
             .find(|e| e.outcome == "completed" && e.request == Some(5))
             .expect("the end of request 5");
         assert_eq!(first.grant.as_deref(), Some(id.as_str()));
-        assert_eq!(first.route.as_deref(), Some(route));
+        assert_eq!(first.method.as_deref(), Some("POST"));
         assert_eq!(first.status, Some(200));
         assert_eq!(first.bytes_sent, Some(105));
         assert_eq!(first.bytes_received, Some(1005));
@@ -2473,23 +2480,21 @@ mod tests {
 
     #[test]
     fn a_request_limit_exhausts_the_grant_and_lets_admitted_requests_finish() {
-        let profile = ProfileRequest {
+        let limits = GrantLimits {
             max_requests: Some(2),
-            ..ProfileRequest::new(Preset::Anthropic)
-        }
-        .resolve()
-        .expect("profile");
-        let s = setup_with(profile, Duration::from_secs(3600), Confirm::AtOnce, 4);
-        let route = "POST /v1/messages/count_tokens";
-        assert_eq!(format!("{:?}", s.broker.admit(1, route)), admitted(1));
+            ..GrantLimits::default()
+        };
+        let s = setup_with(limits, Duration::from_secs(3600), Confirm::AtOnce, 4);
+        let method = MethodLabel::Post;
+        assert_eq!(format!("{:?}", s.broker.admit(1, method)), admitted(1));
         assert_eq!(info(&s.registry, &s.id).state, "active");
-        assert_eq!(format!("{:?}", s.broker.admit(2, route)), admitted(2));
+        assert_eq!(format!("{:?}", s.broker.admit(2, method)), admitted(2));
         let exhausted = info(&s.registry, &s.id);
         assert_eq!(exhausted.state, "exhausted");
         assert_eq!(exhausted.requests, 2);
         assert_eq!(exhausted.max_requests, Some(2));
         assert_eq!(
-            format!("{:?}", s.broker.admit(3, route)),
+            format!("{:?}", s.broker.admit(3, method)),
             refused(3, AdmissionRefusal::Exhausted)
         );
         // The admitted ones finish, the second first.
@@ -2520,44 +2525,44 @@ mod tests {
             ("a number that skips", |b| {
                 b.send(&FromBroker::Admit {
                     request: 3,
-                    method: "POST".into(),
-                    route: "POST /v1/messages".into(),
+                    method: MethodLabel::Post,
                 })
             }),
             ("a number used again", |b| {
                 b.send(&FromBroker::Admit {
                     request: 1,
-                    method: "POST".into(),
-                    route: "POST /v1/messages".into(),
+                    method: MethodLabel::Post,
                 })
             }),
             ("a number from zero", |b| {
                 b.send(&FromBroker::Admit {
                     request: 0,
-                    method: "POST".into(),
-                    route: "POST /v1/messages".into(),
+                    method: MethodLabel::Post,
                 })
             }),
-            ("a route of no preset", |b| {
-                b.send(&FromBroker::Admit {
-                    request: 2,
-                    method: "POST".into(),
-                    route: "POST /v1/messages/batches".into(),
-                })
+            ("an admission with a route", |b| {
+                send_raw(
+                    b,
+                    serde_json::json!({
+                        "type": "admit", "request": 2, "method": "POST",
+                        "route": "POST /v1/messages"
+                    }),
+                )
             }),
-            ("a raw path", |b| {
-                b.send(&FromBroker::Admit {
-                    request: 2,
-                    method: "GET".into(),
-                    route: "GET /v1/models/claude-x".into(),
-                })
+            ("an admission with a raw method", |b| {
+                send_raw(
+                    b,
+                    serde_json::json!({"type": "admit", "request": 2, "method": "PROPFIND"}),
+                )
             }),
-            ("another method", |b| {
-                b.send(&FromBroker::Admit {
-                    request: 2,
-                    method: "GET".into(),
-                    route: "POST /v1/messages".into(),
-                })
+            ("an admission with a path", |b| {
+                send_raw(
+                    b,
+                    serde_json::json!({
+                        "type": "admit", "request": 2, "method": "GET",
+                        "path": "/v1/models/claude-x"
+                    }),
+                )
             }),
             ("a finished request not admitted", |b| {
                 b.finish(7, RequestOutcome::Completed)
@@ -2593,8 +2598,7 @@ mod tests {
                     &writer,
                     &FromBroker::Admit {
                         request: 2,
-                        method: "POST".into(),
-                        route: "POST /v1/messages".into(),
+                        method: MethodLabel::Post,
                     },
                     &[devnull.as_fd()],
                 );
@@ -2604,7 +2608,7 @@ mod tests {
             let s = setup();
             // One request admitted and still open before the breach.
             assert_eq!(
-                format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+                format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
                 admitted(1),
                 "{what}"
             );
@@ -2632,7 +2636,12 @@ mod tests {
 
     #[test]
     fn nothing_may_follow_the_confirmation_of_a_revocation() {
-        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::AtOnce, 2);
+        let s = setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(3600),
+            Confirm::AtOnce,
+            2,
+        );
         s.registry.decide(Which::All, EndReason::Locked).complete();
         assert!(matches!(
             s.broker.next(),
@@ -2645,8 +2654,7 @@ mod tests {
         // A message after it: killed, and the reason stays the revocation's.
         s.broker.send(&FromBroker::Admit {
             request: 1,
-            method: "POST".into(),
-            route: "POST /v1/messages".into(),
+            method: MethodLabel::Post,
         });
         assert!(s.broker.sees_the_end());
         wait_for(|| (s.registry.count() == 0).then_some(()));
@@ -2665,7 +2673,7 @@ mod tests {
         let s = setup();
         s.log.refuse("admitted");
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
             refused(1, AdmissionRefusal::AuditFailed)
         );
         let now = info(&s.registry, &s.id);
@@ -2677,7 +2685,7 @@ mod tests {
         // Once the log works again, so does the grant.
         s.log.accept_all();
         assert_eq!(
-            format!("{:?}", s.broker.admit(2, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(2, MethodLabel::Post)),
             admitted(2)
         );
         assert_eq!(info(&s.registry, &s.id).requests, 1);
@@ -2686,13 +2694,13 @@ mod tests {
     #[test]
     fn an_end_that_cannot_be_recorded_revokes_the_grant() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
         );
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
             admitted(1)
         );
         s.log.refuse("completed");
@@ -2713,13 +2721,13 @@ mod tests {
     #[test]
     fn a_revocation_does_not_need_the_audit_log() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
         );
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
             admitted(1)
         );
         for outcome in ["ended", "admitted", "completed", "revoked", "unknown"] {
@@ -2748,7 +2756,7 @@ mod tests {
     #[test]
     fn an_admission_whose_grant_ends_while_it_is_recorded_is_refused() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
@@ -2760,7 +2768,7 @@ mod tests {
         }));
         // The revocation comes first, then the refusal of the admission
         // that was waiting for its record.
-        let first = s.broker.admit(1, "POST /v1/messages");
+        let first = s.broker.admit(1, MethodLabel::Post);
         assert!(
             matches!(
                 first,
@@ -2802,7 +2810,7 @@ mod tests {
     #[test]
     fn an_admission_whose_grant_expires_while_it_is_recorded_is_refused() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_millis(400),
             Confirm::AfterAnswers,
             0,
@@ -2810,8 +2818,7 @@ mod tests {
         let (release, held) = hold_next(&s.log, "admitted");
         s.broker.send(&FromBroker::Admit {
             request: 1,
-            method: "POST".into(),
-            route: "POST /v1/messages".into(),
+            method: MethodLabel::Post,
         });
         held.recv_timeout(PATIENCE).expect("the record");
         thread::sleep(Duration::from_millis(500));
@@ -2845,7 +2852,7 @@ mod tests {
     #[test]
     fn a_revocation_answers_at_once_the_admissions_waiting_for_their_records() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
@@ -2854,8 +2861,7 @@ mod tests {
         for request in [1, 2] {
             s.broker.send(&FromBroker::Admit {
                 request,
-                method: "POST".into(),
-                route: "POST /v1/messages".into(),
+                method: MethodLabel::Post,
             });
         }
         held.recv_timeout(PATIENCE).expect("the first record");
@@ -2927,13 +2933,13 @@ mod tests {
     #[test]
     fn an_end_that_cannot_be_recorded_holds_up_no_answer() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
         );
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
             admitted(1)
         );
         s.log.refuse("completed");
@@ -2942,8 +2948,7 @@ mod tests {
         held.recv_timeout(PATIENCE).expect("the record of the end");
         s.broker.send(&FromBroker::Admit {
             request: 2,
-            method: "POST".into(),
-            route: "POST /v1/messages".into(),
+            method: MethodLabel::Post,
         });
         wait_for(|| (info(&s.registry, &s.id).in_flight == 1).then_some(()));
         let started = Instant::now();
@@ -2989,10 +2994,15 @@ mod tests {
     /// that never does is killed all the same.
     #[test]
     fn records_go_on_while_a_broker_is_revoked() {
-        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
+        let s = setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(3600),
+            Confirm::Never,
+            0,
+        );
         for request in [1, 2] {
             assert_eq!(
-                format!("{:?}", s.broker.admit(request, "POST /v1/messages")),
+                format!("{:?}", s.broker.admit(request, MethodLabel::Post)),
                 admitted(request)
             );
         }
@@ -3026,19 +3036,16 @@ mod tests {
     /// only the admissions within the limit are recorded.
     #[test]
     fn a_request_beyond_the_limit_is_refused_while_earlier_ones_are_recorded() {
-        let profile = ProfileRequest {
+        let limits = GrantLimits {
             max_requests: Some(2),
-            ..ProfileRequest::new(Preset::Anthropic)
-        }
-        .resolve()
-        .expect("profile");
-        let s = setup_with(profile, Duration::from_secs(3600), Confirm::AfterAnswers, 0);
+            ..GrantLimits::default()
+        };
+        let s = setup_with(limits, Duration::from_secs(3600), Confirm::AfterAnswers, 0);
         let (release, held) = hold_next(&s.log, "admitted");
         for request in 1..=3 {
             s.broker.send(&FromBroker::Admit {
                 request,
-                method: "POST".into(),
-                route: "POST /v1/messages".into(),
+                method: MethodLabel::Post,
             });
         }
         held.recv_timeout(PATIENCE).expect("the first record");
@@ -3071,13 +3078,13 @@ mod tests {
         // refused requests and who revoked it; the request it closed is
         // finished (`revoked`).
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             3,
         );
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "GET /v1/models")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Get)),
             admitted(1)
         );
         let started = Instant::now();
@@ -3115,7 +3122,12 @@ mod tests {
         again.complete();
 
         // Not confirmed: killed once the confirmation is overdue.
-        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
+        let s = setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(3600),
+            Confirm::Never,
+            0,
+        );
         let started = Instant::now();
         s.registry.decide(Which::All, EndReason::Locked).complete();
         let took = started.elapsed();
@@ -3139,7 +3151,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3160,8 +3172,7 @@ mod tests {
                     &broker_end,
                     &FromBroker::Admit {
                         request: n,
-                        method: "POST".into(),
-                        route: "POST /v1/messages".into(),
+                        method: MethodLabel::Post,
                     },
                     &[],
                 );
@@ -3219,19 +3230,19 @@ mod tests {
     #[test]
     fn a_grant_expires_and_admits_nothing_after_its_lifetime() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_millis(300),
             Confirm::AfterAnswers,
             0,
         );
         assert_eq!(
-            format!("{:?}", s.broker.admit(1, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(1, MethodLabel::Post)),
             admitted(1)
         );
         thread::sleep(Duration::from_millis(400));
         assert_eq!(info(&s.registry, &s.id).ends_in_secs, 0);
         assert_eq!(
-            format!("{:?}", s.broker.admit(2, "POST /v1/messages")),
+            format!("{:?}", s.broker.admit(2, MethodLabel::Post)),
             refused(2, AdmissionRefusal::Expired)
         );
         // Refused at once: only the first was recorded as admitted.
@@ -3259,19 +3270,24 @@ mod tests {
 
     #[test]
     fn the_lifetime_given_to_the_broker_is_what_is_left() {
-        let s = setup_with(anthropic(), Duration::from_secs(90), Confirm::AtOnce, 0);
+        let s = setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(90),
+            Confirm::AtOnce,
+            0,
+        );
         let run = s.run.as_ref().expect("run");
         let left = run.lifetime_secs(&s.id);
         assert!((89..=90).contains(&left), "{left}");
-        // Never more than the profile allows, never less than a second.
+        // Never more than the run allows, never less than a second.
         let t = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(720 * 60 + 500),
             Confirm::AtOnce,
             0,
         );
         assert_eq!(t.run.as_ref().expect("run").lifetime_secs(&t.id), 720 * 60);
-        let u = setup_with(anthropic(), Duration::ZERO, Confirm::AtOnce, 0);
+        let u = setup_with(GrantLimits::default(), Duration::ZERO, Confirm::AtOnce, 0);
         assert_eq!(u.run.as_ref().expect("run").lifetime_secs(&u.id), 1);
     }
 
@@ -3284,7 +3300,7 @@ mod tests {
                 new_grant(
                     &broker_protocol::new_grant_id(),
                     &format!("KEY{i}"),
-                    anthropic(),
+                    GrantLimits::default(),
                     Duration::from_secs(60),
                 )
             })
@@ -3295,7 +3311,7 @@ mod tests {
             vec![new_grant(
                 &broker_protocol::new_grant_id(),
                 "MORE",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )]
         };
@@ -3330,8 +3346,8 @@ mod tests {
         // Two grants with the same ID are never entered.
         let id = broker_protocol::new_grant_id();
         let twice = vec![
-            new_grant(&id, "A", anthropic(), Duration::from_secs(60)),
-            new_grant(&id, "B", anthropic(), Duration::from_secs(60)),
+            new_grant(&id, "A", GrantLimits::default(), Duration::from_secs(60)),
+            new_grant(&id, "B", GrantLimits::default(), Duration::from_secs(60)),
         ];
         assert!(registry.enter(twice).is_err());
         drop(again);
@@ -3347,7 +3363,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3387,8 +3403,8 @@ mod tests {
         );
         let run = registry
             .enter(vec![
-                new_grant(&a, "A", anthropic(), Duration::from_secs(60)),
-                new_grant(&b, "B", anthropic(), Duration::from_secs(60)),
+                new_grant(&a, "A", GrantLimits::default(), Duration::from_secs(60)),
+                new_grant(&b, "B", GrantLimits::default(), Duration::from_secs(60)),
             ])
             .expect("enter");
         let (agent_end, broker_end) = UnixStream::pair().expect("pair");
@@ -3400,7 +3416,7 @@ mod tests {
         // An admission before the command starts is refused, at once:
         // nothing is recorded as admitted.
         assert_eq!(
-            format!("{:?}", broker_a.admit(1, "POST /v1/messages")),
+            format!("{:?}", broker_a.admit(1, MethodLabel::Post)),
             refused(1, AdmissionRefusal::Revoked)
         );
         assert!(log.of("broker_request").is_empty());
@@ -3424,7 +3440,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3451,7 +3467,7 @@ mod tests {
     #[test]
     fn the_timer_ends_the_grants_whose_lifetime_has_passed() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(1),
             Confirm::AfterAnswers,
             0,
@@ -3494,7 +3510,7 @@ mod tests {
         let entered = registry.enter(vec![new_grant(
             &broker_protocol::new_grant_id(),
             "KEY",
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(60),
         )]);
         assert_eq!(entered.err(), Some(refused));
@@ -3530,7 +3546,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3608,7 +3624,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3762,7 +3778,7 @@ mod tests {
             grant: id.into(),
             token: broker_protocol::new_token(),
             credential: crate::protocol::SecretString::new("sk-ant-test-0000000000000000".into()),
-            profile: anthropic(),
+            origin: "https://api.example.com".into(),
             max_in_flight: MAX_IN_FLIGHT,
             max_connections: broker_protocol::MAX_CONNECTIONS,
             lifetime_secs: 60,
@@ -3784,7 +3800,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3820,7 +3836,7 @@ mod tests {
             .enter(vec![new_grant(
                 &id,
                 "KEY",
-                anthropic(),
+                GrantLimits::default(),
                 Duration::from_secs(60),
             )])
             .expect("enter");
@@ -3859,25 +3875,33 @@ mod tests {
     fn each_event_ends_the_grants_it_concerns() {
         let log = Arc::new(Log::default());
         let registry = Registry::new(Arc::clone(&log) as Arc<dyn Recorder>);
-        let ending = ProfileRequest {
-            automatic_locks: Some(AutomaticLocks::End),
-            ..ProfileRequest::new(Preset::Openai)
-        }
-        .resolve()
-        .expect("profile");
+        let ending = GrantLimits {
+            automatic_locks: AutomaticLocks::End,
+            ..GrantLimits::default()
+        };
         let ids: Vec<String> = (0..6).map(|_| broker_protocol::new_grant_id()).collect();
         // Two runs whose grants are active, and one whose grants are still
         // starting.
         let first = registry
             .enter(vec![
-                new_grant(&ids[0], "A", anthropic(), Duration::from_secs(60)),
-                new_grant(&ids[1], "B", ending.clone(), Duration::from_secs(60)),
+                new_grant(
+                    &ids[0],
+                    "A",
+                    GrantLimits::default(),
+                    Duration::from_secs(60),
+                ),
+                new_grant(&ids[1], "B", ending, Duration::from_secs(60)),
             ])
             .expect("enter");
         let second = registry
             .enter(vec![
-                new_grant(&ids[2], "C", anthropic(), Duration::from_secs(60)),
-                new_grant(&ids[3], "A", ending.clone(), Duration::from_secs(60)),
+                new_grant(
+                    &ids[2],
+                    "C",
+                    GrantLimits::default(),
+                    Duration::from_secs(60),
+                ),
+                new_grant(&ids[3], "A", ending, Duration::from_secs(60)),
             ])
             .expect("enter");
         let mut brokers = Vec::new();
@@ -3891,13 +3915,18 @@ mod tests {
         }
         let third = registry
             .enter(vec![
-                new_grant(&ids[4], "D", anthropic(), Duration::from_secs(60)),
+                new_grant(
+                    &ids[4],
+                    "D",
+                    GrantLimits::default(),
+                    Duration::from_secs(60),
+                ),
                 new_grant(&ids[5], "E", ending, Duration::from_secs(60)),
             ])
             .expect("enter");
         let state = |id: &str| info(&registry, id).state;
-        // The automatic locks: the profiles that say so, and every grant
-        // still starting, whatever its profile.
+        // The automatic locks: the grants whose run says so, and every
+        // grant still starting, whatever its run says.
         let e = registry.decide(Which::AutomaticLock, EndReason::ScreenLocked);
         assert_eq!(e.ended(), 4);
         e.complete();
@@ -3935,7 +3964,7 @@ mod tests {
     #[test]
     fn stopping_ends_every_grant_and_its_broker() {
         let s = setup_with(
-            anthropic(),
+            GrantLimits::default(),
             Duration::from_secs(3600),
             Confirm::AfterAnswers,
             0,
@@ -3954,10 +3983,15 @@ mod tests {
 
     #[test]
     fn requests_closed_by_a_revocation_are_counted_as_their_broker_reports_them() {
-        let s = setup_with(anthropic(), Duration::from_secs(3600), Confirm::Never, 0);
+        let s = setup_with(
+            GrantLimits::default(),
+            Duration::from_secs(3600),
+            Confirm::Never,
+            0,
+        );
         for n in 1..=3 {
             assert_eq!(
-                format!("{:?}", s.broker.admit(n, "POST /v1/messages")),
+                format!("{:?}", s.broker.admit(n, MethodLabel::Post)),
                 admitted(n)
             );
         }
@@ -4003,8 +4037,9 @@ mod tests {
         let listed = info(&s.registry, &s.id);
         assert_eq!(listed.entry, "KEY (uuid-of-)");
         assert_eq!(listed.var, "ANTHROPIC_API_KEY");
-        assert_eq!(listed.destination, "https://api.anthropic.com");
-        assert_eq!(listed.preset, Preset::Anthropic);
+        // The approved origin, and the base path apart.
+        assert_eq!(listed.destination, "https://api.example.com");
+        assert_eq!(listed.base_path.as_deref(), Some("/v1"));
         assert_eq!(listed.command, "claude");
         assert_eq!(listed.state, "active");
         assert_eq!(listed.automatic_locks, AutomaticLocks::Continue);

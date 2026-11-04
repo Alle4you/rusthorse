@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **8** (`PROTOCOL_VERSION` in
+Protocol version: **9** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -17,6 +17,7 @@ Protocol version: **8** (`PROTOCOL_VERSION` in
 | 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. Imports read by the agent: `keyring_items`, `dotenv_names`, `import_from` (see [Imports read by the agent](#imports-read-by-the-agent)). |
 | 7 | `EntryChanges.group` moves an entry to another group (see [EntryChanges](#entrychanges)). An agent of version 6 would silently drop it and report the edit done, so the version changed. |
 | 8 | `broker_run`, `broker_edit`, `grants`, `revoke_grant`; optional entry profile and broker status fields. Separate request tags make a protocol-7 agent refuse broker operations whole even if the agent changes between the version check and the request. Added later, optional: `GrantInfo.unauthorized`, `exited.unauthorized`. |
+| 9 | The broker without profiles or presets ([ADR 0013](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets)): `broker_run_v2`, whose broker bindings each name their `destination` and whose `limits` set the grants' limits, with unknown fields refused. `broker_run` and `broker_edit` are gone (refused), and so are `EntryInfo.broker`, `EntryChanges.broker`, `"broker"` in `EntryChanges.clear` and `GrantInfo.preset`; `EntryChanges` refuses fields it does not know. `GrantInfo.destination` and `exited.unauthorized[].destination` mean the approved origin, no longer the profile's origin and base path; `GrantInfo.base_path` (optional) is new. A run through the broker is a new request rather than `broker_run` with more fields: a protocol-8 agent would accept that and ignore the destinations and the limits. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -96,7 +97,7 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   command's process group.
 
 The same run framing, descriptor rules, flow control and cancellation apply to
-`broker_run`. Cancelling it also ends its grants.
+`broker_run_v2`. Cancelling it also ends its grants.
 
 ## Requests
 
@@ -118,8 +119,7 @@ Every request is an object with a `type` field.
 | `change_password` | — | `ok` |
 | `backup` | `path` (absolute, must not exist) | `ok` |
 | `run` | see [Run](#run) | `exited` |
-| `broker_run` | Run fields plus non-empty `brokered` (see below) | `exited` |
-| `broker_edit` | `name`, `changes` including setting or clearing `broker` | `ok` |
+| `broker_run_v2` | Run fields plus non-empty `brokered` and `limits` (see [below](#broker-requests-protocol-9)) | `exited` |
 | `grants` | — | `grants` |
 | `revoke_grant` | `id` (optional; absent revokes all) | `ok` |
 | `keyring_items` | — | `keyring_items` |
@@ -286,7 +286,8 @@ Surrounding spaces and letter case are ignored when reading it.
 
 ### EntryChanges
 
-All fields are optional; omitted fields are left unchanged.
+All fields are optional; omitted fields are left unchanged. A field not
+listed here is refused (since protocol 9), and the edit with it.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -295,8 +296,7 @@ All fields are optional; omitted fields are left unchanged.
 | `port` | integer 0–65535 | New port. |
 | `kind` | `"api-key"`, `"login"`, `"server"` or `"device"` | New kind (protocol 5). To remove the kind, put `"kind"` in `clear`. |
 | `group` | string | Move the entry to the group at this path (protocol 7), e.g. `"Work/Servers"`, created if missing; `""` or `"/"` is the top level. See below. |
-| `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"`, `"kind"`, `"broker"` | Fields to remove; `broker` requires `broker_edit`. |
-| `broker` | ProfileRequest object | Set the broker profile; requires `broker_edit`. |
+| `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"`, `"kind"` | Fields to remove. Since protocol 9, `"broker"` is not one of them: a request that names it is refused. |
 | `add_tags`, `remove_tags` | array of strings | Tag changes. |
 | `value` | `"prompt"`, `{"provided": "…"}` or `{"generate": {"length": N, "alphabet": "…"}}` | New secret value: ask the human, use the given one, or generate one. |
 
@@ -349,45 +349,68 @@ with every edit.
   `redact: false`, the three descriptors sent with the request are given to
   the command as they are.
 
-### Broker requests (protocol 8)
+### Broker requests (protocol 9)
 
 ```json
-{"type":"broker_run","bindings":[],"brokered":[{"var":"ANTHROPIC_API_KEY","entry":"anthropic","url_var":"ANTHROPIC_BASE_URL"}],"argv":["python","app.py"],"cwd":"/home/me/project","env":[["PATH","/usr/bin:/bin"]],"redact":true,"forward_stdin":false}
-{"type":"broker_edit","name":"anthropic","changes":{"broker":{"preset":"anthropic","automatic_locks":"continue","max_lifetime_minutes":720}}}
-{"type":"broker_edit","name":"anthropic","changes":{"clear":["broker"]}}
+{"type":"broker_run_v2","bindings":[],"brokered":[{"var":"ANTHROPIC_API_KEY","entry":"anthropic","destination":"https://api.anthropic.com","url_var":"ANTHROPIC_BASE_URL"},{"var":"OPENAI_API_KEY","entry":"openai","destination":"https://api.openai.com/v1"}],"limits":{"automatic_locks":"continue","max_lifetime_minutes":720,"max_requests":200},"argv":["python","app.py"],"cwd":"/home/me/project","env":[["PATH","/usr/bin:/bin"]],"redact":true,"forward_stdin":false}
 {"type":"grants"}
 {"type":"revoke_grant","id":"g0123456789abcdef"}
 {"type":"revoke_grant"}
 ```
 
-`broker_run` has the same fields as `run`, plus a non-empty `brokered` array
-of `{var, entry, url_var?}`. `bindings` may be empty or give other entries by
-value. The agent resolves entries by UUID: an entry cannot be brokered twice
-or be given both ways. All value, token and URL variables must be distinct;
-`NO_PROXY` and `no_proxy` are reserved. `url_var` is omitted when absent. The
-requester cannot supply a profile, destination, token or wider limits. The
-agent uses the stored profile, puts the generated token in `var`, and puts its
-own loopback base URL in `url_var`. It adds `127.0.0.1` to both proxy-bypass
-variables. Approval is never remembered, even when the agent was started with
-`--remember`.
+`broker_run_v2` has the fields of `run` (`bindings`, `argv`, `cwd`, `env`,
+`redact`, optional `forward_stdin`), plus a non-empty `brokered` array of
+`{var, entry, destination, url_var?}` and `limits`. Nothing else is
+accepted: an unknown field in the request, in a binding or in `limits` — a
+`profile`, a `preset`, `routes` — makes it `invalid_request`, before any
+dialog. `bindings` may be empty or give other entries by value. The agent
+resolves entries by UUID: an entry cannot be brokered twice or be given both
+ways. All value, token and URL variables must be distinct; `NO_PROXY` and
+`no_proxy` are reserved. `url_var` is omitted when absent.
 
-`broker_edit` carries `EntryChanges`, including other metadata or value
-changes in the same transaction. Its `broker` is a strict `ProfileRequest`:
-required `preset` (`anthropic`, `openai`, `openai-compatible`), optional
-`origin`, `base_path`, `automatic_locks` (`end` or `continue`),
-`max_lifetime_minutes` (1–1440) and `max_requests` (1–1,000,000). The agent
-resolves omitted settings to the preset defaults and freezes its revision;
-`openai-compatible` requires an origin. This sets a complete profile, not a
-patch of the existing profile. Setting and clearing it together is refused.
-The dialog shows the resolved profile and the grants the edit ends. The format
-and routes are specified in
-[ADR 0013](adr/0013-credential-broker.md#profiles).
+- `destination` (required) is where the grant sends the entry's value:
+  `https://`, a lowercase host name (letters, digits, `-` and `.`; labels of
+  1 to 63 characters that neither start nor end with `-`, at most 253 in
+  all, the last one starting with a letter: no IP address in any form; an
+  international name in its `xn--` form), an optional port (1 to 65535, no
+  leading zero) and an optional base path (`/` and segments of letters,
+  digits, `.`, `_`, `~` and `-`, none made only of dots, no trailing `/`;
+  `https://HOST/` has none). No user information, query or fragment; at
+  most 1000 characters. The approval covers its **origin** — scheme, host
+  and port — at any path: the base path only goes into `url_var`'s value,
+  and limits nothing. There is no default destination: the agent never uses
+  the entry's URL for it.
+- `limits` (required) applies to every grant of the run, each counted on its
+  own: `automatic_locks` (`end` or `continue`: whether screen lock, suspend
+  and the idle lock end the grants), `max_lifetime_minutes` (1–1440) and
+  `max_requests` (1–1,000,000; omitted for no limit). The agent fills in
+  nothing: `automatic_locks` and `max_lifetime_minutes` are required. (The
+  `rusthorse` CLI sends `continue`, 720 and no request limit unless told
+  otherwise.)
+- Invalid destinations and limits are `invalid_request`, before the vault is
+  read and before any dialog.
+
+The agent puts the generated token in `var` and its own loopback base URL
+(`http://127.0.0.1:PORT` and the destination's base path) in `url_var`; the
+values the requester's `env` has for those variables are dropped. It adds
+`127.0.0.1` to both proxy-bypass variables. The requester cannot supply a
+token. Approval is never remembered, even when the agent was started with
+`--remember`. The broker's rules for the requests it forwards to the
+approved origin — the token presented in a header and replaced by the key,
+what is refused, forwarded and relayed — are in
+[ADR 0013](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets).
 
 A plain `run` with non-empty `brokered` is refused during parsing; an absent,
-empty or null list carries no broker binding. A plain `edit` setting a profile
-or clearing `broker` is refused before a dialog. A protocol-7 agent rejects
-the unknown `broker_run` and `broker_edit` tags, rather than silently applying
-only the old fields.
+empty or null list carries no broker binding. An agent of protocol 9 refuses
+protocol 8's `broker_run` and `broker_edit` whole, before any approval, as
+unknown request types (`invalid_request`). An agent of protocol 8 refuses
+`broker_run_v2` whole in the same way, so a client that checked the version
+on one connection and meets an older agent on the next one (after a
+restart) still runs nothing. A client must never retry a refused
+`broker_run_v2` as `broker_run` or as a plain `run`; the `rusthorse` CLI
+never does. An `edit` whose `changes` carry a field the agent does not
+know — protocol 8's `broker` profile among them — is refused whole as
+`invalid_request`, before any approval: nothing of it is applied.
 
 `grants` and `revoke_grant` need neither an unlocked vault nor a dialog. A
 malformed grant ID is `invalid_request`; an unknown well-formed ID is
@@ -404,14 +427,15 @@ credential. Each element has:
 | Field | Meaning |
 |---|---|
 | `id`, `entry`, `var` | Public grant ID; entry identity as shown in dialogs; command variable holding the token. |
-| `destination`, `preset` | Origin plus base path; preset name. |
+| `destination` | The approved origin (`https://`, the host and the port if the run named one), where the broker may send the key at any path. Since protocol 9; before, the profile's origin and base path. |
+| `base_path` | Optional, omitted when the run named none: the base path of the run's destination (`/v1`), which sets up the program's base URL and limits nothing. Since protocol 9. |
 | `command`, `requester` | Command text and unverified requester description. Treat both as untrusted display text. |
 | `state` | `starting` (preparation, no admission), `active`, `exhausted` (no new admission, existing requests finish), or `revoked`. |
 | `started`, `ends_in_secs` | Creation time in RFC 3339 with local offset; seconds left to the maximum lifetime. |
-| `requests`, `max_requests` | Admitted count; optional maximum, omitted for no limit. |
+| `requests`, `max_requests` | Admitted count; optional maximum (the run's request limit), omitted for no limit. |
 | `in_flight` | Occupied request slots, including reservations waiting for their admission record. |
 | `unauthorized` | Optional: admitted requests the destination answered with `401 Unauthorized` — it did not accept the credential the broker sent from the entry. Counted when the broker reports a request's end, whatever its outcome; the broker's own `401` (no token, or another grant's) is never counted. A current agent always reports it, `0` included; omitted by an older agent. |
-| `automatic_locks` | `end` or `continue`. |
+| `automatic_locks` | `end` or `continue`, as the run set it. |
 
 Revoked grants can remain listed until their command ends, still occupying one
 of the agent's 16 grant slots. Broker exit removes the registry entry sooner;
@@ -430,7 +454,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 | `secret` | `value` (string) |
 | `keyring_items` | `items`: array of `{id, label, attributes, locked}`, sorted by label |
 | `names` | `names`: array of strings; `empty` (array, optional): names with an empty value |
-| `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome. `unauthorized` (optional, omitted when empty): the run's grants whose destination answered requests with `401 Unauthorized`, each `{var, entry, destination, requests}` — the token's variable, the entry's identity as dialogs show it, the destination, and how many requests (at least 1). It counts every request whose end the grant's broker reported before it confirmed its revocation or exited; one killed before that may leave some out. The `rusthorse` CLI prints a note for each after the command ([cli.md](cli.md#through-the-credential-broker---broker)). |
+| `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome. `unauthorized` (optional, omitted when empty): the run's grants whose destination answered requests with `401 Unauthorized`, each `{var, entry, destination, requests}` — the token's variable, the entry's identity as dialogs show it, the approved origin (as in `GrantInfo.destination`, since protocol 9), and how many requests (at least 1). It counts every request whose end the grant's broker reported before it confirmed its revocation or exited; one killed before that may leave some out. The `rusthorse` CLI prints a note for each after the command ([cli.md](cli.md#through-the-credential-broker---broker)). |
 | `error` | `code` (see [Errors](#errors)), `message` (string) |
 
 ### StatusInfo
@@ -438,7 +462,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 ```json
 {
   "type": "status",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -521,14 +545,11 @@ new optional fields are omitted, never emitted as null when absent.
 `protected_fields` lists metadata fields (`UserName`, `URL`, `Host`, `Port`,
 `Kind`) that the file marks as protected; their values are withheld.
 `other_fields` lists the names of custom fields other than `Host`, `Port` and
-a valid `Kind` or usable `Rusthorse.Broker`; their values are not disclosed.
-`broker`, when present, is the resolved `BrokerProfile` stored in the entry
-(`version`, `preset`, `revision`, `origin`, `base_path`, `automatic_locks`,
-`max_lifetime_minutes`, optional `max_requests`). It contains no credential.
-An invalid, unknown or oversized profile is absent and named in
-`other_fields`; a protected one is absent and named in `protected_fields`. An
-absent field is different from either unusable case. Replacing an entry
-removes its profile.
+a valid `Kind`; their values are not disclosed. Since protocol 9 an entry has
+no `broker`: a `Rusthorse.Broker` field, where an agent of protocol 8 stored
+a broker profile, is listed in `other_fields` like any custom field. The
+agent never reads or interprets it, and keeps it as it is, also when the
+entry is replaced (`add` or `import` with `replace`).
 
 ## Errors
 
@@ -552,17 +573,18 @@ changed and no command was started.** (The audit log may record the attempt,
 the vault may have been locked, and a `backup` whose copy does not verify
 leaves that copy, which the message names.) A client that sends a request with
 effects — `create_vault`, `add`, `import`, `import_from`, `edit`, `remove`,
-`change_password`, `backup`, `run`, `broker_run`, `broker_edit` — and gets no
-answer, or one it cannot parse, must likewise treat the outcome as unknown.
+`change_password`, `backup`, `run`, `broker_run_v2` — and gets no answer, or
+one it cannot parse, must likewise treat the outcome as unknown.
 
 `revoke_grant`, like `lock`, is safe to repeat and is not classified as a
 request with effects by `Request::has_effects`. A lost reply is a regular
 client error (CLI exit 1), not proof that revocation completed.
 
-For `broker_run`, definite errors before command start map to CLI exit 125;
-`outcome_unknown` or a lost/malformed reply maps to 124. Profile validation
-errors use `invalid_request`; a missing/unusable broker, startup failure or
-failed grant-creation record uses `internal`. There are no new error codes.
+For `broker_run_v2`, definite errors before command start map to CLI exit 125;
+`outcome_unknown` or a lost/malformed reply maps to 124. An unknown field,
+an invalid destination or invalid limits, and a value the broker cannot send,
+use `invalid_request`; a missing/unusable broker, startup failure or failed
+grant-creation record uses `internal`. There are no new error codes.
 Once the command starts, its exit status is reported normally: an HTTP failure
 or revocation does not retroactively make it a did-not-run result. These
 guarantees concern vault writes and command start, not absence of all effects:
@@ -577,20 +599,28 @@ grants may have been revoked even when a later audit write fails.
 - Removing or changing the meaning of a field or of an error code —
   including what an error guarantees about the request's effects — or
   changing framing, bumps `PROTOCOL_VERSION`.
+- Protocol 9 removed fields and changed what `destination` means in
+  `grants` and `exited.unauthorized`. A client of protocol 9 refuses an agent
+  of protocol 8 at its version check, and an agent of protocol 8 refuses
+  `broker_run_v2`, which it does not know, whole. A request type that can be
+  refused for being unknown is never resent as an older one: a client that
+  gets an error for `broker_run_v2` reports it, and does not try
+  `broker_run` or a plain `run` with the values.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-8 requests above, with the same approvals
+`rusthorse-manager` uses the version-9 requests above, with the same approvals
 as the CLI. It targets entries by UUID, sends `reveal` with purpose `show` or
 `copy` for its Show and Copy actions, sends `create_vault` when there is no
 vault yet, imports with `keyring_items`, `dotenv_names` and `import_from`, and
 never sends a master password or a value it read. See
 [ADR 0007](adr/0007-visual-manager.md); the configuration, history and restore
 requests it proposes for later milestones do not exist yet. Its Grants page
-uses `grants` and `revoke_grant`; profiles are read-only in the manager, which
-does not send `broker_edit`.
+uses `grants` and `revoke_grant`. It sends no broker run itself: its command
+templates for `rusthorse run --broker` are text for the human to fill in
+and run.
 
-## Agent–broker control channel (broker protocol 1)
+## Agent–broker control channel (broker protocol 2)
 
 This is a separate socket pair, not the client socket or HTTP interface. The
 exact schemas and constants are in
@@ -603,13 +633,21 @@ owned and closed on refusal, and received descriptors are close-on-exec.
 
 | Direction | Message | Fields |
 |---|---|---|
-| Agent → broker | `install` | `version` (1), `grant`, secret `token` and `credential`, resolved `profile`, `max_in_flight`, `max_connections`, `lifetime_secs`; listening fd. |
+| Agent → broker | `install` | `version` (2), `grant`, secret `token` and `credential`, the approved `origin` (`https://`, a host name and an optional port; no base path, which only the command's base URL holds), `max_in_flight`, `max_connections`, `lifetime_secs`; listening fd. |
 | Broker → agent | `ready` | `version`, `grant`, matching the installation. |
-| Broker → agent | `admit` | Increasing `request` number from 1, `method`, `route` template (including method, relative to base path); never raw path/query. |
+| Broker → agent | `admit` | Increasing `request` number from 1, and the label of its `method`: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method. Never the raw method, the path or the query. |
 | Agent → broker | `admitted` / `refused` | Same `request`; refusal also carries `reason`. |
 | Broker → agent | `finished` | Same `request`, `outcome`, optional `status`, `bytes_sent`, `bytes_received`. |
 | Agent → broker | `revoke` | End `reason`. |
 | Broker → agent | `revoked` | `refused`: count refused locally before asking the agent. |
+
+Version 2 replaced version 1's `profile` in `install` with `origin`, and
+`admit`'s `method` and `route` with the method's label: both sides refuse
+any other version, before a grant is served, and a version-1 message (a
+`profile`, a `route`) is refused as an unknown field. The broker validates
+`origin` as the agent did (`https://` and a host name, optional port, no IP
+address) and connects there and nowhere else, taking the TLS server name and
+`Host` from it.
 
 `ready` follows validation, CA parsing, TLS setup and runtime registration,
 within the agent's 10-second preparation deadline. The process is registered
@@ -617,15 +655,16 @@ before `install`; the state check and non-blocking send share the registry
 lock. A send that cannot complete fails preparation closed; `write_all` can
 finish a partial `sendmsg` without waiting while the socket has room.
 
-An `admit` follows HTTP framing, token and route checks and a reservation of
-the declared body size. The agent reserves a use and slot, records admission
+An `admit` follows the broker's HTTP framing and token checks and a
+reservation of the declared body size. The agent reserves a use and slot, records admission
 durably, rechecks state and lifetime, then answers exactly once. Only
 `admitted` permits body reading and forwarding. Refusals are `revoked`,
 `expired`, `exhausted` (HTTP 403), `too_many_in_flight` (429) or
 `audit_failed` (503). Each admitted attempt spends its use, including a failed
-request or an SDK retry. `finished` frees the slot; numbering or route
-violations end the grant as `broker_failed` without changing counters for the
-offending message.
+request or an SDK retry. `finished` frees the slot; numbering violations and
+messages that do not parse (an `admit` with a route, a path or a method that
+is not one of the labels) end the grant as `broker_failed` without changing
+counters for the offending message.
 
 `finished.outcome` is `completed`, `not_forwarded`, `client_closed`, `revoked`
 or `unknown`. Once a response head arrived, `status` is the upstream status

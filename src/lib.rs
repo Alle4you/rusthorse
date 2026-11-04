@@ -21,9 +21,10 @@
 //! - [`dialog_protocol`]: the protocol between the agent and `rusthorse-dialog`.
 //! - [`helper_program`]: finding and checking the helper programs the agent
 //!   starts (`rusthorse-dialog`, `rusthorse-broker`) next to its executable.
-//! - [`broker_profile`]: the credential broker's profiles and presets, and the
-//!   rules a grant enforces (routes, headers, tokens), shared with
-//!   `rusthorse-broker`.
+//! - [`broker_grant`]: what a grant of the credential broker carries besides
+//!   its token and key — the approved destination and the run's limits —
+//!   and the rules shared with `rusthorse-broker` (method labels,
+//!   token-shaped strings, usable keys).
 //! - [`broker_protocol`]: the control channel between the agent and
 //!   `rusthorse-broker`, tokens and grant IDs, the broker's limits and the
 //!   file of certificate authorities it trusts.
@@ -45,8 +46,8 @@
 
 pub mod agent;
 pub mod audit;
+pub mod broker_grant;
 mod broker_host;
-pub mod broker_profile;
 pub mod broker_protocol;
 pub mod client;
 pub mod dialog_program;

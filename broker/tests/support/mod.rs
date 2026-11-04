@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-use rusthorse::broker_profile::{BrokerProfile, Preset, ProfileRequest};
+use rusthorse::broker_grant::DEFAULT_LIFETIME_MINUTES;
 use rusthorse::broker_protocol::{
     self, AdmissionRefusal, EndReason, FromBroker, Install, MAX_CONNECTIONS, MAX_IN_FLIGHT,
     ToBroker, VERSION,
@@ -32,7 +32,8 @@ use rusthorse::broker_protocol::{
 use rusthorse::protocol::SecretString;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-/// The fake key the broker presents to the destination.
+/// The fake key the broker presents to the destination in place of the
+/// token.
 pub const CREDENTIAL: &str = "sk-ant-test-0000FAKE0000credential-0000";
 
 /// How long a test waits for anything before it fails.
@@ -303,7 +304,7 @@ impl Destination {
         }
     }
 
-    /// The origin of a profile for this destination.
+    /// The origin of a grant for this destination.
     pub fn origin(&self) -> String {
         format!("https://localhost:{}", self.port)
     }
@@ -457,7 +458,11 @@ pub enum Admit {
 
 /// What a broker is started with.
 pub struct Options {
-    pub profile: BrokerProfile,
+    /// The approved origin.
+    pub origin: String,
+    /// The grant's token: a new one for each options (a test may build a
+    /// key from it).
+    pub token: String,
     pub credential: String,
     pub max_in_flight: u32,
     pub max_connections: u32,
@@ -469,27 +474,18 @@ pub struct Options {
 }
 
 impl Options {
-    /// An Anthropic grant for `origin`, admitting everything, reaching
+    /// A grant for the approved `origin`, admitting everything, reaching
     /// `127.0.0.1` only, with the test's authority trusted (`ca`, which
-    /// also asks a broker built for tests to read the other hooks).
-    pub fn anthropic(origin: &str, ca: &TestCa) -> Options {
-        Self::preset(Preset::Anthropic, origin, ca)
-    }
-
-    pub fn preset(preset: Preset, origin: &str, ca: &TestCa) -> Options {
-        let profile = ProfileRequest {
-            origin: Some(origin.to_string()),
-            ..ProfileRequest::new(preset)
-        }
-        .resolve()
-        .expect("profile");
-        let lifetime_secs = u64::from(profile.max_lifetime_minutes) * 60;
+    /// also asks a broker built for tests to read the other hooks), the
+    /// default lifetime and phase 1's limits.
+    pub fn new(origin: &str, ca: &TestCa) -> Options {
         Options {
-            profile,
+            origin: origin.to_string(),
+            token: broker_protocol::new_token().to_string(),
             credential: CREDENTIAL.to_string(),
             max_in_flight: MAX_IN_FLIGHT,
             max_connections: MAX_CONNECTIONS,
-            lifetime_secs,
+            lifetime_secs: u64::from(DEFAULT_LIFETIME_MINUTES) * 60,
             admit: Admit::All,
             env: vec![
                 (
@@ -504,7 +500,7 @@ impl Options {
     /// Without a destination the test can reach: requests are answered
     /// before they would be forwarded.
     pub fn nowhere(ca: &TestCa) -> Options {
-        Self::anthropic("https://localhost:9", ca)
+        Self::new("https://localhost:9", ca)
     }
 
     pub fn admit(mut self, admit: Admit) -> Options {
@@ -529,14 +525,14 @@ impl Options {
         self.env("RUSTHORSE_BROKER_TEST_TIMEOUTS", pairs)
     }
 
-    /// The install for these options, with a new grant ID and token.
+    /// The install for these options, with a new grant ID.
     pub fn install(&self) -> Install {
         Install {
             version: VERSION,
             grant: broker_protocol::new_grant_id(),
-            token: broker_protocol::new_token(),
+            token: SecretString::new(self.token.clone()),
             credential: SecretString::new(self.credential.clone()),
-            profile: self.profile.clone(),
+            origin: self.origin.clone(),
             max_in_flight: self.max_in_flight,
             max_connections: self.max_connections,
             lifetime_secs: self.lifetime_secs,
@@ -1344,7 +1340,7 @@ impl Silent {
         }
     }
 
-    /// The origin of a profile for this listener.
+    /// The origin of a grant for this listener.
     pub fn origin(&self) -> String {
         format!("https://localhost:{}", self.port)
     }

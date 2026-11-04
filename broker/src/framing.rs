@@ -12,14 +12,14 @@
 
 use http::header::{CONNECTION, HOST, ORIGIN, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, Method, Uri, Version};
-use rusthorse::broker_profile::is_origin_form;
+use rusthorse::broker_grant::is_origin_form;
 
 use crate::answer::Refusal;
 
 /// A request whose framing passed.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Framed<'a> {
-    /// The request target, in origin form, as it will be matched and sent.
+    /// The request target, in origin form, as it will be sent.
     pub target: &'a str,
     /// The body's declared length (0 without one).
     pub body_len: u64,
@@ -28,9 +28,9 @@ pub struct Framed<'a> {
 /// Check the framing of a request: HTTP/1.1; not `CONNECT`, `TRACE` or
 /// `OPTIONS`; a target in origin form; exactly one `Host`, `host` itself;
 /// no `Transfer-Encoding`, `Upgrade` or `Origin`; a `Connection` that names
-/// only `close` or `keep-alive`; and a body only on a method whose routes
-/// take one (`POST`), with a length. `body_len` is the length hyper read
-/// from `Content-Length` (`None` for a chunked body).
+/// only `close` or `keep-alive`; and a body, on any method, only with a
+/// length. `body_len` is the length hyper read from `Content-Length`
+/// (`None` for a chunked body).
 pub fn check<'a>(
     method: &Method,
     uri: &'a Uri,
@@ -73,9 +73,6 @@ pub fn check<'a>(
     let Some(body_len) = body_len else {
         return Err(Refusal::TransferEncoding);
     };
-    if body_len > 0 && method != Method::POST {
-        return Err(Refusal::BodyNotAllowed);
-    }
     Ok(Framed { target, body_len })
 }
 
@@ -151,11 +148,21 @@ mod tests {
                 "{connection}"
             );
         }
-        // Targets that are not routes pass the framing: step 3 refuses them.
-        for target in ["/v1/%2e%2e/x", "/v1;x", "/v1\\x", "//v1", "/"] {
-            assert!(
-                checked("POST", target, &[HOST], Some(0)).is_ok(),
+        // Any target in origin form passes, as it is: nothing decodes or
+        // normalizes it.
+        for target in ["/v1/%2e%2e/x", "/v1;x", "/v1\\x", "//v1", "/", "/a?b=c&b=d"] {
+            assert_eq!(
+                checked("POST", target, &[HOST], Some(0)),
+                Ok((target.to_string(), 0)),
                 "{target}"
+            );
+        }
+        // A body, with its length, on any method the broker serves.
+        for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "PROPFIND", "post"] {
+            assert_eq!(
+                checked(method, "/v1/x", &[HOST], Some(10)),
+                Ok(("/v1/x".into(), 10)),
+                "{method}"
             );
         }
     }
@@ -309,8 +316,7 @@ mod tests {
                 Some(0),
                 Connection,
             ),
-            ("GET", "/v1/models", &[HOST], Some(1), BodyNotAllowed),
-            ("PUT", "/v1/messages", &[HOST], Some(10), BodyNotAllowed),
+            ("GET", "/v1/models", &[HOST], None, TransferEncoding),
         ];
         for (method, target, pairs, body, expected) in cases {
             assert_eq!(

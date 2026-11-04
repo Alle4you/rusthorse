@@ -236,11 +236,11 @@ impl Manager {
             .text("imported")
             .build();
         options.add(&tag);
-        // A replaced entry gets only what the import gives it: never a
-        // broker profile, which only an approved edit sets (ADR 0013).
+        // A replaced entry keeps its other fields, as KeePass clients do;
+        // the agent ends its grants of the broker (ADR 0013).
         let replace = adw::SwitchRow::builder()
             .title("Replace entries that already exist")
-            .subtitle("Replacing an entry removes its broker profile, which ends its grants.")
+            .subtitle("Replacing an entry ends its grants of the credential broker, if it has any.")
             .build();
         options.add(&replace);
         body.append(&options);

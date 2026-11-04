@@ -53,18 +53,20 @@ pub struct AuditEvent {
     /// The grant's ID, on `grant` and `broker_request` records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<String>,
-    /// On the `run` record of a `broker_run`: the grants the run creates.
+    /// On the `run` record of a `broker_run_v2`: the grants the run creates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<AuditGrant>>,
     /// On `broker_request` records: the request's number within its grant,
     /// as the broker numbered it (from 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<u64>,
-    /// On `broker_request` records: the route the request matched, as
-    /// [`Route::template`](crate::broker_profile::Route::template) writes it
-    /// (`POST /v1/messages`) — never a raw path or a query.
+    /// On `broker_request` records (its admission and its end): the label
+    /// of the request's method, as
+    /// [`MethodLabel::as_str`](crate::broker_grant::MethodLabel::as_str)
+    /// writes it (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or
+    /// `OTHER`) — never the raw method, a path or a query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
+    pub method: Option<String>,
     /// On the record of an admitted request's end: the status of the
     /// destination's answer, or of the broker's own answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,7 +89,8 @@ pub struct AuditEvent {
     pub requests: Option<AuditRequestCounts>,
 }
 
-/// A grant, as the `run` record of the `broker_run` that creates it lists it.
+/// A grant, as the `run` record of the `broker_run_v2` that creates it lists
+/// it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditGrant {
     /// The grant's ID (`g` and 16 hexadecimal digits).
@@ -95,10 +98,13 @@ pub struct AuditGrant {
     /// Its entry, as records identify entries (in `entries`):
     /// [`EntryInfo::identity`](crate::protocol::EntryInfo::identity).
     pub entry: String,
-    /// Where its requests go: the profile's
-    /// [`destination`](crate::broker_profile::BrokerProfile::destination),
-    /// its origin and base path (`https://api.openai.com/v1`).
+    /// The approved origin (`https://api.openai.com`): the broker may send
+    /// the key to any path there.
     pub destination: String,
+    /// The base path the run named (`/v1`), which sets up the program's base
+    /// URL and limits nothing; left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
 }
 
 /// What became of a grant's requests, on the `grant` record of its end.
@@ -132,7 +138,7 @@ impl AuditEvent {
             grant: None,
             grants: None,
             request: None,
-            route: None,
+            method: None,
             status: None,
             bytes_sent: None,
             bytes_received: None,
@@ -276,10 +282,11 @@ mod tests {
         event.grants = Some(vec![AuditGrant {
             id: "g0123456789abcdef".into(),
             entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
-            destination: "https://api.anthropic.com".into(),
+            destination: "https://api.openai.com".into(),
+            base_path: Some("/v1".into()),
         }]);
         event.request = Some(7);
-        event.route = Some("POST /v1/messages".into());
+        event.method = Some("POST".into());
         event.status = Some(200);
         event.bytes_sent = Some(1234);
         event.bytes_received = Some(u64::MAX);
@@ -303,7 +310,7 @@ mod tests {
         assert_eq!(event.grant, None);
         assert_eq!(event.grants, None);
         assert_eq!(event.request, None);
-        assert_eq!(event.route, None);
+        assert_eq!(event.method, None);
         assert_eq!(event.status, None);
         assert_eq!(event.bytes_sent, None);
         assert_eq!(event.bytes_received, None);
@@ -333,11 +340,12 @@ mod tests {
             serde_json::json!([{
                 "id": "g0123456789abcdef",
                 "entry": "AI/ANTHROPIC_API_KEY (8d2f6c1e)",
-                "destination": "https://api.anthropic.com",
+                "destination": "https://api.openai.com",
+                "base_path": "/v1",
             }])
         );
         assert_eq!(json["request"], 7);
-        assert_eq!(json["route"], "POST /v1/messages");
+        assert_eq!(json["method"], "POST");
         assert_eq!(json["status"], 200);
         assert_eq!(json["bytes_sent"], 1234);
         assert_eq!(json["bytes_received"], u64::MAX);
@@ -384,16 +392,16 @@ mod tests {
         let mut admitted = AuditEvent::new("broker_request", &Peer::agent()).outcome("admitted");
         admitted.grant = Some("g0123456789abcdef".into());
         admitted.request = Some(1);
-        admitted.route = Some("POST /v1/messages".into());
+        admitted.method = Some("POST".into());
         assert_eq!(
             keys(&admitted),
             [
                 "action",
                 "grant",
+                "method",
                 "outcome",
                 "request",
                 "requester",
-                "route",
                 "time"
             ]
             .map(String::from)

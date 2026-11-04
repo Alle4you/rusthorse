@@ -15,16 +15,17 @@
 //! | remove   | yes          | approval                                       |
 //! | reveal   | yes          | approval, never remembered                     |
 //! | run      | yes          | approval, may be remembered for a while        |
-//! | broker_run | yes        | approval, never remembered                     |
-//! | broker_edit | yes       | approval                                       |
+//! | broker_run_v2 | yes     | approval, never remembered                     |
 //! | grants, revoke_grant | no | none                                         |
 //!
 //! Only one dialog is shown at a time. For `run`, the agent itself resolves
 //! the program, cleans the environment, spawns the command as its own child
 //! and filters its output, so what the human approves is what runs. A
-//! `broker_run` gives the command, for each entry it names, the token of a
-//! grant served by a broker process instead of the entry's value (ADR 0013;
-//! the grants are kept in the registry of the crate's `broker_host` module).
+//! `broker_run_v2` gives the command, for each entry it names, the token of
+//! a grant served by a broker process instead of the entry's value, and the
+//! broker sends the value only to the origin the run names and the human
+//! approved (ADR 0013; the grants are kept in the registry of the crate's
+//! `broker_host` module).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -48,8 +49,8 @@ use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::{Pid, getuid};
 
 use crate::audit::{AuditEvent, AuditGrant, AuditLog};
+use crate::broker_grant::{Destination, GrantLimits, is_valid_credential};
 use crate::broker_host::{self, NewGrant, Registry, RunEnder, RunGrants, Which};
-use crate::broker_profile::{BrokerProfile, is_valid_credential};
 use crate::broker_protocol::{self, EndReason, Install, MAX_CONNECTIONS as BROKER_CONNECTIONS};
 use crate::exec;
 use crate::helper_program::{self, Located};
@@ -62,9 +63,7 @@ use crate::redact::Redactor;
 use crate::session_lock;
 use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
-use crate::vault::{
-    ContentFingerprint, FIELD_BROKER, FingerprintKey, KdfParams, Vault, VaultError,
-};
+use crate::vault::{ContentFingerprint, FingerprintKey, KdfParams, Vault, VaultError};
 
 /// How many wrong master passwords are tolerated per unlock.
 const UNLOCK_ATTEMPTS: u32 = 3;
@@ -125,8 +124,8 @@ pub struct AgentConfig {
     /// [`broker_protocol::READY_TIMEOUT`]. Tests shorten it, to see a broker
     /// that never answers fail quickly.
     pub broker_ready_timeout: Option<Duration>,
-    /// The longest a grant lasts. `None` in production: its profile's
-    /// maximum lifetime (`max_lifetime_minutes`), a minute at least. Tests
+    /// The longest a grant lasts. `None` in production: its run's maximum
+    /// lifetime (`max_lifetime_minutes`), a minute at least. Tests
     /// shorten it, to see grants expire; it never lengthens one.
     pub broker_lifetime: Option<Duration>,
 }
@@ -495,11 +494,11 @@ impl Agent {
             // (A `run` that carries broker bindings does not parse: see
             // `Request::Run`. It is refused, never run without its grants.)
             Request::Run(run) => self.run(stream, &peer, run, None, fds),
-            Request::BrokerRun(broker_run) => self.run(
+            Request::BrokerRunV2(broker_run) => self.run(
                 stream,
                 &peer,
                 broker_run.run,
-                Some(broker_run.brokered),
+                Some((broker_run.brokered, broker_run.limits)),
                 fds,
             ),
             _ if !fds.is_empty() => Err(Failure::invalid(
@@ -547,15 +546,7 @@ impl Agent {
             } => self.add(peer, entry, value, generate, replace),
             Request::ChangePassword => self.change_password(peer),
             Request::Import { entries, replace } => self.import(peer, entries, replace),
-            // An older agent would apply the rest of such an edit and drop
-            // the profile: a change to it is a `broker_edit` (ADR 0013).
-            Request::Edit { changes, .. } if changes.touches_broker() => Err(Failure::invalid(
-                "a change to the broker profile is a broker_edit request, not an edit",
-            )),
             Request::Edit { name, changes } => self.edit(peer, &name, changes),
-            // Its dialog shows the whole new profile and how many grants the
-            // edit ends.
-            Request::BrokerEdit { name, changes } => self.edit(peer, &name, changes),
             Request::Remove { name } => self.remove(peer, &name),
             Request::Reveal {
                 name,
@@ -570,7 +561,7 @@ impl Agent {
                 tags,
                 replace,
             } => self.import_from(peer, source, tags, replace),
-            Request::Run(_) | Request::BrokerRun(_) => {
+            Request::Run(_) | Request::BrokerRunV2(_) => {
                 Err(Failure::invalid("run requests carry file descriptors"))
             }
             // Like `lock`: neither needs an approval or an unlocked vault.
@@ -621,7 +612,8 @@ impl Agent {
         }
     }
 
-    /// The broker program, as `status` reports it and `broker_run` needs it.
+    /// The broker program, as `status` reports it and `broker_run_v2` needs
+    /// it.
     fn broker_program(&self) -> Located {
         match &self.config.broker_program {
             None => helper_program::locate(broker_protocol::PROGRAM),
@@ -629,10 +621,10 @@ impl Agent {
         }
     }
 
-    /// How long a grant of `profile` lasts: the profile's maximum lifetime,
-    /// or less where [`AgentConfig::broker_lifetime`] says so.
-    fn grant_lifetime(&self, profile: &BrokerProfile) -> Duration {
-        let longest = Duration::from_secs(u64::from(profile.max_lifetime_minutes) * 60);
+    /// How long a grant with `limits` lasts: the run's maximum lifetime, or
+    /// less where [`AgentConfig::broker_lifetime`] says so.
+    fn grant_lifetime(&self, limits: &GrantLimits) -> Duration {
+        let longest = limits.max_lifetime();
         self.config
             .broker_lifetime
             .map_or(longest, |shorter| shorter.min(longest))
@@ -1505,24 +1497,6 @@ impl Agent {
         if changes.is_empty() {
             return Err(Failure::invalid("nothing to change"));
         }
-        // Setting and clearing the profile at once says two things: neither
-        // is guessed.
-        if changes.broker.is_some() && changes.clear.contains(&protocol::Field::Broker) {
-            return Err(Failure::invalid(
-                "an edit sets the broker profile or clears it, not both",
-            ));
-        }
-        // A new broker profile is checked before anyone is asked, and its
-        // dialog shows the whole of it: what the request resolves to is what
-        // is stored.
-        let profile = match &changes.broker {
-            Some(request) => Some(
-                request
-                    .resolve()
-                    .map_err(|e| Failure::invalid(format!("broker profile: {e}")))?,
-            ),
-            None => None,
-        };
         let generation = self.generation(peer)?;
         let (current, destination) = self.with_vault(peer, |v| {
             let id = v.find(name)?;
@@ -1565,22 +1539,14 @@ impl Agent {
                 details.push(("Move to group".into(), target.describe()));
             }
             details.extend(describe_changes(&changes));
-            if let Some(profile) = &profile {
-                details.extend(describe_profile(profile));
-            }
             details.push(("Requested by (unverified)".into(), peer.describe()));
-            let facts = if changes.touches_broker() && ends == 0 {
-                vec![("Grants it ends".to_string(), "none".to_string())]
-            } else {
-                Vec::new()
-            };
             let request = ApprovalRequest {
                 title: "Rusthorse — change an entry".into(),
                 summary: "Change an entry?".into(),
                 explanation: "The previous version is kept in the entry's history.".into(),
                 command: None,
                 details,
-                facts,
+                facts: Vec::new(),
                 warnings: ends_grants(ends).into_iter().collect(),
                 can_remember: false,
             };
@@ -2005,15 +1971,15 @@ impl Agent {
     }
 
     /// Run a command with secrets in its environment: a `run`, or, with
-    /// `brokered` (a `broker_run`, ADR 0013), a run whose command gets, for
-    /// each broker binding, the token of a grant that a broker process
-    /// serves, never the entry's value.
+    /// `brokered` (a `broker_run_v2`, ADR 0013), a run whose command gets,
+    /// for each broker binding, the token of a grant that a broker process
+    /// serves, never the entry's value, within the run's limits.
     fn run(
         &self,
         stream: &UnixStream,
         peer: &Peer,
         run: RunRequest,
-        brokered: Option<Vec<BrokerBinding>>,
+        brokered: Option<(Vec<BrokerBinding>, GrantLimits)>,
         fds: Vec<OwnedFd>,
     ) -> Result<Response, Failure> {
         // With redaction the agent never touches the client's own descriptors:
@@ -2037,14 +2003,14 @@ impl Agent {
         if run.argv.is_empty() {
             return Err(Failure::invalid("empty command"));
         }
-        let brokered = match brokered {
+        let (brokered, limits) = match brokered {
             None if run.bindings.is_empty() => {
                 return Err(Failure::invalid("no secrets requested"));
             }
-            None => Vec::new(),
-            Some(brokered) if brokered.is_empty() => {
+            None => (Vec::new(), GrantLimits::default()),
+            Some((brokered, _)) if brokered.is_empty() => {
                 return Err(Failure::invalid(
-                    "a broker_run needs at least one broker binding; without any, it is a run",
+                    "a broker_run_v2 needs at least one broker binding; without any, it is a run",
                 ));
             }
             Some(brokered) => brokered,
@@ -2076,6 +2042,25 @@ impl Agent {
                 )));
             }
             seen.push(var);
+        }
+        // Where each grant sends its key, and the limits of all of them:
+        // checked before anything else is (ADR 0013, scope amendment). The
+        // messages name the variable, never repeat the destination.
+        let destinations: Vec<Destination> = brokered
+            .iter()
+            .map(|b| {
+                Destination::parse(&b.destination).map_err(|e| {
+                    Failure::invalid(format!(
+                        "{} of {}: {e}; use VAR=ENTRY@https://HOST[:PORT][/BASE]",
+                        b.var, b.entry
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        if is_broker {
+            limits
+                .validate()
+                .map_err(|e| Failure::invalid(format!("the grants' limits: {e}")))?;
         }
         let cwd = PathBuf::from(&run.cwd);
         if !cwd.is_absolute() || !cwd.is_dir() {
@@ -2155,8 +2140,8 @@ impl Agent {
         };
 
         // Every entry must exist (and have a value) before the human is asked;
-        // an entry used through the broker must also have a usable profile and
-        // a value the broker can carry.
+        // an entry used through the broker must also have a value the broker
+        // can carry.
         let generation = self.generation(peer)?;
         let (entries, grants): (Vec<(String, String, String)>, Vec<Brokered>) = self
             .with_vault_at(generation, |v| {
@@ -2176,7 +2161,7 @@ impl Agent {
                     })
                     .collect::<Result<_, Failure>>()?;
                 let mut grants: Vec<Brokered> = Vec::with_capacity(brokered.len());
-                for binding in &brokered {
+                for (binding, destination) in brokered.iter().zip(&destinations) {
                     let id = v.find(&binding.entry)?;
                     let info = v.info(id);
                     let identity = info.identity();
@@ -2191,7 +2176,6 @@ impl Agent {
                             "{identity} is used through the broker twice"
                         )));
                     }
-                    let profile = usable_profile(&info, &identity)?;
                     match v.secret(id) {
                         None => {
                             return Err(Failure::new(
@@ -2213,7 +2197,7 @@ impl Agent {
                         identity,
                         var: binding.var.clone(),
                         url_var: binding.url_var.clone(),
-                        profile,
+                        destination: destination.clone(),
                     });
                 }
                 Ok((entries, grants))
@@ -2244,7 +2228,9 @@ impl Agent {
                 .map(|(g, id)| AuditGrant {
                     id: id.clone(),
                     entry: g.identity.clone(),
-                    destination: g.profile.destination(),
+                    destination: g.destination.origin.clone(),
+                    base_path: (!g.destination.base_path.is_empty())
+                        .then(|| g.destination.base_path.clone()),
                 })
                 .collect()
         });
@@ -2315,7 +2301,14 @@ impl Agent {
             input,
         };
         let (request, key) = if is_broker {
-            let request = broker_approval(&shown, &secrets_shown, &grants, run.redact, warnings);
+            let request = broker_approval(
+                &shown,
+                &secrets_shown,
+                &grants,
+                &limits,
+                run.redact,
+                warnings,
+            );
             // Each part must be readable on its own, as the command line
             // must: refused rather than shortened.
             if let Some((label, value)) = request
@@ -2489,10 +2482,11 @@ impl Agent {
                             entry_uuid: g.uuid.clone(),
                             entry: g.identity.clone(),
                             var: g.var.clone(),
-                            profile: g.profile.clone(),
+                            destination: g.destination.clone(),
+                            limits,
                             command: command_text.clone(),
                             requester: peer.describe(),
-                            lifetime: self.grant_lifetime(&g.profile),
+                            lifetime: self.grant_lifetime(&limits),
                         })
                         .collect();
                     Some(self.registry.enter(new).map_err(Failure::invalid)?)
@@ -2539,7 +2533,7 @@ impl Agent {
             for ((grant, token), port) in grants.iter().zip(&tokens).zip(&ports) {
                 command.env(&grant.var, token.as_str());
                 if let Some(url_var) = &grant.url_var {
-                    command.env(url_var, grant.profile.local_url(*port));
+                    command.env(url_var, grant.destination.local_url(*port));
                 }
             }
             for name in ["NO_PROXY", "no_proxy"] {
@@ -2756,7 +2750,7 @@ impl Agent {
     /// Prepare a broker run's grants, which are entered as starting: check
     /// the broker program again, record each grant's creation (fail closed),
     /// start their brokers — each with its install: a new token, the
-    /// credential, the profile snapshot and the limits — and make them all
+    /// credential, the approved origin and the limits — and make them all
     /// active. Returns the tokens and ports, in the order of `grants`; on a
     /// failure, the reason the grants end with (the caller ends them, stops
     /// their brokers and releases their ports before it answers).
@@ -2815,7 +2809,7 @@ impl Agent {
                 grant: id.clone(),
                 token: token.clone(),
                 credential,
-                profile: grant.profile.clone(),
+                origin: grant.destination.origin.clone(),
                 max_in_flight: broker_protocol::MAX_IN_FLIGHT,
                 max_connections: BROKER_CONNECTIONS,
                 lifetime_secs: run_grants.lifetime_secs(id),
@@ -2967,34 +2961,8 @@ struct Brokered {
     var: String,
     /// The variable that receives the broker's address, if any.
     url_var: Option<String>,
-    /// Its profile, as it is now: the grant's snapshot.
-    profile: BrokerProfile,
-}
-
-/// The entry's broker profile, if the broker can use it: there is one, it
-/// is not a protected field, and it is valid.
-fn usable_profile(
-    info: &crate::protocol::EntryInfo,
-    identity: &str,
-) -> Result<BrokerProfile, Failure> {
-    if info.protected_fields.iter().any(|f| f == FIELD_BROKER) {
-        return Err(Failure::invalid(format!(
-            "the broker profile of {identity} is a protected field, which the broker cannot use; \
-             set it again with `rusthorse edit`"
-        )));
-    }
-    match &info.broker {
-        Some(profile) => Ok(profile.clone()),
-        None if info.other_fields.iter().any(|f| f == FIELD_BROKER) => {
-            Err(Failure::invalid(format!(
-                "the broker profile of {identity} is unusable (`rusthorse show` says why); set it \
-                 again with `rusthorse edit`"
-            )))
-        }
-        None => Err(Failure::invalid(format!(
-            "{identity} has no broker profile; set one with `rusthorse edit --broker PRESET`"
-        ))),
-    }
+    /// Where the run says its key goes.
+    destination: Destination,
 }
 
 /// What a run's dialog shows besides its secrets and grants.
@@ -3008,10 +2976,11 @@ struct Shown {
     input: &'static str,
 }
 
-/// The approval of a broker run (ADR 0013, decision 7): for each grant,
-/// which variables get its token and the broker's address and the whole
-/// profile — destination, every route, how and when it ends, the requests —
-/// then the secrets given as values in a mixed run, the program, the
+/// The approval of a broker run (ADR 0013, scope amendment): for each grant,
+/// which variables get its token and the broker's address, the approved
+/// origin and the base path apart from it, that the key may go to any path
+/// there, how and when it ends and its requests (the run's limits); then
+/// the secrets given as values in a mixed run, the program, the
 /// directory and the requester; that the command receives a temporary token
 /// and not the key, that it can spend credit, that a request count is not a
 /// spending limit and that request bodies are not inspected; and, without
@@ -3020,6 +2989,7 @@ fn broker_approval(
     shown: &Shown,
     secrets: &str,
     grants: &[Brokered],
+    limits: &GrantLimits,
     redact: bool,
     mut warnings: Vec<String>,
 ) -> ApprovalRequest {
@@ -3028,13 +2998,15 @@ fn broker_approval(
     // and a run with one grant should (a test checks a realistic one).
     let one = grants.len() == 1;
     let mut explanation = format!(
-        "It gets {}, not the key; Rusthorse adds the key to the requests it allows. It runs as \
-         you, outside any sandbox, and programs it starts can use the {} too.",
+        "It gets {}, not the key; Rusthorse puts the key in its place in requests to the \
+         approved origin, {}. It runs as you, outside any sandbox, and programs it starts can \
+         use the {} too.",
         if one {
             "a temporary token"
         } else {
             "a temporary token for each grant"
         },
+        crate::broker_grant::REACHES,
         if one { "token" } else { "tokens" }
     );
     if mixed {
@@ -3043,7 +3015,13 @@ fn broker_approval(
     let mut details: Vec<(String, String)> = grants
         .iter()
         .flat_map(|g| {
-            broker_host::grant_details(&g.var, g.url_var.as_deref(), &g.identity, &g.profile)
+            broker_host::grant_details(
+                &g.var,
+                g.url_var.as_deref(),
+                &g.identity,
+                &g.destination,
+                limits,
+            )
         })
         .collect();
     if mixed {
@@ -3296,22 +3274,6 @@ fn ends_grants(count: usize) -> Option<String> {
              lose access."
         )),
     }
-}
-
-/// A new broker profile as an edit's dialog shows it: the preset and its
-/// revision, then the whole of what it allows ([`BrokerProfile::describe`]).
-fn describe_profile(profile: &BrokerProfile) -> Vec<(String, String)> {
-    let mut details = vec![(
-        "New broker profile".to_string(),
-        format!(
-            "{} preset ({}), revision {}",
-            profile.preset.label(),
-            profile.preset.as_str(),
-            profile.revision
-        ),
-    )];
-    details.extend(profile.describe());
-    details
 }
 
 fn describe_spec(spec: crate::generate::Spec) -> String {
@@ -3799,10 +3761,6 @@ mod tests {
             state.vault = Some(vault);
             state.generation
         };
-        let profile =
-            crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
-                .resolve()
-                .expect("profile");
         let id = broker_protocol::new_grant_id();
         let run = agent
             .registry
@@ -3811,7 +3769,8 @@ mod tests {
                 entry_uuid: "some-other-entry".into(),
                 entry: "OTHER (someothe)".into(),
                 var: "KEY".into(),
-                profile,
+                destination: example_destination(),
+                limits: GrantLimits::default(),
                 command: "true".into(),
                 requester: "test".into(),
                 lifetime: Duration::from_secs(60),
@@ -3866,28 +3825,25 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
 
-    fn anthropic_profile() -> BrokerProfile {
-        crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
-            .resolve()
-            .expect("profile")
+    /// Where the grants of these tests send their key.
+    fn example_destination() -> Destination {
+        Destination::parse("https://api.example.com").expect("destination")
     }
 
-    /// A grant lasts its profile's maximum lifetime; the tests' override
+    /// A grant lasts its run's maximum lifetime; the tests' override
     /// shortens it and never lengthens it, so that a broker's install never
-    /// says more than its profile allows (`Install::validate` refuses that).
+    /// says more than its run allows.
     #[test]
-    fn a_grant_lasts_at_most_its_profiles_lifetime() {
+    fn a_grant_lasts_at_most_its_runs_lifetime() {
         let dir = tempfile::tempdir().expect("tempdir");
         let broker = dir.path().join("rusthorse-broker");
-        let profile = crate::broker_profile::ProfileRequest {
-            max_lifetime_minutes: Some(30),
-            ..crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
-        }
-        .resolve()
-        .expect("profile");
+        let limits = GrantLimits {
+            max_lifetime_minutes: 30,
+            ..GrantLimits::default()
+        };
         let longest = Duration::from_secs(30 * 60);
         let mut agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
-        assert_eq!(agent.grant_lifetime(&profile), longest);
+        assert_eq!(agent.grant_lifetime(&limits), longest);
         for (asked, lasts) in [
             (Duration::from_secs(2), Duration::from_secs(2)),
             (Duration::from_secs(48 * 3600), longest),
@@ -3896,7 +3852,7 @@ mod tests {
                 .expect("only handle")
                 .config
                 .broker_lifetime = Some(asked);
-            assert_eq!(agent.grant_lifetime(&profile), lasts, "{asked:?}");
+            assert_eq!(agent.grant_lifetime(&limits), lasts, "{asked:?}");
         }
     }
 
@@ -3920,7 +3876,8 @@ mod tests {
                 entry_uuid: "uuid-of-key".into(),
                 entry: "KEY (uuid-of-)".into(),
                 var: "K".into(),
-                profile: anthropic_profile(),
+                destination: example_destination(),
+                limits: GrantLimits::default(),
                 command: "true".into(),
                 requester: "test".into(),
                 lifetime: Duration::from_secs(60),
@@ -3932,7 +3889,7 @@ mod tests {
             identity: "KEY (uuid-of-)".into(),
             var: "K".into(),
             url_var: None,
-            profile: anthropic_profile(),
+            destination: example_destination(),
         }];
         let program = std::fs::canonicalize(&broker).expect("canonical");
         let Err((failure, reason)) = agent.prepare_grants(
@@ -3986,7 +3943,8 @@ mod tests {
                 entry_uuid: "uuid-of-key".into(),
                 entry: "KEY (uuid-of-)".into(),
                 var: "K".into(),
-                profile: anthropic_profile(),
+                destination: example_destination(),
+                limits: GrantLimits::default(),
                 command: "true".into(),
                 requester: "test".into(),
                 lifetime: Duration::from_secs(60),
@@ -3998,7 +3956,7 @@ mod tests {
             identity: "KEY (uuid-of-)".into(),
             var: "K".into(),
             url_var: None,
-            profile: anthropic_profile(),
+            destination: example_destination(),
         }];
         let program = std::fs::canonicalize(&broker).expect("canonical");
         let prepared = std::thread::scope(|scope| {
@@ -4072,7 +4030,8 @@ mod tests {
                     entry_uuid: format!("uuid-{i}"),
                     entry: format!("OTHER{i} (uuid-{i})"),
                     var: "K".into(),
-                    profile: anthropic_profile(),
+                    destination: example_destination(),
+                    limits: GrantLimits::default(),
                     command: "true".into(),
                     requester: "test".into(),
                     lifetime: Duration::from_secs(60),
@@ -4116,14 +4075,6 @@ mod tests {
                 false,
             )
             .expect("add");
-        let id = vault.find("KEY").expect("find");
-        let profile = EntryChanges {
-            broker: Some(crate::broker_profile::ProfileRequest::new(
-                crate::broker_profile::Preset::Anthropic,
-            )),
-            ..EntryChanges::default()
-        };
-        vault.edit(id, &profile, None).expect("profile");
         agent.state().vault = Some(vault);
         let run = RunRequest {
             bindings: Vec::new(),
@@ -4136,11 +4087,18 @@ mod tests {
         let brokered = vec![BrokerBinding {
             var: "K".into(),
             entry: "KEY".into(),
+            destination: "https://api.example.com".into(),
             url_var: None,
         }];
         let (stream, _client) = UnixStream::pair().expect("pair");
         let failure = agent
-            .run(&stream, &Peer::agent(), run, Some(brokered), Vec::new())
+            .run(
+                &stream,
+                &Peer::agent(),
+                run,
+                Some((brokered, GrantLimits::default())),
+                Vec::new(),
+            )
             .expect_err("no room left");
         assert_eq!(failure.code, ErrorCode::InvalidRequest);
         assert!(
@@ -4339,10 +4297,6 @@ mod tests {
     /// redaction.
     #[test]
     fn the_dialog_of_a_run_with_one_grant_fits_the_screen() {
-        let profile =
-            crate::broker_profile::ProfileRequest::new(crate::broker_profile::Preset::Anthropic)
-                .resolve()
-                .expect("profile");
         let shown = Shown {
             command_line: "claude --model claude-sonnet-4-5 -p 'Summarise the changes in this \
                            branch'"
@@ -4363,7 +4317,12 @@ mod tests {
             identity: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
             var: "ANTHROPIC_AUTH_TOKEN".into(),
             url_var: Some("ANTHROPIC_BASE_URL".into()),
-            profile,
+            // A base path, so that the dialog shows every line it can.
+            destination: Destination::parse("https://api.anthropic.com/v1").expect("destination"),
+        };
+        let limits = GrantLimits {
+            max_requests: Some(200),
+            ..GrantLimits::default()
         };
         for mixed in ["", "GITHUB_TOKEN ← Dev/GITHUB_TOKEN (1a2b3c4d)"] {
             for redact in [true, false] {
@@ -4371,11 +4330,16 @@ mod tests {
                     &shown,
                     mixed,
                     std::slice::from_ref(&grant),
+                    &limits,
                     redact,
                     Vec::new(),
                 );
                 let text = crate::ui::approval_text(&request);
                 assert!(text.chars().count() <= MAX_DIALOG_CHARS, "{text}");
+                // What the approval covers is said whole.
+                assert!(text.contains(crate::broker_grant::REACHES), "{text}");
+                assert!(text.contains("Approved origin: https://api.anthropic.com\n"));
+                assert!(text.contains("Base path: /v1 (not a limit)\n"), "{text}");
                 assert_eq!(
                     crate::ui::approval_too_tall(&request),
                     None,

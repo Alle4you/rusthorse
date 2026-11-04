@@ -54,9 +54,10 @@ are optional separate programs:
   dialog for the agent and exits. Without it, the agent uses zenity.
 
 - **`rusthorse-broker`** is one process per HTTP grant. It receives only that
-  grant's credential, token, profile and limits, not the vault or master
-  password. It authenticates requests to the profile's HTTPS destination and
-  relays responses; the agent owns approval, accounting and revocation.
+  grant's credential, token, approved origin and limits, not the vault or
+  master password. It puts the credential where the program put the token,
+  in requests it forwards to that HTTPS origin only, and relays responses;
+  the agent owns approval, accounting and revocation.
 
 ## Process model
 
@@ -161,25 +162,34 @@ the agent from reading the connection. If the caller's stdout is closed
 needs no lock) and exits with status 141, like a process killed by
 `SIGPIPE` — within about half a second, even if its other output is stuck.
 
-## Lifecycle of a `broker_run`
+## Lifecycle of a `broker_run_v2`
 
-The CLI sends a distinct protocol-8 request with entry names and variable
-names, never a token, source key or requester-selected profile. It pairs a
-`--url` with the broker binding by the same entry spelling; an alias that
-would instead expose the entry's provider URL is refused. The agent resolves
-UUIDs and the stored profiles and rejects duplicate brokered entries, mixed
-use of the same entry, invalid variables, unusable profiles and credentials
-outside 8–4096 visible ASCII characters. The helper's availability and room
-for the grants are checked even before unlocking; no grant is served if the
-agent's expiry thread could not start.
+The CLI sends a distinct protocol-9 request with entry names, variable names,
+each binding's destination (`--broker VAR=ENTRY@URL`) and the run's limits
+(`--broker-requests`, `--broker-lifetime`, `--broker-locks`), never a token
+or source key. It checks the destinations and the limits before sending, and
+pairs a `--url` with the broker binding by the same entry spelling; an alias
+that would instead expose the entry's provider URL is refused. The agent
+refuses unknown fields, parses each destination into an origin (`https://`,
+a lowercase host name that is not an IP address, an optional port) and a
+base path, checks the limits, resolves UUIDs, and rejects duplicate brokered
+entries, mixed use of the same entry, invalid variables and credentials
+outside 8–4096 visible ASCII characters. Nothing in the entry decides the
+destination: there is no default and no fallback to its URL. The helper's
+availability and room for the grants are checked even before unlocking; no
+grant is served if the agent's expiry thread could not start.
 
-The approval shows each destination, every allowed route, termination policy,
-maximum lifetime, request count (or no limit), concurrency, bindings by value
-in a mixed run, command, program, directory and requester. It warns about
-spending credit, opaque request bodies and unredacted output when requested.
-Broker approvals are never remembered. All dialog parts pass `dialog_text` and
-the size checks; no part is truncated. A single ordinary AI grant fits the
-tested zenity height estimate, but two or more may exceed it and be refused;
+The approval shows, for each grant, the variables of its token and of the
+broker's address, the entry, the approved origin and the base path apart
+from it (marked "not a limit"), how and when it ends, and its request limit
+(or no limit) and concurrency; then bindings by value in a mixed run,
+command, program, directory and requester. Its explanation says that the key
+goes in the token's place in requests to the approved origin, at any path
+there. It warns about spending credit (a request limit is not a spending
+limit), opaque request bodies and unredacted output when requested. Broker
+approvals are never remembered. All dialog parts pass `dialog_text` and the
+size checks; no part is truncated. A single ordinary grant fits the tested
+zenity height estimate, but two or more may exceed it and be refused;
 `rusthorse-dialog` scrolls, subject to the text limits.
 
 Preparation is one transaction:
@@ -202,8 +212,8 @@ Preparation is one transaction:
    Cleanup also precedes a best-effort `aborted` audit record.
 
 The command gets one token per broker binding (`rh_` plus 64 lowercase hex
-characters), and `http://127.0.0.1:PORT` plus the stored base path in its URL
-variable. The agent replaces requester values for those variables and adds
+characters), and `http://127.0.0.1:PORT` plus the destination's base path in
+its URL variable. The agent replaces requester values for those variables and adds
 `127.0.0.1` to `NO_PROXY` and `no_proxy`. This helps clients that honor those
 variables; it does not force a client to use them. Other entries may still be
 given by value. Default output redaction covers both values and tokens;
@@ -218,16 +228,29 @@ failure while that command might still use it. The broker runs with an empty
 environment, cwd `/`, its own process group and a socket pair as stdin/stdout;
 stderr is discarded. It is not an OS sandbox.
 
-HTTP/1.1 is used on both hops; TLS 1.2/1.3, SNI from the profile and the fixed
-ALPN offer `http/1.1` on the upstream hop. Each request uses a new TLS
-connection. The broker rebuilds Host, length, identity encoding and the
-credential header. Header allowlists, exact routes and query rules reject
-requests outside the stored preset. Redirects and encoded responses are
-refused; literal credentials in relayed bodies and headers are removed. SSE is
+HTTP/1.1 is used on both hops; TLS 1.2/1.3, SNI and `Host` from the approved
+origin and the fixed ALPN offer `http/1.1` on the upstream hop. No request
+target or header changes where the broker connects. Each request uses a new
+TLS connection. The broker sets `Host`, `Content-Length` and
+`Accept-Encoding` (identity) and drops hop-by-hop headers; it forwards the
+other request headers, the method (not `CONNECT`, `TRACE` or `OPTIONS`) and
+the origin-form path and query as the program sent them, with a body on any
+accepted method. It knows nothing about the API: there is no route, header
+list or query rule, and any path at the approved origin is allowed. The
+program presents the token literally in a request header; the broker
+replaces each exact occurrence of it in the forwarded header values with the
+credential, in one pass, and refuses the request (`401`, before admission)
+when no forwarded header value holds it, when it appears elsewhere in the
+head, when another token-shaped string or the credential itself appears
+there, or when the head grows past its limit. Redirects and encoded
+responses are refused; literal credentials in relayed bodies are redacted,
+and relayed headers that carry the credential or a token are dropped. SSE is
 streamed through the redactor, which retains a small suffix needed to match a
 credential split across chunks. Opaque request bodies are not inspected. See
-the
-[normative HTTP rules](adr/0013-credential-broker.md#requests-and-responses).
+the [scope amendment's rules](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets),
+which keep phase 1's
+[framing, admission and forwarding rules](adr/0013-credential-broker.md#requests-and-responses)
+without their route check.
 
 Declared bodies are limited to 16 MiB, with a 64 MiB per-broker reservation
 budget before admission. The reservation is held by both the exchange until a
@@ -240,8 +263,11 @@ Public addresses are tried in order within one 10-second resolution/connect
 deadline, without a second resolution. There is no Happy Eyeballs; a stalled
 first address may consume the deadline.
 
-The broker numbers admissions from 1. The agent's reader validates numbers and
-routes, refuses invalid state/limits immediately, or reserves a use and slot
+The broker numbers admissions from 1 and names each request's method by its
+label only (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OTHER`). The
+agent's reader validates numbers and the message's shape (a route, a path or
+a raw method breaks the conversation), refuses invalid state/limits
+immediately, or reserves a use and slot
 under the registry lock. A bounded per-grant queue (256 jobs) feeds an audit
 thread, which durably records the admission, rechecks state and lifetime, then
 answers exactly once. Only then is the body read and the request forwarded. An
@@ -262,9 +288,9 @@ revocation work while locked, without a dialog.
 Every grant ends on explicit lock, failed save, agent exit or its command's
 end; entry changes, manual revocation, broker failure and expiry end the
 grants they concern. Every automatic lock ends every starting grant. For
-active/exhausted grants it follows `automatic_locks`: `end` or `continue`
-(default for AI presets, with a 12-hour maximum). Broker traffic never
-postpones the vault's idle lock.
+active/exhausted grants it follows the run's `automatic_locks`: `end` or
+`continue` (the CLI's default, with a 12-hour maximum lifetime). Broker
+traffic never postpones the vault's idle lock.
 
 Revocation is decided under the registry lock: no later admission succeeds.
 The agent tells the brokers and immediately refuses admissions waiting for
@@ -323,14 +349,13 @@ updates it without revoking unrelated grants.
 | `remove` | yes | approval | no |
 | `reveal` | yes | approval with a warning; the dialog names the client's stated purpose (print, show, copy) | no |
 | `run` | yes | approval | opt-in (`--remember`), exact match |
-| `broker_run` | yes | approval of the whole grant scope | no |
-| `broker_edit` | yes | approval of the resolved profile and other edits | no |
+| `broker_run_v2` | yes | approval of each grant's approved origin and the run's limits | no |
 | `grants`, `revoke_grant` | no | none | — |
 
-"Metadata" includes the usable broker profile, and is the entry name, group,
-username, URL, host, port, tags, whether a value and notes exist, the *names*
-of other fields and the modification time. Values, notes and the values of
-other fields are never sent without approval.
+"Metadata" is the entry name, group, kind, username, URL, host, port, tags,
+whether a value and notes exist, the *names* of other fields and the
+modification time. Values, notes and the values of other fields are never
+sent without approval.
 
 Fields that the KDBX file marks as *protected* (KeePassXC lets you protect
 any field) are withheld from metadata as well; `protected_fields` lists their
@@ -413,7 +438,6 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 | port | `Port` (custom) | no | yes |
 | kind | `Kind` (custom): `api-key`, `login`, `server` or `device` | no | yes |
 | notes | `Notes` | yes | **no** |
-| broker profile | `Rusthorse.Broker` (custom, versioned JSON) | no | yes, when valid and unprotected |
 | tags | `Tags` | — | yes |
 | group | entry's group path | — | yes |
 | other fields | custom fields | as stored | names only |
@@ -430,11 +454,12 @@ the entry has no kind. A metadata field that the file marks as protected —
 `Kind` included — is withheld like a value. The kind only labels fields
 ([ADR 0008](adr/0008-entry-kinds.md)); no policy reads it.
 
-The broker profile is parsed strictly: unknown fields, format/preset
-revisions, invalid origins/paths/limits and oversized JSON make it unusable. A
-protected profile is withheld. `broker_edit` sets a complete resolved profile
-with a frozen preset revision; replacement by add/import removes it. A real
-KeePassXC CLI round trip is covered by an opt-in compatibility test.
+Nothing for the credential broker is stored: a grant's destination and
+limits come with each run. A `Rusthorse.Broker` field, where phase 1 stored
+a broker profile as JSON, is one of the other fields: listed by name only,
+never read, interpreted, migrated or widened, and kept as it is through
+edits, saves and replacements (`add --replace`, `import --replace`), like any
+custom field.
 
 ### Saving
 
@@ -578,12 +603,14 @@ The time is taken from the system clock when the record is written, so an
 approval is dated after the human answered (usually within a moment), not when
 the request arrived. Values are never logged. If a record cannot be written,
 approval-gated requests are refused ("fail closed"). Broker runs add public
-grant IDs, entries and destinations. Each grant has a fail-closed `created`
-record and a best-effort `ended` record with its reason and admitted,
-finished, unknown and refused counts. Each admission has a durable
-`broker_request` record and a completion record with route template, outcome,
-status and byte counts; never raw paths, query strings, headers, bodies,
-tokens or credentials. Refusals are counted through revocation confirmation
+grant IDs, entries, approved origins and base paths. Each grant has a
+fail-closed `created` record and a best-effort `ended` record with its
+reason and admitted, finished, unknown and refused counts. Each admission has
+a durable `broker_request` record with the method's label (`GET`, `HEAD`,
+`POST`, `PUT`, `PATCH`, `DELETE` or `OTHER`) and a completion record with
+the label, outcome, status and byte counts; never raw methods, paths, query
+strings, headers, bodies, tokens or credentials. Which path at the approved
+origin a request reached is therefore not recorded. Refusals are counted through revocation confirmation
 rather than logged individually. An admission revoked while its record is
 written gets a `not_forwarded` follow-up and counts as refused. Last
 request/end records may arrive after the run's reply; a grant's end record is
@@ -592,7 +619,7 @@ are counted apart from these records, as the broker reports each request's
 end: `grants` shows the count, and the run's reply names the grants that have
 one, so that `rusthorse run` can say that the destination did not accept the
 key. See [cli.md](cli.md#rusthorse-audit) and
-[protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-1).
+[protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-2).
 
 ## Code map
 
@@ -601,7 +628,7 @@ key. See [cli.md](cli.md#rusthorse-audit) and
 | [`src/main.rs`](../src/main.rs) | Command-line parsing and output formatting. |
 | [`src/guide/ai.md`](../src/guide/ai.md) | The guide for AI agents that `rusthorse guide ai` prints. |
 | [`broker/`](../broker) | Per-grant HTTP/TLS process and broker/system tests. |
-| [`src/broker_profile.rs`](../src/broker_profile.rs) | Strict profiles, presets, route/header/token rules. |
+| [`src/broker_grant.rs`](../src/broker_grant.rs) | What a grant carries besides its token and key: the destination's rules (origin and base path), the run's limits, method labels, token-shaped strings and which values the broker can send. |
 | [`src/broker_protocol.rs`](../src/broker_protocol.rs) | Control frames, grant/token types, limits and CA-file validation. |
 | [`src/broker_host.rs`](../src/broker_host.rs) | Agent registry, preparation, admission, audit jobs, expiry and containment. |
 | [`src/agent.rs`](../src/agent.rs) | The agent: socket server, policy, unlock, approvals, `run`. |
@@ -652,7 +679,7 @@ its own dialog.
   dialogs. With nothing listening on the socket, it offers **Start agent**,
   which runs `systemctl --user start rusthorse-agent.service` — systemd, not
   the manager, starts the agent ([ADR 0011](adr/0011-first-start-from-the-manager.md)).
-- **Requests.** It uses the protocol-8 requests and targets entries by UUID.
+- **Requests.** It uses the protocol-9 requests and targets entries by UUID.
   Before each request it checks the agent's protocol version. One request
   started by the human runs at a time, on a worker thread, with bounded waits;
   closing the window shuts the connection down. A lost answer to a request
@@ -672,8 +699,9 @@ its own dialog.
 - **Kinds.** The entry form starts with a Kind row; the kind decides which
   of Username, URL, Host and Port the form offers and what the URL is called
   ("Endpoint URL" for an API key, "Admin page" for a device). A row with a
-  value is always shown, and a "Show all fields" switch shows every row. The command snippet of an API key with an endpoint
-  adds `--url` ([ADR 0008](adr/0008-entry-kinds.md)).
+  value is always shown, and a "Show all fields" switch shows every row
+  ([ADR 0008](adr/0008-entry-kinds.md)). The kind grants nothing, and the
+  manager's command templates infer nothing from it.
 - **Copy.** `reveal` with purpose `copy`: the value goes to the clipboard as
   plain text and stays until something else is copied; the desktop and
   clipboard histories may keep it. See
@@ -684,13 +712,19 @@ its own dialog.
   request, without a dialog; listing and revocation each have a 30-second job
   deadline. Rows are keyed by grant ID, updated in place and retained as Ended
   until the page is left, to keep another Revoke button from moving into a
-  removed row's place. Each grant says whether its destination answered
-  requests with `401` (**Key refused**, in the warning colour when it did),
-  as of the last listing. No token reaches this page.
-- **Profiles.** Entry details show usable profiles read-only and distinguish
-  protected/unusable ones. Snippets use broker token and URL bindings;
-  Anthropic SDK and Claude Code recipes keep competing key variables out.
-  Profile editing remains in the CLI; the manager never sends `broker_edit`.
+  removed row's place. Each grant shows its approved origin, and its base
+  path apart, as setup of the program's base URL and not a limit, and says
+  whether its destination answered requests with `401` (**Key refused**, in
+  the warning colour when it did), as of the last listing. No token reaches
+  this page.
+- **Command templates.** An entry offers two command templates, each
+  labelled: one gives the value to the command (`run`), the other goes
+  through the broker and leaves the destination, the token's variable and
+  the base URL's variable for the human to fill in. Nothing in the broker
+  template is inferred from the entry's kind, its URL or a field phase 1
+  stored; left unfilled, it is not a valid command; and no template is
+  stored with the entry.
+  The manager shows no broker profile and edits none: there are none.
 - **Memory.** Values live in zeroizing buffers in Rust; GTK's own copies
   are emptied when no longer needed but cannot be wiped reliably, and a
   copied value is out of reach. The process is non-dumpable.

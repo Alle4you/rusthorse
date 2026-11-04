@@ -2,6 +2,12 @@
 
 - Status: Proposed
 - Date: 2026-11-01
+- Amended: 2026-11-04, by [ADR 0013's scope amendment](0013-credential-broker.md#scope-amendment-2026-11-04):
+  the manager's commands for an entry infer nothing from its kind or its
+  URL any more. It offers two labelled templates, one that gives the value
+  and one through the credential broker; the snippet of section 6, which
+  added `--url` for an API key with an endpoint, is gone. `run --url`
+  (section 5) is unchanged.
 
 ## Context
 

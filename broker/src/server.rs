@@ -1,7 +1,7 @@
 //! Serving the grant once the broker is ready: the listening socket, each
-//! client connection, and steps 1 to 5 of every request (ADR 0013,
-//! "Requests and responses") before an admitted one goes on in
-//! `exchange`.
+//! client connection, and steps 1 to 4 of every request (ADR 0013,
+//! "Requests and responses", as its scope amendment changes them) before
+//! an admitted one goes on in `exchange`.
 //!
 //! Connections: at most the install's `max_connections` are open at once
 //! (one more is closed as soon as it is accepted); a request's head must
@@ -12,24 +12,27 @@
 //! its lifetime, which a task of its own watches — is closed at once.
 //! HTTP/1.1 only, without upgrades.
 //!
-//! Requests, in order: the framing (`400`, `505`), the token (`401`), the
-//! route (`404`), room for the body (`413`, `503`), the admission (`403`,
-//! `429`, `503`, or the agent's answer). A request that hyper cannot parse
-//! it answers itself (`400`, or `431` for a head too large) and closes the
-//! connection. Every request refused before its admission was asked,
+//! Requests, in order: the framing (`400`, `505`), the token and the key in
+//! its place (`401`, `token`), room for the body (`413`, `503`), the
+//! admission (`403`, `429`, `503`, or the agent's answer), which names the
+//! request by its method's label alone. There is no route: the target goes
+//! to the approved origin as the client sent it. A request that hyper cannot
+//! parse it answers itself (`400`, or `431` for a head too large) and closes
+//! the connection. Every request refused before its admission was asked,
 //! those included, is counted, for `revoked`; once the grant is closed,
-//! every request that passes the token and the route gets `403`.
+//! every request that passes the token gets `403`.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use http::{Request, Response};
+use http::header::CONTENT_LENGTH;
+use http::{HeaderValue, Request, Response};
 use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use rusthorse::broker_profile::{RouteRefusal, check_inbound_token, match_route};
+use rusthorse::broker_grant::{self, MethodLabel};
 use rusthorse::broker_protocol::{
     FromBroker, MAX_REQUEST_BODY_BYTES, MAX_REQUEST_HEADER_BYTES, REQUEST_BODY_BUDGET_BYTES,
     VERSION,
@@ -46,7 +49,7 @@ use crate::destination::Destination;
 use crate::exchange::{self, Admission};
 use crate::grant::{Budget, Grant};
 use crate::setup::Prepared;
-use crate::{EXIT_SETUP, control, framing};
+use crate::{EXIT_SETUP, control, framing, headers, token};
 
 /// The largest buffer of a client connection: a whole head fits.
 const MAX_BUFFER_BYTES: usize = 64 * 1024;
@@ -61,6 +64,8 @@ pub struct Server {
     pub budget: Arc<Budget>,
     /// `127.0.0.1:PORT`: the only `Host` served.
     pub host: String,
+    /// The approved origin's authority: the `Host` the destination gets.
+    pub authority: HeaderValue,
     /// How the destination is reached.
     pub destination: Destination,
     /// TLS to the destination.
@@ -90,7 +95,16 @@ pub async fn run(prepared: Prepared, config: Config) -> u8 {
         port,
         tls,
     } = prepared;
-    let Ok(server_name) = ServerName::try_from(install.profile.host().to_string()) else {
+    // The approved origin, which `Install::validate` checked: the host,
+    // the port, the TLS server name and `Host` all come from it.
+    let approved = broker_grant::Destination {
+        origin: install.origin.clone(),
+        base_path: String::new(),
+    };
+    let Ok(server_name) = ServerName::try_from(approved.host().to_string()) else {
+        return EXIT_SETUP;
+    };
+    let Ok(authority) = HeaderValue::from_str(approved.authority()) else {
         return EXIT_SETUP;
     };
     let listener = match listener
@@ -116,12 +130,13 @@ pub async fn run(prepared: Prepared, config: Config) -> u8 {
     if queue.send(ready).is_err() {
         return EXIT_SETUP;
     }
-    let destination = Destination::new(&install.profile, &config);
+    let destination = Destination::new(approved.host(), approved.port(), &config);
     let max_connections = install.max_connections as usize;
     let server = Arc::new(Server {
         grant: Grant::new(install, received, queue),
         budget: Budget::new(REQUEST_BODY_BUDGET_BYTES),
         host: format!("127.0.0.1:{port}"),
+        authority,
         destination,
         tls: TlsConnector::from(tls),
         server_name,
@@ -193,7 +208,7 @@ async fn connection(stream: TcpStream, server: Arc<Server>, _slot: OwnedSemaphor
     }
 }
 
-/// One request: steps 1 to 5 here, the rest in `exchange`.
+/// One request: steps 1 to 4 here, the rest in `exchange`.
 async fn handle(
     request: Request<Incoming>,
     server: Arc<Server>,
@@ -214,7 +229,7 @@ async fn handle(
     Ok(response.map(|body| body.hold(busy)))
 }
 
-/// Steps 1 to 5 up to the question to the agent: the admission asked, or
+/// Steps 1 to 4 up to the question to the agent: the admission asked, or
 /// the local refusal and whether the request's body is left unread.
 fn screen(server: &Server, request: Request<Incoming>) -> Result<Admission, (Refusal, bool)> {
     let (parts, body) = request.into_parts();
@@ -232,28 +247,26 @@ fn screen(server: &Server, request: Request<Incoming>) -> Result<Admission, (Ref
         &server.host,
     )
     .map_err(refuse)?;
-    // 2. The token, in every header that may carry one.
-    let presented = parts
-        .headers
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_bytes()));
-    check_inbound_token(grant.spec(), presented, grant.token())
-        .map_err(|_| refuse(Refusal::Token))?;
-    // 3. The route, exactly.
-    let matched = match_route(
-        grant.spec(),
-        &grant.profile().base_path,
-        parts.method.as_str(),
-        framed.target,
-    )
-    .map_err(|refusal| {
-        refuse(match refusal {
-            RouteRefusal::Malformed => Refusal::Target,
-            RouteRefusal::NotAllowed => Refusal::Route,
-        })
-    })?;
-    // 4. Room for the body.
     let body_len = framed.body_len;
+    // What the broker sets itself: `Host`, `Accept-Encoding`, and the
+    // length the client declared, if it declared one.
+    let declared_length = parts.headers.contains_key(CONTENT_LENGTH);
+    let own = headers::own(&server.authority, declared_length.then_some(body_len));
+    // 2. The token where the key goes, and the head the broker would send
+    // with the key in. Without the key (the grant is closed), the admission
+    // refuses the request below.
+    let credential = grant.credential();
+    token::check(
+        parts.method.as_str().as_bytes(),
+        framed.target.as_bytes(),
+        &parts.headers,
+        &own,
+        grant.token().as_bytes(),
+        credential.as_ref().map(|key| key.as_bytes()),
+    )
+    .map_err(|refusal| refuse(refusal.into()))?;
+    drop(credential);
+    // 3. Room for the body.
     if body_len > MAX_REQUEST_BODY_BYTES as u64 {
         return Err(refuse(Refusal::BodyTooLarge));
     }
@@ -261,16 +274,18 @@ fn screen(server: &Server, request: Request<Incoming>) -> Result<Admission, (Ref
         .budget
         .reserve(body_len)
         .ok_or_else(|| refuse(Refusal::NoRoom))?;
-    // 5. The admission: the broker's own checks, then the question.
+    // 4. The admission: the broker's own checks, then the question, with
+    // the method's label alone.
     let (number, answer) = grant
-        .ask_admission(parts.method.as_str(), &matched.template)
+        .ask_admission(MethodLabel::of(parts.method.as_str()))
         .map_err(|held| refuse(held.into()))?;
     Ok(Admission {
         request: number,
         answer,
         method: parts.method,
-        matched,
+        target: parts.uri,
         headers: parts.headers,
+        own,
         body,
         body_len,
         reservation,

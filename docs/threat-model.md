@@ -27,11 +27,13 @@ different guarantees are easy to confuse, so they are stated separately:
    Ordinary `run` gives the approved command the value and redacts literal
    copies of it by default. For each `run --broker` binding, the command gets
    a token, never the source credential; the broker puts that credential only
-   in the authentication header it builds for the profile's destination and
-   routes, over verified TLS. A grant approves a capability, not each API
-   call: allowed requests can spend credit or access data without another
-   dialog. Mixed runs still deliver values for their ordinary bindings.
-   Neither mode makes a hostile approved command harmless (L3–L5, L16).
+   where the command put the token, in the header values of requests it
+   forwards to the origin the run named and the human approved, over verified
+   TLS. A grant approves a capability, not each API call: requests to any
+   path at that origin can spend credit, access data or do whatever else the
+   key allows there without another dialog (L25). Mixed runs still deliver
+   values for their ordinary bindings. Neither mode makes a hostile approved
+   command harmless (L3–L5, L16).
 2. **Resisting a hostile requester that runs code as your user — not
    provided on a normal desktop.** A requester that deliberately attacks
    Rusthorse from a shell running as your user, in your graphical session,
@@ -58,9 +60,9 @@ this setup. It is outside what Rusthorse can enforce on its own.
 | Approval decisions | The human's control over *what* a secret is used for. |
 | Metadata (names, usernames, URLs, hosts, ports, tags) | Reveals what you have access to; useful for targeting. Treated as low sensitivity unless the file marks a field protected. |
 | The vault file and its backups | Encrypted at rest; exposed to offline guessing if copied. |
-| Broker tokens | Bearer capabilities usable through the local listener until the grant ends, within its routes and limits. |
+| Broker tokens | Bearer capabilities usable through the local listener until the grant ends, for any path at its approved origin, within its limits. |
 | A grant's credential in broker memory | Each broker holds only its own grant's credential; memory disclosure there must not expose the whole vault. |
-| Broker profiles and HTTP traffic | Profiles determine authority; prompts, responses and opaque bodies may contain sensitive data. The broker does not interpret them. |
+| Approved origins and HTTP traffic | The origin a run names and the human approves decides where a credential goes; any path there is allowed. Prompts, responses and opaque bodies may contain sensitive data. The broker does not interpret them. |
 | The audit log | Lets you notice misuse after the fact. |
 
 ## 3. Adversaries
@@ -107,9 +109,10 @@ Rusthorse's guarantees hold only if all of the following are trustworthy:
   Debian and Fedora) and the file system holding the vault;
 - **every program you approve**, for the secrets you approve it for, and
   everything that program loads or executes (L4). With a broker binding, this
-  trust concerns the granted API operations, not direct receipt of the
-  credential. The broker is trusted with that credential and runs as the same
-  user; it is not a code-execution sandbox (L16).
+  trust concerns what the key allows at the approved origin (L25), not
+  direct receipt of the credential. The broker is trusted with that
+  credential and runs as the same user; it is not a code-execution sandbox
+  (L16).
 
 ## 5. Trust boundaries
 
@@ -134,7 +137,7 @@ flowchart LR
     AG -- "spawns with values and/or broker tokens" --> CMD
     AG -- "private socketpair: grant and admission" --> BR
     CMD -- "HTTP on 127.0.0.1 + token" --> BR
-    BR -- "verified TLS + credential header" --> API["profile destination"]
+    BR -- "verified TLS, credential where the token was" --> API["approved origin"]
     AG <--> FILE
 ```
 
@@ -151,13 +154,13 @@ still holds the grant, including after revocation.
 |---|---|---|---|
 | P1 | A requester never receives a secret value, notes or a protected field without an approval for that specific request. | Only `reveal` returns a value, after a non-rememberable approval. `list`/`show` return metadata only, and withhold any field the KDBX file marks as protected — including a protected title, which is shown as `[protected title]` and matched only by UUID — reporting only the field's name. | A1, A2 |
 | P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap in the instant between that check and the start of the program, and changes to file *contents*, are not prevented (L4). | A1, A2 |
-| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. For ordinary `run`, reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. For `broker_run`, the same state lock also registers grants as `starting`; any lock ends starting grants, and all grants must still be starting before the command starts. Automatic locks can preserve already active grants by profile (L22). | A1, A2 |
+| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. For ordinary `run`, reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. For `broker_run_v2`, the same state lock also registers grants as `starting`; any lock ends starting grants, and all grants must still be starting before the command starts. Automatic locks can preserve already active grants when the run says so (L22). | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
-| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). Broker tokens are filtered from command output too. Independently, the broker redacts literal copies of its credential from response bodies and drops relayed headers whose values contain it. With `--no-redact`, the command instead gets the requester's input/output descriptors directly and its output is unfiltered; HTTP response redaction stays on. | A1 |
+| P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). Broker tokens are filtered from command output too. Independently, the broker redacts literal copies of its credential from response bodies and drops relayed response headers whose name or value carries it or a token. With `--no-redact`, the command instead gets the requester's input/output descriptors directly and its output is unfiltered; HTTP response redaction stays on. | A1 |
 | P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
 | P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and the start of their UUID, so two entries with the same title in different groups do not look alike (unless a file written by another program gave them UUIDs that start alike, L9); requests whose dialog text would exceed 4000 characters (or 1000 for the command line, program path or directory of a `run`) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
-| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token, checks its exact form and compares it in constant time; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
-| P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a profile can keep its grant credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
+| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token in a header value it forwards; every token-shaped string in the request's head (`rh_` and 64 hexadecimal digits, in any case) must be that token byte for byte, compared in constant time; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
+| P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
 | P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
@@ -169,9 +172,12 @@ entries in the grant registry per agent (normally revoked brokers stay listed
 and count until run cleanup; broker exit removes the entry sooner), 16
 admitted/reserved requests and 64 connections per broker, 16 MiB per request
 body, 64 MiB of retained request bodies and 64 MiB of upstream body per
-response, before redaction. Only exact preset routes pass; the broker drops
-other headers, refuses redirects and encoded responses, and builds Host, SNI
-and authentication itself. Its own lifetime task and forwarding checks use
+response, before redaction. There is no route check: any path at the
+approved origin passes (L25). The broker connects to that origin only,
+taking SNI and Host from it; it sets `Content-Length` and `Accept-Encoding`,
+drops hop-by-hop headers, forwards the program's other request headers,
+puts the credential only where the token was in the header values it
+forwards, and refuses redirects and encoded responses. Its own lifetime task and forwarding checks use
 `CLOCK_BOOTTIME`; the agent also expires grants and serves none if its expiry
 timer cannot start. These are bounded resources and scheduled checks, not a
 guarantee of availability under arbitrary same-user denial of service.
@@ -206,8 +212,9 @@ on.
 | **Deny**, closing the dialog, timeout | Nothing. The command does not run. |
 
 Locking, unlocking and any saved change invalidate remembered approvals.
-`broker_run` never uses them. Its approval creates a grant whose individual
-requests need admission and an audit record, but no new human dialog.
+A run with `--broker` (`broker_run_v2`) never uses them. Its approval
+creates a grant for the approved origin whose individual requests — to any
+path there — need admission and an audit record, but no new human dialog.
 
 ## 7. Known limitations and residual risks
 
@@ -245,10 +252,10 @@ While an approved command runs, any process of the same user can read
 `/proc/<pid>/environ`. Ordinary bindings contain the secret; broker bindings
 contain a token. Marking the command non-dumpable would prevent that, but
 `execve` resets the flag. A stolen broker token still works through its
-listener while the grant lives, within its routes and limits. *Mitigation:*
-short-lived commands, narrow grants and isolation (§8). Broker phase 1 keeps
-the source credential out of that binding's environment; it does not hide the
-token.
+listener while the grant lives, for any path at its approved origin, within
+its limits. *Mitigation:* short-lived commands, short lifetimes and request
+limits, narrow keys and isolation (§8). The broker keeps the source
+credential out of that binding's environment; it does not hide the token.
 
 ### L4 — Approving a command trusts everything it executes
 
@@ -291,12 +298,19 @@ entry's metadata, looks the same as a variable the requester set
 ([ADR 0008](adr/0008-entry-kinds.md)). *Mitigation:* read the dialog — check
 the host of every destination; prefer well-known binaries with explicit
 arguments; review recent changes to scripts before approving them. For a
-broker binding, the stored profile fixes the credential's destination and
-routes. Requester proxy/CA settings do not configure the broker, which starts
-with an empty environment. The command can still misuse allowed operations,
-send the token or other data in an opaque body, or send its token elsewhere
-without using the broker. `NO_PROXY` helps cooperative clients reach loopback;
-it is not enforcement.
+broker binding, the run names the credential's destination, and the dialog
+shows its approved origin apart from everything else: the broker connects
+there and nowhere else, whatever the request's target or headers say, and
+there is no default or fallback (not the entry's URL). The requester chose
+that origin, so check its host as you would a destination variable's; it is
+lowercase ASCII (an international name in its `xn--` form), so letters of
+other scripts cannot imitate a known host, but ASCII lookalikes can (L9).
+Requester proxy/CA settings do not configure the broker, which starts with
+an empty environment. The command can still use any operation the key
+allows at that origin (L25), send the token or other data in an opaque
+body, send credentials of its own in other headers, or send its token
+elsewhere without using the broker. `NO_PROXY` helps cooperative clients
+reach loopback; it is not enforcement.
 
 ### L5 — Redaction only catches exact copies in the command's output
 
@@ -309,8 +323,9 @@ defense against exfiltration by a command written to leak.
 
 For a broker binding the command does not receive the source credential. The
 broker's response redactor matches its literal bytes across chunks, using a
-bounded look-behind buffer; compressed responses are refused and headers with
-credential-bearing values are dropped. Encoded or transformed copies returned
+bounded look-behind buffer; compressed responses are refused and response
+headers whose name or value carries the credential are dropped. Encoded or
+transformed copies returned
 by the destination are not caught. Output redaction filters the token by
 default; `--no-redact` exposes anything the command prints, including that
 token. HTTP response redaction stays on in either mode.
@@ -343,8 +358,9 @@ says. This is why remembering is **off by default** and should only be enabled
 for commands whose inputs you control. See
 [ADR 0005](adr/0005-remembered-approvals-opt-in.md). Broker grants are a
 separate capability: no `--remember`, but each grant permits multiple API
-calls until its limit or end. A request count is not a spending limit, and the
-broker does not inspect prompts or other bodies.
+calls, to any path at its approved origin, until its limit or end (L25). A
+request count is not a spending limit, and the broker does not inspect
+prompts or other bodies.
 
 ### L9 — Dialog information can mislead
 
@@ -538,18 +554,22 @@ HTTP hop and it is not encrypted. The fixed Host check and rejection of Origin
 limit browser/DNS-rebinding uses; they do not isolate a hostile process with
 the token. The agent holds the port until the run releases it, so a
 replacement process cannot claim that port while the grant is retained. A
-client can put its token in an opaque request body, which is forwarded; the
-broker only excludes it from the headers it builds or relays upstream.
+client can put its token in an opaque request body, which is forwarded; in
+the request's head the broker never sends it upstream: it replaces it with
+the credential in the header values it forwards and refuses a request that
+holds it anywhere else there.
 
 ### L22 — Automatic locks can leave grant credentials in brokers
 
-AI profiles default to `automatic_locks: continue`, with a 12-hour maximum
-lifetime. Screen lock, suspend and idle lock drop the decrypted vault but
-leave already active/exhausted grants running. All starting grants end on any
-lock; explicit `rusthorse lock`, entry changes, failed saves, manual
-revocation, command end and expiry end grants regardless of this policy. Use
-`end` for profiles that must stop with the desktop. L20's signal and inhibitor
-limits still apply; revocation cannot promise to beat suspend.
+A run's grants default to `--broker-locks continue`, with a 12-hour maximum
+lifetime (`--broker-lifetime 720`). Screen lock, suspend and idle lock drop
+the decrypted vault but leave already active/exhausted grants running. All
+starting grants end on any lock; explicit `rusthorse lock`, entry changes,
+failed saves, manual revocation, command end and expiry end grants
+regardless of this policy. Use `--broker-locks end` for runs whose grants
+must stop with the desktop; the dialog says which the run chose. L20's
+signal and inhibitor limits still apply; revocation cannot promise to beat
+suspend.
 
 Across locks the agent retains a keyed fingerprint of the encrypted vault
 content. A valid unlock compares it before publishing the unlocked state: a
@@ -584,21 +604,47 @@ records are best effort.
 ### L24 — Parser and client compatibility have explicit limits
 
 Hyper drops a request target's `#` fragment before the broker sees it; the
-broker cannot reject that spelling, but never forwards the fragment and still
-checks the resulting path. Hyper-generated malformed/framing errors can also
-precede the broker's JSON errors and retry hints.
+broker cannot reject that spelling, and never forwards the fragment.
+Hyper-generated malformed/framing errors can also precede the broker's JSON
+errors and retry hints.
 
 The fake HTTPS tests cover the protocol, not every SDK's behaviour. By hand,
-with a real key (2026-11-04), the Anthropic Python SDK 2.4.0 worked through
-the broker for the requests tried; Claude Code's requests went through it,
-and the API answered them `400`, as it answered SDK requests with some of
-Claude Code's parameters sent with the key by value, so no Claude Code
-answer through the broker has been seen yet. SDK configuration can
-override environment variables or send both Anthropic token headers; both
-must match. With zenity, a run requesting two or more grants may exceed the
-dialog height estimate and be refused before asking. `rusthorse-dialog`
+with a real key (2026-11-04) and phase 1's broker, the Anthropic Python SDK
+2.4.0 worked through the broker for the requests tried; Claude Code's
+requests went through it, and the API answered them `400`, as it answered
+SDK requests with some of Claude Code's parameters sent with the key by
+value, so no Claude Code answer through the broker has been seen yet. The
+broker without profiles has not been tried by hand yet. A program works
+through it only if it presents the token literally in a header: one that
+encodes the token or derives its credential from it, and an API that signs
+requests with the key or takes it in the URL or the body, cannot use it.
+SDK configuration can override environment variables, or send a key of its
+own beside the token in another header, which the broker forwards to the
+approved origin as it came unless it is the entry's own key or
+token-shaped. With zenity, a run requesting two or more grants may exceed
+the dialog height estimate and be refused before asking. `rusthorse-dialog`
 scrolls long approvals; character limits still apply, and no approval is
 truncated.
+
+### L25 — A grant covers its whole approved origin
+
+The human approves an origin — scheme, host and port — that the requester
+named in the run. Through the grant, the command can send the key to any
+path there, with any method the broker accepts and a body on any of them,
+and so do whatever the key allows at that origin: an administration or key
+management endpoint as much as a model call. The base path the dialog shows
+apart from the origin only sets up the program's base URL; it limits
+nothing. Rusthorse knows nothing about the API and does not narrow what a
+key can do there: that is scoped where the key is issued
+([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)). The
+broker forwards the program's request headers as they came, apart from
+those it sets or drops, so credentials of the program's own in other
+headers reach the origin too. The audit log records each request's method
+label, never its path, so it does not tell which operation was used.
+*Mitigation:* give an agent the narrowest key that does the job, with a
+spending limit at the provider; check the origin in the dialog as you would
+any destination (L4, L9); keep lifetimes and request limits short for keys
+that can do more than the task needs.
 
 ## 8. Running AI agents in isolation
 
@@ -628,9 +674,11 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - Read every dialog; be suspicious of `sh -c`, scripts the agent just edited,
   unexpected programs or directories, and risky-variable warnings.
 - Edit the vault in other programs only while the agent is locked.
-- Prefer broker bindings for the supported HTTP routes. Set provider-side
-  spending limits, narrow the profile's lifetime/request count, and disable
-  SDK retries where practical: every admitted attempt spends a use.
+- Prefer broker bindings for HTTP APIs that take their key in a request
+  header. Check the approved origin in the dialog; set provider-side
+  spending limits and use narrow keys (L25); give the run a short
+  `--broker-lifetime` and a `--broker-requests` limit, and disable SDK
+  retries where practical: every admitted attempt spends a use.
 - Use `rusthorse grants` to inspect grants, `rusthorse grants revoke ID` for
   one, and explicit `rusthorse lock` to end all grants. Screen lock alone
   preserves `continue` grants.
@@ -638,13 +686,6 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 ## 10. Planned improvements
 
-- **The broker without profiles or presets**: the agent names the
-  destination in the run and the human approves it in the dialog; the
-  broker puts the key in the request header where the program put the
-  token, for an HTTP API that takes its key in a header, over verified TLS. Phase 1's broker, with its presets and stored profiles,
-  is implemented. Other connectors (`ssh-agent`, databases, private devices
-  with pinned TLS) are not planned: `run` serves those uses, with L3–L5
-  ([ADR 0013](adr/0013-credential-broker.md)).
 - **Isolation support** (§8): uid allow-list on the socket and documentation
   for running agents as a separate user.
 - **One cgroup per approved command** (L17), with resource limits.
@@ -657,6 +698,12 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 Per-entry policies that restrict an entry to listed programs or hosts are
 outside the product's scope and not planned; L3 and L4 remain limits.
+Nothing more is planned for the credential broker, which no longer has
+profiles or presets: the run names the destination, the human approves its
+origin, and the broker puts the key where the program put the token (L25).
+Narrower operations per API are not planned (L25), nor other connectors
+(`ssh-agent`, databases, private devices with pinned TLS): `run` serves
+those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 
 ## 11. Review history
 

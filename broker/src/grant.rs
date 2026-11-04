@@ -41,7 +41,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use rusthorse::broker_profile::{BrokerProfile, PresetSpec};
+use rusthorse::broker_grant::MethodLabel;
 use rusthorse::broker_protocol::{AdmissionRefusal, FromBroker, Install, RequestOutcome};
 use rusthorse::protocol::SecretString;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -133,8 +133,6 @@ pub struct Grant {
     /// Dropped, and so wiped, when the grant closes: revoked, or past its
     /// lifetime.
     credential: Mutex<Option<SecretString>>,
-    profile: BrokerProfile,
-    spec: &'static PresetSpec,
     max_in_flight: usize,
     /// When the lifetime ends, on the boot-time clock; `None` if that clock
     /// could not be read, which counts as expired.
@@ -178,16 +176,12 @@ impl Grant {
         let Install {
             token,
             credential,
-            profile,
             max_in_flight,
             ..
         } = install;
-        let spec = profile.spec();
         Arc::new(Grant {
             token,
             credential: Mutex::new(Some(credential)),
-            profile,
-            spec,
             max_in_flight: max_in_flight as usize,
             expires,
             state: Mutex::new(State {
@@ -205,16 +199,6 @@ impl Grant {
     /// The token clients must present.
     pub fn token(&self) -> &str {
         &self.token
-    }
-
-    /// The profile, as the grant was created with it.
-    pub fn profile(&self) -> &BrokerProfile {
-        &self.profile
-    }
-
-    /// The preset revision the profile names.
-    pub fn spec(&self) -> &'static PresetSpec {
-        self.spec
     }
 
     /// A copy of the credential (wiped when dropped), unless the grant is
@@ -323,13 +307,12 @@ impl Grant {
         state.refused = state.refused.saturating_add(1);
     }
 
-    /// Ask the agent to admit a request (`method`, the route it matched):
+    /// Ask the agent to admit a request, named by its method's label only:
     /// its number and where the answer will come, or why the broker did not
     /// ask.
     pub fn ask_admission(
         &self,
-        method: &str,
-        route: &str,
+        method: MethodLabel,
     ) -> Result<(u64, oneshot::Receiver<Answer>), Held> {
         let mut state = lock(&self.state);
         match state.phase {
@@ -348,14 +331,7 @@ impl Grant {
         state.next += 1;
         let (answer, receiver) = oneshot::channel();
         state.waiting.insert(request, answer);
-        self.send(
-            &state,
-            FromBroker::Admit {
-                request,
-                method: method.into(),
-                route: route.into(),
-            },
-        );
+        self.send(&state, FromBroker::Admit { request, method });
         Ok((request, receiver))
     }
 
@@ -505,7 +481,6 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusthorse::broker_profile::{Preset, ProfileRequest};
     use rusthorse::broker_protocol::{VERSION, new_grant_id, new_token};
 
     const FAKE_CREDENTIAL: &str = "sk-ant-test-0000000000000000";
@@ -516,9 +491,7 @@ mod tests {
             grant: new_grant_id(),
             token: new_token(),
             credential: SecretString::new(FAKE_CREDENTIAL.into()),
-            profile: ProfileRequest::new(Preset::Anthropic)
-                .resolve()
-                .expect("profile"),
+            origin: "https://api.example.com".into(),
             max_in_flight,
             max_connections: 4,
             lifetime_secs: 60,
@@ -541,8 +514,7 @@ mod tests {
     fn admit(request: u64) -> FromBroker {
         FromBroker::Admit {
             request,
-            method: "POST".into(),
-            route: "POST /v1/messages".into(),
+            method: MethodLabel::Post,
         }
     }
 
@@ -568,8 +540,8 @@ mod tests {
     #[test]
     fn requests_are_numbered_from_one_and_answered_once() {
         let (grant, mut rx) = grant(4);
-        let (one, mut answer_one) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
-        let (two, _answer_two) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (one, mut answer_one) = grant.ask_admission(MethodLabel::Post).expect("1");
+        let (two, _answer_two) = grant.ask_admission(MethodLabel::Post).expect("2");
         assert_eq!((one, two), (1, 2));
         assert_eq!(sent(&mut rx), vec![admit(1), admit(2)]);
         // Answers may come in any order; each number once.
@@ -591,36 +563,32 @@ mod tests {
         grant.finish(1, ended(RequestOutcome::Unknown));
         assert_eq!(sent(&mut rx), vec![finished(1, RequestOutcome::Completed)]);
         // The numbers go on without gaps.
-        let (three, _) = grant.ask_admission("GET", "GET /v1/models").expect("3");
+        let (three, _) = grant.ask_admission(MethodLabel::Get).expect("3");
         assert_eq!(three, 3);
     }
 
     #[test]
     fn requests_in_flight_are_limited_and_refusals_free_their_slots() {
         let (grant, mut rx) = grant(2);
-        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
-        let (two, _b) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (one, _a) = grant.ask_admission(MethodLabel::Post).expect("1");
+        let (two, _b) = grant.ask_admission(MethodLabel::Post).expect("2");
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::TooManyInFlight)
         );
         // Admitted and unfinished still counts; refused frees its slot.
         grant.on_answer(one, Answer::Admitted).expect("answer");
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::TooManyInFlight)
         );
         grant
             .on_answer(two, Answer::Refused(AdmissionRefusal::TooManyInFlight))
             .expect("answer");
-        let (three, _c) = grant.ask_admission("POST", "POST /v1/messages").expect("3");
+        let (three, _c) = grant.ask_admission(MethodLabel::Post).expect("3");
         assert_eq!(three, 3);
         grant.finish(one, ended(RequestOutcome::Completed));
-        let (four, _d) = grant.ask_admission("POST", "POST /v1/messages").expect("4");
+        let (four, _d) = grant.ask_admission(MethodLabel::Post).expect("4");
         assert_eq!(four, 4);
         assert_eq!(
             sent(&mut rx),
@@ -637,8 +605,8 @@ mod tests {
     #[test]
     fn revocation_waits_for_every_answer_and_every_finish() {
         let (grant, mut rx) = grant(8);
-        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
-        let (two, mut answer_two) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (one, _a) = grant.ask_admission(MethodLabel::Post).expect("1");
+        let (two, mut answer_two) = grant.ask_admission(MethodLabel::Post).expect("2");
         grant.on_answer(one, Answer::Admitted).expect("answer");
         grant.count_refusal();
         grant.count_refusal();
@@ -652,9 +620,7 @@ mod tests {
         assert_eq!(grant.on_revoke(), Err(Violation("a second revoke")));
         // Nothing more is asked.
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Revoked)
         );
         assert_eq!(sent(&mut rx), vec![admit(1), admit(2)]);
@@ -683,7 +649,7 @@ mod tests {
     #[test]
     fn a_revocation_with_nothing_open_is_confirmed_at_once() {
         let (grant, mut rx) = grant(8);
-        let (one, _a) = grant.ask_admission("GET", "GET /v1/models").expect("1");
+        let (one, _a) = grant.ask_admission(MethodLabel::Get).expect("1");
         grant
             .on_answer(one, Answer::Refused(AdmissionRefusal::AuditFailed))
             .expect("answer");
@@ -693,8 +659,7 @@ mod tests {
             vec![
                 FromBroker::Admit {
                     request: 1,
-                    method: "GET".into(),
-                    route: "GET /v1/models".into()
+                    method: MethodLabel::Get,
                 },
                 FromBroker::Revoked { refused: 0 }
             ]
@@ -714,7 +679,7 @@ mod tests {
     #[test]
     fn an_admission_nobody_waits_for_ends_unsent() {
         let (grant, mut rx) = grant(8);
-        let (one, answer) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
+        let (one, answer) = grant.ask_admission(MethodLabel::Post).expect("1");
         drop(answer);
         grant.on_answer(one, Answer::Admitted).expect("answer");
         assert_eq!(
@@ -723,7 +688,7 @@ mod tests {
         );
         // After a revocation, it ends revoked, and then the revocation is
         // confirmed.
-        let (two, answer) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (two, answer) = grant.ask_admission(MethodLabel::Post).expect("2");
         grant.on_revoke().expect("revoke");
         drop(answer);
         grant.on_answer(two, Answer::Admitted).expect("answer");
@@ -745,24 +710,18 @@ mod tests {
             .saturating_sub(Duration::from_secs(1));
         let grant = Grant::with_expiry(install(4), tx.clone(), Some(past));
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         // An unreadable clock counts as expired, at the start or later.
         let grant = Grant::with_expiry(install(4), tx.clone(), None);
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         let grant = Grant::new(install(4), None, tx);
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         // The lifetime counts from when the install was received.
@@ -772,16 +731,14 @@ mod tests {
             .saturating_sub(Duration::from_secs(61));
         let grant = Grant::new(install(4), Some(long_ago), tx);
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired),
             "a lifetime of 60 s, received 61 s ago"
         );
         assert_eq!(sent(&mut rx), vec![]);
         // A fresh grant does.
         let (grant, _rx) = self::grant(4);
-        assert!(grant.ask_admission("POST", "POST /v1/messages").is_ok());
+        assert!(grant.ask_admission(MethodLabel::Post).is_ok());
         assert!(boot_time().is_some());
     }
 
@@ -793,8 +750,8 @@ mod tests {
     #[test]
     fn the_end_of_the_lifetime_closes_the_grant_as_a_revocation_does_and_says_nothing() {
         let (grant, mut rx) = grant(8);
-        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
-        let (two, mut answer_two) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (one, _a) = grant.ask_admission(MethodLabel::Post).expect("1");
+        let (two, mut answer_two) = grant.ask_admission(MethodLabel::Post).expect("2");
         grant.on_answer(one, Answer::Admitted).expect("answer");
         grant.count_refusal();
         let watcher = grant.subscribe();
@@ -808,9 +765,7 @@ mod tests {
         assert!(dropped(&grant), "the credential is dropped");
         assert!(grant.credential().is_none());
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         grant.count_refusal();
@@ -842,8 +797,8 @@ mod tests {
     #[test]
     fn a_revoke_after_the_end_of_the_lifetime_waits_for_the_answers_and_the_ends() {
         let (grant, mut rx) = grant(8);
-        let (one, _a) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
-        let (two, _b) = grant.ask_admission("POST", "POST /v1/messages").expect("2");
+        let (one, _a) = grant.ask_admission(MethodLabel::Post).expect("1");
+        let (two, _b) = grant.ask_admission(MethodLabel::Post).expect("2");
         grant.on_answer(one, Answer::Admitted).expect("answer");
         grant.expire();
         grant.on_revoke().expect("revoke");
@@ -864,7 +819,7 @@ mod tests {
         // An admission nobody waits for any more, answered after the end of
         // the lifetime, ends unsent and `revoked`.
         let (grant, mut rx) = self::grant(8);
-        let (one, answer) = grant.ask_admission("POST", "POST /v1/messages").expect("1");
+        let (one, answer) = grant.ask_admission(MethodLabel::Post).expect("1");
         grant.expire();
         drop(answer);
         grant.on_answer(one, Answer::Admitted).expect("answer");
@@ -896,9 +851,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let grant = Grant::with_expiry(install(4), tx, Some(past()));
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         assert!(dropped(&grant) && *grant.subscribe().borrow());
@@ -938,9 +891,7 @@ mod tests {
         assert!(boot_time().expect("clock") >= start + lifetime);
         assert!(dropped(&grant));
         assert_eq!(
-            grant
-                .ask_admission("POST", "POST /v1/messages")
-                .map(|(n, _)| n),
+            grant.ask_admission(MethodLabel::Post).map(|(n, _)| n),
             Err(Held::Expired)
         );
         assert_eq!(sent(&mut rx), vec![]);

@@ -84,10 +84,11 @@ And check the following by hand:
 
 - Only the agent, and the broker it starts for each grant, handle secrets
   taken from the vault. The agent gives a `rusthorse-broker` process the
-  credential of its one grant, with the grant's token, profile and limits,
-  over the control channel, and nothing else from the vault (ADR 0013). The
-  broker puts the credential only in the authentication header it builds for
-  the profile's destination. A command run with `--broker` gets a token for
+  credential of its one grant, with the grant's token, approved origin and
+  limits, over the control channel, and nothing else from the vault (ADR
+  0013). The broker puts the credential only where the program put the
+  token, in the header values of requests it forwards to that origin. A
+  command run with `--broker` gets a token for
   that binding, never the credential (ordinary `run` bindings give their
   values to the approved command, as before). A client — the CLI or the
   manager — holds a secret only when the user supplies one — `init` without an

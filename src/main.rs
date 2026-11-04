@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use rusthorse::agent::{self, Agent, AgentConfig};
-use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+use rusthorse::broker_grant::{AutomaticLocks, Destination, GrantLimits};
 use rusthorse::client::Client;
 use rusthorse::dialog_program::DesktopUi;
 use rusthorse::generate::{Alphabet, Spec};
@@ -357,9 +357,6 @@ enum ClearField {
     Port,
     Notes,
     Kind,
-    /// The broker profile: the entry can no longer be used with `run
-    /// --broker`, and its grants end.
-    Broker,
 }
 
 impl ClearField {
@@ -371,47 +368,7 @@ impl ClearField {
             ClearField::Port => Field::Port,
             ClearField::Notes => Field::Notes,
             ClearField::Kind => Field::Kind,
-            ClearField::Broker => Field::Broker,
         }
-    }
-}
-
-/// A preset of the credential broker, as `edit --broker` names it: the
-/// presets this build knows ([`Preset::ALL`]), by their stored names.
-#[derive(Clone, Copy)]
-struct PresetArg(Preset);
-
-impl ValueEnum for PresetArg {
-    fn value_variants<'a>() -> &'a [Self] {
-        const ALL: [PresetArg; Preset::ALL.len()] = {
-            let mut all = [PresetArg(Preset::ALL[0]); Preset::ALL.len()];
-            let mut i = 0;
-            while i < all.len() {
-                all[i] = PresetArg(Preset::ALL[i]);
-                i += 1;
-            }
-            all
-        };
-        &ALL
-    }
-
-    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        let spec = rusthorse::broker_profile::latest(self.0);
-        let help = match spec.default_origin {
-            Some(origin) => format!(
-                "The {} API, at {origin}{} unless --broker-origin or --broker-base-path says \
-                 otherwise",
-                self.0.label(),
-                spec.default_base_path
-            ),
-            None => format!(
-                "An {} API, at the origin --broker-origin names (there is no default), with \
-                 the base path {} unless --broker-base-path says otherwise",
-                self.0.label(),
-                spec.default_base_path
-            ),
-        };
-        Some(clap::builder::PossibleValue::new(self.0.as_str()).help(help))
     }
 }
 
@@ -449,65 +406,6 @@ impl ValueEnum for LocksArg {
     }
 }
 
-/// The broker profile options of `edit` (ADR 0013).
-#[derive(Args)]
-struct BrokerOptions {
-    /// Give the entry a broker profile from this preset, so that `run
-    /// --broker` can use it: the API a grant reaches, the requests it allows
-    /// and when it ends. Options left out take the preset's defaults. It
-    /// replaces any profile, and ends the entry's grants.
-    #[arg(long = "broker", value_enum, value_name = "PRESET")]
-    preset: Option<PresetArg>,
-    /// The API's origin: https:// and a host name, with an optional port
-    /// (openai-compatible has no default).
-    #[arg(long = "broker-origin", requires = "preset", value_name = "URL")]
-    origin: Option<String>,
-    /// What the client's base URL adds after the origin, e.g. /v1; '' for
-    /// nothing.
-    #[arg(long = "broker-base-path", requires = "preset", value_name = "PATH")]
-    base_path: Option<String>,
-    /// Whether the screen locking, a suspend and the idle timeout end the
-    /// entry's grants (`rusthorse lock` always does). Unless given, the
-    /// preset's default: continue for the presets of this version.
-    #[arg(
-        long = "broker-locks",
-        requires = "preset",
-        value_enum,
-        value_name = "POLICY"
-    )]
-    locks: Option<LocksArg>,
-    /// The longest a grant lasts, in minutes (1–1440). Unless given, the
-    /// preset's default: 720 (12 hours) for the presets of this version.
-    #[arg(long = "broker-lifetime", requires = "preset", value_name = "MINUTES")]
-    lifetime: Option<u32>,
-    /// The most requests one grant admits (1–1000000); no limit unless given.
-    #[arg(long = "broker-requests", requires = "preset", value_name = "N")]
-    requests: Option<u64>,
-}
-
-impl BrokerOptions {
-    /// The profile request these options make, checked as the agent will
-    /// check it (the agent decides): only the options given, the agent
-    /// filling in the defaults of the preset's latest revision.
-    fn request(&self) -> anyhow::Result<Option<ProfileRequest>> {
-        let Some(PresetArg(preset)) = self.preset else {
-            return Ok(None);
-        };
-        let request = ProfileRequest {
-            preset,
-            origin: self.origin.clone(),
-            base_path: self.base_path.clone(),
-            automatic_locks: self.locks.map(|LocksArg(locks)| locks),
-            max_lifetime_minutes: self.lifetime,
-            max_requests: self.requests,
-        };
-        request
-            .resolve()
-            .map_err(|e| anyhow::anyhow!("broker profile: {e}"))?;
-        Ok(Some(request))
-    }
-}
-
 #[derive(Args)]
 struct EditArgs {
     /// Entry name or Group/Name path.
@@ -538,8 +436,6 @@ struct EditArgs {
     stdin: bool,
     #[command(flatten)]
     generate: GenerateOptions,
-    #[command(flatten)]
-    broker: BrokerOptions,
 }
 
 #[derive(Args)]
@@ -552,11 +448,31 @@ struct RunArgs {
     #[arg(long)]
     stdin: bool,
     /// Use an entry through the credential broker (repeatable): VAR gets a
-    /// temporary token, never the entry's value, and the grant ends with
-    /// the command. ENTRY alone names the variable like the entry. The
-    /// entry needs a broker profile.
-    #[arg(long = "broker", value_name = "VAR=ENTRY")]
+    /// temporary token, never the entry's value, and the broker puts the
+    /// value in its place in requests to URL's origin, which you approve
+    /// (any path there). URL is https://HOST[:PORT][/BASE]; the base path
+    /// only goes into the --url variable. VAR ends at the first '=', URL
+    /// starts after the last '@'; ENTRY@URL alone names the variable like
+    /// the entry. The grant ends with the command.
+    #[arg(long = "broker", value_name = "VAR=ENTRY@URL")]
     brokers: Vec<String>,
+    /// The most requests each grant of this run admits (1–1000000); no
+    /// limit unless given.
+    #[arg(long = "broker-requests", requires = "brokers", value_name = "N")]
+    broker_requests: Option<u64>,
+    /// The longest each grant of this run lasts, in minutes (1–1440); 720
+    /// (12 hours) unless given.
+    #[arg(long = "broker-lifetime", requires = "brokers", value_name = "MINUTES")]
+    broker_lifetime: Option<u32>,
+    /// Whether the screen locking, a suspend and the idle timeout end this
+    /// run's grants (`rusthorse lock` always does); continue unless given.
+    #[arg(
+        long = "broker-locks",
+        requires = "brokers",
+        value_enum,
+        value_name = "POLICY"
+    )]
+    broker_locks: Option<LocksArg>,
     /// Also put an entry's URL (an API's endpoint) in variable VAR; for an
     /// entry given with --broker, the broker's address instead. Not a secret:
     /// it is not redacted.
@@ -1322,47 +1238,7 @@ fn show(client: &Client, name: String, json: bool) -> anyhow::Result<u8> {
     line("protected:", Some(entry.protected_fields.join(", ")));
     line("fields:", Some(entry.other_fields.join(", ")));
     line("modified:", entry.modified.clone());
-    for (i, text) in profile_lines(&entry).iter().enumerate() {
-        println!("{:<11} {text}", if i == 0 { "broker:" } else { "" });
-    }
     Ok(0)
-}
-
-/// What `show` says of an entry's broker profile (ADR 0013): its preset and
-/// revision, then what an approval dialog says of it — the destination,
-/// every route, how a grant ends and its limits; or why the entry cannot be
-/// used with the broker. Nothing for an entry without a profile.
-fn profile_lines(entry: &EntryInfo) -> Vec<String> {
-    use rusthorse::vault::FIELD_BROKER;
-    if let Some(profile) = &entry.broker {
-        let mut lines = vec![format!(
-            "{} preset, revision {}",
-            profile.preset, profile.revision
-        )];
-        lines.extend(
-            profile
-                .describe()
-                .into_iter()
-                .map(|(label, value)| rusthorse::util::visible(&format!("{label}: {value}"))),
-        );
-        return lines;
-    }
-    if entry.protected_fields.iter().any(|f| f == FIELD_BROKER) {
-        return vec![
-            "withheld: the file marks the profile as protected, so the entry cannot be used \
-             with the broker"
-                .into(),
-        ];
-    }
-    if entry.other_fields.iter().any(|f| f == FIELD_BROKER) {
-        return vec![
-            "unusable: this Rusthorse does not read the stored profile, so the entry cannot be \
-             used with the broker (set a new one with `rusthorse edit NAME --broker PRESET`, or \
-             remove it with `--clear broker`)"
-                .into(),
-        ];
-    }
-    Vec::new()
 }
 
 fn read_stdin_value() -> anyhow::Result<SecretString> {
@@ -1410,12 +1286,6 @@ fn add(client: &Client, args: AddArgs) -> anyhow::Result<u8> {
 }
 
 fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
-    // The profile is checked before anything is sent, as the agent will
-    // check it: a mistake in it reaches no dialog.
-    let broker = args.broker.request()?;
-    if broker.is_some() && args.clear.contains(&ClearField::Broker) {
-        bail!("--broker sets a broker profile and --clear broker removes it: give one of them");
-    }
     client.check_compatible()?;
     let value = if args.stdin {
         Some(ValueChange::Provided(read_stdin_value()?))
@@ -1443,21 +1313,17 @@ fn edit(client: &Client, args: EditArgs) -> anyhow::Result<u8> {
         add_tags: args.add_tags,
         remove_tags: args.remove_tags,
         value,
-        broker,
     };
     if changes.is_empty() {
         bail!("nothing to change (see `rusthorse edit --help`)");
     }
-    // A change to the profile is a request of its own (protocol 8), which
-    // an older agent refuses whole rather than apply the rest of the edit
-    // without it; the agent refuses it as a plain edit.
-    let name = args.name;
-    let request = if changes.touches_broker() {
-        Request::BrokerEdit { name, changes }
-    } else {
-        Request::Edit { name, changes }
-    };
-    simple(client, &request)
+    simple(
+        client,
+        &Request::Edit {
+            name: args.name,
+            changes,
+        },
+    )
 }
 
 fn reveal(client: &Client, name: String, notes: bool) -> anyhow::Result<u8> {
@@ -1536,8 +1402,22 @@ fn plan_run(secrets: &[String], brokers: &[String], urls: &[String]) -> anyhow::
     }
     let mut brokered: Vec<BrokerBinding> = Vec::new();
     for spec in brokers {
+        // The URL starts after the last `@`, so that an entry's name may
+        // hold one; the variable ends at the first `=`.
+        let Some((binding, url)) = spec.rsplit_once('@') else {
+            bail!(
+                "--broker {spec:?}: name the destination, VAR=ENTRY@https://HOST[:PORT][/BASE], \
+                 e.g. --broker OPENAI_API_KEY=OPENAI_API_KEY@https://api.openai.com/v1"
+            );
+        };
         let Binding { var, entry } =
-            parse_binding(spec).map_err(|e| anyhow::anyhow!("--broker: {e}"))?;
+            parse_binding(binding).map_err(|e| anyhow::anyhow!("--broker: {e}"))?;
+        Destination::parse(url).map_err(|e| {
+            anyhow::anyhow!(
+                "--broker {var}: {e}; write VAR=ENTRY@https://HOST[:PORT][/BASE], with no user, \
+                 query or fragment"
+            )
+        })?;
         if starts_programs(&var) {
             bail!(
                 "--broker {var}: this variable changes how programs start; it cannot carry a token"
@@ -1563,6 +1443,7 @@ fn plan_run(secrets: &[String], brokers: &[String], urls: &[String]) -> anyhow::
         brokered.push(BrokerBinding {
             var,
             entry,
+            destination: url.to_string(),
             url_var: None,
         });
     }
@@ -1660,11 +1541,30 @@ fn endpoint_urls(client: &Client, plan: &RunPlan) -> anyhow::Result<Vec<(String,
     Ok(out)
 }
 
+/// The limits of a run's grants, from its options and the defaults (no
+/// request limit, 12 hours, `continue`), checked as the agent will check
+/// them.
+fn run_limits(args: &RunArgs) -> anyhow::Result<GrantLimits> {
+    let defaults = GrantLimits::default();
+    let limits = GrantLimits {
+        automatic_locks: args
+            .broker_locks
+            .map_or(defaults.automatic_locks, |LocksArg(locks)| locks),
+        max_lifetime_minutes: args
+            .broker_lifetime
+            .unwrap_or(defaults.max_lifetime_minutes),
+        max_requests: args.broker_requests.or(defaults.max_requests),
+    };
+    limits.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(limits)
+}
+
 fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
     let outcome = (|| -> anyhow::Result<u8> {
         // Every argument is checked before anything is sent: a mistake asks
         // nothing and runs nothing.
         let plan = plan_run(&args.secrets, &args.brokers, &args.urls)?;
+        let limits = run_limits(&args)?;
         client.check_compatible()?;
         let cwd = std::env::current_dir().context("cannot determine the working directory")?;
         let cwd = cwd
@@ -1708,15 +1608,17 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
             redact: !args.no_redact,
             forward_stdin: args.stdin,
         };
-        // With broker bindings, a request of its own (protocol 8): an older
+        // With broker bindings, a request of its own (protocol 9): an older
         // agent refuses it whole instead of running the command without its
-        // grants. There is no fallback to the values.
+        // destinations and limits. There is no fallback to the values, and
+        // a refused request is never sent again as another type.
         let response = if brokered.is_empty() {
             client.run(request)?
         } else {
             client.broker_run(BrokerRunRequest {
                 run: request,
                 brokered,
+                limits,
             })?
         };
         match response {
@@ -1865,9 +1767,9 @@ fn unauthorized_note(grant: &UnauthorizedGrant, name: Option<&str>) -> String {
         ),
     };
     format!(
-        "rusthorse: note: the command ran, and the broker accepted its token, but {} answered \
-         401 Unauthorized to {}: it did not accept the key stored in {entry}. If that key is \
-         wrong, revoked, or not of the kind the destination expects, {fix}",
+        "rusthorse: note: the command ran, and the broker accepted its token, but the approved \
+         origin {} answered 401 Unauthorized to {}: it did not accept the key stored in {entry}. \
+         If that key is wrong, revoked, or not of the kind the destination expects, {fix}",
         visible(&grant.destination),
         requests_count(grant.requests),
     )
@@ -1878,9 +1780,9 @@ fn unauthorized_note(grant: &UnauthorizedGrant, name: Option<&str>) -> String {
 fn grant_unauthorized_note(grant: &GrantInfo, requests: u64) -> String {
     use rusthorse::util::visible;
     format!(
-        "rusthorse: note: grant {}: {} answered 401 Unauthorized to {}: it did not accept the \
-         key stored in {}. If that key is wrong, revoked, or not of the kind the destination \
-         expects, replace the entry's value (rusthorse edit NAME --value)",
+        "rusthorse: note: grant {}: the approved origin {} answered 401 Unauthorized to {}: it did \
+         not accept the key stored in {}. If that key is wrong, revoked, or not of the kind the \
+         destination expects, replace the entry's value (rusthorse edit NAME --value)",
         visible(&grant.id),
         visible(&grant.destination),
         requests_count(requests),
@@ -1896,10 +1798,11 @@ fn grant_unauthorized_note(grant: &GrantInfo, requests: u64) -> String {
 /// token to show: the agent never reports one.
 fn grants_table(grants: &[GrantInfo]) -> String {
     use rusthorse::util::visible;
-    const HEADERS: [&str; 11] = [
+    const HEADERS: [&str; 12] = [
         "ID",
         "ENTRY",
-        "DESTINATION",
+        "APPROVED ORIGIN",
+        "BASE PATH (NOT A LIMIT)",
         "STATE",
         "STARTED",
         "ENDS IN",
@@ -1909,13 +1812,16 @@ fn grants_table(grants: &[GrantInfo]) -> String {
         "REQUESTER",
         "COMMAND",
     ];
-    let rows: Vec<[String; 11]> = grants
+    let rows: Vec<[String; 12]> = grants
         .iter()
         .map(|g| {
             [
                 visible(&g.id),
                 visible(&g.entry),
                 visible(&g.destination),
+                g.base_path
+                    .as_deref()
+                    .map_or_else(|| "none".to_string(), visible),
                 visible(&g.state),
                 visible(&g.started),
                 format_duration(Duration::from_secs(g.ends_in_secs)),
@@ -2796,7 +2702,7 @@ fn show_audit(lines: usize, json: bool) -> anyhow::Result<u8> {
 
 /// One audit record as `rusthorse audit` prints it: the time, action and
 /// outcome, then what the record has — the entries; for the credential
-/// broker (ADR 0013), the grant, the request's number and route, the
+/// broker (ADR 0013), the grant, the request's number and method label, the
 /// destination's status and the bytes each way; the grants a run creates;
 /// the command line; why a grant ended and what became of its requests; the
 /// detail — and the requester. Control and invisible characters are escaped
@@ -2814,8 +2720,8 @@ fn audit_line(event: &audit::AuditEvent) -> String {
     if let Some(request) = event.request {
         line.push_str(&format!(" #{request}"));
     }
-    if let Some(route) = &event.route {
-        line.push_str(&format!(" {route}"));
+    if let Some(method) = &event.method {
+        line.push_str(&format!(" {method}"));
     }
     if let Some(status) = event.status {
         line.push_str(&format!(" status {status}"));
@@ -2831,7 +2737,13 @@ fn audit_line(event: &audit::AuditEvent) -> String {
     if let Some(grants) = &event.grants {
         let grants: Vec<String> = grants
             .iter()
-            .map(|g| format!("{} for {} to {}", g.id, g.entry, g.destination))
+            .map(|g| match &g.base_path {
+                Some(base) => format!(
+                    "{} for {} to {} (base path {base}, not a limit)",
+                    g.id, g.entry, g.destination
+                ),
+                None => format!("{} for {} to {}", g.id, g.entry, g.destination),
+            })
             .collect();
         line.push_str(&format!(" grants: {};", grants.join(", ")));
     }
@@ -3057,7 +2969,13 @@ mod tests {
     fn run_sorts_out_broker_bindings_and_the_variables_of_their_address() {
         let plan = plan_run(
             &strings(&["DB_PASSWORD=db"]),
-            &strings(&["ANTHROPIC_AUTH_TOKEN=AI/anthropic", "OPENAI_API_KEY"]),
+            &strings(&[
+                "ANTHROPIC_AUTH_TOKEN=AI/anthropic@https://api.anthropic.com",
+                "OPENAI_API_KEY@https://api.openai.com/v1",
+                // The URL starts after the last `@`, the variable ends at
+                // the first `=`: an entry's name may hold both.
+                "T=me@work=x@https://api.example.com:8443/v2",
+            ]),
             &strings(&["DOCS_URL=docs", "ANTHROPIC_BASE_URL=AI/anthropic"]),
         )
         .expect("a valid run");
@@ -3068,12 +2986,20 @@ mod tests {
                 BrokerBinding {
                     var: "ANTHROPIC_AUTH_TOKEN".into(),
                     entry: "AI/anthropic".into(),
+                    destination: "https://api.anthropic.com".into(),
                     url_var: Some("ANTHROPIC_BASE_URL".into()),
                 },
                 // ENTRY alone: the variable is named like the entry.
                 BrokerBinding {
                     var: "OPENAI_API_KEY".into(),
                     entry: "OPENAI_API_KEY".into(),
+                    destination: "https://api.openai.com/v1".into(),
+                    url_var: None,
+                },
+                BrokerBinding {
+                    var: "T".into(),
+                    entry: "me@work=x".into(),
+                    destination: "https://api.example.com:8443/v2".into(),
                     url_var: None,
                 },
             ]
@@ -3094,13 +3020,18 @@ mod tests {
         let twice = plan_run(&strings(&["A=k", "B=k"]), &[], &[]).expect("two variables");
         assert_eq!(twice.bindings, [binding("A", "k"), binding("B", "k")]);
         // Through the broker only.
-        let only = plan_run(&[], &strings(&["T=k"]), &[]).expect("broker only");
+        let only = plan_run(&[], &strings(&["T=k@https://x.example"]), &[]).expect("broker only");
         assert!(only.bindings.is_empty() && only.urls.is_empty());
         assert_eq!(only.brokered.len(), 1);
         // The --url of another entry keeps its meaning, whatever its
         // variable: only a token and the broker's address stay out of
         // NO_PROXY.
-        let other = plan_run(&[], &strings(&["T=k"]), &strings(&["NO_PROXY=docs"])).expect("url");
+        let other = plan_run(
+            &[],
+            &strings(&["T=k@https://x.example"]),
+            &strings(&["NO_PROXY=docs"]),
+        )
+        .expect("url");
         assert_eq!(other.urls, [binding("NO_PROXY", "docs")]);
     }
 
@@ -3115,7 +3046,31 @@ mod tests {
 
     #[test]
     fn run_refuses_mistakes_in_broker_bindings_before_anything_is_sent() {
-        let cases: [Refusal; 24] = [
+        let cases: [Refusal; 31] = [
+            // The destination is named, valid, and not the entry's own URL
+            // by default: there is none.
+            (&[], &["K=x"], &[], "name the destination"),
+            (&[], &["x"], &[], "name the destination"),
+            (
+                &[],
+                &["K=x@http://x.example"],
+                &[],
+                "must start with https://",
+            ),
+            (
+                &[],
+                &["K=x@https://x.example?q=1"],
+                &[],
+                "query or a fragment",
+            ),
+            (&[], &["K=x@https://10.0.0.1"], &[], "not an IP address"),
+            (
+                &[],
+                &["K=x@https://x.example/v1/"],
+                &[],
+                "base path is not valid",
+            ),
+            (&[], &["K=x@"], &[], "must start with https://"),
             // Every variable is set once: two SECRETs too, with --broker or
             // without it (the agent refuses them anyway; the CLI sends
             // nothing).
@@ -3133,86 +3088,126 @@ mod tests {
             ),
             (
                 &["K=a", "K=b"],
-                &["T=x"],
+                &["T=x@https://x.example"],
                 &[],
                 "K=b: the variable is already set by another binding",
             ),
             (
                 &[],
-                &["1BAD=x"],
+                &["1BAD=x@https://x.example"],
                 &[],
                 "not a valid environment variable name",
             ),
-            (&[], &["x-y"], &[], "not a valid environment variable name"),
-            (&[], &["K="], &[], "missing entry name"),
-            (&[], &["LD_PRELOAD=x"], &[], "cannot carry a token"),
-            (&[], &["NODE_OPTIONS=x"], &[], "cannot carry a token"),
-            (&[], &["BASH_FUNC_x=x"], &[], "cannot carry a token"),
+            (
+                &[],
+                &["x-y@https://x.example"],
+                &[],
+                "not a valid environment variable name",
+            ),
+            (&[], &["K=@https://x.example"], &[], "missing entry name"),
+            (
+                &[],
+                &["LD_PRELOAD=x@https://x.example"],
+                &[],
+                "cannot carry a token",
+            ),
+            (
+                &[],
+                &["NODE_OPTIONS=x@https://x.example"],
+                &[],
+                "cannot carry a token",
+            ),
+            (
+                &[],
+                &["BASH_FUNC_x=x@https://x.example"],
+                &[],
+                "cannot carry a token",
+            ),
             // The agent adds 127.0.0.1 to NO_PROXY: neither a token nor the
             // broker's address goes there, whatever the case.
             (
                 &[],
-                &["NO_PROXY=x"],
+                &["NO_PROXY=x@https://x.example"],
                 &[],
                 "the agent adds 127.0.0.1 to this variable",
             ),
             (
                 &[],
-                &["no_proxy=x"],
+                &["no_proxy=x@https://x.example"],
                 &[],
                 "the agent adds 127.0.0.1 to this variable",
             ),
             (
                 &[],
-                &["K=x"],
+                &["K=x@https://x.example"],
                 &["NO_PROXY=x"],
                 "it cannot carry the broker's address",
             ),
             (
                 &[],
-                &["K=x"],
+                &["K=x@https://x.example"],
                 &["No_Proxy=x"],
                 "it cannot carry the broker's address",
             ),
             (
                 &["K=y"],
-                &["K=x"],
+                &["K=x@https://x.example"],
                 &[],
                 "the variable is already set by another binding",
             ),
             (
                 &[],
-                &["K=x", "K=y"],
+                &["K=x@https://x.example", "K=y@https://x.example"],
                 &[],
                 "the variable is already set by another binding",
             ),
-            (&[], &["K=x", "L=x"], &[], "x is already given to --broker"),
+            (
+                &[],
+                &["K=x@https://x.example", "L=x@https://x.example"],
+                &[],
+                "x is already given to --broker",
+            ),
             // The same entry both ways, by its name (the agent compares UUIDs).
-            (&["V=x"], &["K=x"], &[], "x is also given by value"),
-            (&[], &["K=x"], &["U=x", "V=x"], "x already has --url U"),
+            (
+                &["V=x"],
+                &["K=x@https://x.example"],
+                &[],
+                "x is also given by value",
+            ),
             (
                 &[],
-                &["K=x"],
+                &["K=x@https://x.example"],
+                &["U=x", "V=x"],
+                "x already has --url U",
+            ),
+            (
+                &[],
+                &["K=x@https://x.example"],
                 &["K=x"],
                 "the variable is already set by another binding",
             ),
             (
                 &[],
-                &["K=x", "L=y"],
+                &["K=x@https://x.example", "L=y@https://x.example"],
                 &["U=x", "U=y"],
                 "the variable is already set by another binding",
             ),
             (
                 &["S=s"],
-                &["K=x"],
+                &["K=x@https://x.example"],
                 &["S=x"],
                 "the variable is already set by another binding",
             ),
-            (&[], &["K=x"], &["LD_AUDIT=x"], "cannot carry a URL"),
-            (&[], &["K=x"], &["x"], "write VAR=ENTRY"),
             (
                 &[],
-                &["K=x"],
+                &["K=x@https://x.example"],
+                &["LD_AUDIT=x"],
+                "cannot carry a URL",
+            ),
+            (&[], &["K=x@https://x.example"], &["x"], "write VAR=ENTRY"),
+            (
+                &[],
+                &["K=x@https://x.example"],
                 &["1U=x"],
                 "not a valid environment variable name",
             ),
@@ -3239,7 +3234,6 @@ mod tests {
             has_notes: false,
             other_fields: vec![],
             modified: None,
-            broker: None,
         }
     }
 
@@ -3261,13 +3255,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cli_names_every_preset_and_policy_as_profiles_store_them() {
-        let presets: Vec<Preset> = PresetArg::value_variants().iter().map(|p| p.0).collect();
-        assert_eq!(presets, Preset::ALL);
-        for preset in PresetArg::value_variants() {
-            let value = preset.to_possible_value().expect("a value");
-            assert_eq!(value.get_name(), preset.0.as_str());
-        }
+    fn the_cli_names_every_lock_policy_as_runs_send_them() {
         let policies: Vec<AutomaticLocks> =
             LocksArg::value_variants().iter().map(|l| l.0).collect();
         assert_eq!(policies, AutomaticLocks::ALL);
@@ -3275,26 +3263,23 @@ mod tests {
             let value = policy.to_possible_value().expect("a value");
             assert_eq!(value.get_name(), policy.0.as_str());
         }
-        // The help of --broker-locks and --broker-lifetime, and docs/cli.md,
-        // give the presets' defaults: they hold for every preset.
-        for preset in Preset::ALL {
-            let spec = rusthorse::broker_profile::latest(preset);
-            assert_eq!(spec.default_automatic_locks, AutomaticLocks::Continue);
-            assert_eq!(spec.default_max_lifetime_minutes, 720);
-        }
+        // The help of run's limits, and docs/cli.md, give the defaults.
+        let defaults = GrantLimits::default();
+        assert_eq!(defaults.automatic_locks, AutomaticLocks::Continue);
+        assert_eq!(defaults.max_lifetime_minutes, 720);
+        assert_eq!(defaults.max_requests, None);
         let help = Cli::command()
-            .find_subcommand_mut("edit")
-            .expect("edit")
+            .find_subcommand_mut("run")
+            .expect("run")
             .render_long_help()
             .to_string();
-        assert!(
-            help.contains("continue for the presets of this version"),
-            "{help}"
-        );
-        assert!(
-            help.contains("720 (12 hours) for the presets of this version"),
-            "{help}"
-        );
+        for said in [
+            "continue unless given",
+            "720 (12 hours) unless given",
+            "no limit unless given",
+        ] {
+            assert!(help.contains(said), "{said}: {help}");
+        }
     }
 
     /// A line of `rusthorse doctor` shows what it quotes escaped.
@@ -3356,37 +3341,28 @@ mod tests {
         }
     }
 
-    /// The arguments of `rusthorse edit KEY ARGS…`.
-    fn edit_args(args: &[&str]) -> Result<EditArgs, clap::Error> {
-        let argv = ["rusthorse", "edit", "KEY"].iter().chain(args);
+    /// The arguments of `rusthorse run ARGS… -- true`.
+    fn run_args(args: &[&str]) -> Result<RunArgs, clap::Error> {
+        let argv = ["rusthorse", "run"]
+            .iter()
+            .chain(args)
+            .chain(&["--", "true"]);
         match Cli::try_parse_from(argv)?.command {
-            Command::Edit(args) => Ok(args),
-            _ => panic!("not an edit"),
+            Command::Run(args) => Ok(args),
+            _ => panic!("not a run"),
         }
     }
 
     #[test]
-    fn a_profile_edit_sends_only_the_options_given_once_they_check_out() {
-        let request = |args: &[&str]| {
-            edit_args(args)
-                .expect("parses")
-                .broker
-                .request()
-                .map(|request| request.map(|r| serde_json::to_value(r).expect("json")))
+    fn a_runs_limits_are_its_options_or_the_defaults_once_they_check_out() {
+        let broker = ["--broker", "T=k@https://x.example"];
+        let limits = |extra: &[&str]| {
+            let args: Vec<&str> = broker.iter().chain(extra).copied().collect();
+            run_limits(&run_args(&args).expect("parses"))
         };
-        assert_eq!(request(&["--host", "h"]).expect("no profile"), None);
+        assert_eq!(limits(&[]).expect("defaults"), GrantLimits::default());
         assert_eq!(
-            request(&["--broker", "anthropic"]).expect("defaults"),
-            Some(serde_json::json!({"preset": "anthropic"}))
-        );
-        assert_eq!(
-            request(&[
-                "--broker",
-                "openai-compatible",
-                "--broker-origin",
-                "https://api.deepseek.com",
-                "--broker-base-path",
-                "",
+            limits(&[
                 "--broker-locks",
                 "end",
                 "--broker-lifetime",
@@ -3395,150 +3371,73 @@ mod tests {
                 "200",
             ])
             .expect("every option"),
-            Some(serde_json::json!({
-                "preset": "openai-compatible",
-                "origin": "https://api.deepseek.com",
-                "base_path": "",
-                "automatic_locks": "end",
-                "max_lifetime_minutes": 90,
-                "max_requests": 200,
-            }))
+            GrantLimits {
+                automatic_locks: AutomaticLocks::End,
+                max_lifetime_minutes: 90,
+                max_requests: Some(200),
+            }
         );
-        // Checked as the agent checks it: the foundation's messages.
-        let refused: [(&[&str], &str); 9] = [
-            (&["--broker", "openai-compatible"], "no default origin"),
+        // Checked as the agent checks them.
+        for (args, expected) in [
+            (["--broker-lifetime", "0"], "1 to 1440 minutes, not 0"),
+            (["--broker-lifetime", "1441"], "1 to 1440 minutes, not 1441"),
+            (["--broker-requests", "0"], "1 to 1000000, not 0"),
             (
-                &["--broker", "openai", "--broker-origin", "http://x.example"],
-                "must start with https://",
-            ),
-            (
-                &["--broker", "openai", "--broker-origin", "https://10.0.0.1"],
-                "not an IP address",
-            ),
-            (
-                &["--broker", "openai", "--broker-base-path", "/v1/"],
-                "the base path is not valid",
-            ),
-            (
-                &["--broker", "openai", "--broker-base-path", "/../x"],
-                "the base path is not valid",
-            ),
-            (
-                &["--broker", "anthropic", "--broker-lifetime", "0"],
-                "1 to 1440 minutes, not 0",
-            ),
-            (
-                &["--broker", "anthropic", "--broker-lifetime", "1441"],
-                "1 to 1440 minutes, not 1441",
-            ),
-            (
-                &["--broker", "anthropic", "--broker-requests", "0"],
-                "1 to 1000000, not 0",
-            ),
-            (
-                &["--broker", "anthropic", "--broker-requests", "1000001"],
+                ["--broker-requests", "1000001"],
                 "1 to 1000000, not 1000001",
             ),
-        ];
-        for (args, expected) in refused {
-            let err = request(args).expect_err(expected).to_string();
-            assert!(err.starts_with("broker profile: "), "{args:?}: {err}");
+        ] {
+            let err = limits(&args).expect_err(expected).to_string();
             assert!(err.contains(expected), "{args:?}: {err}");
         }
-        // What clap refuses: an unknown preset or policy, a number that is
-        // not one, and the profile's options without --broker.
+        // What clap refuses: an unknown policy, a number that is not one,
+        // and the limits without --broker. Neither `edit --broker` nor
+        // `--clear broker` exists any more.
         use clap::error::ErrorKind;
-        let by_clap: [(&[&str], ErrorKind); 8] = [
-            (&["--broker", "gemini"], ErrorKind::InvalidValue),
+        let by_clap: [(&[&str], ErrorKind); 5] = [
             (
-                &["--broker", "anthropic", "--broker-locks", "never"],
+                &[
+                    "--broker",
+                    "T=k@https://x.example",
+                    "--broker-locks",
+                    "never",
+                ],
                 ErrorKind::InvalidValue,
             ),
             (
-                &["--broker", "anthropic", "--broker-lifetime", "a day"],
+                &[
+                    "--broker",
+                    "T=k@https://x.example",
+                    "--broker-lifetime",
+                    "a day",
+                ],
                 ErrorKind::ValueValidation,
             ),
             (
-                &["--broker-origin", "https://x.example"],
+                &["K", "--broker-locks", "end"],
                 ErrorKind::MissingRequiredArgument,
             ),
             (
-                &["--broker-base-path", "/v1"],
+                &["K", "--broker-lifetime", "5"],
                 ErrorKind::MissingRequiredArgument,
             ),
             (
-                &["--broker-locks", "end"],
-                ErrorKind::MissingRequiredArgument,
-            ),
-            (
-                &["--broker-lifetime", "5"],
-                ErrorKind::MissingRequiredArgument,
-            ),
-            (
-                &["--broker-requests", "5"],
+                &["K", "--broker-requests", "5"],
                 ErrorKind::MissingRequiredArgument,
             ),
         ];
         for (args, kind) in by_clap {
-            let err = edit_args(args).err().expect("refused");
+            let err = run_args(args).err().expect("refused");
             assert_eq!(err.kind(), kind, "{args:?}: {err}");
             assert_eq!(err.exit_code(), 2, "{args:?}");
         }
-        assert!(matches!(
-            edit_args(&["--clear", "broker"]).expect("parses").clear[..],
-            [ClearField::Broker]
-        ));
-        assert_eq!(ClearField::Broker.field(), Field::Broker);
-    }
-
-    #[test]
-    fn show_says_what_a_profile_allows_or_why_the_entry_cannot_use_it() {
-        let id = "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12";
-        let mut info = entry(id, Some("AI"), "anthropic");
-        assert!(profile_lines(&info).is_empty());
-        let profile = ProfileRequest {
-            max_requests: Some(200),
-            ..ProfileRequest::new(Preset::Anthropic)
+        for args in [
+            &["rusthorse", "edit", "KEY", "--broker", "anthropic"][..],
+            &["rusthorse", "edit", "KEY", "--clear", "broker"],
+        ] {
+            let err = Cli::try_parse_from(args).err().expect("refused");
+            assert_eq!(err.exit_code(), 2, "{args:?}");
         }
-        .resolve()
-        .expect("profile");
-        info.broker = Some(profile.clone());
-        let lines = profile_lines(&info);
-        assert_eq!(lines[0], "anthropic preset, revision 1");
-        let described: Vec<String> = profile
-            .describe()
-            .into_iter()
-            .map(|(label, value)| format!("{label}: {value}"))
-            .collect();
-        assert_eq!(lines[1..], described);
-        assert!(lines[1].starts_with("Destination: https://api.anthropic.com"));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l == "Requests: at most 200; at most 16 at a time")
-        );
-        // What the agent sends is shown escaped: a profile is not checked
-        // again here, and nothing in it may rewrite the terminal.
-        info.broker = Some(rusthorse::broker_profile::BrokerProfile {
-            base_path: "/v1\u{1b}[2J\n".into(),
-            ..profile.clone()
-        });
-        let lines = profile_lines(&info);
-        assert!(
-            lines.iter().all(|l| !l.contains(['\u{1b}', '\n'])),
-            "{lines:?}"
-        );
-        assert!(
-            lines.contains(&r"Destination: https://api.anthropic.com/v1\u{1b}[2J\u{a}".to_string()),
-            "{lines:?}"
-        );
-        // Protected, or not one this Rusthorse reads: why it cannot be used.
-        info.broker = None;
-        info.protected_fields = vec![rusthorse::vault::FIELD_BROKER.into()];
-        assert!(matches!(&profile_lines(&info)[..], [line] if line.starts_with("withheld:")));
-        info.protected_fields.clear();
-        info.other_fields = vec![rusthorse::vault::FIELD_BROKER.into()];
-        assert!(matches!(&profile_lines(&info)[..], [line] if line.starts_with("unusable:")));
     }
 
     fn grant() -> GrantInfo {
@@ -3547,7 +3446,7 @@ mod tests {
             entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
             var: "ANTHROPIC_AUTH_TOKEN".into(),
             destination: "https://api.anthropic.com".into(),
-            preset: Preset::Anthropic,
+            base_path: None,
             command: "claude".into(),
             requester: "rusthorse[4300] ← bash[4242]".into(),
             state: "active".into(),
@@ -3582,6 +3481,7 @@ mod tests {
             id: "g\u{1b}[1Afake".into(),
             entry: "AI/evil\u{1b}[2J\u{1b}[1;1Hfake".into(),
             destination: "https://api.example.com\u{202e}moc.live".into(),
+            base_path: Some("/v1\u{1b}[2K".into()),
             state: "active\u{1b}[8m".into(),
             started: "2026-11-02\u{200b}T18:00\n".into(),
             ..grant()
@@ -3592,7 +3492,8 @@ mod tests {
         for header in [
             "ID",
             "ENTRY",
-            "DESTINATION",
+            "APPROVED ORIGIN",
+            "BASE PATH (NOT A LIMIT)",
             "STATE",
             "STARTED",
             "ENDS IN",
@@ -3608,6 +3509,7 @@ mod tests {
             "g0123456789abcdef",
             "AI/ANTHROPIC_API_KEY (8d2f6c1e)",
             "https://api.anthropic.com",
+            "none",
             "active",
             "2026-11-02T18:00:00-03:00",
             "11h59m",
@@ -3618,6 +3520,10 @@ mod tests {
             assert!(lines[1].contains(cell), "{cell}: {}", lines[1]);
         }
         assert!(lines[1].ends_with("  claude"), "{}", lines[1]);
+        // The base path is in a column of its own, after the origin.
+        let origin = lines[1].find("https://api.anthropic.com").expect("origin");
+        assert!(lines[1][origin..].find(" none ").is_some(), "{}", lines[1]);
+        assert!(lines[3].contains(r"/v1\u{1b}[2K"), "{}", lines[3]);
         for cell in ["gfedcba9876543210", "exhausted", "200 of 200", "end"] {
             assert!(lines[2].contains(cell), "{cell}: {}", lines[2]);
         }
@@ -3703,18 +3609,31 @@ mod tests {
             id: grant_id.into(),
             entry: "AI/KEY (8d2f6c1e)".into(),
             destination: "https://api.anthropic.com".into(),
+            base_path: None,
         }]);
         assert!(audit_line(&run).contains(
             " [AI/KEY (8d2f6c1e)] grants: g0123456789abcdef for AI/KEY (8d2f6c1e) to \
              https://api.anthropic.com; $ claude  by "
         ));
+        run.grants = Some(vec![AuditGrant {
+            id: grant_id.into(),
+            entry: "AI/KEY (8d2f6c1e)".into(),
+            destination: "https://api.openai.com".into(),
+            base_path: Some("/v1".into()),
+        }]);
+        assert!(
+            audit_line(&run)
+                .contains(" to https://api.openai.com (base path /v1, not a limit); $ claude  by ")
+        );
         let mut admitted = event("broker_request", "admitted");
         admitted.grant = Some(grant_id.into());
         admitted.request = Some(7);
-        admitted.route = Some("POST /v1/messages".into());
-        assert!(audit_line(&admitted).contains(
-            "broker_request admitted             grant g0123456789abcdef #7 POST /v1/messages  by "
-        ));
+        admitted.method = Some("POST".into());
+        assert!(
+            audit_line(&admitted).contains(
+                "broker_request admitted             grant g0123456789abcdef #7 POST  by "
+            )
+        );
         let mut finished = event("broker_request", "completed");
         finished.grant = Some(grant_id.into());
         finished.request = Some(7);
@@ -3744,7 +3663,7 @@ mod tests {
         ));
         // The new fields are escaped like the others.
         let mut forged = event("grant", "ended");
-        forged.route = Some("\u{1b}[2K".into());
+        forged.method = Some("\u{1b}[2K".into());
         forged.reason = Some("x\ny".into());
         let line = audit_line(&forged);
         assert!(!line.contains(['\n', '\u{1b}']), "{line:?}");
@@ -4200,46 +4119,22 @@ mod tests {
         }
     }
 
-    /// The AI guide shows how to give an entry a profile of every preset, and
-    /// every profile it shows is one `rusthorse edit` sends: an AI agent
-    /// suggests these lines to the human as they are, and one that `edit`
-    /// refuses (`openai-compatible` without `--broker-origin`) helps nobody.
-    #[test]
-    fn the_ai_guide_shows_a_profile_of_every_preset_that_edit_accepts() {
-        let guide = GuideTopic::Ai.text();
-        let mut shown = Vec::new();
-        for (line, _) in guide_command_lines(&guide) {
-            let argv = std::iter::once("rusthorse".to_string()).chain(shell_words(&line));
-            let Ok(Cli {
-                command: Command::Edit(args),
-                ..
-            }) = Cli::try_parse_from(argv)
-            else {
-                continue;
-            };
-            if let Some(PresetArg(preset)) = args.broker.preset {
-                if let Err(e) = args.broker.request() {
-                    panic!("`rusthorse {line}`: {e}");
-                }
-                shown.push(preset);
-            }
-        }
-        for preset in Preset::ALL {
-            assert!(
-                shown.contains(&preset),
-                "the guide shows no `rusthorse edit NAME --broker {}`",
-                preset.as_str()
-            );
-        }
-    }
-
     /// The facts of the AI guide that tests cannot draw from its commands:
     /// the kinds, the exit statuses and the JSON fields it names.
     #[test]
     fn the_ai_guide_lists_the_real_kinds_statuses_and_fields() {
         let guide = GuideTopic::Ai.text();
         assert!(guide.contains(env!("CARGO_PKG_VERSION")));
-        assert!(!guide.contains('@'), "a placeholder is left in the guide");
+        // No placeholder (`@VERSION@`) is left; the `@` of `--broker
+        // VAR=NAME@URL` is no placeholder.
+        let placeholder = guide.split('@').skip(1).any(|part| {
+            let word: String = part
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                .collect();
+            !word.is_empty() && part[word.len()..].starts_with('@')
+        });
+        assert!(!placeholder, "a placeholder is left in the guide");
         // Every kind, and nothing else.
         let kinds = guide
             .lines()
@@ -4297,11 +4192,6 @@ mod tests {
             has_notes: true,
             other_fields: vec!["f".into()],
             modified: Some("2026-01-01T00:00:00Z".into()),
-            broker: Some(
-                ProfileRequest::new(Preset::Anthropic)
-                    .resolve()
-                    .expect("profile"),
-            ),
         };
         let json = serde_json::to_value(&info).expect("json");
         let sentence = guide
@@ -4327,7 +4217,6 @@ mod tests {
             protected_fields: Vec::new(),
             other_fields: Vec::new(),
             modified: None,
-            broker: None,
             ..info
         };
         let json = serde_json::to_value(&bare).expect("json");

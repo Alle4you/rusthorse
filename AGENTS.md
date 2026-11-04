@@ -25,7 +25,8 @@ nothing about APIs or providers. Do not propose or build more controls: no autho
 routes or operations, no per-provider logic (presets, headers), no
 destinations or policies stored with an entry, no connectors for other
 protocols — `rusthorse run` serves every other use. Phase 1's broker
-profiles and presets are being removed for this reason (ADR 0013).
+profiles and presets were removed for this reason (ADR 0013, scope
+amendment).
 
 Read before changing anything: [README.md](README.md),
 [docs/architecture.md](docs/architecture.md) and
@@ -115,10 +116,11 @@ Breaking one of these is a security bug, whatever the tests say.
 
 1. **Only the agent, and the broker it starts for each grant, handle secrets
    taken from the vault.** The agent gives a `rusthorse-broker` process the
-   credential of its one grant, with the grant's token, profile and limits,
-   over the control channel, and nothing else from the vault (ADR 0013). The
-   broker puts the credential only in the authentication header it builds for
-   the profile's destination. A command run with `--broker` gets a token for
+   credential of its one grant, with the grant's token, the approved origin
+   and limits, over the control channel, and nothing else from the vault (ADR
+   0013). The broker puts the credential only in place of the grant's token,
+   in the request headers it forwards to the approved origin. A command run
+   with `--broker` gets a token for
    that binding, never the credential (ordinary `run` bindings give their
    values to the approved command, as before). A client — the CLI or the
    manager — holds a secret only when the user supplies one — `init` without
@@ -297,7 +299,7 @@ present and capture only its window, in a dark and a light theme
 | `src/dialog_program.rs`, `src/dialog_protocol.rs` | Driving `rusthorse-dialog`; the protocol between them |
 | `src/helper_program.rs` | Finding and checking the programs the agent starts next to its own (`rusthorse-dialog`, `rusthorse-broker`) |
 | `broker/` | `rusthorse-broker`, the credential broker (ADR 0013): one process per grant, serving it on a loopback port; its tests run it in front of a fake HTTPS destination |
-| `src/broker_profile.rs` | Broker profiles and presets: destinations, routes, headers, tokens; shared with the broker |
+| `src/broker_grant.rs` | What a grant carries besides its token and key — the approved destination, the run's limits — and the rules shared with the broker (method labels, token-shaped strings, usable keys) |
 | `src/broker_protocol.rs` | The control channel between the agent and a broker, tokens and grant IDs, phase 1's limits, the file of certificate authorities |
 | `src/broker_host.rs` | The agent's side of the broker: the registry of grants, starting and supervising brokers, admission, revocation, expiry |
 | `manager/` | The GTK metadata client; Show requires agent approval (ADR 0007). |

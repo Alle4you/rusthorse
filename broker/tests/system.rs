@@ -7,8 +7,9 @@
 //! test's certificate authority; the commands are `/bin/sh` scripts that the
 //! agent runs; the client is the library's, over the agent's socket; the
 //! destination is the fake HTTPS server of `support`, on loopback, reached
-//! as `https://localhost:PORT` — the origin of the entry's profile, set
-//! through an approved `broker_edit`.
+//! as `https://localhost:PORT` — the destination each run names for its
+//! broker bindings (`--broker VAR=ENTRY@URL`), which the human approves in
+//! the run's dialog.
 //!
 //! A test uses a grant's token as a stolen token would be used: the command
 //! writes what it received to a file in the test's directory (or prints it,
@@ -59,7 +60,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use rusthorse::agent::{Agent, AgentConfig};
-use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+use rusthorse::broker_grant::{AutomaticLocks, GrantLimits};
 use rusthorse::broker_protocol::is_well_formed_token;
 use rusthorse::client::RunIo;
 use rusthorse::protocol::{
@@ -188,6 +189,9 @@ struct System {
     tapped: Arc<Mutex<Vec<String>>>,
     /// The gates of the outputs held for the test ([`System::start_held`]).
     held: Mutex<Vec<Gate>>,
+    /// Where the runs of the test send each entry's key, by entry name
+    /// ([`System::set_destination`]).
+    destinations: Mutex<BTreeMap<String, String>>,
 }
 
 /// The file whose creation ends every command of a test that still waits
@@ -280,6 +284,7 @@ impl System {
             runs: Arc::default(),
             tapped: Arc::default(),
             held: Mutex::default(),
+            destinations: Mutex::default(),
         }
     }
 
@@ -357,23 +362,32 @@ impl System {
         vault.save().expect("save");
     }
 
-    /// Give `entry` the profile `profile` as the human does: a `broker_edit`,
-    /// approved.
-    fn set_profile(&self, entry: &str, profile: ProfileRequest) {
-        self.decide(&[Decision::AllowOnce]);
-        let changes = EntryChanges {
-            broker: Some(profile),
-            ..EntryChanges::default()
-        };
-        let response = self.call(&Request::BrokerEdit {
-            name: entry.into(),
-            changes,
-        });
-        assert!(
-            matches!(response, Response::Ok { .. }),
-            "the profile of {entry} was not set: {}",
-            describe(&response)
-        );
+    /// Where the runs of the test send `entry`'s key from now on: the
+    /// destination their broker bindings of it name (`--broker
+    /// VAR=ENTRY@URL`), which each run's dialog shows the human.
+    fn set_destination(&self, entry: &str, url: &str) {
+        self.destinations
+            .lock()
+            .expect("lock")
+            .insert(entry.into(), url.into());
+    }
+
+    /// A broker binding of `entry` to the destination set for it: the token
+    /// in `var`, the broker's address in `url_var`.
+    fn brokered(&self, var: &str, entry: &str, url_var: Option<&str>) -> BrokerBinding {
+        let destination = self
+            .destinations
+            .lock()
+            .expect("lock")
+            .get(entry)
+            .cloned()
+            .unwrap_or_else(|| panic!("no destination for {entry}"));
+        BrokerBinding {
+            var: var.into(),
+            entry: entry.into(),
+            destination,
+            url_var: url_var.map(str::to_string),
+        }
     }
 
     /// Put a wrapper of the real broker where the agent looks for its
@@ -443,7 +457,9 @@ impl System {
             .collect()
     }
 
-    /// A run of `sh -c script` in the test's directory, with redaction.
+    /// A run of `sh -c script` in the test's directory, with redaction, its
+    /// grants with the default limits (no request limit, 12 hours, and the
+    /// automatic locks do not end them).
     fn run_request(
         &self,
         bindings: Vec<Binding>,
@@ -460,6 +476,7 @@ impl System {
                 forward_stdin: false,
             },
             brokered,
+            limits: GrantLimits::default(),
         }
     }
 
@@ -523,7 +540,7 @@ impl System {
         let stream = UnixStream::connect(&self.socket).expect("connect to the agent");
         protocol::send_frame(
             &stream,
-            &Request::BrokerRun(request),
+            &Request::BrokerRunV2(request),
             &[null.as_fd(), to_command.as_fd(), to_command.as_fd()],
         )
         .expect("send the run");
@@ -573,18 +590,21 @@ impl System {
 
     /// Start a command tagged `tag`, approved, with a grant of `entry`: the
     /// token in `ANTHROPIC_API_KEY`, the broker's address in
-    /// `ANTHROPIC_BASE_URL`; return it once it runs.
+    /// `ANTHROPIC_BASE_URL`; return it once it runs. Its grant has the
+    /// default limits.
     fn start_grant(&self, entry: &str, tag: &str) -> Started {
+        self.start_grant_with(entry, tag, GrantLimits::default())
+    }
+
+    /// [`System::start_grant`], the run's grant with `limits`.
+    fn start_grant_with(&self, entry: &str, tag: &str, limits: GrantLimits) -> Started {
         self.decide(&[Decision::AllowOnce]);
-        let request = self.run_request(
+        let mut request = self.run_request(
             vec![],
-            vec![brokered(
-                "ANTHROPIC_API_KEY",
-                entry,
-                Some("ANTHROPIC_BASE_URL"),
-            )],
+            vec![self.brokered("ANTHROPIC_API_KEY", entry, Some("ANTHROPIC_BASE_URL"))],
             &waits(tag),
         );
+        request.limits = limits;
         let running = self.start(request);
         let env = self.command_env(tag, &running);
         Started {
@@ -656,16 +676,9 @@ impl System {
     /// An approved edit of `entry`.
     fn edit(&self, entry: &str, changes: EntryChanges) {
         self.decide(&[Decision::AllowOnce]);
-        let request = if changes.touches_broker() {
-            Request::BrokerEdit {
-                name: entry.into(),
-                changes,
-            }
-        } else {
-            Request::Edit {
-                name: entry.into(),
-                changes,
-            }
+        let request = Request::Edit {
+            name: entry.into(),
+            changes,
         };
         let response = self.call(&request);
         assert!(
@@ -1068,14 +1081,6 @@ fn endpoint(env: &BTreeMap<String, String>, token_var: &str, url_var: &str) -> E
     }
 }
 
-fn brokered(var: &str, entry: &str, url_var: Option<&str>) -> BrokerBinding {
-    BrokerBinding {
-        var: var.into(),
-        entry: entry.into(),
-        url_var: url_var.map(str::to_string),
-    }
-}
-
 fn by_value(var: &str, entry: &str) -> Binding {
     Binding {
         var: var.into(),
@@ -1083,20 +1088,21 @@ fn by_value(var: &str, entry: &str) -> Binding {
     }
 }
 
-/// An Anthropic profile for `destination`, its other settings the
-/// preset's.
-fn anthropic(destination: &Destination) -> ProfileRequest {
-    ProfileRequest {
-        origin: Some(destination.origin()),
-        ..ProfileRequest::new(Preset::Anthropic)
+/// The limits of a run whose grants the automatic locks end, the others
+/// the defaults.
+fn ending_limits() -> GrantLimits {
+    GrantLimits {
+        automatic_locks: AutomaticLocks::End,
+        ..GrantLimits::default()
     }
 }
 
-/// The same, whose grants the automatic locks end.
-fn anthropic_ending(destination: &Destination) -> ProfileRequest {
-    ProfileRequest {
-        automatic_locks: Some(AutomaticLocks::End),
-        ..anthropic(destination)
+/// The limits of a run whose grants admit at most `limit` requests each,
+/// the others the defaults.
+fn at_most(limit: u64) -> GrantLimits {
+    GrantLimits {
+        max_requests: Some(limit),
+        ..GrantLimits::default()
     }
 }
 
@@ -1463,14 +1469,15 @@ fn assert_nothing_more_forwarded(endpoint: &Endpoint, destination: &Destination)
 
 /// The key never reaches the command: not its environment, a file it writes
 /// from what it received, its output, the broker's error bodies or response
-/// headers, `grants`, `status` or the audit log. The destination gets it in
-/// exactly one header, the one the broker builds — `x-api-key` for the
-/// Anthropic preset, `Authorization: Bearer` for an OpenAI-compatible one
-/// — and never the token, even in a header the preset forwards (a
-/// `User-Agent` that carries it, an `x-stainless-` header named after it).
-/// One run, two grants, two brokers.
+/// headers, `grants`, `status` or the audit log. The destination gets it
+/// where the command put the token, and only there — `x-api-key: KEY` for
+/// one grant, `Authorization: Bearer KEY` for the other — and never the
+/// token; a request with the token where it does not belong (a header named
+/// after it) is refused. Each grant reaches the origin its run named: the
+/// base path of one only sets up its command's base URL. One run, two
+/// grants, two brokers.
 #[test]
-fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds() {
+fn the_key_leaves_only_for_the_destination_in_place_of_the_token() {
     let sys = System::new();
     let destination = Destination::new(
         &sys.ca,
@@ -1484,14 +1491,8 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
         ),
     );
     sys.seed(&[("ANTHROPIC", CREDENTIAL), ("OPENAI", OPENAI_KEY)]);
-    sys.set_profile("ANTHROPIC", anthropic(&destination));
-    sys.set_profile(
-        "OPENAI",
-        ProfileRequest {
-            origin: Some(destination.origin()),
-            ..ProfileRequest::new(Preset::OpenaiCompatible)
-        },
-    );
+    sys.set_destination("ANTHROPIC", &destination.origin());
+    sys.set_destination("OPENAI", &format!("{}/v1", destination.origin()));
     sys.install_broker(&[]);
     sys.decide(&[Decision::AllowOnce]);
     let script = format!(
@@ -1501,8 +1502,8 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
     let running = sys.start(sys.run_request(
         vec![],
         vec![
-            brokered("ANTHROPIC_API_KEY", "ANTHROPIC", Some("ANTHROPIC_BASE_URL")),
-            brokered("OPENAI_API_KEY", "OPENAI", Some("OPENAI_BASE_URL")),
+            sys.brokered("ANTHROPIC_API_KEY", "ANTHROPIC", Some("ANTHROPIC_BASE_URL")),
+            sys.brokered("OPENAI_API_KEY", "OPENAI", Some("OPENAI_BASE_URL")),
         ],
         &script,
     ));
@@ -1515,9 +1516,16 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
         "{}",
         env["OPENAI_BASE_URL"]
     );
+    assert!(!env["ANTHROPIC_BASE_URL"].ends_with('/'));
     assert!(is_well_formed_token(&first.token) && is_well_formed_token(&second.token));
     assert_ne!(first.token, second.token);
     assert_ne!(first.port, second.port);
+    // The grants name the approved origin, and the base path apart.
+    for grant in sys.grants() {
+        assert_eq!(grant.destination, destination.origin(), "{grant:?}");
+        let base_path = (grant.id == ids["OPENAI"]).then(|| "/v1".to_string());
+        assert_eq!(grant.base_path, base_path, "{grant:?}");
+    }
     let keys = [CREDENTIAL, OPENAI_KEY];
     let everything = [
         CREDENTIAL,
@@ -1529,21 +1537,16 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
     let written = std::fs::read_to_string(sys.path("env-k.txt")).expect("env");
     assert_free_of("the command's environment", &written, &keys);
 
-    // The Anthropic grant: both token headers carry the token; a forwarded
-    // header carries it in its value, another in its name. The query, the
-    // other headers and the body are the destination's alone: the audit log
-    // records the route.
+    // The first grant: the token in `x-api-key`. The target, the other
+    // headers and the body go as the command sent them, and are the
+    // destination's alone: the audit log records the method's label.
     let body = br#"{"model":"claude-test","max_tokens":1,"note":"body-marker-0000"}"#;
-    let user_agent = format!("Anthropic/Python 9.9 {}", first.token);
-    let named = format!("x-stainless-{}", first.token);
     let response = first.send(&first.request(
         "POST",
         "/v1/messages?beta=true",
         &[
-            ("authorization", &format!("Bearer {}", first.token)),
             ("content-type", "application/json"),
-            ("user-agent", &user_agent),
-            (&named, "1"),
+            ("user-agent", "Anthropic/Python 9.9"),
             ("x-stainless-lang", "python"),
             ("anthropic-beta", "header-marker-0000"),
         ],
@@ -1561,23 +1564,19 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
         "the key in more than one header"
     );
     assert!(got.values("authorization").is_empty(), "{:?}", got.names());
-    assert!(
-        got.values("user-agent").is_empty(),
-        "the token's user-agent"
-    );
-    assert!(!got.names().contains(&named), "the header named after it");
+    assert_eq!(got.values("user-agent"), ["Anthropic/Python 9.9"]);
     assert_eq!(got.values("x-stainless-lang"), ["python"]);
     assert_eq!(got.values("anthropic-beta"), ["header-marker-0000"]);
     assert_free_of(
         "the destination's request",
         &got.head_text(),
-        &[first.token.as_str()],
+        &[first.token.as_str(), second.token.as_str(), OPENAI_KEY],
     );
     assert_eq!(got.body, body);
     assert_eq!(got.sni.as_deref(), Some("localhost"));
 
-    // The OpenAI-compatible grant: the key as a bearer token, after the
-    // base path.
+    // The second grant: the token as a bearer token, under the base path
+    // the command was given.
     let response = second.send(&second.bearer_request(
         "POST",
         "/v1/chat/completions",
@@ -1601,7 +1600,7 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
     assert_free_of(
         "the destination's request",
         &got.head_text(),
-        &[second.token.as_str()],
+        &[first.token.as_str(), second.token.as_str(), CREDENTIAL],
     );
 
     // The broker's own answers: neither a key nor a token.
@@ -1609,9 +1608,10 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
         "authorization".to_string(),
         format!("Bearer {}", first.token),
     )];
+    let named = format!("x-stainless-{}", first.token);
     let refused = [
         first.send(&raw_request("GET", "/v1/models", first.port, &[], b"")),
-        first.send(&first.request("POST", "/v1/messages/batches", &[], b"{}")),
+        first.send(&first.request("GET", "/v1/models", &[(&named, "1")], b"")),
         first.send(&first.request("GET", "/v1/models", &[("origin", "https://x.example")], b"")),
         second.send(&raw_request(
             "GET",
@@ -1621,7 +1621,7 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
             b"",
         )),
     ];
-    for (response, status) in refused.iter().zip([401, 404, 400, 401]) {
+    for (response, status) in refused.iter().zip([401, 401, 400, 401]) {
         response.assert_local(status);
         assert_free_of("an error answer", &response_text(response), &everything);
     }
@@ -1651,14 +1651,24 @@ fn the_key_leaves_only_for_the_destination_in_the_one_header_the_broker_builds()
     let audit = sys.audit_text();
     assert_free_of("the audit log", &audit, &everything);
     assert!(!audit.contains("rh_"), "a token in the audit log");
-    // Each request by its route, never its path, query, headers or body.
-    let routes: Vec<Value> = sys
-        .requests_of(&ids["ANTHROPIC"])
-        .into_iter()
-        .map(|r| r["route"].clone())
-        .collect();
-    assert_eq!(routes, ["POST /v1/messages", "POST /v1/messages"]);
-    for marker in ["beta=true", "header-marker", "body-marker"] {
+    // Each request by its method's label, never its path, query, headers or
+    // body.
+    for (entry, label) in [("ANTHROPIC", "POST"), ("OPENAI", "POST")] {
+        let records = sys.requests_of(&ids[entry]);
+        let methods: Vec<Value> = records.iter().map(|r| r["method"].clone()).collect();
+        assert_eq!(methods, [label, label], "{entry}");
+        assert!(
+            records.iter().all(|r| r.get("route").is_none()),
+            "{records:?}"
+        );
+    }
+    for marker in [
+        "/v1/messages",
+        "chat/completions",
+        "beta=true",
+        "header-marker",
+        "body-marker",
+    ] {
         assert!(!audit.contains(marker), "{marker:?} is in the audit log");
     }
 }
@@ -1681,7 +1691,7 @@ fn an_unredacted_run_shows_its_token_never_the_key_and_its_dialog_warns() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     sys.decide(&[Decision::AllowOnce]);
     let script = format!(
@@ -1690,11 +1700,7 @@ fn an_unredacted_run_shows_its_token_never_the_key_and_its_dialog_warns() {
     );
     let running = sys.start_unredacted(sys.run_request(
         vec![],
-        vec![brokered(
-            "ANTHROPIC_API_KEY",
-            "KEY",
-            Some("ANTHROPIC_BASE_URL"),
-        )],
+        vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL"))],
         &script,
     ));
     // The token, as whoever reads the output reads it (once its line is
@@ -1752,17 +1758,19 @@ fn an_unredacted_run_shows_its_token_never_the_key_and_its_dialog_warns() {
 
 // ===== Tokens =====
 
-/// A request is forwarded only with its own grant's token: without one,
-/// with one malformed or wrong, with the token of another grant (two runs
-/// at once, of one entry), or with two token headers that disagree, it
-/// gets `401` and nothing reaches the destination; each grant's own token
-/// works on its own broker only.
+/// A request is forwarded only with its own grant's token, where the key
+/// would go: without one, with one malformed or wrong, with the token of
+/// another grant (two runs at once, of one entry), with two token headers
+/// that disagree, with its token in another case, in a header the broker
+/// drops, in a header's name or in the target, or with the key itself
+/// beside it, it gets `401` and nothing reaches the destination; each
+/// grant's own token works on its own broker only.
 #[test]
 fn requests_without_their_grants_token_get_401_and_reach_nothing() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let b = sys.start_grant("KEY", "b");
@@ -1770,6 +1778,7 @@ fn requests_without_their_grants_token_get_401_and_reach_nothing() {
     let (token, theirs) = (a.endpoint.token.clone(), b.endpoint.token.clone());
     let wrong = rusthorse::broker_protocol::new_token().to_string();
     let header = |name: &str, value: String| (name.to_string(), value);
+    let named = format!("x-{token}");
     let cases: Vec<(&str, Vec<(String, String)>)> = vec![
         ("missing", vec![]),
         ("empty", vec![header("x-api-key", String::new())]),
@@ -1799,6 +1808,34 @@ fn requests_without_their_grants_token_get_401_and_reach_nothing() {
                 header("x-api-key", wrong.clone()),
             ],
         ),
+        (
+            "right and in uppercase",
+            vec![
+                header("x-api-key", token.clone()),
+                header("x-request-tag", token.to_uppercase()),
+            ],
+        ),
+        (
+            "right and in a header the broker drops",
+            vec![
+                header("x-api-key", token.clone()),
+                header("proxy-authorization", format!("Bearer {token}")),
+            ],
+        ),
+        (
+            "right and in a header's name",
+            vec![
+                header("x-api-key", token.clone()),
+                header(&named, "1".into()),
+            ],
+        ),
+        (
+            "right and the key itself",
+            vec![
+                header("x-api-key", token.clone()),
+                header("x-backup", CREDENTIAL.into()),
+            ],
+        ),
     ];
     for (why, headers) in &cases {
         let response = a.endpoint.send(&raw_request(
@@ -1810,6 +1847,15 @@ fn requests_without_their_grants_token_get_401_and_reach_nothing() {
         ));
         assert_eq!(response.status, 401, "{why}: {response:?}");
         response.assert_local(401);
+        assert_free_of("an error answer", &response_text(&response), &[CREDENTIAL]);
+    }
+    // In the target.
+    let mut refused = cases.len() as u64;
+    for target in [format!("/v1/messages?key={token}"), format!("/{token}")] {
+        a.endpoint
+            .send(&a.endpoint.request("POST", &target, &[], b"{}"))
+            .assert_local(401);
+        refused += 1;
     }
     // A's token on B's broker.
     b.endpoint
@@ -1827,7 +1873,7 @@ fn requests_without_their_grants_token_get_401_and_reach_nothing() {
     assert_works(&a.endpoint);
     assert_works(&b.endpoint);
     assert_eq!(destination.connections(), 2);
-    for (started, refused) in [(&a, cases.len() as u64), (&b, 1)] {
+    for (started, refused) in [(&a, refused), (&b, 1)] {
         let grant = sys.grant(&started.id).expect("listed");
         assert_eq!(grant.requests, 1);
         // The broker's own 401s are not the destination's: none counts.
@@ -1863,7 +1909,7 @@ fn a_destinations_401_is_relayed_counted_and_reported_when_the_run_ends() {
         ),
     );
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let refused = |endpoint: &Endpoint| {
         let response = endpoint.send(&endpoint.request("POST", "/v1/messages", &[], b"{}"));
@@ -1918,39 +1964,25 @@ fn a_destinations_401_is_relayed_counted_and_reported_when_the_run_ends() {
 
 // ===== Routes and framing =====
 
-/// Requests off the profile's routes or badly framed are refused by the
-/// real broker before anything else (B's tests go through the whole list):
-/// message batches, an escaped `..`, a foreign `Host`, an `Origin`,
-/// `CONNECT`, a request `Transfer-Encoding` (alone and with a length) —
-/// nothing is asked of the agent, nothing reaches the destination, and the
-/// grant's end counts them.
+/// Badly framed requests are refused by the real broker before anything
+/// else (B's tests go through the whole list): a foreign `Host`, an
+/// `Origin`, `CONNECT`, an absolute target, a request `Transfer-Encoding`
+/// (alone and with a length) — nothing is asked of the agent, nothing
+/// reaches the destination, and the grant's end counts them. Any path and
+/// query, with a body on any method, goes to the approved origin as the
+/// command sent it: there is no route.
 #[test]
-fn requests_off_the_routes_or_badly_framed_are_refused_and_reach_nothing() {
+fn badly_framed_requests_are_refused_and_any_path_goes_as_sent() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
     let port = ep.port;
     let key = format!("x-api-key: {}\r\n", ep.token);
     let host = format!("host: 127.0.0.1:{port}\r\n");
-    let routes = [
-        ("POST", "/v1/messages/batches"),
-        ("GET", "/v1/messages/batches/msgbatch_01"),
-        ("POST", "/v1/files"),
-        ("POST", "/v1/%2e%2e/v1/messages"),
-        ("POST", "/v1//messages"),
-        ("POST", "/v1/messages;x=1"),
-        ("POST", "/v1/messages?beta=true&beta=true"),
-    ];
-    for (method, target) in routes {
-        // Only a POST may carry a body (another is a framing error).
-        let body: &[u8] = if method == "POST" { b"{}" } else { b"" };
-        ep.send(&ep.request(method, target, &[], body))
-            .assert_local(404);
-    }
     let framing = [
         format!("GET /v1/models HTTP/1.1\r\nhost: localhost:{port}\r\n{key}\r\n"),
         format!("GET /v1/models HTTP/1.1\r\nhost: api.anthropic.com\r\n{key}\r\n"),
@@ -1978,21 +2010,51 @@ fn requests_off_the_routes_or_badly_framed_are_refused_and_reach_nothing() {
     let grant = sys.grant(&a.id).expect("listed");
     assert_eq!((grant.requests, grant.in_flight), (0, 0));
     assert!(sys.requests_of(&a.id).is_empty(), "a request was admitted");
-    // The routes themselves are forwarded.
-    assert_works(ep);
+    // Any target goes as it is, a body with any method.
+    let targets = [
+        ("POST", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_01"),
+        ("DELETE", "/v1/files/file_01"),
+        ("PUT", "/v1/%2e%2e/v1/messages"),
+        ("PATCH", "/v1//messages"),
+        ("GET", "/v1/messages;x=1"),
+        ("POST", "/v1/messages?beta=true&beta=true"),
+    ];
+    for (n, (method, target)) in targets.iter().enumerate() {
+        let response = ep.send(&ep.request(method, target, &[], b"{}"));
+        assert_eq!(response.status, 200, "{method} {target}: {response:?}");
+        let got = &destination.wait_for(n + 1)[n];
+        assert_eq!(
+            (got.method.as_str(), got.target.as_str()),
+            (*method, *target)
+        );
+        assert_eq!(got.body, b"{}");
+    }
     sys.go("a");
     assert_eq!(a.running.exit_code(), Some(0));
-    let refused = (routes.len() + framing.len()) as u64;
+    let (admitted, refused) = (targets.len() as u64, framing.len() as u64);
     assert_eq!(
         sys.end_of(&a.id)["requests"],
-        serde_json::json!({"admitted": 1, "finished": 1, "unknown": 0, "refused": refused})
+        serde_json::json!({
+            "admitted": admitted, "finished": admitted, "unknown": 0, "refused": refused
+        })
+    );
+    let methods: Vec<Value> = sys
+        .requests_of(&a.id)
+        .into_iter()
+        .filter(|r| r["outcome"] == "admitted")
+        .map(|r| r["method"].clone())
+        .collect();
+    assert_eq!(
+        methods,
+        ["POST", "GET", "DELETE", "PUT", "PATCH", "GET", "POST"]
     );
 }
 
 // ===== Destination =====
 
-/// The broker reaches the profile's destination and no other, whatever the
-/// environments say: `Host` and SNI are the profile's, and ALPN is
+/// The broker reaches the approved origin and no other, whatever the
+/// environments say: `Host` and SNI are the origin's, and ALPN is
 /// `http/1.1`, the one protocol the broker offers (the destination would
 /// rather have `h2`). The requester's proxy and certificate variables reach
 /// the command and not the broker, which the agent starts with nothing of
@@ -2005,7 +2067,7 @@ fn requests_off_the_routes_or_badly_framed_are_refused_and_reach_nothing() {
 /// anything of it reaches the client; both are recorded as sent, with an
 /// unknown outcome.
 #[test]
-fn the_broker_reaches_the_profiles_destination_whatever_the_environment_says() {
+fn the_broker_reaches_the_approved_origin_whatever_the_environment_says() {
     let sys = System::new();
     let handler: Handler = Arc::new(|request, peer| {
         let reply: &[u8] = if request.target.ends_with("/redirect") {
@@ -2045,15 +2107,15 @@ fn the_broker_reaches_the_profiles_destination_whatever_the_environment_says() {
         ("NODE_EXTRA_CA_CERTS", &roots),
     ];
     sys.seed(&[("KEY", CREDENTIAL), ("ELSEWHERE", OTHER_KEY)]);
-    sys.set_profile("KEY", anthropic(&destination));
-    sys.set_profile("ELSEWHERE", anthropic(&impostor));
+    sys.set_destination("KEY", &destination.origin());
+    sys.set_destination("ELSEWHERE", &impostor.origin());
     sys.install_broker(&variables);
     sys.decide(&[Decision::AllowOnce]);
     let mut request = sys.run_request(
         vec![],
         vec![
-            brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL")),
-            brokered("ELSEWHERE_KEY", "ELSEWHERE", Some("ELSEWHERE_URL")),
+            sys.brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL")),
+            sys.brokered("ELSEWHERE_KEY", "ELSEWHERE", Some("ELSEWHERE_URL")),
         ],
         &waits("a"),
     );
@@ -2157,7 +2219,7 @@ fn a_broker_built_for_tests_that_the_agent_starts_reaches_no_loopback_destinatio
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_bare_broker();
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
@@ -2218,7 +2280,7 @@ fn the_key_echoed_by_the_destination_is_redacted_on_its_way_back() {
     };
     let destination = Destination::new(&sys.ca, handler);
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
@@ -2281,15 +2343,9 @@ fn a_request_limit_of_n_lets_n_through_however_many_arrive_at_once() {
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile(
-        "KEY",
-        ProfileRequest {
-            max_requests: Some(LIMIT),
-            ..anthropic(&destination)
-        },
-    );
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
-    let a = sys.start_grant("KEY", "a");
+    let a = sys.start_grant_with("KEY", "a", at_most(LIMIT));
     let ep = a.endpoint.clone();
     {
         let _broken = sys.break_audit();
@@ -2365,14 +2421,15 @@ fn a_request_limit_of_n_lets_n_through_however_many_arrive_at_once() {
 /// twenty refused for want of an audit record leave all sixteen — and a
 /// request that ends frees its slot. Requests that end in another order
 /// than they started are counted by their numbers: the listing and the
-/// audit log agree, and each request's end is recorded with its own route.
+/// audit log agree, and each request's end is recorded with its own
+/// method's label.
 #[test]
 fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_in() {
     let sys = System::new();
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
@@ -2385,27 +2442,15 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         }
     }
     // Sixteen held at the destination (requests 21 to 36), numbered in the
-    // order they arrive, of two routes in turn: so that a request's end is
-    // recorded with its own route only if the agent frees it by its own
-    // number.
-    let target = |n: usize| {
-        if n % 2 == 1 {
-            format!("/v1/models/r{n}")
-        } else {
-            format!("/v1/models?after_id=r{n}")
-        }
-    };
-    let route = |n: usize| {
-        if n % 2 == 1 {
-            "GET /v1/models/{id}"
-        } else {
-            "GET /v1/models"
-        }
-    };
+    // order they arrive, of two methods in turn: so that a request's end is
+    // recorded with its own method's label only if the agent frees it by
+    // its own number.
+    let target = |n: usize| format!("/v1/models/r{n}");
+    let method = |n: usize| if n % 2 == 1 { "GET" } else { "DELETE" };
     let mut clients = Vec::new();
     for n in 1..=16 {
         let mut client = ep.connect();
-        client.write(&ep.request("GET", &target(n), &[], b""));
+        client.write(&ep.request(method(n), &target(n), &[], b""));
         destination.wait_for(n);
         clients.push(client);
     }
@@ -2424,7 +2469,7 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         (sys.grant(&a.id).expect("listed").in_flight == 15).then_some(())
     });
     let mut client = ep.connect();
-    client.write(&ep.request("GET", &target(17), &[], b""));
+    client.write(&ep.request(method(17), &target(17), &[], b""));
     destination.wait_for(17);
     clients.push(client);
     // The others end last first.
@@ -2445,25 +2490,25 @@ fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_
         sys.end_of(&a.id)["requests"],
         serde_json::json!({"admitted": 17, "finished": 17, "unknown": 0, "refused": 21})
     );
-    // Each request by its number and route, as admitted and as ended.
+    // Each request by its number and method, as admitted and as ended.
     let records = |outcome: &str| -> Vec<(u64, String)> {
         sys.requests_of(&a.id)
             .into_iter()
             .filter(|r| r["outcome"] == outcome)
             .map(|r| {
                 let number = r["request"].as_u64().expect("a number");
-                (number, r["route"].as_str().expect("a route").to_string())
+                (number, r["method"].as_str().expect("a method").to_string())
             })
             .collect()
     };
     let admitted: Vec<(u64, String)> = (1..=17)
-        .map(|n| (20 + n as u64, route(n).to_string()))
+        .map(|n| (20 + n as u64, method(n).to_string()))
         .collect();
     assert_eq!(records("admitted"), admitted);
     let ended: Vec<(u64, String)> = [1]
         .into_iter()
         .chain((2..=17).rev())
-        .map(|n| (20 + n as u64, route(n).to_string()))
+        .map(|n| (20 + n as u64, method(n).to_string()))
         .collect();
     assert_eq!(records("completed"), ended);
 }
@@ -2478,14 +2523,13 @@ enum Ending {
     RevokeAll,
     ScreenLock,
     Suspend,
-    ProfileEdit,
     EntryEdit,
 }
 
 impl Ending {
     /// Whether it ends every grant of every run: the explicit lock and
     /// revoking every grant do, and so do the automatic locks for grants
-    /// whose profile says `end` (both profiles of these tests do then).
+    /// whose run says `end` (both runs of these tests do then).
     /// Revoking one grant, or changing one entry, ends only that grant, or
     /// that entry's.
     fn ends_every_grant(self) -> bool {
@@ -2511,15 +2555,15 @@ fn assert_ending_cuts_streams(ending: Ending, reason: &str) {
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
     for entry in ["KEY", "OTHER"] {
-        let profile = match ending {
-            Ending::ScreenLock | Ending::Suspend => anthropic_ending(&destination),
-            _ => anthropic(&destination),
-        };
-        sys.set_profile(entry, profile);
+        sys.set_destination(entry, &destination.origin());
     }
+    let limits = match ending {
+        Ending::ScreenLock | Ending::Suspend => ending_limits(),
+        _ => GrantLimits::default(),
+    };
     sys.install_broker(&[]);
-    let a = sys.start_grant("KEY", "a");
-    let b = sys.start_grant("OTHER", "b");
+    let a = sys.start_grant_with("KEY", "a", limits);
+    let b = sys.start_grant_with("OTHER", "b", limits);
     assert_works(&a.endpoint);
     assert_works(&b.endpoint);
     let mut stream = open_stream(&a.endpoint);
@@ -2545,16 +2589,6 @@ fn assert_ending_cuts_streams(ending: Ending, reason: &str) {
         }
         Ending::ScreenLock => sys.agent.lock_for(SCREEN_LOCK, "test"),
         Ending::Suspend => sys.agent.lock_for(SUSPEND, "test"),
-        Ending::ProfileEdit => sys.edit(
-            "KEY",
-            EntryChanges {
-                broker: Some(ProfileRequest {
-                    max_requests: Some(5),
-                    ..anthropic(&destination)
-                }),
-                ..EntryChanges::default()
-            },
-        ),
         Ending::EntryEdit => sys.edit(
             "KEY",
             EntryChanges {
@@ -2633,18 +2667,13 @@ fn revoking_every_grant_by_hand_cuts_the_streams_of_every_run_and_nothing_is_for
 }
 
 #[test]
-fn a_screen_lock_cuts_the_streams_of_every_grant_whose_profile_says_end() {
+fn a_screen_lock_cuts_the_streams_of_every_grant_whose_run_says_end() {
     assert_ending_cuts_streams(Ending::ScreenLock, "screen_locked");
 }
 
 #[test]
-fn a_suspend_cuts_the_streams_of_every_grant_whose_profile_says_end() {
+fn a_suspend_cuts_the_streams_of_every_grant_whose_run_says_end() {
     assert_ending_cuts_streams(Ending::Suspend, "suspend");
-}
-
-#[test]
-fn a_change_to_the_profile_cuts_its_grants_streams_in_flight_and_no_others() {
-    assert_ending_cuts_streams(Ending::ProfileEdit, "entry_changed");
 }
 
 #[test]
@@ -2652,16 +2681,16 @@ fn a_change_to_the_entry_cuts_its_grants_streams_in_flight_and_no_others() {
     assert_ending_cuts_streams(Ending::EntryEdit, "entry_changed");
 }
 
-/// The screen lock and a suspend keep the grants whose profile says
-/// `continue`: their streams go on, and new requests are forwarded while
-/// the vault is locked.
+/// The screen lock and a suspend keep the grants whose run says `continue`
+/// (the default): their streams go on, and new requests are forwarded
+/// while the vault is locked.
 #[test]
-fn the_automatic_locks_keep_the_grants_whose_profile_says_continue() {
+fn the_automatic_locks_keep_the_grants_whose_run_says_continue() {
     let sys = System::new();
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let mut stream = open_stream(&a.endpoint);
@@ -2680,13 +2709,13 @@ fn the_automatic_locks_keep_the_grants_whose_profile_says_continue() {
     assert_eq!(sys.end_of(&a.id)["reason"], "command_ended");
 }
 
-/// The idle lock ends the grants whose profile says `end`, cutting their
+/// The idle lock ends the grants whose run says `end`, cutting their
 /// streams, and keeps the others, whose requests go on. Requests through
 /// the broker do not postpone it (P9): they keep coming through the grant
 /// that stays while the idle time runs out.
 #[test]
-fn the_idle_lock_ends_only_the_grants_whose_profile_says_end() {
-    // Long enough for the run to start and its streams to open first.
+fn the_idle_lock_ends_only_the_grants_whose_run_says_end() {
+    // Long enough for the runs to start and their streams to open first.
     let sys = System::with(Settings {
         idle_timeout: Duration::from_secs(6),
         ..Settings::default()
@@ -2694,26 +2723,14 @@ fn the_idle_lock_ends_only_the_grants_whose_profile_says_end() {
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("ENDS", CREDENTIAL), ("STAYS", OTHER_KEY)]);
-    sys.set_profile("ENDS", anthropic_ending(&destination));
-    sys.set_profile("STAYS", anthropic(&destination));
+    sys.set_destination("ENDS", &destination.origin());
+    sys.set_destination("STAYS", &destination.origin());
     sys.install_broker(&[]);
-    sys.decide(&[Decision::AllowOnce]);
-    let running = sys.start(sys.run_request(
-        vec![],
-        vec![
-            brokered("ENDS_KEY", "ENDS", Some("ENDS_URL")),
-            brokered("STAYS_KEY", "STAYS", Some("STAYS_URL")),
-        ],
-        &waits("a"),
-    ));
-    let env = sys.command_env("a", &running);
-    let ids = sys.grants_of("a");
-    let (ends, stays) = (
-        endpoint(&env, "ENDS_KEY", "ENDS_URL"),
-        endpoint(&env, "STAYS_KEY", "STAYS_URL"),
-    );
-    let mut ending = open_stream(&ends);
-    let mut staying = open_stream(&stays);
+    let a = sys.start_grant_with("ENDS", "a", ending_limits());
+    let b = sys.start_grant("STAYS", "b");
+    let (ends, stays) = (&a.endpoint, &b.endpoint);
+    let mut ending = open_stream(ends);
+    let mut staying = open_stream(stays);
     // Requests go on through the grant that stays — admitted, forwarded and
     // recorded — and the streams flow, until the vault locks itself.
     let mut requests = 0;
@@ -2723,24 +2740,26 @@ fn the_idle_lock_ends_only_the_grants_whose_profile_says_end() {
             Instant::now() < until,
             "requests through the broker kept the vault from locking itself"
         );
-        assert_works(&stays);
+        assert_works(stays);
         requests += 1;
         let _ = staying.chunk();
     }
     assert!(requests > 0);
     // Its end is recorded once its broker has confirmed it.
-    assert_eq!(sys.end_of(&ids["ENDS"])["reason"], "idle_timeout");
+    assert_eq!(sys.end_of(&a.id)["reason"], "idle_timeout");
     assert_cut(&mut ending, streams.sent());
     streams.wait_closed(1);
-    assert_eq!(sys.state(&ids["STAYS"]).as_deref(), Some("active"));
+    assert_eq!(sys.state(&b.id).as_deref(), Some("active"));
     assert_goes_on(&mut staying);
-    assert_works(&stays);
+    assert_works(stays);
     let forwarded = destination.connections();
-    assert_nothing_more_forwarded(&ends, &destination);
+    assert_nothing_more_forwarded(ends, &destination);
     assert_eq!(forwarded, 2 + requests + 1);
-    sys.go("a");
-    assert_eq!(running.exit_code(), Some(0));
-    assert_eq!(sys.end_of(&ids["STAYS"])["reason"], "command_ended");
+    for (started, tag) in [(&a, "a"), (&b, "b")] {
+        sys.go(tag);
+        assert_eq!(started.running.exit_code(), Some(0), "{tag}");
+    }
+    assert_eq!(sys.end_of(&b.id)["reason"], "command_ended");
 }
 
 /// A grant ends when its lifetime passes, with its stream open: the agent's
@@ -2756,7 +2775,7 @@ fn a_grant_whose_lifetime_passes_cuts_its_streams() {
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let started = Instant::now();
     let a = sys.start_grant("KEY", "a");
@@ -2788,7 +2807,7 @@ fn an_admission_waiting_for_its_record_is_refused_when_the_grant_is_revoked() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
@@ -2872,7 +2891,7 @@ fn grants_that_survive_a_lock_end_at_the_unlock_after_another_program_changed_th
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     // Locked: the grant goes on. Unlocked, the file as the agent read it:
@@ -2984,7 +3003,7 @@ fn an_unlock_cancelled_by_a_lock_keeps_the_last_fingerprint_and_the_next_one_end
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let mut stream = open_stream(&a.endpoint);
@@ -3055,7 +3074,7 @@ fn the_unlock_barrier_cuts_streams_before_the_unlock_is_recorded() {
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let mut stream = open_stream(&a.endpoint);
@@ -3129,7 +3148,7 @@ fn a_stolen_token_stops_working_once_the_commands_leader_exits() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let descendant = sys.path("descendant.sh");
     std::fs::write(
@@ -3152,11 +3171,7 @@ fn a_stolen_token_stops_working_once_the_commands_leader_exits() {
     let running = sys.start_held(
         sys.run_request(
             vec![],
-            vec![brokered(
-                "ANTHROPIC_API_KEY",
-                "KEY",
-                Some("ANTHROPIC_BASE_URL"),
-            )],
+            vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL"))],
             &script,
         ),
         drain.clone(),
@@ -3202,8 +3217,8 @@ fn a_missing_or_unusable_broker_program_fails_the_run_before_its_dialog() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    // A usable profile: only the program stands in the way.
-    sys.set_profile("KEY", anthropic(&destination));
+    // A usable destination: only the program stands in the way.
+    sys.set_destination("KEY", &destination.origin());
     let response = sys.call(&Request::Lock);
     assert!(
         matches!(response, Response::Ok { .. }),
@@ -3217,7 +3232,7 @@ fn a_missing_or_unusable_broker_program_fails_the_run_before_its_dialog() {
     let request = || {
         sys.run_request(
             vec![],
-            vec![brokered("ANTHROPIC_API_KEY", "KEY", None)],
+            vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", None)],
             &script,
         )
     };
@@ -3281,8 +3296,8 @@ fn a_run_whose_second_broker_fails_to_start_keeps_none_of_its_grants() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("A", CREDENTIAL), ("B", OTHER_KEY)]);
-    sys.set_profile("A", anthropic(&destination));
-    sys.set_profile("B", anthropic(&destination));
+    sys.set_destination("A", &destination.origin());
+    sys.set_destination("B", &destination.origin());
     // Each wrapper notes its process ID first; then the first to get there
     // becomes the broker, and the other exits. (Noted first: the agent
     // stops the whole run as soon as one fails, perhaps before the other
@@ -3301,8 +3316,8 @@ fn a_run_whose_second_broker_fails_to_start_keeps_none_of_its_grants() {
         .start(sys.run_request(
             vec![],
             vec![
-                brokered("KEY_A", "A", Some("URL_A")),
-                brokered("KEY_B", "B", Some("URL_B")),
+                sys.brokered("KEY_A", "A", Some("URL_A")),
+                sys.brokered("KEY_B", "B", Some("URL_B")),
             ],
             &format!("touch {}", quote(&marker)),
         ))
@@ -3367,16 +3382,12 @@ fn a_broker_killed_mid_request_leaves_an_unknown_outcome_and_the_commands_status
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     sys.decide(&[Decision::AllowOnce]);
     let running = sys.start(sys.run_request(
         vec![],
-        vec![brokered(
-            "ANTHROPIC_API_KEY",
-            "KEY",
-            Some("ANTHROPIC_BASE_URL"),
-        )],
+        vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL"))],
         &format!("{}; exit 7", waits("a")),
     ));
     let env = sys.command_env("a", &running);
@@ -3436,7 +3447,7 @@ fn a_broker_that_does_not_confirm_a_revocation_is_killed_and_the_revocation_is_d
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     assert_works(&a.endpoint);
@@ -3498,7 +3509,7 @@ fn a_broker_exits_by_itself_once_its_channel_ends_even_with_a_resolution_hanging
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     let exit = sys.path("broker-exit");
     // Each resolution hangs for a minute, and the deadline of resolving and
     // connecting is longer still: only the end of the channel can stop it.
@@ -3566,15 +3577,9 @@ fn an_admission_that_cannot_be_recorded_is_not_forwarded() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile(
-        "KEY",
-        ProfileRequest {
-            max_requests: Some(1),
-            ..anthropic(&destination)
-        },
-    );
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
-    let a = sys.start_grant("KEY", "a");
+    let a = sys.start_grant_with("KEY", "a", at_most(1));
     {
         let _broken = sys.break_audit();
         let response = a
@@ -3608,7 +3613,7 @@ fn a_finished_record_that_cannot_be_written_ends_the_grant() {
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let ep = &a.endpoint;
@@ -3669,15 +3674,15 @@ fn revocation_works_while_the_audit_log_cannot_be_written() {
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("A", CREDENTIAL), ("B", OTHER_KEY)]);
-    sys.set_profile("A", anthropic(&destination));
-    sys.set_profile("B", anthropic(&destination));
+    sys.set_destination("A", &destination.origin());
+    sys.set_destination("B", &destination.origin());
     sys.install_broker(&[]);
     sys.decide(&[Decision::AllowOnce]);
     let running = sys.start(sys.run_request(
         vec![],
         vec![
-            brokered("KEY_A", "A", Some("URL_A")),
-            brokered("KEY_B", "B", Some("URL_B")),
+            sys.brokered("KEY_A", "A", Some("URL_A")),
+            sys.brokered("KEY_B", "B", Some("URL_B")),
         ],
         &waits("a"),
     ));
@@ -3733,13 +3738,13 @@ fn a_mixed_run_gets_values_and_tokens_and_one_entry_cannot_be_both() {
     let sys = System::new();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL), ("PLAIN", "plain-value-0000")]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let asked = sys.approvals().len();
     let response = sys
         .start(sys.run_request(
             vec![by_value("VALUE", "KEY")],
-            vec![brokered("ANTHROPIC_API_KEY", "KEY", None)],
+            vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", None)],
             "true",
         ))
         .wait();
@@ -3756,11 +3761,7 @@ fn a_mixed_run_gets_values_and_tokens_and_one_entry_cannot_be_both() {
     );
     let running = sys.start(sys.run_request(
         vec![by_value("VALUE", "PLAIN")],
-        vec![brokered(
-            "ANTHROPIC_API_KEY",
-            "KEY",
-            Some("ANTHROPIC_BASE_URL"),
-        )],
+        vec![sys.brokered("ANTHROPIC_API_KEY", "KEY", Some("ANTHROPIC_BASE_URL"))],
         &script,
     ));
     let env = sys.command_env("m", &running);
@@ -3781,18 +3782,18 @@ fn a_mixed_run_gets_values_and_tokens_and_one_entry_cannot_be_both() {
     );
 }
 
-// ===== Profiles =====
+// ===== Entries =====
 
-/// Replacing an entry (`add --replace`) removes its profile and ends its
-/// grants, cutting their streams; the entry can no longer be used through
-/// the broker until a profile is set again.
+/// Replacing an entry (`add --replace`) ends its grants, cutting their
+/// streams; a new run's grant of it sends the new value, as nothing about
+/// the broker is stored with the entry.
 #[test]
-fn replacing_an_entry_removes_its_profile_and_ends_its_grants() {
+fn replacing_an_entry_ends_its_grants() {
     let sys = System::new();
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     let mut stream = open_stream(&a.endpoint);
@@ -3816,23 +3817,17 @@ fn replacing_an_entry_removes_its_profile_and_ends_its_grants() {
     assert_cut(&mut stream, before);
     streams.wait_closed(1);
     assert_nothing_more_forwarded(&a.endpoint, &destination);
-    match sys.call(&Request::Show { name: "KEY".into() }) {
-        Response::Entry { entry } => assert_eq!(entry.broker, None, "the profile was kept"),
-        other => panic!("{}", describe(&other)),
+    let b = sys.start_grant("KEY", "b");
+    assert_works(&b.endpoint);
+    let received = destination.received();
+    let last = received.last().expect("a request");
+    assert_eq!(last.values("x-api-key"), [OTHER_KEY]);
+    for (started, tag) in [(&a, "a"), (&b, "b")] {
+        sys.go(tag);
+        assert_eq!(started.running.exit_code(), Some(0), "{tag}");
     }
-    let response = sys
-        .start(sys.run_request(
-            vec![],
-            vec![brokered("ANTHROPIC_API_KEY", "KEY", None)],
-            "true",
-        ))
-        .wait();
-    let (code, message) = error_of(&response);
-    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
-    assert!(message.contains("no broker profile"), "{message}");
-    sys.go("a");
-    assert_eq!(a.running.exit_code(), Some(0));
     assert_eq!(sys.end_of(&a.id)["reason"], "entry_changed");
+    assert_eq!(sys.end_of(&b.id)["reason"], "command_ended");
 }
 
 // ===== The harness =====
@@ -3853,7 +3848,7 @@ fn dropping_a_system_with_its_run_going_ends_the_run_and_leaves_nothing_behind()
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL)]);
-    sys.set_profile("KEY", anthropic(&destination));
+    sys.set_destination("KEY", &destination.origin());
     sys.install_broker(&[]);
     let a = sys.start_grant("KEY", "a");
     assert_works(&a.endpoint);

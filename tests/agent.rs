@@ -753,7 +753,7 @@ fn import_dotenv_edit_and_remove() {
 fn a_title_written_elsewhere_is_printed_escaped() {
     use keepass::db::fields;
     let h = Harness::new();
-    let uuids = seed(&h, &[("PLAIN", "value-1234", None)]);
+    let uuids = seed(&h, &[("PLAIN", "value-1234")]);
     set_field_elsewhere(&h, "PLAIN", fields::USERNAME, "user\u{202e}gpj.exe", false);
     set_field_elsewhere(&h, "PLAIN", fields::TITLE, "SAFE\u{1b}[2J\rFORGED", false);
     let raw = |out: &str| out.contains('\u{1b}') || out.contains('\r') || out.contains('\u{202e}');
@@ -2724,7 +2724,7 @@ fn open_shows_a_url_written_elsewhere_escaped() {
     use keepass::db::fields;
     use std::os::unix::fs::PermissionsExt;
     let h = Harness::new();
-    seed(&h, &[("SITE", "value-1234", None)]);
+    seed(&h, &[("SITE", "value-1234")]);
     let url = "https://example.invalid/\u{1b}[2J\rFORGED";
     set_field_elsewhere(&h, "SITE", fields::URL, url, false);
     let bin = h.dir.path().join("bin");
@@ -3909,15 +3909,15 @@ send({"type": "ready", "version": version, "grant": grant})
 
 if MODE == "bad_number":
     wait_for(LOG + ".go")
-    send({"type": "admit", "request": 5, "method": "POST", "route": "POST /v1/messages"})
+    send({"type": "admit", "request": 5, "method": "POST"})
 if MODE == "admit":
     wait_for(LOG + ".go")
-    send({"type": "admit", "request": 1, "method": "POST", "route": "POST /v1/messages"})
+    send({"type": "admit", "request": 1, "method": "POST"})
     answer, _ = read_frame()
     log({"event": "answer", "message": answer})
     send({"type": "finished", "request": 1, "outcome": "completed", "status": 200,
           "bytes_sent": 10, "bytes_received": 20})
-    send({"type": "admit", "request": 2, "method": "GET", "route": "GET /v1/models"})
+    send({"type": "admit", "request": 2, "method": "GET"})
     answer, _ = read_frame()
     log({"event": "answer", "message": answer})
     open(LOG + ".done", "w").close()
@@ -3925,8 +3925,7 @@ if MODE == "unauthorized":
     wait_for(LOG + ".go")
     for request, status, outcome in [(1, 401, "completed"), (2, 200, "completed"),
                                       (3, 401, "client_closed")]:
-        send({"type": "admit", "request": request, "method": "POST",
-              "route": "POST /v1/messages"})
+        send({"type": "admit", "request": request, "method": "POST"})
         answer, _ = read_frame()
         log({"event": "answer", "message": answer})
         send({"type": "finished", "request": request, "outcome": outcome, "status": status,
@@ -3960,8 +3959,8 @@ fn fake_broker(h: &Harness, mode: &str) -> PathBuf {
 }
 
 /// Whether an install a stand-in broker logged is one the real broker would
-/// take: the checks of `Install::validate`, a lifetime of at most the
-/// profile's maximum among them.
+/// take: the checks of `Install::validate` — control channel 2, a valid
+/// origin, a lifetime of at most a day among them.
 fn installs_validly(install: &serde_json::Value) -> Result<(), String> {
     use rusthorse::broker_protocol::ToBroker;
     match serde_json::from_value::<ToBroker>(install.clone()) {
@@ -4163,20 +4162,13 @@ fn port_released(port: u16) -> bool {
     }
 }
 
-/// Write entries into the vault file before the agent opens it — name,
-/// value and broker profile — and return their UUIDs by name.
-fn seed(
-    h: &Harness,
-    entries: &[(
-        &str,
-        &str,
-        Option<rusthorse::broker_profile::ProfileRequest>,
-    )],
-) -> std::collections::HashMap<String, String> {
-    use rusthorse::protocol::{EntryChanges, NewEntry};
+/// Write entries into the vault file before the agent opens it — name and
+/// value — and return their UUIDs by name.
+fn seed(h: &Harness, entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+    use rusthorse::protocol::NewEntry;
     let mut vault = Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("open");
     let mut uuids = std::collections::HashMap::new();
-    for (name, value, profile) in entries {
+    for (name, value) in entries {
         let entry = NewEntry {
             name: name.to_string(),
             ..NewEntry::default()
@@ -4185,13 +4177,6 @@ fn seed(
             .add(&entry, &SecretString::new(value.to_string()), false)
             .expect("add");
         let id = vault.find(name).expect("find");
-        if let Some(profile) = profile {
-            let set = EntryChanges {
-                broker: Some(profile.clone()),
-                ..EntryChanges::default()
-            };
-            vault.edit(id, &set, None).expect("set the profile");
-        }
         uuids.insert(name.to_string(), vault.info(id).id);
     }
     vault.save().expect("save");
@@ -4226,18 +4211,6 @@ fn set_field_elsewhere(h: &Harness, title: &str, key: &str, value: &str, protect
         .expect("save");
 }
 
-fn anthropic() -> rusthorse::broker_profile::ProfileRequest {
-    rusthorse::broker_profile::ProfileRequest::new(rusthorse::broker_profile::Preset::Anthropic)
-}
-
-/// An Anthropic profile whose grants the automatic locks end.
-fn anthropic_ending() -> rusthorse::broker_profile::ProfileRequest {
-    rusthorse::broker_profile::ProfileRequest {
-        automatic_locks: Some(rusthorse::broker_profile::AutomaticLocks::End),
-        ..anthropic()
-    }
-}
-
 fn by_value(var: &str, entry: &str) -> rusthorse::protocol::Binding {
     rusthorse::protocol::Binding {
         var: var.into(),
@@ -4245,15 +4218,33 @@ fn by_value(var: &str, entry: &str) -> rusthorse::protocol::Binding {
     }
 }
 
+/// Where the grants of these tests send their key, unless a test names
+/// another destination: no stand-in broker connects anywhere.
+const DESTINATION: &str = "https://api.example.com";
+
+/// A broker binding of `entry` to [`DESTINATION`].
 fn brokered(var: &str, entry: &str, url_var: Option<&str>) -> rusthorse::protocol::BrokerBinding {
+    brokered_to(var, entry, DESTINATION, url_var)
+}
+
+/// A broker binding of `entry` to `destination`, as `--broker
+/// VAR=ENTRY@URL` sends it.
+fn brokered_to(
+    var: &str,
+    entry: &str,
+    destination: &str,
+    url_var: Option<&str>,
+) -> rusthorse::protocol::BrokerBinding {
     rusthorse::protocol::BrokerBinding {
         var: var.into(),
         entry: entry.into(),
+        destination: destination.into(),
         url_var: url_var.map(str::to_string),
     }
 }
 
-/// A run of `sh -c script` in the harness's directory, with redaction.
+/// A run of `sh -c script` in the harness's directory, with redaction and
+/// the default limits (no request limit, 12 hours, `continue`).
 fn broker_run_request(
     h: &Harness,
     bindings: Vec<rusthorse::protocol::Binding>,
@@ -4270,6 +4261,7 @@ fn broker_run_request(
             forward_stdin: false,
         },
         brokered,
+        limits: rusthorse::broker_grant::GrantLimits::default(),
     }
 }
 
@@ -4401,13 +4393,12 @@ fn error_of(response: &rusthorse::protocol::Response) -> (rusthorse::protocol::E
 
 /// A run through the broker is refused before any dialog when one of its
 /// checks fails (ADR 0013: the broker program, the number of grants, the
-/// variables, the entries, their profiles and values), and so is a plain
-/// `run` that carries broker bindings: no dialog, no command, no grant, no
-/// `run` record, no broker started — and never the values instead.
+/// variables, the entries and their values), and so is a plain `run` that
+/// carries broker bindings: no dialog, no command, no grant, no `run`
+/// record, no broker started — and never the values instead.
 #[test]
 fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
     use rusthorse::protocol::{ErrorCode, Request, Response, read_message, send_frame};
-    use rusthorse::vault::FIELD_BROKER;
     use std::os::unix::net::UnixStream;
     if !python3() {
         return;
@@ -4416,18 +4407,12 @@ fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
     let uuids = seed(
         &h,
         &[
-            ("T", "abcdefgh", None),
-            ("KEY", FAKE_KEY, Some(anthropic())),
-            ("PLAIN", FAKE_KEY, None),
-            ("SHORT", "sk-1234", Some(anthropic())),
-            ("SPACED", "sk-ant-test 0000", Some(anthropic())),
-            ("BROKEN", FAKE_KEY, None),
-            ("HIDDEN", FAKE_KEY, None),
+            ("T", "abcdefgh"),
+            ("KEY", FAKE_KEY),
+            ("SHORT", "sk-1234"),
+            ("SPACED", "sk-ant-test 0000"),
         ],
     );
-    set_field_elsewhere(&h, "BROKEN", FIELD_BROKER, r#"{"version":2}"#, false);
-    let stored = anthropic().resolve().expect("profile").to_stored();
-    set_field_elsewhere(&h, "HIDDEN", FIELD_BROKER, &stored, true);
     // Had the agent asked, the run would be allowed, and the command would
     // leave this file behind.
     h.decide(&[Decision::AllowOnce]);
@@ -4500,8 +4485,8 @@ fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
         h.ui.password_prompts.lock().unwrap().is_empty(),
         "the vault was unlocked for a request refused without it"
     );
-    // Entries: the same one both ways or twice (by UUID), without a usable
-    // profile, or with a value the broker cannot carry.
+    // Entries: the same one both ways or twice (by UUID), or with a value
+    // the broker cannot carry.
     let uuid = uuids["KEY"].as_str();
     for (bindings, brokered_now, code, says) in [
         (
@@ -4515,24 +4500,6 @@ fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
             vec![brokered("A", "KEY", None), brokered("B", uuid, None)],
             ErrorCode::InvalidRequest,
             "twice",
-        ),
-        (
-            vec![],
-            vec![brokered("A", "PLAIN", None)],
-            ErrorCode::InvalidRequest,
-            "no broker profile",
-        ),
-        (
-            vec![],
-            vec![brokered("A", "BROKEN", None)],
-            ErrorCode::InvalidRequest,
-            "unusable",
-        ),
-        (
-            vec![],
-            vec![brokered("A", "HIDDEN", None)],
-            ErrorCode::InvalidRequest,
-            "protected",
         ),
         (
             vec![],
@@ -4575,7 +4542,7 @@ fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
         Response::Error {
             code: ErrorCode::InvalidRequest,
             message,
-        } => assert!(message.contains("broker_run"), "{message}"),
+        } => assert!(message.contains("broker_run_v2"), "{message}"),
         other => panic!("unexpected {}", other.kind()),
     }
 
@@ -4594,26 +4561,21 @@ fn broker_runs_that_fail_a_check_start_nothing_and_ask_nothing() {
 }
 
 /// The command of a broker run gets a token and the broker's address in the
-/// variables it named, never the key (ADR 0013, decisions 1, 2 and 6): the
-/// broker gets the key, the token, the profile, the limits and a listening
-/// socket on 127.0.0.1, in an empty environment of its own; the grant is
-/// listed while the command runs and ends with it; the tokens are redacted
-/// from the output, and every step is in the audit log.
+/// variables it named, never the key (ADR 0013, decisions 1, 2 and 6, and
+/// the scope amendment): the broker gets the key, the token, the approved
+/// origin the run named, the limits and a listening socket on 127.0.0.1,
+/// in an empty environment of its own; the grant is listed while the
+/// command runs and ends with it; the tokens are redacted from the output,
+/// and every step is in the audit log.
 #[test]
 fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key() {
-    use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+    use rusthorse::broker_grant::AutomaticLocks;
     use rusthorse::protocol::Response;
     if !python3() {
         return;
     }
     let h = Harness::new();
-    let uuids = seed(
-        &h,
-        &[
-            ("T", "value-of-t-1234", None),
-            ("KEY", FAKE_KEY, Some(ProfileRequest::new(Preset::Openai))),
-        ],
-    );
+    let uuids = seed(&h, &[("T", "value-of-t-1234"), ("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     // A long command line: a dialog that scrolls, as rusthorse-dialog's
     // does (that one grant fits zenity's is a unit test of the agent's).
@@ -4624,7 +4586,12 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     let mut request = broker_run_request(
         &h,
         vec![by_value("T", "T")],
-        vec![brokered("OPENAI_API_KEY", "KEY", Some("OPENAI_BASE_URL"))],
+        vec![brokered_to(
+            "OPENAI_API_KEY",
+            "KEY",
+            "https://api.openai.com/v1",
+            Some("OPENAI_BASE_URL"),
+        )],
         &script,
     );
     // What the requester sends for those variables is dropped; its
@@ -4647,7 +4614,7 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     let env = command_env(&h);
 
     // The broker: started with nothing of the requester's, in a process
-    // group of its own, given the key, a token, the profile and a socket.
+    // group of its own, given the key, a token, the origin and a socket.
     let installed = logged(&log, "install");
     assert_eq!(installed["argv"], serde_json::json!([]));
     assert_eq!(installed["environ"], "");
@@ -4661,7 +4628,7 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     let port = installed["listen"][1].as_u64().expect("port");
     let install = &installed["install"];
     assert_eq!(install["type"], "install");
-    assert_eq!(install["version"], 1);
+    assert_eq!(install["version"], 2);
     assert_eq!(install["credential"], FAKE_KEY);
     let token = install["token"].as_str().expect("token").to_string();
     assert!(
@@ -4673,13 +4640,10 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
         rusthorse::broker_protocol::is_well_formed_grant_id(&id),
         "{id}"
     );
-    let profile = ProfileRequest::new(Preset::Openai)
-        .resolve()
-        .expect("profile");
-    assert_eq!(
-        install["profile"],
-        serde_json::to_value(&profile).expect("json")
-    );
+    // The approved origin, without the base path, which only goes into the
+    // command's base URL; no profile.
+    assert_eq!(install["origin"], "https://api.openai.com");
+    assert!(install.get("profile").is_none(), "{install}");
     assert_eq!(install["max_in_flight"], 16);
     assert_eq!(install["max_connections"], 64);
     let lifetime = install["lifetime_secs"].as_u64().expect("lifetime");
@@ -4709,8 +4673,9 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     let grant = &listed[0];
     assert_eq!(grant.id, id);
     assert_eq!(grant.var, "OPENAI_API_KEY");
-    assert_eq!(grant.destination, "https://api.openai.com/v1");
-    assert_eq!(grant.preset, Preset::Openai);
+    assert_eq!(grant.destination, "https://api.openai.com");
+    assert_eq!(grant.base_path.as_deref(), Some("/v1"));
+    assert_eq!(grant.max_requests, None);
     assert!(grant.command.starts_with("sh -c "), "{}", grant.command);
     assert!(grant.entry.starts_with("KEY ("), "{}", grant.entry);
     assert_eq!(grant.state, "active");
@@ -4762,12 +4727,19 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
     // the run's answer.
     assert_eq!(ended_with(&h, &id), "command_ended");
 
-    // The dialog said what the grant allows.
+    // The dialog said where the key goes and how the grant ends.
     let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
     let detail = |label: &str| approval_detail(&h, label).unwrap_or_default();
     assert!(!asked.can_remember);
     assert!(
         asked.explanation.contains("temporary token, not the key"),
+        "{}",
+        asked.explanation
+    );
+    assert!(
+        asked.explanation.contains(
+            "requests to the approved origin, at any path there: a base path is not a limit"
+        ),
         "{}",
         asked.explanation
     );
@@ -4784,16 +4756,16 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
             "OPENAI_API_KEY ← a token for {key_identity}; OPENAI_BASE_URL ← the broker's address"
         )
     );
-    assert_eq!(detail("Destination"), "https://api.openai.com/v1");
-    assert!(
-        detail("Allows").contains("POST /chat/completions"),
-        "{}",
-        detail("Allows")
-    );
-    assert!(
-        detail("Ends").contains("when the command ends"),
-        "{}",
-        detail("Ends")
+    assert_eq!(detail("Approved origin"), "https://api.openai.com");
+    assert_eq!(detail("Base path"), "/v1 (not a limit)");
+    // No profile: nothing about routes or presets.
+    for gone in ["Destination", "Allows", "Preset"] {
+        assert_eq!(approval_detail(&h, gone), None, "{gone}");
+    }
+    assert_eq!(
+        detail("Ends"),
+        "with the command, on rusthorse lock, revocation or a change to the entry, or after \
+         12h; not on screen lock, suspend or idle lock"
     );
     assert_eq!(detail("Requests"), "no limit; at most 16 at a time");
     assert!(
@@ -4837,7 +4809,8 @@ fn a_broker_run_gives_the_command_a_token_and_the_brokers_address_never_the_key(
         serde_json::json!([{
             "id": id,
             "entry": key_identity,
-            "destination": "https://api.openai.com/v1",
+            "destination": "https://api.openai.com",
+            "base_path": "/v1",
         }])
     );
     assert_eq!(approval["entries"].as_array().map(Vec::len), Some(2));
@@ -4870,7 +4843,7 @@ fn a_broker_run_is_never_remembered_and_warns_when_its_output_is_not_filtered() 
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let _log = fake_broker(&h, "ready");
     // An answer that allows for a while anyway allows once.
     h.decide(&[
@@ -4915,7 +4888,7 @@ fn a_broker_run_is_never_remembered_and_warns_when_its_output_is_not_filtered() 
     let stream = UnixStream::connect(&h.socket).expect("connect");
     send_frame(
         &stream,
-        &Request::BrokerRun(request),
+        &Request::BrokerRunV2(request),
         &[null.as_fd(), sink.as_fd(), sink.as_fd()],
     )
     .expect("send");
@@ -4972,7 +4945,7 @@ fn a_broker_that_does_not_start_serving_fails_the_run_and_leaves_nothing_behind(
         return;
     }
     let h = Harness::with_broker_ready_timeout(Duration::from_secs(2));
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let marker = h.dir.path().join("ran");
     let script = format!("touch {}", marker.display());
     for mode in ["exits", "silent", "wrong_grant", "old_version"] {
@@ -5062,10 +5035,7 @@ fn a_run_whose_broker_fails_to_start_keeps_none_of_its_grants() {
     h.ui.scrolls.store(true, Ordering::SeqCst);
     seed(
         &h,
-        &[
-            ("A", FAKE_KEY, Some(anthropic())),
-            ("B", "sk-ant-test-1111111111111111", Some(anthropic())),
-        ],
+        &[("A", FAKE_KEY), ("B", "sk-ant-test-1111111111111111")],
     );
     // One broker answers ready, the other exits without answering.
     let log = fake_broker(&h, "first_serves");
@@ -5123,7 +5093,7 @@ fn a_run_whose_command_cannot_start_ends_its_grants_before_it_waits_for_the_audi
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "held_ready");
     let ready = log.with_extension("jsonl.ready");
     // A program the agent finds and the human approves, which cannot start:
@@ -5157,8 +5127,8 @@ fn a_run_whose_command_cannot_start_ends_its_grants_before_it_waits_for_the_audi
 }
 
 /// A lock while a run's brokers start ends the run's grants, which were
-/// entered as starting — a screen lock too, whatever their profile says
-/// about the automatic locks, since nothing of the run has been used yet —
+/// entered as starting — a screen lock too, whatever their run says about
+/// the automatic locks, since nothing of the run has been used yet —
 /// and the run fails before anything runs: a broker that has its install
 /// and has not answered ready is killed, and the lock is done only once it
 /// is gone (ADR 0013, preparing a run's grants and revocation).
@@ -5170,8 +5140,8 @@ fn a_lock_while_the_brokers_start_ends_the_runs_grants_and_nothing_runs() {
         return;
     }
     let h = Harness::new();
-    // A profile whose grants outlive the automatic locks once active.
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    // Grants that outlive the automatic locks once active: the default.
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let marker = h.dir.path().join("ran");
     let script = format!("touch {}", marker.display());
     for (lock, reason) in [("screen lock", "screen_locked"), ("lock", "locked")] {
@@ -5266,15 +5236,13 @@ fn grants_are_listed_and_revoked_without_a_dialog_locked_or_unlocked() {
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
     assert!(h.ui.password_prompts.lock().unwrap().is_empty());
 
-    // Two grants that survive a screen lock (their profile says so), in a
-    // dialog that scrolls, as rusthorse-dialog's does.
+    // Two grants that survive a screen lock (their run says so: `continue`
+    // is the default), in a dialog that scrolls, as rusthorse-dialog's
+    // does.
     h.ui.scrolls.store(true, Ordering::SeqCst);
     seed(
         &h,
-        &[
-            ("A", FAKE_KEY, Some(anthropic())),
-            ("B", "sk-ant-test-1111111111111111", Some(anthropic())),
-        ],
+        &[("A", FAKE_KEY), ("B", "sk-ant-test-1111111111111111")],
     );
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
@@ -5355,11 +5323,39 @@ fn grants_are_listed_and_revoked_without_a_dialog_locked_or_unlocked() {
     }
 }
 
+/// A broker run of `entry` whose grant has `limits` and whose command
+/// waits until the test creates `go_file` (see [`WAITS`]), once it has
+/// started. Its approval must be queued.
+fn start_waiting(
+    h: &Harness,
+    var: &str,
+    entry: &str,
+    limits: rusthorse::broker_grant::GrantLimits,
+    go_file: &str,
+) -> Running {
+    let _ = std::fs::remove_file(h.dir.path().join("env.txt"));
+    let script = WAITS.replace("-e go ]", &format!("-e {go_file} ]"));
+    let mut request = broker_run_request(h, vec![], vec![brokered(var, entry, None)], &script);
+    request.limits = limits;
+    let running = start(h, request);
+    command_env(h);
+    running
+}
+
+/// The default limits, except that the automatic locks end the grants.
+fn ending_with_the_automatic_locks() -> rusthorse::broker_grant::GrantLimits {
+    rusthorse::broker_grant::GrantLimits {
+        automatic_locks: rusthorse::broker_grant::AutomaticLocks::End,
+        ..rusthorse::broker_grant::GrantLimits::default()
+    }
+}
+
 /// `rusthorse lock` ends every grant; the screen lock and a suspend end the
-/// grants whose profile says that the automatic locks end them, and keep
-/// the others (ADR 0013, decision 8).
+/// grants of the runs that said that the automatic locks end them, and keep
+/// the others (ADR 0013, decision 8; the run's limits, scope amendment).
 #[test]
-fn locks_end_the_grants_their_profiles_say() {
+fn locks_end_the_grants_their_runs_say() {
+    use rusthorse::broker_grant::{AutomaticLocks, GrantLimits};
     use rusthorse::protocol::{Request, Response};
     use rusthorse::session_lock::{Locker, SCREEN_LOCK, SUSPEND};
     if !python3() {
@@ -5369,45 +5365,42 @@ fn locks_end_the_grants_their_profiles_say() {
     seed(
         &h,
         &[
-            ("STAYS", FAKE_KEY, Some(anthropic())),
-            ("SCREEN", FAKE_KEY, Some(anthropic_ending())),
-            ("SLEEP", FAKE_KEY, Some(anthropic_ending())),
+            ("STAYS", FAKE_KEY),
+            ("SCREEN", FAKE_KEY),
+            ("SLEEP", FAKE_KEY),
         ],
     );
     let _log = fake_broker(&h, "ready");
     h.ui.scrolls.store(true, Ordering::SeqCst);
-    // Two runs: the suspend's grant is created after the screen lock.
-    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
-    let first = start(
-        &h,
-        broker_run_request(
-            &h,
-            vec![],
-            vec![brokered("A", "STAYS", None), brokered("B", "SCREEN", None)],
-            WAITS,
-        ),
+    // Three runs: the suspend's grant is created after the screen lock.
+    h.decide(&[
+        Decision::AllowOnce,
+        Decision::AllowOnce,
+        Decision::AllowOnce,
+    ]);
+    let first = start_waiting(&h, "A", "STAYS", GrantLimits::default(), "go");
+    let second = start_waiting(&h, "B", "SCREEN", ending_with_the_automatic_locks(), "go2");
+    // Its dialog said so.
+    let ends = approval_detail(&h, "Ends").expect("Ends");
+    assert!(
+        ends.ends_with("; also on screen lock, suspend or idle lock"),
+        "{ends}"
     );
-    command_env(&h);
     let id_of = |entry: &str| {
         grants(&h)
             .into_iter()
             .find(|g| g.entry.starts_with(&format!("{entry} (")))
-            .map(|g| g.id)
             .expect("a grant")
     };
-    let (stays, screen) = (id_of("STAYS"), id_of("SCREEN"));
+    assert_eq!(id_of("STAYS").automatic_locks, AutomaticLocks::Continue);
+    assert_eq!(id_of("SCREEN").automatic_locks, AutomaticLocks::End);
+    let (stays, screen) = (id_of("STAYS").id, id_of("SCREEN").id);
     h.agent.lock_for(SCREEN_LOCK, "test");
     assert_eq!(grant_state(&h, &screen).as_deref(), Some("revoked"));
     assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
 
-    std::fs::remove_file(h.dir.path().join("env.txt")).expect("rm");
-    let script = WAITS.replace("go ]", "go2 ]");
-    let second = start(
-        &h,
-        broker_run_request(&h, vec![], vec![brokered("C", "SLEEP", None)], &script),
-    );
-    command_env(&h);
-    let sleep = id_of("SLEEP");
+    let third = start_waiting(&h, "C", "SLEEP", ending_with_the_automatic_locks(), "go3");
+    let sleep = id_of("SLEEP").id;
     h.agent.lock_for(SUSPEND, "test");
     assert_eq!(grant_state(&h, &sleep).as_deref(), Some("revoked"));
     assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
@@ -5418,45 +5411,36 @@ fn locks_end_the_grants_their_profiles_say() {
         other => panic!("unexpected {}", other.kind()),
     }
     assert_eq!(grant_state(&h, &stays).as_deref(), Some("revoked"));
-    go(&h);
-    std::fs::write(h.dir.path().join("go2"), "").expect("go");
-    assert!(matches!(first.wait(), Response::Exited { .. }));
-    assert!(matches!(second.wait(), Response::Exited { .. }));
+    for file in ["go", "go2", "go3"] {
+        std::fs::write(h.dir.path().join(file), "").expect("go");
+    }
+    for running in [first, second, third] {
+        assert!(matches!(running.wait(), Response::Exited { .. }));
+    }
     assert_eq!(ended_with(&h, &screen), "screen_locked");
     assert_eq!(ended_with(&h, &sleep), "suspend");
     assert_eq!(ended_with(&h, &stays), "locked");
 }
 
-/// The idle timeout ends the grants whose profile says so and keeps the
+/// The idle timeout ends the grants of the runs that said so and keeps the
 /// others; requests through the broker do not postpone it (P9).
 #[test]
-fn the_idle_lock_ends_only_the_grants_whose_profile_says_so() {
+fn the_idle_lock_ends_only_the_grants_whose_run_says_so() {
+    use rusthorse::broker_grant::GrantLimits;
     use rusthorse::protocol::Response;
     if !python3() {
         return;
     }
-    // Long enough for the run to start before the vault locks itself.
+    // Long enough for the runs to start before the vault locks itself.
+    // Should it lock between them, the grant that ends has ended already,
+    // and the second run unlocks it again.
     let h = Harness::with_idle_timeout(Duration::from_secs(5));
     h.ui.scrolls.store(true, Ordering::SeqCst);
-    seed(
-        &h,
-        &[
-            ("STAYS", FAKE_KEY, Some(anthropic())),
-            ("ENDS", FAKE_KEY, Some(anthropic_ending())),
-        ],
-    );
+    seed(&h, &[("STAYS", FAKE_KEY), ("ENDS", FAKE_KEY)]);
     let _log = fake_broker(&h, "ready");
-    h.decide(&[Decision::AllowOnce]);
-    let running = start(
-        &h,
-        broker_run_request(
-            &h,
-            vec![],
-            vec![brokered("A", "STAYS", None), brokered("B", "ENDS", None)],
-            WAITS,
-        ),
-    );
-    command_env(&h);
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+    let first = start_waiting(&h, "B", "ENDS", ending_with_the_automatic_locks(), "go");
+    let second = start_waiting(&h, "A", "STAYS", GrantLimits::default(), "go2");
     let listed = grants(&h);
     let id_of = |entry: &str| {
         listed
@@ -5472,7 +5456,9 @@ fn the_idle_lock_ends_only_the_grants_whose_profile_says_so() {
     });
     assert_eq!(grant_state(&h, &stays).as_deref(), Some("active"));
     go(&h);
-    assert!(matches!(running.wait(), Response::Exited { .. }));
+    std::fs::write(h.dir.path().join("go2"), "").expect("go");
+    assert!(matches!(first.wait(), Response::Exited { .. }));
+    assert!(matches!(second.wait(), Response::Exited { .. }));
     assert_eq!(ended_with(&h, &ends), "idle_timeout");
     assert_eq!(ended_with(&h, &stays), "command_ended");
 }
@@ -5481,7 +5467,7 @@ fn the_idle_lock_ends_only_the_grants_whose_profile_says_so() {
 /// the agent's timer revokes it (`expired`) and tells its broker, so that a
 /// stream open then ends too — refusing new requests is not enough (ADR
 /// 0013, limits). The broker's install says how long the grant has, never
-/// more than its profile allows. (Tests shorten the lifetime through
+/// more than its run allows. (Tests shorten the lifetime through
 /// `AgentConfig::broker_lifetime`.)
 #[test]
 fn a_grant_ends_when_its_lifetime_passes_while_its_command_runs() {
@@ -5491,7 +5477,7 @@ fn a_grant_ends_when_its_lifetime_passes_while_its_command_runs() {
     }
     let lifetime = Duration::from_secs(3);
     let h = Harness::with_broker_lifetime(lifetime);
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     let asked = Instant::now();
@@ -5519,16 +5505,13 @@ fn a_grant_ends_when_its_lifetime_passes_while_its_command_runs() {
     assert_eq!(ended_with(&h, &id), "expired");
 }
 
-/// A change to the broker profile is a request of its own, `broker_edit`
-/// (ADR 0013): a plain `edit` that sets or clears the profile is refused
-/// before any dialog, and so is a profile that does not resolve. The dialog
-/// of a `broker_edit` shows the whole new profile and how many grants the
-/// edit ends; any change to an entry — its profile, its name, its value,
-/// its removal, its replacement — ends its grants once it is saved.
+/// Any change to an entry — its user name, its name, its removal, its
+/// replacement, an import over it, its tags — ends its grants once it is
+/// saved, and its dialog says how many (ADR 0013); an edit that ends none
+/// says nothing about grants.
 #[test]
 fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
-    use rusthorse::broker_profile::{Preset, ProfileRequest};
-    use rusthorse::protocol::{EntryChanges, ErrorCode, Field, NewEntry, Request, Response};
+    use rusthorse::protocol::{EntryChanges, NewEntry, Request, Response};
     if !python3() {
         return;
     }
@@ -5536,105 +5519,32 @@ fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
     seed(
         &h,
         &[
-            ("KEY", FAKE_KEY, None),
-            ("RENAMED", FAKE_KEY, Some(anthropic())),
-            ("REMOVED", FAKE_KEY, Some(anthropic())),
-            ("REPLACED", FAKE_KEY, Some(anthropic())),
-            ("IMPORTED", FAKE_KEY, Some(anthropic())),
-            ("UNTOUCHED", FAKE_KEY, Some(anthropic())),
+            ("KEY", FAKE_KEY),
+            ("RENAMED", FAKE_KEY),
+            ("REMOVED", FAKE_KEY),
+            ("REPLACED", FAKE_KEY),
+            ("IMPORTED", FAKE_KEY),
+            ("UNTOUCHED", FAKE_KEY),
         ],
     );
-    let on_disk = std::fs::read(h.vault_path()).expect("read");
-    let set = |profile: ProfileRequest| EntryChanges {
-        username: Some("me".into()),
-        broker: Some(profile),
-        ..EntryChanges::default()
-    };
-    let clear = || EntryChanges {
-        clear: vec![Field::Broker],
-        ..EntryChanges::default()
-    };
-    // Refused before anything: a plain edit that touches the profile, a
-    // profile that does not resolve, setting and clearing it at once.
-    for changes in [set(anthropic()), clear()] {
-        let response = h.call(&Request::Edit {
-            name: "KEY".into(),
-            changes,
-        });
-        let (code, message) = error_of(&response);
-        assert_eq!(code, ErrorCode::InvalidRequest);
-        assert!(message.contains("broker_edit"), "{message}");
-    }
-    let no_origin = ProfileRequest::new(Preset::OpenaiCompatible);
-    let response = h.call(&Request::BrokerEdit {
-        name: "KEY".into(),
-        changes: set(no_origin),
-    });
-    let (code, message) = error_of(&response);
-    assert_eq!(code, ErrorCode::InvalidRequest);
-    assert!(message.contains("no default origin"), "{message}");
-    let both = EntryChanges {
-        broker: Some(anthropic()),
-        clear: vec![Field::Broker],
-        ..EntryChanges::default()
-    };
-    let response = h.call(&Request::BrokerEdit {
-        name: "KEY".into(),
-        changes: both,
-    });
-    assert_eq!(error_of(&response).0, ErrorCode::InvalidRequest);
-    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
-    assert!(h.ui.password_prompts.lock().unwrap().is_empty(), "unlocked");
-    assert!(audit_outcomes(&h, "edit").is_empty());
-    assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
-
-    // Setting a profile: the dialog shows all of it, and that it ends no
-    // grant.
-    let show = |name: &str| match h.call(&Request::Show { name: name.into() }) {
-        Response::Entry { entry } => entry,
-        other => panic!("unexpected {}", other.kind()),
-    };
     let edit = |request: Request| match h.call(&request) {
         Response::Ok { .. } => {}
         other => panic!("unexpected {}", other.kind()),
     };
-    let deepseek = ProfileRequest {
-        origin: Some("https://api.deepseek.com".into()),
-        max_requests: Some(50),
-        ..ProfileRequest::new(Preset::OpenaiCompatible)
+    let username = |name: &str, username: &str| Request::Edit {
+        name: name.into(),
+        changes: EntryChanges {
+            username: Some(username.into()),
+            ..EntryChanges::default()
+        },
     };
+
+    // Before any grant: the dialog says nothing about grants.
     h.decide(&[Decision::AllowOnce]);
-    edit(Request::BrokerEdit {
-        name: "KEY".into(),
-        changes: set(deepseek.clone()),
-    });
+    edit(username("KEY", "someone"));
     let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
-    assert_eq!(
-        approval_detail(&h, "New broker profile").as_deref(),
-        Some("OpenAI-compatible preset (openai-compatible), revision 1")
-    );
-    assert_eq!(
-        approval_detail(&h, "Destination").as_deref(),
-        Some("https://api.deepseek.com/v1")
-    );
-    assert!(approval_detail(&h, "Allows").is_some_and(|a| a.contains("POST /chat/completions")));
-    assert!(approval_detail(&h, "Ends").is_some());
-    assert_eq!(
-        approval_detail(&h, "Requests").as_deref(),
-        Some("at most 50; at most 16 at a time")
-    );
-    assert!(
-        asked
-            .facts
-            .contains(&("Grants it ends".to_string(), "none".to_string())),
-        "{:?}",
-        asked.facts
-    );
     assert!(asked.warnings.is_empty(), "{:?}", asked.warnings);
-    assert_eq!(
-        show("KEY").broker,
-        Some(deepseek.resolve().expect("profile"))
-    );
+    assert!(asked.facts.is_empty(), "{:?}", asked.facts);
 
     // A run with a grant of each entry, in a dialog that scrolls.
     let log = fake_broker(&h, "ready");
@@ -5663,12 +5573,9 @@ fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
     };
     let ids: Vec<String> = names.iter().map(|name| id_of(name)).collect();
 
-    // Its profile changed: the dialog says that the edit ends its grant.
+    // Its user name changed: the dialog says that the edit ends its grant.
     h.decide(&[Decision::AllowOnce]);
-    edit(Request::BrokerEdit {
-        name: "KEY".into(),
-        changes: set(anthropic()),
-    });
+    edit(username("KEY", "me"));
     let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
     assert_eq!(
         asked.warnings,
@@ -5710,11 +5617,6 @@ fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
         asked.warnings
     );
     assert_eq!(grant_state(&h, &ids[3]).as_deref(), Some("revoked"));
-    assert_eq!(
-        show("REPLACED").broker,
-        None,
-        "replacing removes the profile"
-    );
     h.decide(&[Decision::AllowOnce]);
     edit(Request::Import {
         entries: vec![rusthorse::protocol::ImportedEntry {
@@ -5744,14 +5646,15 @@ fn a_change_to_an_entry_ends_its_grants_and_its_dialog_says_how_many() {
         .count();
     assert_eq!(revokes, 5);
 
-    // Clearing a profile works the same way, through `broker_edit` only.
+    // Even a change of its tags ends it.
     h.decide(&[Decision::AllowOnce]);
-    edit(Request::BrokerEdit {
+    edit(Request::Edit {
         name: "UNTOUCHED".into(),
-        changes: clear(),
+        changes: EntryChanges {
+            add_tags: vec!["touched".into()],
+            ..EntryChanges::default()
+        },
     });
-    assert_eq!(approval_detail(&h, "Clear").as_deref(), Some("broker"));
-    assert!(show("UNTOUCHED").broker.is_none());
     assert_eq!(grant_state(&h, &ids[5]).as_deref(), Some("revoked"));
     go(&h);
     assert!(matches!(running.wait(), Response::Exited { .. }));
@@ -5773,13 +5676,7 @@ fn grants_that_survive_a_lock_end_when_the_vault_file_changed_meanwhile() {
         return;
     }
     let h = Harness::new();
-    seed(
-        &h,
-        &[
-            ("KEY", FAKE_KEY, Some(anthropic())),
-            ("OTHER", "abcdefgh", None),
-        ],
-    );
+    seed(&h, &[("KEY", FAKE_KEY), ("OTHER", "abcdefgh")]);
     let _log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     let running = start(
@@ -5895,13 +5792,7 @@ fn the_unlock_barrier_tells_the_brokers_before_it_waits_for_the_audit_log() {
         return;
     }
     let h = Harness::new();
-    seed(
-        &h,
-        &[
-            ("KEY", FAKE_KEY, Some(anthropic())),
-            ("OTHER", "abcdefgh", None),
-        ],
-    );
+    seed(&h, &[("KEY", FAKE_KEY), ("OTHER", "abcdefgh")]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     let running = start(
@@ -5968,7 +5859,7 @@ fn a_lock_does_not_wait_for_the_record_of_an_unlock() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     let running = start(
@@ -6032,7 +5923,7 @@ fn a_new_vault_file_ends_the_grants_that_survived_the_lock() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let _log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     let running = start(
@@ -6064,7 +5955,7 @@ fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     for mode in ["bad_number", "ignore_revoke"] {
         let log = fake_broker(&h, mode);
         let _ = std::fs::remove_file(h.dir.path().join("env.txt"));
@@ -6133,9 +6024,10 @@ fn a_broker_that_breaks_the_conversation_or_ignores_a_revocation_is_killed() {
     }
 }
 
-/// Every request a broker admits is recorded before it is forwarded, and
-/// again when it ends (ADR 0013, decision 9); a request limit refuses the
-/// next one, and the grant's end record counts them all.
+/// Every request a broker admits is recorded before it is forwarded, with
+/// its method's label and nothing of its path, and again when it ends (ADR
+/// 0013, decision 9 and the scope amendment); the run's request limit
+/// refuses the next one, and the grant's end record counts them all.
 #[test]
 fn admissions_are_recorded_before_the_broker_forwards_anything() {
     use rusthorse::protocol::Response;
@@ -6143,11 +6035,7 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         return;
     }
     let h = Harness::new();
-    let limited = rusthorse::broker_profile::ProfileRequest {
-        max_requests: Some(1),
-        ..anthropic()
-    };
-    seed(&h, &[("KEY", FAKE_KEY, Some(limited))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "admit");
     h.decide(&[Decision::AllowOnce]);
     let go_file = log.with_extension("jsonl.go");
@@ -6157,10 +6045,9 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         go_file.display(),
         done.display()
     );
-    let running = start(
-        &h,
-        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
-    );
+    let mut request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
+    request.limits.max_requests = Some(1);
+    let running = start(&h, request);
     // Its one request answered 200: nothing to report.
     assert!(matches!(
         running.wait(),
@@ -6194,7 +6081,8 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
     assert_eq!(records[0]["outcome"], "admitted");
     assert_eq!(records[0]["grant"], id.as_str());
     assert_eq!(records[0]["request"], 1);
-    assert_eq!(records[0]["route"], "POST /v1/messages");
+    assert_eq!(records[0]["method"], "POST");
+    assert!(records[0].get("route").is_none(), "{}", records[0]);
     assert_eq!(records[1]["outcome"], "completed");
     assert_eq!(records[1]["status"], 200);
     assert_eq!(records[1]["bytes_sent"], 10);
@@ -6213,9 +6101,9 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
 /// The requests a grant's destination answered with `401 Unauthorized` are
 /// counted — whatever became of them after their head — and shown in
 /// `grants` while the command runs; when it ends, the run's answer names
-/// the grant, its entry and its destination, with the count, so that
-/// `rusthorse run` can say that the destination refused the key. Other
-/// statuses are not counted.
+/// the grant, its entry and its approved origin (no base path), with the
+/// count, so that `rusthorse run` can say that the destination refused the
+/// key. Other statuses are not counted.
 #[test]
 fn a_run_reports_the_grants_whose_destination_answered_401() {
     use rusthorse::protocol::{Response, UnauthorizedGrant};
@@ -6223,14 +6111,19 @@ fn a_run_reports_the_grants_whose_destination_answered_401() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "unauthorized");
     h.decide(&[Decision::AllowOnce]);
     let go_file = log.with_extension("jsonl.go");
     let script = format!("touch {}; {WAITS}", go_file.display());
     let running = start(
         &h,
-        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+        broker_run_request(
+            &h,
+            vec![],
+            vec![brokered_to("K", "KEY", "https://api.example.com/v1", None)],
+            &script,
+        ),
     );
     // While the command runs: the stand-in reports its three requests, two
     // of them answered 401.
@@ -6238,6 +6131,8 @@ fn a_run_reports_the_grants_whose_destination_answered_401() {
         grants(&h).into_iter().find(|g| g.unauthorized == Some(2))
     });
     assert_eq!(listed.requests, 3);
+    assert_eq!(listed.destination, "https://api.example.com");
+    assert_eq!(listed.base_path.as_deref(), Some("/v1"));
     go(&h);
     let Response::Exited {
         code, unauthorized, ..
@@ -6251,7 +6146,7 @@ fn a_run_reports_the_grants_whose_destination_answered_401() {
         [UnauthorizedGrant {
             var: "K".into(),
             entry: listed.entry.clone(),
-            destination: listed.destination.clone(),
+            destination: "https://api.example.com".into(),
             requests: 2,
         }]
     );
@@ -6281,7 +6176,7 @@ fn the_end_of_the_command_revokes_its_grants_before_its_output_is_drained() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     // A descendant in a session of its own goes on printing after the
@@ -6332,7 +6227,7 @@ fn a_requester_that_goes_away_ends_its_runs_grants() {
         return;
     }
     let h = Harness::new();
-    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     // A command that ignores SIGTERM, so that terminating it takes a
@@ -6340,7 +6235,7 @@ fn a_requester_that_goes_away_ends_its_runs_grants() {
     let script = format!("trap '' TERM; {WAITS}");
     let request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
     let stream = UnixStream::connect(&h.socket).expect("connect");
-    send_frame(&stream, &Request::BrokerRun(request), &[]).expect("send");
+    send_frame(&stream, &Request::BrokerRunV2(request), &[]).expect("send");
     command_env(&h);
     let id = grants(&h)[0].id.clone();
     let pid = logged(&log, "install")["pid"].as_u64().expect("pid");
@@ -6363,6 +6258,763 @@ fn a_requester_that_goes_away_ends_its_runs_grants() {
         audit_outcomes(&h, "run").last().map(String::as_str),
         Some("exited")
     );
+}
+
+/// A broker run's destination and limits are checked before anything else
+/// (ADR 0013, scope amendment). `rusthorse run` refuses a destination that
+/// is not `https://`, a host name, an optional port and an optional base
+/// path — user information, a query, a fragment, an IP address, a bad base
+/// path — and limits out of range before it sends anything (125); the
+/// agent refuses them from any other client before any dialog or unlock,
+/// without repeating the destination. Nothing runs, no broker starts,
+/// nothing is audited; the same run with a valid destination is asked and
+/// runs.
+#[test]
+fn a_broker_runs_destination_and_limits_are_checked_before_any_dialog() {
+    use rusthorse::broker_grant::GrantLimits;
+    use rusthorse::protocol::ErrorCode;
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(
+        &h,
+        &[("KEY", FAKE_KEY), ("OTHER", "sk-other-test-0000000000")],
+    );
+    let log = fake_broker(&h, "ready");
+    // Had anyone asked, the run would be allowed, and its command would
+    // leave this file behind.
+    h.decide(&[Decision::AllowOnce]);
+    let marker = h.dir.path().join("ran");
+    let script = format!("touch {}", marker.display());
+
+    // Through `rusthorse run`: refused before anything is sent.
+    let valid = "K=KEY@https://api.example.com";
+    for (args, says) in [
+        (&["--broker", "K=KEY"][..], "name the destination"),
+        (
+            &["--broker", "K=KEY@api.example.com"][..],
+            "must start with https://",
+        ),
+        (
+            &["--broker", "K=KEY@http://api.example.com"][..],
+            "must start with https://",
+        ),
+        // The URL starts after the last `@`: one with user information is
+        // left without its https://.
+        (
+            &["--broker", "K=KEY@https://user@api.example.com"][..],
+            "must start with https://",
+        ),
+        (
+            &["--broker", "K=KEY@https://api.example.com?q=1"][..],
+            "query or a fragment",
+        ),
+        (
+            &["--broker", "K=KEY@https://api.example.com/v1?q=1"][..],
+            "base path is not valid",
+        ),
+        (
+            &["--broker", "K=KEY@https://192.0.2.1"][..],
+            "not an IP address",
+        ),
+        (
+            &["--broker", "K=KEY@https://api.example.com/v1/"][..],
+            "base path is not valid",
+        ),
+        (
+            &["--broker", valid, "--broker-lifetime", "0"][..],
+            "1 to 1440 minutes, not 0",
+        ),
+        (
+            &["--broker", valid, "--broker-lifetime", "1441"][..],
+            "1 to 1440 minutes, not 1441",
+        ),
+        (
+            &["--broker", valid, "--broker-requests", "0"][..],
+            "1 to 1000000, not 0",
+        ),
+    ] {
+        let mut argv = vec!["run"];
+        argv.extend(args);
+        argv.extend(["--", "sh", "-c", script.as_str()]);
+        let out = h.run(&argv);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(125), "{args:?}: {stderr}");
+        assert!(stderr.contains(says), "{args:?}: {says:?} not in {stderr}");
+    }
+
+    // From another client: refused by the agent, whole.
+    let refused = |brokered: Vec<rusthorse::protocol::BrokerBinding>, limits: GrantLimits| {
+        let mut request = broker_run_request(&h, vec![], brokered, &script);
+        request.limits = limits;
+        let (code, message) = error_of(&broker_run(&h, request));
+        assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+        message
+    };
+    let defaults = GrantLimits::default();
+    for (destination, says) in [
+        ("", "must start with https://"),
+        ("api.example.com", "must start with https://"),
+        ("http://api.example.com", "must start with https://"),
+        ("https://", "must name a host"),
+        ("https://user@api.example.com", "user information"),
+        (
+            "https://user:FAKE-pw@api.example.com/v1",
+            "user information",
+        ),
+        ("https://api.example.com?q=1", "query or a fragment"),
+        ("https://api.example.com#top", "query or a fragment"),
+        ("https://api.example.com/v1?q=1", "base path is not valid"),
+        ("https://192.0.2.1", "not an IP address"),
+        ("https://[2001:db8::1]:8443", "not an IP address"),
+        ("https://2130706433", "not an IP address"),
+        ("https://API.example.com", "lowercase"),
+        ("https://api.example.com:99999", "the port must be a number"),
+        ("https://api.example.com/v1/", "base path is not valid"),
+        ("https://api.example.com/v1//x", "base path is not valid"),
+        ("https://api.example.com/../v1", "base path is not valid"),
+        ("https://api.example.com/v1%2Fx", "base path is not valid"),
+    ] {
+        let message = refused(vec![brokered_to("K", "KEY", destination, None)], defaults);
+        assert!(
+            message.starts_with("K of KEY: the destination"),
+            "{destination}: {message}"
+        );
+        assert!(
+            message.contains(says),
+            "{destination}: {says:?} not in {message}"
+        );
+        // What it refuses is not repeated.
+        assert!(
+            !message.contains("user@")
+                && !message.contains("user:")
+                && !message.contains("FAKE")
+                && !message.contains("2001"),
+            "{destination}: {message}"
+        );
+    }
+    // One destination that does not check out refuses the whole run.
+    let message = refused(
+        vec![
+            brokered("A", "KEY", None),
+            brokered_to("B", "OTHER", "http://api.example.com", None),
+        ],
+        defaults,
+    );
+    assert!(message.starts_with("B of OTHER: "), "{message}");
+    for (limits, says) in [
+        (
+            GrantLimits {
+                max_lifetime_minutes: 0,
+                ..defaults
+            },
+            "1 to 1440 minutes, not 0",
+        ),
+        (
+            GrantLimits {
+                max_lifetime_minutes: 1441,
+                ..defaults
+            },
+            "1 to 1440 minutes, not 1441",
+        ),
+        (
+            GrantLimits {
+                max_requests: Some(0),
+                ..defaults
+            },
+            "1 to 1000000, not 0",
+        ),
+        (
+            GrantLimits {
+                max_requests: Some(1_000_001),
+                ..defaults
+            },
+            "1 to 1000000, not 1000001",
+        ),
+    ] {
+        let message = refused(vec![brokered("K", "KEY", None)], limits);
+        assert!(message.starts_with("the grants' limits: "), "{message}");
+        assert!(message.contains(says), "{says:?} not in {message}");
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the command ran");
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(
+        h.ui.password_prompts.lock().unwrap().is_empty(),
+        "the vault was unlocked for a request refused without it"
+    );
+    assert_eq!(h.audit_text(), "", "something was audited");
+    assert!(broker_log(&log).is_empty(), "a broker was started");
+    assert!(grants(&h).is_empty());
+
+    // The same run with a valid destination is asked, and runs.
+    let out = h.run(&["run", "--broker", valid, "--", "sh", "-c", &script]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(marker.exists(), "the command did not run");
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+    assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "exited"]);
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    assert_eq!(ended_with(&h, &id), "command_ended");
+}
+
+/// A child process killed, if it still runs, when the test is done with it
+/// — a failed assertion included.
+struct Reaped(Option<std::process::Child>);
+
+impl Reaped {
+    /// Wait for the child's end, within [`TEST_LIMIT`], and take its output.
+    fn output(&mut self) -> Output {
+        let child = self.0.take().expect("the child");
+        within(TEST_LIMIT, move || child.wait_with_output().expect("wait"))
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// What a run through the broker shows and records of its destination and
+/// limits, end to end through `rusthorse run` (ADR 0013, scope amendment):
+/// the dialog shows the approved origin, the base path apart from it, and
+/// the limits the run asked for; the broker is given the origin alone; the
+/// `--url` variable gets the broker's address with the base path; and the
+/// run's audit record, `rusthorse grants` and `rusthorse grants --json`
+/// show the origin and the base path apart.
+#[test]
+fn a_broker_run_shows_and_lists_its_origin_apart_from_its_base_path() {
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    let uuids = seed(&h, &[("KEY", FAKE_KEY)]);
+    let identity = format!("KEY ({})", &uuids["KEY"][..8]);
+    let log = fake_broker(&h, "ready");
+    h.decide(&[Decision::AllowOnce]);
+    let script = format!("printf 'base=%s\\n' \"$BASE\"; {WAITS}");
+    let mut client = Reaped(Some(
+        h.cmd(&[
+            "run",
+            "--broker",
+            "K=KEY@https://api.example.com:8443/v2",
+            "--url",
+            "BASE=KEY",
+            "--broker-requests",
+            "5",
+            "--broker-lifetime",
+            "30",
+            "--broker-locks",
+            "end",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rusthorse"),
+    ));
+    let env = command_env(&h);
+    let installed = logged(&log, "install");
+    let install = &installed["install"];
+    let port = installed["listen"][1].as_u64().expect("port");
+    let id = install["grant"].as_str().expect("grant").to_string();
+    // The broker: the approved origin alone, and the run's lifetime.
+    assert_eq!(install["origin"], "https://api.example.com:8443");
+    let lifetime = install["lifetime_secs"].as_u64().expect("lifetime");
+    assert!((30 * 60 - 30..=30 * 60).contains(&lifetime), "{lifetime}");
+    assert_eq!(installs_validly(install), Ok(()));
+    // The command: the token, and the broker's address with the base path.
+    assert_eq!(env["K"], install["token"].as_str().expect("token"));
+    assert_eq!(env["BASE"], format!("http://127.0.0.1:{port}/v2"));
+
+    // The dialog: the origin, the base path apart, the limits asked for.
+    let detail = |label: &str| approval_detail(&h, label).unwrap_or_default();
+    assert_eq!(
+        detail("Grant"),
+        format!("K ← a token for {identity}; BASE ← the broker's address")
+    );
+    assert_eq!(detail("Approved origin"), "https://api.example.com:8443");
+    assert_eq!(detail("Base path"), "/v2 (not a limit)");
+    assert_eq!(
+        detail("Ends"),
+        "with the command, on rusthorse lock, revocation or a change to the entry, or after \
+         30m; also on screen lock, suspend or idle lock"
+    );
+    assert_eq!(detail("Requests"), "at most 5; at most 16 at a time");
+
+    // `rusthorse grants`: the origin and the base path in columns of their
+    // own, never joined.
+    let out = h.run(&["grants"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let table = text(&out.stdout);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 2, "{table}");
+    // (Every cell before the requester's is ASCII: byte positions are
+    // character positions.)
+    let column = |header: &str| {
+        let at = lines[0].find(header).expect("a column");
+        lines[1][at..]
+            .split("  ")
+            .next()
+            .expect("a cell")
+            .to_string()
+    };
+    assert_eq!(column("ID"), id);
+    assert_eq!(column("ENTRY"), identity);
+    assert_eq!(column("APPROVED ORIGIN"), "https://api.example.com:8443");
+    assert_eq!(column("BASE PATH (NOT A LIMIT)"), "/v2");
+    assert_eq!(column("STATE"), "active");
+    assert_eq!(column("REQUESTS"), "0 of 5");
+    assert_eq!(column("AUTOMATIC LOCKS"), "end");
+    assert!(!table.contains("8443/v2"), "{table}");
+    let out = h.run(&["grants", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let grant = &listed[0];
+    assert_eq!(grant["id"], id.as_str());
+    assert_eq!(grant["entry"], identity.as_str());
+    assert_eq!(grant["var"], "K");
+    assert_eq!(grant["destination"], "https://api.example.com:8443");
+    assert_eq!(grant["base_path"], "/v2");
+    assert_eq!(grant["max_requests"], 5);
+    assert_eq!(grant["automatic_locks"], "end");
+    assert!(grant.get("preset").is_none(), "{grant}");
+    assert!(
+        grant["ends_in_secs"]
+            .as_u64()
+            .is_some_and(|left| left <= 30 * 60),
+        "{grant}"
+    );
+
+    go(&h);
+    let out = client.output();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("base=http://127.0.0.1:{port}/v2\n")),
+        "{stdout}"
+    );
+    // The run's record: the origin and the base path apart.
+    let approval = audit_records(&h)
+        .into_iter()
+        .find(|r| r["action"] == "run" && r["outcome"] == "allowed_once")
+        .expect("the approval's record");
+    assert_eq!(
+        approval["grants"],
+        serde_json::json!([{
+            "id": id,
+            "entry": identity,
+            "destination": "https://api.example.com:8443",
+            "base_path": "/v2",
+        }])
+    );
+    let out = h.run(&["audit", "-n", "20"]);
+    let shown = text(&out.stdout);
+    assert!(
+        shown.contains(&format!(
+            " grants: {id} for {identity} to https://api.example.com:8443 (base path /v2, not a \
+             limit);"
+        )),
+        "{shown}"
+    );
+    assert_eq!(ended_with(&h, &id), "command_ended");
+}
+
+/// Send `request` as it is, on a connection of its own, without descriptors,
+/// and read the agent's answer.
+fn send_raw(h: &Harness, request: &serde_json::Value) -> rusthorse::protocol::Response {
+    use rusthorse::protocol::{read_message, send_frame};
+    let stream = std::os::unix::net::UnixStream::connect(&h.socket).expect("connect");
+    send_frame(&stream, request, &[]).expect("send");
+    read_message(&stream).expect("an answer")
+}
+
+/// The requests of protocol 8 that knew broker profiles — `broker_run`,
+/// whose bindings name no destination, and `broker_edit` — are refused
+/// whole by this agent, before any unlock or approval, and so is
+/// `--clear broker` in an edit (ADR 0013, scope amendment); a
+/// `broker_run_v2` with a field this agent does not know, or without a
+/// destination or limits, is refused too, never acted on in part. Nothing
+/// runs, no broker starts, the vault file is untouched, nothing is audited;
+/// the same run as a well-formed `broker_run_v2` is asked and runs.
+#[test]
+fn the_agent_refuses_protocol_8s_broker_requests_and_unknown_fields_before_any_approval() {
+    use rusthorse::protocol::{ErrorCode, Request, Response};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY)]);
+    let log = fake_broker(&h, "ready");
+    let on_disk = std::fs::read(h.vault_path()).expect("read");
+    h.decide(&[Decision::AllowOnce]);
+    let marker = h.dir.path().join("ran");
+    let script = format!("touch {}", marker.display());
+    let refused = |request: &serde_json::Value, says: &str| {
+        let response = send_raw(&h, request);
+        let (code, message) = error_of(&response);
+        assert_eq!(code, ErrorCode::InvalidRequest, "{request}: {message}");
+        assert!(message.contains(says), "{says:?} not in {message}");
+    };
+
+    // Protocol 8's run through the broker, as its clients sent it, and with
+    // this protocol's destinations and limits added: unknown either way.
+    let mut protocol_8_run = serde_json::json!({
+        "type": "broker_run",
+        "bindings": [],
+        "brokered": [{"var": "K", "entry": "KEY", "url_var": "K_URL"}],
+        "argv": ["sh", "-c", &script],
+        "cwd": h.dir.path().to_str().expect("utf8"),
+        "env": [["PATH", "/usr/bin:/bin"]],
+        "redact": true,
+        "forward_stdin": false,
+    });
+    refused(&protocol_8_run, "unknown variant `broker_run`");
+    protocol_8_run["brokered"][0]["destination"] = DESTINATION.into();
+    protocol_8_run["limits"] =
+        serde_json::to_value(rusthorse::broker_grant::GrantLimits::default()).expect("json");
+    refused(&protocol_8_run, "unknown variant `broker_run`");
+    // Its edit of a profile, setting one or clearing it, and the field to
+    // clear in a plain edit.
+    for changes in [
+        serde_json::json!({"broker": {"preset": "anthropic"}}),
+        serde_json::json!({"username": "me", "broker": {"preset": "openai"}}),
+        serde_json::json!({"clear": ["broker"]}),
+    ] {
+        refused(
+            &serde_json::json!({"type": "broker_edit", "name": "KEY", "changes": changes}),
+            "unknown variant `broker_edit`",
+        );
+    }
+    refused(
+        &serde_json::json!({"type": "edit", "name": "KEY", "changes": {"clear": ["broker"]}}),
+        "unknown variant `broker`",
+    );
+
+    // This protocol's run, with a field it does not know, or without one it
+    // needs.
+    let valid = serde_json::to_value(Request::BrokerRunV2(broker_run_request(
+        &h,
+        vec![],
+        vec![brokered("K", "KEY", Some("K_URL"))],
+        &script,
+    )))
+    .expect("json");
+    let spoiled = |spoil: &dyn Fn(&mut serde_json::Value)| {
+        let mut request = valid.clone();
+        spoil(&mut request);
+        request
+    };
+    for (request, says) in [
+        (
+            spoiled(&|r| r["profile"] = "anthropic".into()),
+            "unknown field `profile`",
+        ),
+        (
+            spoiled(&|r| r["brokered"][0]["preset"] = "anthropic".into()),
+            "unknown field `preset`",
+        ),
+        (
+            spoiled(&|r| r["brokered"][0]["routes"] = serde_json::json!(["POST /v1/messages"])),
+            "unknown field `routes`",
+        ),
+        (
+            spoiled(&|r| r["limits"]["max_in_flight"] = 1.into()),
+            "unknown field `max_in_flight`",
+        ),
+        (
+            spoiled(&|r| {
+                r["brokered"][0]
+                    .as_object_mut()
+                    .expect("binding")
+                    .remove("destination");
+            }),
+            "missing field `destination`",
+        ),
+        (
+            spoiled(&|r| {
+                r.as_object_mut().expect("request").remove("limits");
+            }),
+            "missing field `limits`",
+        ),
+        (
+            spoiled(&|r| r["limits"]["automatic_locks"] = "never".into()),
+            "unknown variant `never`",
+        ),
+    ] {
+        refused(&request, says);
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "the command ran");
+    assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+    assert!(
+        h.ui.password_prompts.lock().unwrap().is_empty(),
+        "the vault was unlocked"
+    );
+    assert_eq!(h.audit_text(), "", "something was audited");
+    assert!(broker_log(&log).is_empty(), "a broker was started");
+    assert_eq!(std::fs::read(h.vault_path()).expect("read"), on_disk);
+
+    // The same run, well formed, is asked and runs.
+    let request = broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script);
+    match broker_run(&h, request) {
+        Response::Exited { code, .. } => assert_eq!(code, Some(0)),
+        other => panic!("unexpected {}", other.kind()),
+    }
+    assert!(marker.exists(), "the command did not run");
+    assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "exited"]);
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    assert_eq!(ended_with(&h, &id), "command_ended");
+}
+
+/// Where phase 1 of the credential broker stored an entry's profile.
+const PHASE_1_PROFILE: &str = "Rusthorse.Broker";
+
+/// A profile as phase 1 stored it: an origin, a base path and limits other
+/// than those of the runs below.
+const STORED_PROFILE: &str = r#"{"version":1,"preset":"anthropic","revision":1,"origin":"https://api.anthropic.com","base_path":"/v1","automatic_locks":"end","max_lifetime_minutes":5,"max_requests":1}"#;
+
+/// The field `key` of the entry titled `title`, as another KeePass client
+/// reads it from the file: its text, and whether it is protected.
+fn field_elsewhere(h: &Harness, title: &str, key: &str) -> Option<(String, bool)> {
+    use keepass::{Database, DatabaseKey};
+    let db = Database::open(
+        &mut std::fs::File::open(h.vault_path()).expect("open"),
+        DatabaseKey::new().with_password(PASSWORD),
+    )
+    .expect("decrypt");
+    let entry = db
+        .iter_all_entries()
+        .find(|e| e.get_title() == Some(title))
+        .expect("the entry");
+    entry
+        .fields
+        .get(key)
+        .map(|value| (value.get().clone(), value.is_protected()))
+}
+
+/// An entry that carries a profile stored by phase 1 (ADR 0013, scope
+/// amendment) is an entry like any other: the field is listed by name only;
+/// the entry is used through `--broker VAR=ENTRY@URL` whatever the field
+/// holds — a profile, something unreadable, a protected field; and the field
+/// is never read: each grant goes to the destination its run names, with
+/// the run's limits, never the stored origin, base path or limits. The
+/// field is kept as it was, byte for byte, through runs and edits.
+#[test]
+fn an_entry_with_a_phase_1_profile_is_used_like_any_other_and_its_profile_is_never_read() {
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    let names = ["STORED", "UNREADABLE", "HIDDEN"];
+    seed(
+        &h,
+        &[
+            ("STORED", FAKE_KEY),
+            ("UNREADABLE", "sk-ant-test-1111111111111111"),
+            ("HIDDEN", "sk-ant-test-2222222222222222"),
+        ],
+    );
+    set_field_elsewhere(&h, "STORED", PHASE_1_PROFILE, STORED_PROFILE, false);
+    set_field_elsewhere(&h, "UNREADABLE", PHASE_1_PROFILE, r#"{"version":2"#, false);
+    set_field_elsewhere(&h, "HIDDEN", PHASE_1_PROFILE, STORED_PROFILE, true);
+    let fields = || -> Vec<Option<(String, bool)>> {
+        names
+            .iter()
+            .map(|name| field_elsewhere(&h, name, PHASE_1_PROFILE))
+            .collect()
+    };
+    let before = fields();
+    assert_eq!(before[2], Some((STORED_PROFILE.to_string(), true)));
+
+    // Listed by name, its value never shown.
+    for name in names {
+        let out = h.run(&["show", name, "--json"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(
+            json["other_fields"],
+            serde_json::json!([PHASE_1_PROFILE]),
+            "{name}: {json}"
+        );
+        assert!(json.get("broker").is_none(), "{name}: {json}");
+        assert!(json.get("protected_fields").is_none(), "{name}: {json}");
+        let out = h.run(&["show", name]);
+        let shown = text(&out.stdout);
+        assert!(
+            shown.contains("fields:     Rusthorse.Broker\n"),
+            "{name}: {shown}"
+        );
+        assert!(
+            !shown.lines().any(|line| line.starts_with("broker:")),
+            "{name}: {shown}"
+        );
+        assert!(
+            !shown.contains("anthropic") && !shown.contains("preset"),
+            "{name}: {shown}"
+        );
+    }
+    let out = h.run(&["list", "--json"]);
+    let listed = text(&out.stdout);
+    assert!(
+        !listed.contains("\"broker\"") && !listed.contains("anthropic"),
+        "{listed}"
+    );
+
+    // Each used through the broker, to the destination the run names, with
+    // the run's limits: the defaults, not the stored ones.
+    let log = fake_broker(&h, "ready");
+    h.ui.scrolls.store(true, Ordering::SeqCst);
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&[
+        "run",
+        "--broker",
+        "A=STORED@https://a.example.com/v2",
+        "--url",
+        "A_URL=STORED",
+        "--broker",
+        "B=UNREADABLE@https://b.example.com",
+        "--broker",
+        "C=HIDDEN@https://c.example.com:8443",
+        "--",
+        "sh",
+        "-c",
+        "printf 'url=%s\\n' \"$A_URL\"",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let installs: Vec<serde_json::Value> = broker_log(&log)
+        .into_iter()
+        .filter(|e| e["event"] == "install")
+        .collect();
+    assert_eq!(installs.len(), 3, "{installs:?}");
+    let origin_of = |install: &serde_json::Value| {
+        install["install"]["origin"]
+            .as_str()
+            .expect("origin")
+            .to_string()
+    };
+    let mut origins: Vec<String> = installs.iter().map(origin_of).collect();
+    origins.sort();
+    assert_eq!(
+        origins,
+        [
+            "https://a.example.com",
+            "https://b.example.com",
+            "https://c.example.com:8443"
+        ]
+    );
+    for install in &installs {
+        let lifetime = install["install"]["lifetime_secs"]
+            .as_u64()
+            .expect("lifetime");
+        assert!(lifetime > 700 * 60, "not the run's lifetime: {lifetime}");
+        assert!(
+            install["install"].get("profile").is_none(),
+            "{}",
+            install["install"]
+        );
+    }
+    let a = installs
+        .iter()
+        .find(|i| origin_of(i) == "https://a.example.com")
+        .expect("A's broker");
+    let port = a["listen"][1].as_u64().expect("port");
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("url=http://127.0.0.1:{port}/v2\n")),
+        "{stdout}"
+    );
+
+    // The dialog showed what the run named, nothing of what is stored.
+    let asked = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    let shown = |label: &str| -> Vec<String> {
+        asked
+            .details
+            .iter()
+            .filter(|(k, _)| k == label)
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    assert_eq!(
+        shown("Approved origin"),
+        [
+            "https://a.example.com",
+            "https://b.example.com",
+            "https://c.example.com:8443"
+        ]
+    );
+    assert_eq!(shown("Base path"), ["/v2 (not a limit)"]);
+    assert_eq!(shown("Requests"), ["no limit; at most 16 at a time"; 3]);
+    for ends in shown("Ends") {
+        assert!(
+            ends.ends_with("after 12h; not on screen lock, suspend or idle lock"),
+            "{ends}"
+        );
+    }
+    for (label, value) in &asked.details {
+        assert!(
+            !value.contains("anthropic") && !value.contains("preset"),
+            "{label}: {value}"
+        );
+    }
+
+    // The run's record: the destinations it named.
+    let approval = audit_records(&h)
+        .into_iter()
+        .find(|r| r["action"] == "run" && r["outcome"] == "allowed_once")
+        .expect("the approval's record");
+    let recorded: Vec<(String, Option<String>)> = approval["grants"]
+        .as_array()
+        .expect("grants")
+        .iter()
+        .map(|g| {
+            (
+                g["destination"].as_str().expect("destination").to_string(),
+                g["base_path"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            ("https://a.example.com".to_string(), Some("/v2".to_string())),
+            ("https://b.example.com".to_string(), None),
+            ("https://c.example.com:8443".to_string(), None),
+        ]
+    );
+    for install in &installs {
+        let id = install["install"]["grant"].as_str().expect("grant");
+        assert_eq!(ended_with(&h, id), "command_ended");
+    }
+
+    // Kept as it was, byte for byte, protection included, through the run
+    // and through edits of its entry.
+    assert_eq!(fields(), before);
+    h.decide(&[Decision::AllowOnce, Decision::AllowOnce]);
+    for edit in [
+        ["edit", "STORED", "--username", "me"],
+        ["edit", "HIDDEN", "--add-tag", "touched"],
+    ] {
+        let out = h.run(&edit);
+        assert!(out.status.success(), "{edit:?}: {}", text(&out.stderr));
+    }
+    assert_eq!(fields(), before);
 }
 
 #[test]
@@ -8242,7 +8894,7 @@ mod import_from {
 /// with the agent itself.
 mod broker_cli {
     use super::*;
-    use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
+    use rusthorse::broker_grant::AutomaticLocks;
     use rusthorse::protocol::{
         EntryFields, EntryInfo, ErrorCode, GrantInfo, PROTOCOL_VERSION, Request, Response,
         StatusInfo, UnauthorizedGrant, recv_frame, send_frame,
@@ -8445,11 +9097,6 @@ mod broker_cli {
             has_notes: false,
             other_fields: vec![],
             modified: None,
-            broker: Some(
-                ProfileRequest::new(Preset::Anthropic)
-                    .resolve()
-                    .expect("profile"),
-            ),
         }
     }
 
@@ -8464,16 +9111,16 @@ mod broker_cli {
             .map(|pair| pair[1].as_str().expect("a value"))
     }
 
-    /// A run with a binding by value, two broker bindings — one with the
-    /// variable of the broker's address — and a `--url` of another entry,
-    /// which still reads that entry's URL.
+    /// A run with a binding by value, two broker bindings, each with its
+    /// destination — one with the variable of the broker's address — and a
+    /// `--url` of another entry, which still reads that entry's URL.
     const MIXED: &[&str] = &[
         "run",
         "DB_PASSWORD=db",
         "--broker",
-        "ANTHROPIC_AUTH_TOKEN=AI/anthropic",
+        "ANTHROPIC_AUTH_TOKEN=AI/anthropic@https://api.anthropic.com",
         "--broker",
-        "OPENAI_API_KEY",
+        "OPENAI_API_KEY@https://api.openai.com/v1",
         "--url",
         "ANTHROPIC_BASE_URL=AI/anthropic",
         "--url",
@@ -8485,17 +9132,14 @@ mod broker_cli {
     fn run_agent(answer: impl Fn() -> Option<Response> + Send + 'static) -> FakeAgent {
         FakeAgent::new(plain_status(), move |request| match request {
             Request::Show { name } if name == "docs" => Some(Response::Entry {
-                entry: EntryInfo {
-                    broker: None,
-                    ..entry(
-                        "11111111-2222-4333-8444-555555555555",
-                        None,
-                        "docs",
-                        Some("https://docs.example.invalid/api"),
-                    )
-                },
+                entry: entry(
+                    "11111111-2222-4333-8444-555555555555",
+                    None,
+                    "docs",
+                    Some("https://docs.example.invalid/api"),
+                ),
             }),
-            Request::Run(_) | Request::BrokerRun(_) => answer(),
+            Request::Run(_) | Request::BrokerRunV2(_) => answer(),
             other => panic!("unexpected {other:?}"),
         })
     }
@@ -8517,19 +9161,34 @@ mod broker_cli {
         // The command's own status, as the agent reports it.
         assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
         let types: Vec<Value> = agent.requests().iter().map(|r| r["type"].clone()).collect();
-        assert_eq!(types, ["status", "show", "broker_run"]);
+        assert_eq!(types, ["status", "show", "broker_run_v2"]);
         let (request, fds) = agent.sent().pop().expect("the run");
         assert_eq!(fds, 0, "with redaction, no descriptor goes with it");
         assert_eq!(
             request["bindings"],
             json!([{"var": "DB_PASSWORD", "entry": "db"}])
         );
+        // Each with its destination as the command line wrote it, and the
+        // default limits: no request limit, 12 hours, `continue`.
         assert_eq!(
             request["brokered"],
             json!([
-                {"var": "ANTHROPIC_AUTH_TOKEN", "entry": "AI/anthropic", "url_var": "ANTHROPIC_BASE_URL"},
-                {"var": "OPENAI_API_KEY", "entry": "OPENAI_API_KEY"},
+                {
+                    "var": "ANTHROPIC_AUTH_TOKEN",
+                    "entry": "AI/anthropic",
+                    "destination": "https://api.anthropic.com",
+                    "url_var": "ANTHROPIC_BASE_URL"
+                },
+                {
+                    "var": "OPENAI_API_KEY",
+                    "entry": "OPENAI_API_KEY",
+                    "destination": "https://api.openai.com/v1"
+                },
             ])
+        );
+        assert_eq!(
+            request["limits"],
+            json!({"automatic_locks": "continue", "max_lifetime_minutes": 720})
         );
         assert_eq!(request["argv"], json!(["sh", "-c", "exit 0"]));
         assert_eq!(request["redact"], true);
@@ -8557,12 +9216,22 @@ mod broker_cli {
             [("--no-redact", false, false, 3), ("--stdin", true, true, 0)]
         {
             let agent = run_agent(|| exited(0));
-            let out = agent.run(&["run", option, "--broker", "T=k", "--", "true"]);
+            let out = agent.run(&[
+                "run",
+                option,
+                "--broker",
+                "T=k@https://x.example",
+                "--",
+                "true",
+            ]);
             assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
             let (request, fds) = agent.only_sent();
-            assert_eq!(request["type"], "broker_run");
+            assert_eq!(request["type"], "broker_run_v2");
             assert_eq!(request["bindings"], json!([]), "through the broker only");
-            assert_eq!(request["brokered"], json!([{"var": "T", "entry": "k"}]));
+            assert_eq!(
+                request["brokered"],
+                json!([{"var": "T", "entry": "k", "destination": "https://x.example"}])
+            );
             assert_eq!(
                 (
                     request["redact"].clone(),
@@ -8573,6 +9242,34 @@ mod broker_cli {
                 "{option}"
             );
         }
+
+        // The run's limits, as its options give them, for every grant.
+        let agent = run_agent(|| exited(0));
+        let out = agent.run(&[
+            "run",
+            "--broker",
+            "A=a@https://a.example",
+            "--broker",
+            "B=b@https://b.example:8443/v2",
+            "--broker-requests",
+            "5",
+            "--broker-lifetime",
+            "30",
+            "--broker-locks",
+            "end",
+            "--",
+            "true",
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+        let (request, _) = agent.only_sent();
+        assert_eq!(
+            request["limits"],
+            json!({"automatic_locks": "end", "max_lifetime_minutes": 30, "max_requests": 5})
+        );
+        assert_eq!(
+            request["brokered"][1]["destination"],
+            "https://b.example:8443/v2"
+        );
 
         // Without --broker, a plain run, as before.
         let agent = run_agent(|| exited(0));
@@ -8596,9 +9293,9 @@ mod broker_cli {
         let cases: Vec<(RunAnswer, i32, &str)> = vec![
             // Refused or failed before the command started: no fallback.
             (
-                Box::new(|| error(ErrorCode::InvalidRequest, "KEY has no broker profile")),
+                Box::new(|| error(ErrorCode::InvalidRequest, "KEY has no value")),
                 125,
-                "KEY has no broker profile",
+                "KEY has no value",
             ),
             (
                 Box::new(|| error(ErrorCode::Internal, "the broker did not start")),
@@ -8634,11 +9331,72 @@ mod broker_cli {
         ];
         for (answer, expected, message) in cases {
             let agent = run_agent(answer);
-            let out = agent.run(&["run", "--broker", "T=k", "--", "true"]);
+            let out = agent.run(&["run", "--broker", "T=k@https://x.example", "--", "true"]);
             let stderr = text(&out.stderr);
             assert_eq!(out.status.code(), Some(expected), "{stderr}");
             assert!(stderr.contains(message), "{stderr}");
-            assert_eq!(agent.only_sent().0["type"], "broker_run");
+            assert_eq!(agent.only_sent().0["type"], "broker_run_v2");
+        }
+    }
+
+    /// How an agent of protocol 8 answers a `broker_run_v2`: a request it
+    /// cannot read (`invalid_request`), in the words of `c06af42`'s agent,
+    /// the position in the frame aside.
+    const REFUSED_BY_PROTOCOL_8: &str = "malformed request: unknown variant `broker_run_v2`, \
+        expected one of `status`, `unlock`, `create_vault`, `lock`, `list`, `show`, `add`, \
+        `import`, `edit`, `remove`, `change_password`, `reveal`, `backup`, `run`, \
+        `keyring_items`, `dotenv_names`, `import_from`, `broker_run`, `broker_edit`, `grants`, \
+        `revoke_grant` at line 1 column 23";
+
+    /// The version check and the run are separate connections: an agent
+    /// restarted between them may be of protocol 8, which knows no
+    /// `broker_run_v2` and refuses it whole (ADR 0013, scope amendment).
+    /// The client says so and exits 125, the run not started; it never
+    /// sends the run again — not as protocol 8's `broker_run`, which would
+    /// ignore its destinations and limits, nor as a plain `run`, nor as
+    /// anything else — with redaction or without, with its input or not.
+    #[test]
+    fn a_broker_run_an_older_agent_refuses_is_never_sent_again_as_another_request() {
+        for (options, descriptors) in [
+            (&[][..], 0),
+            (&["--no-redact"][..], 3),
+            (&["--stdin"][..], 0),
+        ] {
+            // It answers `status` as an agent of this protocol did on the
+            // first connection, and the run as protocol 8 does.
+            let agent = run_agent(|| error(ErrorCode::InvalidRequest, REFUSED_BY_PROTOCOL_8));
+            let mut args = vec!["run"];
+            args.extend(options);
+            args.extend([
+                "DB_PASSWORD=db",
+                "--broker",
+                "K=KEY@https://api.example.com/v1",
+                "--url",
+                "K_URL=KEY",
+                "--url",
+                "DOCS_URL=docs",
+                "--",
+                "true",
+            ]);
+            let out = agent.run(&args);
+            let stderr = text(&out.stderr);
+            assert_eq!(out.status.code(), Some(125), "{options:?}: {stderr}");
+            assert_eq!(
+                stderr,
+                format!("rusthorse: {REFUSED_BY_PROTOCOL_8}\n"),
+                "{options:?}"
+            );
+            assert!(out.stdout.is_empty(), "{options:?}");
+            // A request sent after the client left would still be read.
+            std::thread::sleep(Duration::from_millis(200));
+            let types: Vec<Value> = agent.requests().iter().map(|r| r["type"].clone()).collect();
+            assert_eq!(types, ["status", "show", "broker_run_v2"], "{options:?}");
+            let (request, fds) = agent.sent().pop().expect("the run");
+            assert_eq!(fds, descriptors, "{options:?}");
+            assert_eq!(
+                request["brokered"][0]["destination"],
+                "https://api.example.com/v1"
+            );
         }
     }
 
@@ -8659,10 +9417,10 @@ mod broker_cli {
     #[test]
     fn a_refused_key_is_named_after_the_command_which_keeps_its_status() {
         const NOTE: &str = "rusthorse: note: the command ran, and the broker accepted its \
-                            token, but https://api.anthropic.com answered 401 Unauthorized \
-                            to 2 requests: it did not accept the key stored in AI/k. If that \
-                            key is wrong, revoked, or not of the kind the destination \
-                            expects, replace it: rusthorse edit AI/k --value\n";
+                            token, but the approved origin https://api.anthropic.com answered \
+                            401 Unauthorized to 2 requests: it did not accept the key stored \
+                            in AI/k. If that key is wrong, revoked, or not of the kind the \
+                            destination expects, replace it: rusthorse edit AI/k --value\n";
         for (no_redact, code, signal, expected) in [
             (false, Some(7), None, 7),
             (true, Some(7), None, 7),
@@ -8681,7 +9439,7 @@ mod broker_cli {
             if no_redact {
                 args.push("--no-redact");
             }
-            args.extend(["--broker", "T=AI/k", "--", "true"]);
+            args.extend(["--broker", "T=AI/k@https://api.anthropic.com", "--", "true"]);
             let out = agent.run(&args);
             assert_eq!(out.status.code(), Some(expected), "{}", text(&out.stderr));
             assert_eq!(text(&out.stderr), NOTE);
@@ -8699,7 +9457,13 @@ mod broker_cli {
             })
         });
         let out = agent.run(&[
-            "run", "--broker", "A=AI/k", "--broker", "B=my key", "--", "true",
+            "run",
+            "--broker",
+            "A=AI/k@https://api.anthropic.com",
+            "--broker",
+            "B=my key@https://api.anthropic.com",
+            "--",
+            "true",
         ]);
         assert_eq!(out.status.code(), Some(0));
         let stderr = text(&out.stderr);
@@ -8730,7 +9494,7 @@ mod broker_cli {
         });
         let stderr = text(
             &agent
-                .run(&["run", "--broker", "T=AI/k", "--", "true"])
+                .run(&["run", "--broker", "T=AI/k@https://x.example", "--", "true"])
                 .stderr,
         );
         assert!(
@@ -8738,7 +9502,7 @@ mod broker_cli {
             "{stderr:?}"
         );
         assert!(
-            stderr.contains("but https://api.example\\u{202e}.com answered")
+            stderr.contains("but the approved origin https://api.example\\u{202e}.com answered")
                 && stderr.contains("stored in AI/k\\u{1b}[2J (8d2f6c1e).")
                 && stderr.trim_end().ends_with("replace the entry's value"),
             "{stderr}"
@@ -8752,7 +9516,7 @@ mod broker_cli {
                 unauthorized: vec![refused_grant("T", "AI/k (8d2f6c1e)", 1)],
             })
         });
-        let out = agent.run(&["run", "--broker", "T=AI/k", "--", "true"]);
+        let out = agent.run(&["run", "--broker", "T=AI/k@https://x.example", "--", "true"]);
         assert_eq!(out.status.code(), Some(124));
         let stderr = text(&out.stderr);
         assert!(
@@ -8761,7 +9525,7 @@ mod broker_cli {
         );
         // Nothing reported (or an older agent): nothing said.
         let agent = run_agent(|| exited(3));
-        let out = agent.run(&["run", "--broker", "T=AI/k", "--", "true"]);
+        let out = agent.run(&["run", "--broker", "T=AI/k@https://x.example", "--", "true"]);
         assert_eq!(out.status.code(), Some(3));
         assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     }
@@ -8771,66 +9535,88 @@ mod broker_cli {
         let agent = FakeAgent::new(plain_status(), |request| {
             panic!("nothing should be sent, got {request:?}")
         });
+        // A destination valid for every case but those about it.
+        const K: &str = "K=x@https://x.example";
         for (args, expected, message) in [
             // `run`: did not run.
             (
                 &[
-                    "run", "--broker", "K=x", "--url", "U=x", "--url", "V=x", "--", "true",
+                    "run", "--broker", K, "--url", "U=x", "--url", "V=x", "--", "true",
                 ][..],
                 125,
                 "x already has --url U",
             ),
             (
-                &["run", "--broker", "1K=x", "--", "true"][..],
+                &["run", "--broker", "1K=x@https://x.example", "--", "true"][..],
                 125,
                 "not a valid environment variable name",
             ),
             (
-                &["run", "--broker", "K=", "--", "true"][..],
+                &["run", "--broker", "K=@https://x.example", "--", "true"][..],
                 125,
                 "missing entry name",
             ),
             (
-                &["run", "X=x", "--broker", "K=x", "--", "true"][..],
+                &["run", "X=x", "--broker", K, "--", "true"][..],
                 125,
                 "also given by value",
-            ),
-            (
-                &["run", "--broker", "K=x", "--broker", "L=x", "--", "true"][..],
-                125,
-                "already given to --broker",
-            ),
-            (
-                &["run", "--broker", "LD_PRELOAD=x", "--", "true"][..],
-                125,
-                "cannot carry a token",
-            ),
-            (
-                &["run", "--broker", "NO_PROXY=x", "--", "true"][..],
-                125,
-                "the agent adds 127.0.0.1 to this variable",
             ),
             (
                 &[
                     "run",
                     "--broker",
-                    "K=x",
-                    "--url",
-                    "no_proxy=x",
+                    K,
+                    "--broker",
+                    "L=x@https://x.example",
                     "--",
                     "true",
                 ][..],
                 125,
+                "already given to --broker",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "LD_PRELOAD=x@https://x.example",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "cannot carry a token",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "NO_PROXY=x@https://x.example",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "the agent adds 127.0.0.1 to this variable",
+            ),
+            (
+                &["run", "--broker", K, "--url", "no_proxy=x", "--", "true"][..],
+                125,
                 "it cannot carry the broker's address",
             ),
             (
-                &["run", "K=y", "--broker", "K=x", "--", "true"][..],
+                &["run", "K=y", "--broker", K, "--", "true"][..],
                 125,
                 "already set by another binding",
             ),
             // Two SECRETs in one variable, with --broker or without it.
             (
-                &["run", "K=a", "K=b", "--broker", "T=x", "--", "true"][..],
+                &[
+                    "run",
+                    "K=a",
+                    "K=b",
+                    "--broker",
+                    "T=x@https://x.example",
+                    "--",
+                    "true",
+                ][..],
                 125,
                 "K=b: the variable is already set by another binding",
             ),
@@ -8839,7 +9625,128 @@ mod broker_cli {
                 125,
                 "K=b: the variable is already set by another binding",
             ),
-            // No secret and no --broker: a usage error.
+            // The destination: named, https://, a host name, no user
+            // information, query or fragment, a valid base path; there is no
+            // default (the entry's URL is not one).
+            (
+                &["run", "--broker", "K=x", "--", "true"][..],
+                125,
+                "name the destination",
+            ),
+            (
+                &["run", "--broker", "x", "--", "true"][..],
+                125,
+                "name the destination",
+            ),
+            (
+                &["run", "--broker", "K=x@http://x.example", "--", "true"][..],
+                125,
+                "must start with https://",
+            ),
+            // The URL starts after the last `@`: user information leaves no
+            // URL that starts with https://.
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "K=x@https://user@x.example",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "must start with https://",
+            ),
+            (
+                &["run", "--broker", "K=x@https://x.example?q=1", "--", "true"][..],
+                125,
+                "query or a fragment",
+            ),
+            (
+                &["run", "--broker", "K=x@https://x.example#top", "--", "true"][..],
+                125,
+                "query or a fragment",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "K=x@https://x.example/v1?q=1",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "base path is not valid",
+            ),
+            (
+                &["run", "--broker", "K=x@https://10.0.0.1", "--", "true"][..],
+                125,
+                "not an IP address",
+            ),
+            (
+                &["run", "--broker", "K=x@https://[::1]:8443", "--", "true"][..],
+                125,
+                "not an IP address",
+            ),
+            (
+                &["run", "--broker", "K=x@https://x.example/v1/", "--", "true"][..],
+                125,
+                "base path is not valid",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    "K=x@https://x.example/../v1",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "base path is not valid",
+            ),
+            (
+                &["run", "--broker", "K=x@https://x.example:0", "--", "true"][..],
+                125,
+                "the port must be a number from 1 to 65535",
+            ),
+            // The run's limits.
+            (
+                &["run", "--broker", K, "--broker-lifetime", "0", "--", "true"][..],
+                125,
+                "1 to 1440 minutes, not 0",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    K,
+                    "--broker-lifetime",
+                    "1441",
+                    "--",
+                    "true",
+                ][..],
+                125,
+                "1 to 1440 minutes, not 1441",
+            ),
+            (
+                &["run", "--broker", K, "--broker-requests", "0", "--", "true"][..],
+                125,
+                "1 to 1000000, not 0",
+            ),
+            (
+                &[
+                    "run",
+                    "--broker",
+                    K,
+                    "--broker-locks",
+                    "never",
+                    "--",
+                    "true",
+                ][..],
+                2,
+                "invalid value 'never'",
+            ),
+            // No secret and no --broker: a usage error; limits without
+            // --broker too.
             (
                 &["run", "--", "true"][..],
                 2,
@@ -8850,56 +9757,21 @@ mod broker_cli {
                 2,
                 "a value is required",
             ),
-            // `edit`: the profile's options need --broker, and a profile is
-            // checked as the agent checks it.
             (
-                &["edit", "KEY", "--broker-origin", "https://x.example"][..],
+                &["run", "K=x", "--broker-requests", "5", "--", "true"][..],
                 2,
-                "--broker <PRESET>",
+                "--broker <VAR=ENTRY@URL>",
             ),
+            // `edit` has no profile any more.
             (
-                &["edit", "KEY", "--broker-requests", "5"][..],
+                &["edit", "KEY", "--broker", "anthropic"][..],
                 2,
-                "--broker <PRESET>",
+                "unexpected argument '--broker'",
             ),
             (
-                &["edit", "KEY", "--broker", "gemini"][..],
+                &["edit", "KEY", "--clear", "broker"][..],
                 2,
-                "invalid value 'gemini'",
-            ),
-            (
-                &["edit", "KEY", "--broker", "anthropic", "--clear", "broker"][..],
-                1,
-                "give one of them",
-            ),
-            (
-                &["edit", "KEY", "--broker", "openai-compatible"][..],
-                1,
-                "no default origin",
-            ),
-            (
-                &[
-                    "edit",
-                    "KEY",
-                    "--broker",
-                    "openai",
-                    "--broker-origin",
-                    "https://127.0.0.1",
-                ][..],
-                1,
-                "not an IP address",
-            ),
-            (
-                &[
-                    "edit",
-                    "KEY",
-                    "--broker",
-                    "anthropic",
-                    "--broker-lifetime",
-                    "0",
-                ][..],
-                1,
-                "1 to 1440 minutes",
+                "invalid value 'broker'",
             ),
             // `grants revoke`: exactly one of an ID and --all, and an ID.
             (&["grants", "revoke"][..], 2, "<ID|--all>"),
@@ -8956,7 +9828,7 @@ mod broker_cli {
             agent.run(&[
                 "run",
                 "--broker",
-                "ANTHROPIC_AUTH_TOKEN=AI/anthropic",
+                "ANTHROPIC_AUTH_TOKEN=AI/anthropic@https://api.anthropic.com",
                 "--url",
                 url,
                 "--",
@@ -8986,108 +9858,13 @@ mod broker_cli {
         );
     }
 
-    #[test]
-    fn an_edit_that_touches_the_profile_is_a_broker_edit() {
-        let answers = Arc::new(Mutex::new(VecDeque::new()));
-        let queue = Arc::clone(&answers);
-        let agent = FakeAgent::new(plain_status(), move |request| {
-            assert!(
-                matches!(request, Request::Edit { .. } | Request::BrokerEdit { .. }),
-                "{request:?}"
-            );
-            queue.lock().unwrap().pop_front().expect("an answer")
-        });
-        let edit = |args: &[&str], answer: Option<Response>| {
-            answers.lock().unwrap().push_back(answer);
-            let mut argv = vec!["edit", "KEY"];
-            argv.extend(args);
-            let out = agent.run(&argv);
-            (out, agent.sent().pop().expect("a request").0)
-        };
-
-        // A profile, with only the options given (the agent fills in the
-        // defaults), and another change beside it.
-        let (out, request) = edit(
-            &[
-                "--username",
-                "me",
-                "--broker",
-                "openai-compatible",
-                "--broker-origin",
-                "https://api.deepseek.com",
-                "--broker-requests",
-                "200",
-            ],
-            ok("changed KEY"),
-        );
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert!(text(&out.stderr).contains("changed KEY"));
-        assert_eq!(request["type"], "broker_edit");
-        assert_eq!(request["name"], "KEY");
-        assert_eq!(request["changes"]["username"], "me");
-        assert_eq!(
-            request["changes"]["broker"],
-            json!({"preset": "openai-compatible", "origin": "https://api.deepseek.com", "max_requests": 200})
-        );
-        // Every option.
-        let (out, request) = edit(
-            &[
-                "--broker",
-                "anthropic",
-                "--broker-origin",
-                "https://gateway.example.com:8443",
-                "--broker-base-path",
-                "",
-                "--broker-locks",
-                "end",
-                "--broker-lifetime",
-                "15",
-            ],
-            ok("changed KEY"),
-        );
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert_eq!(
-            request["changes"]["broker"],
-            json!({
-                "preset": "anthropic",
-                "origin": "https://gateway.example.com:8443",
-                "base_path": "",
-                "automatic_locks": "end",
-                "max_lifetime_minutes": 15,
-            })
-        );
-        // Clearing it.
-        let (out, request) = edit(&["--clear", "broker", "--clear", "port"], ok("changed KEY"));
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert_eq!(request["type"], "broker_edit");
-        assert_eq!(request["changes"]["clear"], json!(["broker", "port"]));
-        assert!(request["changes"].get("broker").is_none(), "{request}");
-        // Any other edit is a plain edit, as before.
-        let (out, request) = edit(&["--username", "me", "--clear", "kind"], ok("changed KEY"));
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        assert_eq!(request["type"], "edit");
-        assert!(request["changes"].get("broker").is_none(), "{request}");
-        // Its answers mean what they mean for an edit.
-        for (answer, expected) in [
-            (error(ErrorCode::Denied, "denied"), 4),
-            (error(ErrorCode::Cancelled, "cancelled"), 4),
-            (error(ErrorCode::InvalidRequest, "broker profile: …"), 1),
-            (error(ErrorCode::OutcomeUnknown, "not durable"), 124),
-            (None, 124),
-        ] {
-            let (out, request) = edit(&["--broker", "anthropic"], answer);
-            assert_eq!(out.status.code(), Some(expected), "{}", text(&out.stderr));
-            assert_eq!(request["type"], "broker_edit");
-        }
-    }
-
     fn grant(id: &str) -> GrantInfo {
         GrantInfo {
             id: id.into(),
             entry: "AI/anthropic (8d2f6c1e)".into(),
             var: "ANTHROPIC_AUTH_TOKEN".into(),
             destination: "https://api.anthropic.com".into(),
-            preset: Preset::Anthropic,
+            base_path: None,
             command: "claude".into(),
             requester: "rusthorse[4300] ← bash[4242]".into(),
             state: "active".into(),
@@ -9101,9 +9878,18 @@ mod broker_cli {
         }
     }
 
+    /// `rusthorse grants` lists each grant's approved origin and, apart from
+    /// it, its base path, which is not a limit (ADR 0013, scope amendment).
     #[test]
     fn grants_are_listed_and_revoked_without_approval() {
-        let listed = vec![grant("g0123456789abcdef"), grant("gfedcba9876543210")];
+        let listed = vec![
+            grant("g0123456789abcdef"),
+            GrantInfo {
+                destination: "https://api.openai.com".into(),
+                base_path: Some("/v1".into()),
+                ..grant("gfedcba9876543210")
+            },
+        ];
         let shown = listed.clone();
         let agent = FakeAgent::new(plain_status(), move |request| match request {
             Request::Grants => Some(Response::Grants {
@@ -9125,10 +9911,18 @@ mod broker_cli {
             lines[0].starts_with("ID  ") && lines[0].ends_with("COMMAND"),
             "{table}"
         );
+        assert!(
+            lines[0].contains("  APPROVED ORIGIN  ")
+                && lines[0].contains("  BASE PATH (NOT A LIMIT)  ")
+                && !lines[0].contains("DESTINATION")
+                && !lines[0].contains("PRESET"),
+            "{table}"
+        );
         for cell in [
             "g0123456789abcdef",
             "AI/anthropic (8d2f6c1e)",
-            "https://api.anthropic.com",
+            "https://api.anthropic.com  ",
+            "  none  ",
             "active",
             "2026-11-02T18:00:00-03:00",
             "1h",
@@ -9139,6 +9933,19 @@ mod broker_cli {
             assert!(lines[1].contains(cell), "{cell}: {table}");
         }
         assert!(lines[2].starts_with("gfedcba9876543210"), "{table}");
+        // The origin and the base path in their own columns: the origin
+        // alone, never joined with the base path.
+        let column = |line: &str, header: &str| {
+            let at = lines[0].find(header).expect("a column");
+            line[at..].split("  ").next().expect("a cell").to_string()
+        };
+        assert_eq!(
+            column(lines[2], "APPROVED ORIGIN"),
+            "https://api.openai.com"
+        );
+        assert_eq!(column(lines[2], "BASE PATH (NOT A LIMIT)"), "/v1");
+        assert_eq!(column(lines[1], "BASE PATH (NOT A LIMIT)"), "none");
+        assert!(!table.contains("api.openai.com/v1"), "{table}");
         // The JSON is the agent's list, as it reports it.
         let out = agent.run(&["grants", "--json"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
@@ -9216,7 +10023,7 @@ mod broker_cli {
             Request::RevokeGrant { id: None } => {
                 error(ErrorCode::NotFound, "no \u{1b}]0;title\u{7}grant")
             }
-            Request::BrokerRun(_) => error(ErrorCode::InvalidRequest, "K\u{202e} has no profile"),
+            Request::BrokerRunV2(_) => error(ErrorCode::InvalidRequest, "K\u{202e} has no value"),
             other => panic!("unexpected {other:?}"),
         });
         for (args, status, says) in [
@@ -9231,9 +10038,9 @@ mod broker_cli {
                 "rusthorse: no \\u{1b}]0;title\\u{7}grant",
             ),
             (
-                &["run", "--broker", "T=k", "--", "true"][..],
+                &["run", "--broker", "T=k@https://x.example", "--", "true"][..],
                 125,
-                "rusthorse: K\\u{202e} has no profile",
+                "rusthorse: K\\u{202e} has no value",
             ),
         ] {
             let out = agent.run(args);
@@ -9276,10 +10083,11 @@ mod broker_cli {
         );
         assert_eq!(
             text(&out.stderr),
-            "rusthorse: note: grant gfedcba9876543210: https://api.anthropic.com answered 401 \
-             Unauthorized to 2 requests: it did not accept the key stored in AI/anthropic \
-             (8d2f6c1e). If that key is wrong, revoked, or not of the kind the destination \
-             expects, replace the entry's value (rusthorse edit NAME --value)\n"
+            "rusthorse: note: grant gfedcba9876543210: the approved origin \
+             https://api.anthropic.com answered 401 Unauthorized to 2 requests: it did not \
+             accept the key stored in AI/anthropic (8d2f6c1e). If that key is wrong, revoked, \
+             or not of the kind the destination expects, replace the entry's value (rusthorse \
+             edit NAME --value)\n"
         );
         let out = agent.run(&["grants", "--json"]);
         assert!(out.status.success() && out.stderr.is_empty());
@@ -9326,63 +10134,6 @@ mod broker_cli {
             !shown.contains("broker:") && !shown.contains("grants:"),
             "{shown}"
         );
-    }
-
-    #[test]
-    fn list_and_show_carry_the_broker_profile() {
-        let with_profile = entry(
-            "8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12",
-            Some("AI"),
-            "anthropic",
-            None,
-        );
-        let profile =
-            serde_json::to_value(with_profile.broker.as_ref().expect("a profile")).expect("json");
-        // How the agent reports a stored profile it cannot read.
-        let unusable = EntryInfo {
-            id: "11111111-2222-4333-8444-555555555555".into(),
-            name: "broken".into(),
-            other_fields: vec![rusthorse::vault::FIELD_BROKER.into()],
-            broker: None,
-            ..with_profile.clone()
-        };
-        let listed = vec![with_profile.clone(), unusable.clone()];
-        let agent = FakeAgent::new(plain_status(), move |request| match request {
-            Request::List => Some(Response::Entries {
-                entries: listed.clone(),
-            }),
-            Request::Show { name } if name == "anthropic" => Some(Response::Entry {
-                entry: with_profile.clone(),
-            }),
-            Request::Show { name } if name == "broken" => Some(Response::Entry {
-                entry: unusable.clone(),
-            }),
-            other => panic!("unexpected {other:?}"),
-        });
-        // The JSON carries the profile as the agent reports it.
-        let out = agent.run(&["list", "--json"]);
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        let json: Value = serde_json::from_slice(&out.stdout).expect("json");
-        assert_eq!(json[0]["broker"], profile);
-        assert!(json[1].get("broker").is_none(), "{json}");
-        assert_eq!(json[1]["other_fields"], json!(["Rusthorse.Broker"]));
-        let out = agent.run(&["show", "anthropic", "--json"]);
-        let json: Value = serde_json::from_slice(&out.stdout).expect("json");
-        assert_eq!(json["broker"], profile);
-        // The text says what a grant allows, or why there can be none.
-        let out = agent.run(&["show", "anthropic"]);
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        let shown = text(&out.stdout);
-        assert!(
-            shown.contains(
-                "broker:     anthropic preset, revision 1\n            Destination: \
-                 https://api.anthropic.com\n            Allows: POST /v1/messages, "
-            ),
-            "{shown}"
-        );
-        let shown = text(&agent.run(&["show", "broken"]).stdout);
-        assert!(shown.contains("fields:     Rusthorse.Broker\n"), "{shown}");
-        assert!(shown.contains("broker:     unusable: "), "{shown}");
     }
 
     /// `rusthorse doctor` on `agent`, again while a program written for the
@@ -9522,15 +10273,24 @@ mod broker_cli {
             .outcome("allowed_once")
             .entries(vec!["AI/anthropic (8d2f6c1e)".into()]);
         run.argv = Some(vec!["claude".into()]);
-        run.grants = Some(vec![AuditGrant {
-            id: id.into(),
-            entry: "AI/anthropic (8d2f6c1e)".into(),
-            destination: "https://api.anthropic.com".into(),
-        }]);
+        run.grants = Some(vec![
+            AuditGrant {
+                id: id.into(),
+                entry: "AI/anthropic (8d2f6c1e)".into(),
+                destination: "https://api.anthropic.com".into(),
+                base_path: None,
+            },
+            AuditGrant {
+                id: "gfedcba9876543210".into(),
+                entry: "AI/openai (11111111)".into(),
+                destination: "https://api.openai.com".into(),
+                base_path: Some("/v1".into()),
+            },
+        ]);
         let mut admitted = AuditEvent::new("broker_request", &agent).outcome("admitted");
         admitted.grant = Some(id.into());
         admitted.request = Some(1);
-        admitted.route = Some("POST /v1/messages".into());
+        admitted.method = Some("POST".into());
         let mut finished = AuditEvent::new("broker_request", &agent).outcome("completed");
         finished.grant = Some(id.into());
         finished.request = Some(1);
@@ -9564,9 +10324,11 @@ mod broker_cli {
         assert!(out.status.success(), "{}", text(&out.stderr));
         let shown = text(&out.stdout);
         for part in [
-            " grants: g0123456789abcdef for AI/anthropic (8d2f6c1e) to https://api.anthropic.com; $ claude",
+            " grants: g0123456789abcdef for AI/anthropic (8d2f6c1e) to https://api.anthropic.com, \
+             gfedcba9876543210 for AI/openai (11111111) to https://api.openai.com (base path /v1, \
+             not a limit); $ claude",
             "broker_request admitted",
-            " grant g0123456789abcdef #1 POST /v1/messages  by ",
+            " grant g0123456789abcdef #1 POST  by ",
             " grant g0123456789abcdef #1 status 200 (120 bytes sent, 4096 received)  by ",
             " reason: command_ended requests: 1 admitted (1 finished, 0 unknown), 2 refused",
         ] {
@@ -9590,11 +10352,9 @@ mod broker_cli {
             Request::Grants => Some(Response::Grants { grants: vec![] }),
             _ => ok("done"),
         });
-        let commands: [&[&str]; 8] = [
+        let commands: [&[&str]; 6] = [
             &["edit", "KEY", "--username", "x"],
             &["edit", "KEY", "--group", "Work"],
-            &["edit", "KEY", "--broker", "anthropic"],
-            &["edit", "KEY", "--clear", "broker"],
             &["grants"],
             &["grants", "--json"],
             &["grants", "revoke", "--all"],

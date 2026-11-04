@@ -1,7 +1,10 @@
 //! An admitted request, from the agent's answer to the end of its response
-//! (ADR 0013, steps 5 to 8): the body read whole, the destination reached
-//! over TLS, the request built from what was checked, the response checked
-//! and streamed through the redactor.
+//! (ADR 0013, the steps after the admission): the body read whole, the
+//! approved origin reached over TLS, the request built from what was checked
+//! — the method and the target as the client sent them, its headers with the
+//! key in the token's place, and the broker's own `Host`, `Accept-Encoding`
+//! and `Content-Length` — the response checked and streamed through the
+//! redactor.
 //!
 //! Each request asked for admission runs in a task of its own, which gives
 //! the client its response head over a channel and its body as a stream of
@@ -53,9 +56,9 @@
 //! has written them all; it keeps the bytes until the destination has read
 //! them or the connection is dropped.
 //!
-//! What it holds of the credential is wiped when dropped, except the copy
-//! in the header value that hyper sends, which is an ordinary buffer
-//! (`HeaderValue`, marked sensitive so that it is never printed).
+//! What it holds of the credential is wiped when dropped, except the copies
+//! in the header values that hyper sends, which are ordinary buffers
+//! (`HeaderValue`, marked sensitive so that they are never printed).
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -65,14 +68,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, HOST};
-use http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version,
-};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::rt::TokioIo;
-use rusthorse::broker_profile::MatchedRoute;
 use rusthorse::broker_protocol::{AdmissionRefusal, MAX_RESPONSE_BODY_BYTES, RequestOutcome};
 use rusthorse::protocol::SecretString;
 use rusthorse::redact::Redactor;
@@ -82,8 +81,8 @@ use tokio::time::timeout;
 
 use crate::answer::{Chunk, Refusal, ResponseBody, local};
 use crate::grant::{Answer, Ended, Grant, Reservation};
-use crate::headers;
 use crate::server::Server;
+use crate::{headers, token};
 
 /// Chunks of a relayed body waiting for the client.
 const RELAY_QUEUE: usize = 8;
@@ -99,10 +98,12 @@ pub struct Admission {
     pub answer: oneshot::Receiver<Answer>,
     /// Its method.
     pub method: Method,
-    /// The route it matched, and the target that is sent.
-    pub matched: MatchedRoute,
+    /// Its target, in origin form, sent as it is.
+    pub target: Uri,
     /// The client's headers, all of them.
     pub headers: HeaderMap,
+    /// The headers the broker sets itself (`headers::own`).
+    pub own: HeaderMap,
     /// Its body, not read yet.
     pub body: Incoming,
     /// The body's declared length.
@@ -221,8 +222,9 @@ async fn run(
         request,
         answer,
         method,
-        matched,
+        target,
         headers,
+        own,
         body,
         body_len,
         reservation,
@@ -244,8 +246,9 @@ async fn run(
     };
     let request = Forward {
         method,
-        matched,
+        target,
         headers,
+        own,
         body,
         body_len,
         reservation,
@@ -260,15 +263,16 @@ async fn run(
 /// What an admitted request forwards.
 struct Forward {
     method: Method,
-    matched: MatchedRoute,
+    target: Uri,
     headers: HeaderMap,
+    own: HeaderMap,
     body: Incoming,
     body_len: u64,
     reservation: Reservation,
     sent: Arc<AtomicU64>,
 }
 
-/// Steps 6 to 8.
+/// Steps 5 to 7.
 async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outcome {
     use RequestOutcome::*;
     let grant = &server.grant;
@@ -286,7 +290,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
         return Outcome::new(left(false), None);
     }
 
-    // 6. The body, whole, within its deadline.
+    // 5. The body, whole, within its deadline.
     let body = tokio::select! {
         biased;
         _ = closed.wait_for(|closed| *closed) => return Outcome::new(Revoked, None),
@@ -310,7 +314,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
         return Outcome::new(Revoked, None);
     };
 
-    // 7. The destination: resolved, connected, TLS.
+    // 6. The destination: resolved, connected, TLS.
     let unreachable = |client: &mut Client| {
         client.answer(local(Refusal::Unreachable, false));
         Outcome::new(NotForwarded, Some(502))
@@ -351,9 +355,10 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     let body = OutBody::new(body, request.sent);
     let Some(outgoing) = build_request(
         server,
-        &request.method,
-        &request.matched,
+        request.method,
+        request.target,
         &request.headers,
+        request.own,
         body,
         &credential,
     ) else {
@@ -387,7 +392,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
     // that hyper has not written yet keep its room.
     drop(room);
 
-    // 8. The response: checked before anything is passed on, and nothing of
+    // 7. The response: checked before anything is passed on, and nothing of
     // it once the grant is closed.
     let status = response.status();
     let code = Some(status.as_u16());
@@ -399,8 +404,7 @@ async fn forward(server: &Server, request: Forward, client: &mut Client) -> Outc
         return Outcome::new(Unknown, code);
     }
     let (head, mut body) = response.into_parts();
-    let secrets = [credential.as_bytes(), grant.token().as_bytes()];
-    let relayed = headers::relayed(grant.spec(), &head.headers, &secrets);
+    let relayed = headers::relayed(&head.headers, credential.as_bytes());
     if status == StatusCode::NO_CONTENT {
         // Nothing to stream.
         let mut answer = Response::new(ResponseBody::local(Bytes::new()));
@@ -534,38 +538,29 @@ fn held_body(data: BytesMut, room: Arc<Reservation>) -> Bytes {
     Bytes::from_owner(HeldBody { data, _room: room })
 }
 
-/// The request to the destination, from what was checked: the method, the
-/// target exactly as matched, `Host` the profile's authority, the client's
-/// headers the preset forwards (none carrying the token or the credential),
-/// `Accept-Encoding: identity`, `Content-Length` for a method with a body,
-/// and the credential header the broker builds.
+/// The request to the destination, from what was checked: the method and
+/// the target as the client sent them; the client's headers that the broker
+/// forwards, each exact occurrence of the token in their values replaced
+/// with the key (`token::substitute`); and the broker's `own` headers —
+/// `Host`, the approved origin's authority, `Accept-Encoding: identity`,
+/// and `Content-Length` when the client declared one.
 fn build_request(
     server: &Server,
-    method: &Method,
-    matched: &MatchedRoute,
+    method: Method,
+    target: Uri,
     client: &HeaderMap,
+    own: HeaderMap,
     body: OutBody,
     credential: &SecretString,
 ) -> Option<Request<OutBody>> {
-    let grant = &server.grant;
-    let spec = grant.spec();
-    let secrets = [grant.token().as_bytes(), credential.as_bytes()];
-    let mut headers = headers::forwarded(spec, client, &secrets);
-    headers.insert(
-        HOST,
-        HeaderValue::from_str(grant.profile().authority()).ok()?,
-    );
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if method == Method::POST {
-        headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    let token = server.grant.token().as_bytes();
+    let mut headers = token::substitute(client, token, credential.as_bytes())?;
+    for (name, value) in &own {
+        headers.insert(name.clone(), value.clone());
     }
-    let header = spec.credential_header;
-    let mut value = HeaderValue::from_str(&header.value(credential)).ok()?;
-    value.set_sensitive(true);
-    headers.insert(HeaderName::from_static(header.name()), value);
     let mut outgoing = Request::new(body);
-    *outgoing.method_mut() = method.clone();
-    *outgoing.uri_mut() = Uri::try_from(matched.path_and_query.as_str()).ok()?;
+    *outgoing.method_mut() = method;
+    *outgoing.uri_mut() = target;
     *outgoing.version_mut() = Version::HTTP_11;
     *outgoing.headers_mut() = headers;
     Some(outgoing)
@@ -577,21 +572,15 @@ fn build_request(
 /// room ([`held_body`]).
 pub struct OutBody {
     data: Option<Bytes>,
-    len: u64,
     sent: Arc<AtomicU64>,
 }
 
 impl OutBody {
     fn new(data: Bytes, sent: Arc<AtomicU64>) -> OutBody {
         OutBody {
-            len: data.len() as u64,
             data: Some(data).filter(|data| !data.is_empty()),
             sent,
         }
-    }
-
-    fn len(&self) -> u64 {
-        self.len
     }
 }
 

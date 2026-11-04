@@ -6,22 +6,27 @@
 //! process group, with standard input and output one end of a socket pair
 //! (the control channel) and standard error `/dev/null`. The broker makes
 //! itself non-dumpable and disables core files before it reads anything,
-//! reads the agent's `install` (the grant's ID, token, credential, profile
-//! and limits) with the listening socket the agent bound, checks all of it,
-//! opens the system's file of certificate authorities, and answers `ready`
-//! — or exits with a non-zero status without answering. It then serves the
-//! grant on that socket: HTTP/1.1 requests that present the token, for the
-//! routes of the profile's preset, are forwarded over TLS to the profile's
-//! destination with the credential added, once the agent has admitted each
-//! one ([`rusthorse::broker_protocol`]). It exits as soon as the control
-//! channel ends, without waiting for work in progress.
+//! reads the agent's `install` (the grant's ID, token, credential, approved
+//! origin and limits) with the listening socket the agent bound, checks all
+//! of it, opens the system's file of certificate authorities, and answers
+//! `ready` — or exits with a non-zero status without answering. It then
+//! serves the grant on that socket: HTTP/1.1 requests that present the
+//! token in the value of a header it forwards go, once the agent has
+//! admitted each one ([`rusthorse::broker_protocol`]), over TLS to the
+//! approved origin and nowhere else, with the key in place of the token and
+//! their method, target and other headers as the client sent them. The
+//! broker knows no API: no profile, preset or route (ADR 0013, scope
+//! amendment). It exits as soon as the control channel ends, without
+//! waiting for work in progress.
 //!
 //! The modules, in the order a request meets them: [`setup`] (before
-//! `ready`), [`server`] (connections and steps 1 to 5), [`framing`] (step
-//! 1), [`grant`] (the conversation with the agent and the body budget),
-//! [`exchange`] (steps 6 to 8), [`destination`] (resolving and connecting),
-//! [`headers`] (what crosses, each way), [`answer`] (local answers and
-//! response bodies) and [`control`] (the control channel once ready);
+//! `ready`), [`server`] (connections and steps 1 to 4), [`framing`] (step
+//! 1), [`token`] (step 2: the token, and the key in its place), [`grant`]
+//! (the conversation with the agent and the body budget), [`exchange`]
+//! (the steps after the admission), [`destination`] (resolving and
+//! connecting), [`headers`] (what crosses, each way), [`answer`] (local
+//! answers and response bodies) and [`control`] (the control channel once
+//! ready);
 //! [`config`] holds the deadlines and the hooks of the `test-upstream`
 //! feature, which is for tests only and never in a release: a build
 //! without debug assertions refuses it, `--check` reports it, and a build
@@ -64,6 +69,7 @@ mod grant;
 mod headers;
 mod server;
 mod setup;
+mod token;
 
 /// The control channel ended: the agent is done with the grant.
 pub const EXIT_CHANNEL_ENDED: u8 = 0;

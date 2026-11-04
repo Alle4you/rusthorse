@@ -12,7 +12,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusthorse::broker_profile::BrokerProfile;
 use rusthorse::broker_protocol::MAX_CONCURRENT_RESOLUTIONS;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -126,7 +125,7 @@ impl Resolver {
     }
 }
 
-/// The destination of a grant.
+/// The destination of a grant: the host and port of its approved origin.
 pub struct Destination {
     host: String,
     port: u16,
@@ -138,11 +137,12 @@ pub struct Destination {
 }
 
 impl Destination {
-    /// The destination of `profile`, as `config` says to reach it.
-    pub fn new(profile: &BrokerProfile, config: &Config) -> Destination {
+    /// The destination `host` and `port` (those of the approved origin), as
+    /// `config` says to reach it.
+    pub fn new(host: &str, port: u16, config: &Config) -> Destination {
         Destination {
-            host: profile.host().to_string(),
-            port: profile.port(),
+            host: host.to_string(),
+            port,
             resolver: Resolver::new(MAX_CONCURRENT_RESOLUTIONS),
             allow_loopback: config.allow_loopback,
             addresses: config.addresses.clone(),
@@ -332,11 +332,7 @@ mod tests {
     /// resolver's places hold the lookups back.
     #[tokio::test(flavor = "current_thread")]
     async fn a_destination_runs_at_most_the_allowed_lookups_at_once_even_abandoned_ones() {
-        use rusthorse::broker_profile::{Preset, ProfileRequest};
-        let profile = ProfileRequest::new(Preset::Anthropic)
-            .resolve()
-            .expect("profile");
-        let destination = Arc::new(Destination::new(&profile, &Config::release()));
+        let destination = Arc::new(Destination::new("api.example.com", 443, &Config::release()));
         let running = Arc::new(AtomicUsize::new(0));
         let most = Arc::new(AtomicUsize::new(0));
         let (release, released) = mpsc::channel::<()>();

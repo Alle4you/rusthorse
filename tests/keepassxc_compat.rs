@@ -8,9 +8,8 @@
 use std::path::PathBuf;
 
 use keepass::{Database, DatabaseKey};
-use rusthorse::broker_profile::{Preset, ProfileRequest};
 use rusthorse::protocol::{EntryChanges, EntryFields, NewEntry, SecretString};
-use rusthorse::vault::{FIELD_BROKER, KdfParams, Vault};
+use rusthorse::vault::{KdfParams, Vault};
 
 const FIXTURE: &str = "tests/fixtures/keepassxc-2.7.12-kdbx41.kdbx";
 const PASSWORD: &str = "demopass";
@@ -27,6 +26,23 @@ fn raw(path: &PathBuf) -> Database {
         DatabaseKey::new().with_password(PASSWORD),
     )
     .expect("decrypt")
+}
+
+/// Where phase 1 of the credential broker stored an entry's profile (ADR
+/// 0013). Rusthorse no longer reads it: it is a custom field like any other.
+const PHASE_1_PROFILE: &str = "Rusthorse.Broker";
+
+/// A profile as phase 1 stored it.
+const STORED_PROFILE: &str = r#"{"version":1,"preset":"openai-compatible","revision":1,"origin":"https://api.deepseek.com","base_path":"/v1","automatic_locks":"continue","max_lifetime_minutes":720,"max_requests":200}"#;
+
+/// The field `key` of the entry `id` as a KeePass reader sees it: its text,
+/// and whether it is protected.
+fn field(db: &Database, id: keepass::db::EntryId, key: &str) -> Option<(String, bool)> {
+    db.entry(id)
+        .expect("the entry")
+        .fields
+        .get(key)
+        .map(|value| (value.get().clone(), value.is_protected()))
 }
 
 #[test]
@@ -99,30 +115,92 @@ fn rusthorse_edits_preserve_everything_else_in_a_keepassxc_vault() {
     assert!(reopened.find("ADDED_BY_RUSTHORSE").is_ok());
 }
 
-/// A broker profile (ADR 0013) is one plain custom field that another KDBX
-/// client keeps as it is: set by Rusthorse in a KeePassXC vault, read and
-/// saved again by another client, it is still usable, and nothing else
-/// changed on the way.
+/// A profile stored by phase 1 of the credential broker (ADR 0013, scope
+/// amendment) is an ordinary custom field: in a KeePassXC vault, Rusthorse
+/// lists it by name only and keeps it byte for byte, protected or not,
+/// through its edits of the entry — a rename, a new user name, host, tag and
+/// value — and its save; nothing else changes on the way.
 #[test]
-fn a_broker_profile_survives_a_round_trip_through_a_keepassxc_vault() {
+fn a_phase_1_profile_is_kept_byte_for_byte_through_rusthorses_edits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = copy_fixture(&dir);
+    // Two entries of the KeePassXC vault (outside its recycle bin) get the
+    // field, as phase 1 stored it and as another client may have protected
+    // it.
+    let listed: Vec<String> = Vault::open(&path, SecretString::new(PASSWORD.into()))
+        .expect("open")
+        .list()
+        .into_iter()
+        .map(|info| info.id)
+        .take(2)
+        .collect();
+    assert_eq!(listed.len(), 2, "the fixture has two entries");
+    let mut db = raw(&path);
+    let ids: Vec<keepass::db::EntryId> = listed
+        .iter()
+        .map(|uuid| {
+            db.iter_all_entries()
+                .find(|e| e.id().to_string() == *uuid)
+                .map(|e| e.id())
+                .expect("the entry")
+        })
+        .collect();
+    db.entry_mut(ids[0])
+        .expect("entry")
+        .set_unprotected(PHASE_1_PROFILE, STORED_PROFILE);
+    db.entry_mut(ids[1])
+        .expect("entry")
+        .set_protected(PHASE_1_PROFILE, STORED_PROFILE);
+    let mut file = std::fs::File::create(&path).expect("rewrite");
+    db.save(&mut file, DatabaseKey::new().with_password(PASSWORD))
+        .expect("save as another client");
+    drop(file);
     let before = raw(&path);
+    let stored = [
+        Some((STORED_PROFILE.to_string(), false)),
+        Some((STORED_PROFILE.to_string(), true)),
+    ];
+    for (id, stored) in ids.iter().zip(&stored) {
+        assert_eq!(&field(&before, *id, PHASE_1_PROFILE), stored);
+    }
 
+    // Rusthorse lists it by name, never its value, and changes the entries.
     let mut vault = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("open");
-    let edited = vault.list()[0].id.clone();
-    let id = vault.find(&edited).expect("find by uuid");
-    let request = ProfileRequest {
-        origin: Some("https://api.deepseek.com".into()),
-        max_requests: Some(200),
-        ..ProfileRequest::new(Preset::OpenaiCompatible)
-    };
-    let profile = request.resolve().expect("profile");
+    for id in &ids {
+        let info = vault.info(vault.find(&id.to_string()).expect("find by uuid"));
+        assert!(
+            info.other_fields.iter().any(|f| f == PHASE_1_PROFILE),
+            "{:?}",
+            info.other_fields
+        );
+        assert!(!info.protected_fields.iter().any(|f| f == PHASE_1_PROFILE));
+        let json = serde_json::to_string(&info).expect("json");
+        assert!(
+            !json.contains("deepseek") && !json.contains("preset"),
+            "{json}"
+        );
+    }
+    let first = vault.find(&ids[0].to_string()).expect("find");
     vault
         .edit(
-            id,
+            first,
             &EntryChanges {
-                broker: Some(request),
+                rename: Some("RENAMED_BY_RUSTHORSE".into()),
+                username: Some("me".into()),
+                host: Some("10.9.8.7".into()),
+                add_tags: vec!["rusthorse".into()],
+                ..EntryChanges::default()
+            },
+            Some(&SecretString::new("a-new-fake-value".into())),
+        )
+        .expect("edit");
+    let second = vault.find(&ids[1].to_string()).expect("find");
+    vault
+        .edit(
+            second,
+            &EntryChanges {
+                port: Some(2222),
+                add_tags: vec!["rusthorse".into()],
                 ..EntryChanges::default()
             },
             None,
@@ -130,48 +208,55 @@ fn a_broker_profile_survives_a_round_trip_through_a_keepassxc_vault() {
         .expect("edit");
     vault.save().expect("save");
 
-    // Another client sees one more field, unprotected, holding the stored
-    // form; every other field of the entry, and every other entry, is as
-    // it was.
+    // The field is as it was, byte for byte, its protection included; the
+    // edits took; every other field of the two entries, every other entry
+    // and the database's metadata are as they were.
     let after = raw(&path);
-    let old = before
-        .iter_all_entries()
-        .find(|e| e.id().to_string() == edited)
-        .expect("the edited entry");
-    let new = after.entry(old.id()).expect("entry kept");
-    let field = new.fields.get(FIELD_BROKER).expect("the profile's field");
-    assert!(!field.is_protected());
-    assert_eq!(field.get(), &profile.to_stored());
-    assert_eq!(new.fields.len(), old.fields.len() + 1);
-    for (key, value) in &old.fields {
-        assert_eq!(new.fields.get(key), Some(value), "field {key} changed");
+    for (id, stored) in ids.iter().zip(&stored) {
+        assert_eq!(&field(&after, *id, PHASE_1_PROFILE), stored);
     }
-    assert_eq!(new.tags, old.tags);
+    let edited = after.entry(ids[0]).expect("entry");
+    assert_eq!(edited.get_title(), Some("RENAMED_BY_RUSTHORSE"));
+    assert_eq!(edited.get_username(), Some("me"));
+    assert_eq!(edited.get("Host"), Some("10.9.8.7"));
+    assert_eq!(edited.get_password(), Some("a-new-fake-value"));
+    assert_eq!(
+        after.entry(ids[1]).expect("entry").get("Port"),
+        Some("2222")
+    );
+    let changed: [&[&str]; 2] = [&["Title", "UserName", "Password", "Host"], &["Port"]];
+    for (id, changed) in ids.iter().zip(changed) {
+        let old = before.entry(*id).expect("entry");
+        let new = after.entry(*id).expect("entry");
+        for (key, value) in &old.fields {
+            if !changed.contains(&key.as_str()) {
+                assert_eq!(new.fields.get(key), Some(value), "field {key} changed");
+            }
+        }
+        assert_eq!(
+            new.fields.len(),
+            old.fields.len()
+                + changed
+                    .iter()
+                    .filter(|k| !old.fields.contains_key(**k))
+                    .count()
+        );
+        assert!(new.tags.contains(&"rusthorse".to_string()));
+    }
     for entry in before.iter_all_entries() {
-        if entry.id() != old.id() {
+        if !ids.contains(&entry.id()) {
             let other = after.entry(entry.id()).expect("entry kept");
             assert_eq!(*entry, *other, "an untouched entry changed: {}", entry.id());
         }
     }
     assert_eq!(after.meta, before.meta, "database metadata changed");
-
-    // Saved again by that client, the profile is still usable.
-    let mut file = std::fs::File::create(&path).expect("rewrite");
-    after
-        .save(&mut file, DatabaseKey::new().with_password(PASSWORD))
-        .expect("save as another client");
-    drop(file);
-    let reopened = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("reopen");
-    let info = reopened.info(reopened.find(&edited).expect("find"));
-    assert_eq!(info.broker, Some(profile));
-    assert!(!info.other_fields.iter().any(|f| f == FIELD_BROKER));
-    assert!(!info.protected_fields.iter().any(|f| f == FIELD_BROKER));
 }
 
-/// A broker profile survives KeePassXC itself saving the file (ADR 0013): a
-/// vault written through the library, with a profile on one entry, in
-/// which `keepassxc-cli` changes another entry and saves the file, reads
-/// back with the profile's field intact and unprotected, and still usable.
+/// A profile stored by phase 1 survives Rusthorse and KeePassXC itself
+/// saving the file (ADR 0013, scope amendment): in a vault written through
+/// the library, with the field on one entry, Rusthorse edits that entry and
+/// then `keepassxc-cli` another, each saving the file; the field reads back
+/// byte for byte, unprotected, and Rusthorse lists it by name only.
 ///
 /// It needs `keepassxc-cli`, so it is ignored by default: run `cargo test
 /// --test keepassxc_compat -- --ignored` where it is installed. The program
@@ -179,7 +264,7 @@ fn a_broker_profile_survives_a_round_trip_through_a_keepassxc_vault() {
 /// the test's own directory and the (fake) password on its standard input.
 #[test]
 #[ignore = "needs keepassxc-cli: run with --ignored where it is installed"]
-fn a_broker_profile_survives_keepassxc_cli_saving_the_vault() {
+fn a_phase_1_profile_survives_rusthorse_and_keepassxc_cli_saving_the_vault() {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let dir = tempfile::tempdir().expect("tempdir");
@@ -199,26 +284,48 @@ fn a_broker_profile_survives_keepassxc_cli_saving_the_vault() {
         let value = SecretString::new(format!("sk-ant-test-0000FAKE0000{name}-0000"));
         vault.add(&entry, &value, false).expect("add");
     }
-    let request = ProfileRequest {
-        origin: Some("https://api.deepseek.com".into()),
-        max_requests: Some(200),
-        ..ProfileRequest::new(Preset::OpenaiCompatible)
-    };
-    let profile = request.resolve().expect("profile");
-    let key = vault.find("KEY").expect("find");
-    vault
-        .edit(
-            key,
-            &EntryChanges {
-                broker: Some(request),
-                ..EntryChanges::default()
-            },
-            None,
-        )
-        .expect("set the profile");
     vault.save().expect("save");
     drop(vault);
+    let open = || {
+        Database::open(
+            &mut std::fs::File::open(&path).expect("open"),
+            DatabaseKey::new().with_password(password),
+        )
+        .expect("decrypt")
+    };
+    let by_title = |db: &Database, title: &str| {
+        db.iter_all_entries()
+            .find(|e| e.get_title() == Some(title))
+            .map(|e| e.id())
+            .unwrap_or_else(|| panic!("no entry {title}"))
+    };
+    // The field, as phase 1 stored it.
+    let mut db = open();
+    let key = by_title(&db, "KEY");
+    db.entry_mut(key)
+        .expect("entry")
+        .set_unprotected(PHASE_1_PROFILE, STORED_PROFILE);
+    let mut file = std::fs::File::create(&path).expect("rewrite");
+    db.save(&mut file, DatabaseKey::new().with_password(password))
+        .expect("save");
+    drop(file);
+    let stored = Some((STORED_PROFILE.to_string(), false));
 
+    // Rusthorse changes that entry and saves the file.
+    let mut vault = Vault::open(&path, SecretString::new(password.into())).expect("open");
+    let id = vault.find("KEY").expect("find");
+    assert_eq!(vault.info(id).other_fields, [PHASE_1_PROFILE]);
+    let changes = EntryChanges {
+        username: Some("changed-by-rusthorse".into()),
+        add_tags: vec!["rusthorse".into()],
+        ..EntryChanges::default()
+    };
+    vault.edit(id, &changes, None).expect("edit");
+    vault.save().expect("save");
+    drop(vault);
+    assert_eq!(field(&open(), key, PHASE_1_PROFILE), stored);
+
+    // KeePassXC changes the other entry and saves the file.
     let home = dir.path().join("home");
     std::fs::create_dir(&home).expect("a home for keepassxc-cli");
     let mut child = Command::new("keepassxc-cli")
@@ -252,31 +359,28 @@ fn a_broker_profile_survives_keepassxc_cli_saving_the_vault() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Read by another reader: KeePassXC changed the other entry and kept
-    // the profile's field as it was, unprotected.
-    let db = Database::open(
-        &mut std::fs::File::open(&path).expect("open"),
-        DatabaseKey::new().with_password(password),
-    )
-    .expect("decrypt");
-    let by_title = |title: &str| {
-        db.iter_all_entries()
-            .find(|e| e.get_title() == Some(title))
-            .unwrap_or_else(|| panic!("no entry {title}"))
-    };
+    // Read by another reader: both changes are there, and the field is as
+    // it was, unprotected.
+    let db = open();
+    let other = by_title(&db, "OTHER");
     assert_eq!(
-        by_title("OTHER").get_username(),
+        db.entry(other).expect("entry").get_username(),
         Some("changed-by-keepassxc")
     );
-    let key = by_title("KEY");
-    let field = key.fields.get(FIELD_BROKER).expect("the profile's field");
-    assert!(!field.is_protected(), "KeePassXC protected the profile");
-    assert_eq!(field.get(), &profile.to_stored());
-    // And Rusthorse reads it as the usable profile it was.
-    let reopened = Vault::open(&path, SecretString::new(password.into())).expect("reopen");
-    let info = reopened.info(reopened.find("KEY").expect("find"));
-    assert_eq!(info.broker, Some(profile));
-    assert!(!info.protected_fields.iter().any(|f| f == FIELD_BROKER));
+    assert_eq!(
+        db.entry(key).expect("entry").get_username(),
+        Some("changed-by-rusthorse")
+    );
+    assert_eq!(field(&db, key, PHASE_1_PROFILE), stored);
+    // And Rusthorse still lists it by name only.
+    let vault = Vault::open(&path, SecretString::new(password.into())).expect("reopen");
+    let info = vault.info(vault.find("KEY").expect("find"));
+    assert_eq!(info.other_fields, [PHASE_1_PROFILE]);
+    assert!(
+        info.protected_fields.is_empty(),
+        "{:?}",
+        info.protected_fields
+    );
 }
 
 #[test]

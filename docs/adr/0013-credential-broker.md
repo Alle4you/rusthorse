@@ -1,8 +1,9 @@
 # 0013. A credential broker: approved programs get a grant, not the secret
 
 - Status: Proposed
-- Implementation: phase 1 implemented and reviewed ready, unreleased; the
-  broker without profiles or presets planned; the other phases dropped
+- Implementation: phase 1 implemented and reviewed ready, unreleased, then
+  replaced by the broker without profiles or presets, implemented on
+  2026-11-04, unreleased, under review; the other phases dropped
   ([scope amendment](#scope-amendment-2026-11-04))
 - Date: 2026-11-02
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).
@@ -673,7 +674,7 @@ admission (its own refusals, not the agent's). The normal broker sends
 `revoked` after every admission answer and every admitted request's
 `finished`. The agent tolerates an early acknowledgement and finishes
 outstanding admitted requests as unknown rather than hanging; see
-[the control-channel contract](../protocol.md#agentbroker-control-channel-broker-protocol-1).
+[the control-channel contract](../protocol.md#agentbroker-control-channel-broker-protocol-2).
 The credential and the token are kept in zeroizing buffers and never printed.
 Nothing else crosses: no vault, no master password, no requester environment.
 

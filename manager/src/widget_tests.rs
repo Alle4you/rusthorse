@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use rusthorse::agent::{Agent, AgentConfig};
-use rusthorse::broker_profile::{AutomaticLocks, Preset};
+use rusthorse::broker_grant::AutomaticLocks;
 use rusthorse::protocol::{ErrorCode, PROTOCOL_VERSION};
 use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
@@ -611,24 +611,31 @@ fn desktop_flow() {
     s.search.set_text("");
     s.populate_rows();
     s.rows.select_row(s.rows.row_at_index(0).as_ref());
-    // An API key's details call the URL its endpoint, and the command gets
-    // the endpoint too.
+    // An API key's details call the URL its endpoint; the command that
+    // gives the value takes nothing from it (ADR 0013).
     assert!(descendants(&s.detail).iter().any(|w| {
         w.clone()
             .downcast::<gtk::Label>()
             .is_ok_and(|l| l.text() == "Endpoint URL")
     }));
-    button(&s.detail, "Copy command snippet").emit_clicked();
+    named(&s.detail, "copy-value-command").emit_clicked();
     let copied = glib::MainContext::default()
         .block_on(s.window.clipboard().read_text_future())
         .unwrap()
         .unwrap();
-    assert!(copied.contains(&id));
-    assert!(
-        copied.contains(&format!("--url FAKE_DESKTOP_BASE_URL={id}")),
-        "{copied}"
+    assert_eq!(
+        copied.as_str(),
+        format!("rusthorse run FAKE_DESKTOP_KEY={id} -- your-command")
     );
-    // Drawn on three lines, as copied: no escaped line breaks.
+    // The template through the broker: drawn on four lines, as copied — no
+    // escaped line breaks.
+    named(&s.detail, "copy-broker-command").emit_clicked();
+    let copied = glib::MainContext::default()
+        .block_on(s.window.clipboard().read_text_future())
+        .unwrap()
+        .unwrap();
+    assert_eq!(copied.lines().count(), 4, "{copied}");
+    assert!(copied.contains(&id) && !copied.contains("example.invalid"));
     assert!(descendants(&s.detail).iter().any(|w| {
         w.clone()
             .downcast::<gtk::Label>()
@@ -1402,8 +1409,8 @@ fn import_windows() {
         !shown(&picker).contains("fake-a-value"),
         "a value in the window"
     );
-    // Replacing says what it takes from the entry it replaces (vault.rs
-    // writes a replaced entry without its broker profile).
+    // Replacing says what it ends (the agent ends a replaced entry's
+    // grants; vault.rs keeps its other fields).
     let replace = descendants(&picker)
         .into_iter()
         .find_map(|w| w.downcast::<adw::SwitchRow>().ok())
@@ -1411,7 +1418,7 @@ fn import_windows() {
     assert_eq!(replace.title(), "Replace entries that already exist");
     assert_eq!(
         replace.subtitle().as_deref(),
-        Some("Replacing an entry removes its broker profile, which ends its grants.")
+        Some("Replacing an entry ends its grants of the credential broker, if it has any.")
     );
     drop(replace);
     // Names from the attribute "nome"; only the segredo items, ticked.
@@ -1821,8 +1828,8 @@ fn grants_page() {
     first.command = "sh -c '<b>fake</b>'\u{202e}gpj.exe\nrm -rf fake".into();
     first.requester = "bash ← fake\u{200b}agent".into();
     let mut second = crate::model::tests::grant("gfedcba9876543210", "exhausted");
-    second.preset = Preset::Openai;
-    second.destination = "https://api.openai.com/v1".into();
+    second.destination = "https://api.openai.com".into();
+    second.base_path = Some("/v1".into());
     second.max_requests = Some(3);
     second.in_flight = 0;
     second.automatic_locks = AutomaticLocks::End;
@@ -1911,7 +1918,8 @@ fn grants_page() {
     let shown = texts(&s.grants_list);
     for expected in [
         "AI/ANTHROPIC_API_KEY (11111111)",
-        "https://api.anthropic.com (Anthropic)",
+        "Approved origin",
+        "https://api.anthropic.com",
         "sh -c '<b>fake</b>'\\u{202e}gpj.exe\\u{a}rm -rf fake",
         "Requested by (unverified)",
         "bash ← fake\\u{200b}agent",
@@ -1924,7 +1932,10 @@ fn grants_page() {
         "No",
         "Do not end it: it keeps working while the screen or the vault is locked",
         "g0123456789abcdef",
-        "https://api.openai.com/v1 (OpenAI)",
+        // The base path apart from the approved origin.
+        "https://api.openai.com",
+        "Base path",
+        "/v1 (not a limit)",
         "3 of 3; 0 in flight",
         "End it: the screen locking, suspend and the idle timeout",
     ] {
@@ -1945,7 +1956,20 @@ fn grants_page() {
         .into_iter()
         .filter_map(|w| w.downcast::<adw::PreferencesRow>().ok())
         .collect();
-    assert_eq!(rows.len(), 24, "twelve rows a grant");
+    assert_eq!(
+        rows.len(),
+        25,
+        "twelve rows a grant, and one for the second's base path"
+    );
+    // Nothing shown names a preset, a profile or a route.
+    assert!(
+        shown
+            .iter()
+            .all(|t| !["Destination", "Preset", "Profile", "route"]
+                .iter()
+                .any(|word| t.contains(word))),
+        "{shown:#?}"
+    );
     assert!(rows.iter().all(|row| {
         descendants(row)
             .into_iter()
@@ -2715,12 +2739,15 @@ fn grants_say_when_their_destination_refused_the_key() {
     s.window.close();
 }
 
-/// An entry's broker profile in its details — read-only, or why it cannot
-/// be used — and the command snippet that uses it, with a fake agent that
-/// lists entries as the vault reports them.
+/// An entry's two commands in its details, each labelled with what the
+/// command gets: its value, or a token through the broker in a template to
+/// fill in. Nothing comes from the entry's kind, its URL or a profile stored
+/// by phase 1, which is listed by name like any other field; nothing about
+/// profiles, presets or routes is left in the window. Driven by a fake
+/// agent that lists entries as the vault reports them.
 #[test]
-fn broker_profiles() {
-    if !on_xvfb("broker_profiles") {
+fn command_templates() {
+    if !on_xvfb("command_templates") {
         return;
     }
     adw::init().expect("GTK only on Xvfb");
@@ -2736,41 +2763,28 @@ fn broker_profiles() {
         e.protected_fields.clear();
         e
     };
-    let mut usable = entry(
+    // An API key with an endpoint, and the profile phase 1 stored for it.
+    let mut key = entry(
         "10000000-0000-4000-8000-000000000001",
-        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
         EntryKind::ApiKey,
     );
-    usable.broker = Some(crate::model::tests::usable(Preset::Anthropic));
-    let mut unusable = entry(
+    key.fields.url = Some("https://api.openai.com/v1".into());
+    key.other_fields = vec!["Rusthorse.Broker".into()];
+    // A website login with a URL, and no field of phase 1.
+    let mut login = entry(
         "10000000-0000-4000-8000-000000000002",
-        "OLD_KEY",
-        EntryKind::ApiKey,
+        "WEB_LOGIN",
+        EntryKind::Login,
     );
-    unusable.other_fields = vec!["Rusthorse.Broker".into()];
-    let mut protected = entry(
-        "10000000-0000-4000-8000-000000000003",
-        "SEALED_KEY",
-        EntryKind::ApiKey,
-    );
-    protected.protected_fields = vec!["Rusthorse.Broker".into()];
-    let absent = entry(
-        "10000000-0000-4000-8000-000000000004",
-        "PLAIN_KEY",
-        EntryKind::ApiKey,
-    );
+    login.fields.url = Some("https://example.invalid/login".into());
+    // A name that is no variable name.
     let device = entry(
-        "10000000-0000-4000-8000-000000000005",
+        "10000000-0000-4000-8000-000000000003",
         "core-router",
         EntryKind::Device,
     );
-    state.lock().unwrap().entries = vec![
-        usable.clone(),
-        unusable.clone(),
-        protected.clone(),
-        absent.clone(),
-        device.clone(),
-    ];
+    state.lock().unwrap().entries = vec![key.clone(), login.clone(), device.clone()];
     fake_agent(&socket, &state);
     let app = adw::Application::builder()
         .flags(gio::ApplicationFlags::NON_UNIQUE)
@@ -2780,7 +2794,7 @@ fn broker_profiles() {
     s.window.present();
     s.refresh();
     settle(&s);
-    assert_eq!(s.entries.borrow().len(), 5);
+    assert_eq!(s.entries.borrow().len(), 3);
     let select = |e: &EntryInfo| {
         let row = (0..)
             .map_while(|i| s.rows.row_at_index(i))
@@ -2795,138 +2809,140 @@ fn broker_profiles() {
             .filter_map(|w| w.downcast::<adw::PreferencesGroup>().ok())
             .collect::<Vec<_>>()
     };
-    let broker = |s: &Manager| {
+    let group_named = |s: &Manager, name: &str| {
         groups(s)
             .into_iter()
-            .find(|g| g.widget_name() == "credential-broker")
+            .find(|g| g.widget_name() == name)
+            .unwrap_or_else(|| panic!("no group {name}"))
     };
-    let usage = |s: &Manager| {
-        groups(s)
-            .into_iter()
-            .find(|g| g.title() == "Use it from a command")
-            .and_then(|g| g.description())
-            .map(|d| d.to_string())
-            .expect("the usage")
-    };
-    let snippet_shown = |s: &Manager| {
-        descendants(&s.detail)
+    // The command a group shows: its one monospace label.
+    let shown_command = |g: &adw::PreferencesGroup| {
+        let codes: Vec<String> = descendants(g)
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Label>().ok())
-            .find(|l| l.has_css_class("monospace"))
+            .filter(|l| l.has_css_class("monospace"))
             .map(|l| l.text().to_string())
-            .expect("the snippet")
+            .collect();
+        assert_eq!(codes.len(), 1, "{codes:#?}");
+        codes[0].clone()
     };
-
-    // Usable: the profile as approval dialogs show it, read-only.
-    select(&usable);
-    let g = broker(&s).expect("the profile");
-    assert_eq!(g.title(), "Credential broker");
-    let shown = texts(&g);
-    for (key, value) in crate::model::profile_facts(usable.broker.as_ref().unwrap()) {
-        assert!(
-            shown.contains(&key) && shown.contains(&value),
-            "{key}: {value} is not in {shown:#?}"
-        );
-    }
-    assert!(shown.contains(&"Anthropic (anthropic), revision 1".to_string()));
-    assert!(
-        g.description()
+    let copy = |name: &str| {
+        named(&s.detail, &format!("copy-{name}")).emit_clicked();
+        glib::MainContext::default()
+            .block_on(s.window.clipboard().read_text_future())
             .unwrap()
-            .contains("rusthorse edit ENTRY --broker PRESET")
+            .unwrap()
+            .to_string()
+    };
+    // The detail's value for `key`: the text that follows it.
+    let detail = |s: &Manager, key: &str| {
+        let shown = texts(&s.detail);
+        let at = shown.iter().position(|t| t == key)?;
+        shown.get(at + 1).cloned()
+    };
+    let without_id = |command: String, e: &EntryInfo| command.replace(&e.id, "UUID");
+
+    for e in [&key, &login, &device] {
+        select(e);
+        let titles: Vec<String> = groups(&s).iter().map(|g| g.title().to_string()).collect();
+        assert_eq!(
+            titles[titles.len() - 2..],
+            [
+                "Give the value to a command",
+                "Give a token to a command, through the broker"
+            ],
+            "{titles:#?}"
+        );
+        // Each group shows its command, and copies it as shown.
+        let value = group_named(&s, "value-command");
+        let broker = group_named(&s, "broker-command");
+        let by_value = crate::model::value_command(e);
+        let template = crate::model::broker_command(e);
+        assert_eq!(shown_command(&value), by_value);
+        assert_eq!(shown_command(&broker), template);
+        assert_eq!(copy("value-command"), by_value);
+        assert_eq!(s.message.text(), "Command copied. It contains no secret.");
+        assert_eq!(copy("broker-command"), template);
+        assert!(s.message.text().starts_with("Command template copied."));
+        // The labels say what each gives, and that the broker's
+        // destination is the one the dialog asks the human to approve.
+        let said = |g: &adw::PreferencesGroup| g.description().unwrap().to_string();
+        assert!(said(&value).contains("the command gets the entry's value"));
+        for text in [
+            "A template to fill in",
+            "Until the destination is filled in, the command is refused.",
+            "the command gets a temporary token in TOKEN_VAR, never the value",
+            "only in requests to the destination's origin — its scheme, host and port, which the agent's dialog shows you to approve — at any path there",
+            "it is not a limit",
+        ] {
+            assert!(said(&broker).contains(text), "{text}: {}", said(&broker));
+        }
+        // Nothing taken from the entry but its name and UUID: never its
+        // URL, and the template through the broker is the same for every
+        // entry.
+        assert!(!by_value.contains("--url"));
+        if let Some(url) = &e.fields.url {
+            assert!(!by_value.contains(url.as_str()) && !template.contains(url.as_str()));
+        }
+        assert_eq!(
+            without_id(template, e),
+            without_id(crate::model::broker_command(&key), &key)
+        );
+        // Any change ends the entry's grants: the Edit form says so for
+        // every entry.
+        s.edit(s.current());
+        let editor = s.editor.borrow().as_ref().unwrap().clone();
+        assert!(texts(&editor).iter().any(|t| t
+            == "Any change to this entry ends its grants of the credential broker, if it has any."));
+        button(&editor, "Cancel").emit_clicked();
+        spin_until(|| !editor.is_visible());
+    }
+    // The variable is named after the entry when it can be.
+    select(&key);
+    assert_eq!(
+        crate::model::value_command(&key),
+        format!("rusthorse run OPENAI_API_KEY={} -- your-command", key.id)
     );
-    assert!(
-        descendants(&g).iter().all(|w| {
-            !w.is::<gtk::Button>() && !w.is::<gtk::Editable>() && !w.is::<gtk::Switch>()
-        })
+    // Phase 1's profile is a field like any other, listed by name only.
+    assert_eq!(
+        detail(&s, "Other fields (names only)").as_deref(),
+        Some("Rusthorse.Broker")
     );
-    // A screenshot of the profile, for reviewers: the details scrolled down.
+    // A screenshot of the two commands, for reviewers: the details
+    // scrolled down.
     spin_until(|| s.window.width() > 0);
-    let settle_frame = Instant::now() + Duration::from_millis(200);
-    spin_until(|| Instant::now() >= settle_frame);
     let scroll = s
         .detail
         .ancestor(gtk::ScrolledWindow::static_type())
         .and_downcast::<gtk::ScrolledWindow>()
         .expect("the details scroll");
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
     scroll.vadjustment().set_value(scroll.vadjustment().upper());
     let settle_frame = Instant::now() + Duration::from_millis(200);
     spin_until(|| Instant::now() >= settle_frame);
-    snapshot(&s, "details-broker.png");
-    // Its command goes through the broker, the token in the variable the
-    // Anthropic libraries take their key from, and copies as shown.
-    let expected = crate::model::snippet(&usable);
-    assert!(
-        expected.starts_with(&format!(
-            "rusthorse run \\\n  --broker ANTHROPIC_API_KEY={} \\\n  \
-             --url ANTHROPIC_BASE_URL={} ",
-            usable.id, usable.id
-        )),
-        "{expected}"
-    );
-    assert_eq!(snippet_shown(&s), expected);
-    assert!(usage(&s).contains("temporary token"), "{}", usage(&s));
-    // What would compete with the token is named, and Claude Code is sent
-    // to its own recipe.
-    assert!(
-        usage(&s).ends_with(crate::model::broker_snippet_note(Preset::Anthropic).unwrap()),
-        "{}",
-        usage(&s)
-    );
-    button(&s.detail, "Copy command snippet").emit_clicked();
-    let copied = glib::MainContext::default()
-        .block_on(s.window.clipboard().read_text_future())
-        .unwrap()
-        .unwrap();
-    assert_eq!(copied.as_str(), expected);
-    // The Edit form says that a change ends the entry's grants.
-    s.edit(s.current());
-    let editor = s.editor.borrow().as_ref().unwrap().clone();
-    assert!(
-        texts(&editor)
-            .iter()
-            .any(|t| t.starts_with("Any change to this entry ends its grants"))
-    );
-    button(&editor, "Cancel").emit_clicked();
-    spin_until(|| !editor.is_visible());
-    drop(editor);
-
-    // Unusable or protected: said so, with how to fix it; the command
-    // gives the value, and says why.
-    for (e, said) in [(&unusable, "Unusable: "), (&protected, "Withheld: ")] {
-        select(e);
-        let g = broker(&s).expect("the profile's state");
-        let shown = texts(&g);
-        assert!(shown.iter().any(|t| t.starts_with(said)), "{shown:#?}");
-        assert!(g.description().unwrap().contains("--clear broker"));
-        assert_eq!(snippet_shown(&s), crate::model::snippet(e));
-        assert!(!snippet_shown(&s).contains("--broker"));
-        assert!(
-            usage(&s).starts_with("The entry's broker profile cannot be used"),
-            "{}",
-            usage(&s)
-        );
-        s.edit(s.current());
-        let editor = s.editor.borrow().as_ref().unwrap().clone();
-        assert!(
-            !texts(&editor)
-                .iter()
-                .any(|t| t.starts_with("Any change to this entry ends its grants"))
-        );
-        button(&editor, "Cancel").emit_clicked();
-        spin_until(|| !editor.is_visible());
-    }
-    // No profile: an API key is told how to give it one; other entries
-    // say nothing about it.
-    select(&absent);
-    let shown = texts(&broker(&s).expect("how to give it one"));
-    assert!(
-        shown
-            .iter()
-            .any(|t| t == "None: commands get the value itself.")
-    );
-    assert!(!snippet_shown(&s).contains("--broker"));
-    assert!(!usage(&s).contains("broker"));
+    snapshot(&s, "details-commands.png");
     select(&device);
-    assert!(broker(&s).is_none());
+    assert_eq!(
+        crate::model::value_command(&device),
+        format!("rusthorse run SECRET={} -- your-command", device.id)
+    );
+    // No page, help text or detail of the window speaks of profiles,
+    // presets or routes any more (as words: `core-router` is a name).
+    let stale_words = [
+        "profile", "profiles", "preset", "presets", "route", "routes",
+    ];
+    for page in ["entries", "grants", "status", "help"] {
+        show_page(&s, page);
+        let stale: Vec<String> = texts(&s.window)
+            .into_iter()
+            .filter(|t| {
+                t.to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|word| stale_words.contains(&word))
+            })
+            .collect();
+        assert!(stale.is_empty(), "{page}: {stale:#?}");
+    }
     s.window.close();
 }

@@ -2,13 +2,12 @@
 
 use std::time::Duration;
 
-use rusthorse::broker_profile::{AutomaticLocks, BrokerProfile, Preset};
+use rusthorse::broker_grant::AutomaticLocks;
 use rusthorse::generate::Spec;
 use rusthorse::protocol::{
     EntryChanges, EntryFields, EntryInfo, EntryKind, Field, GrantInfo, NewEntry, Request,
     ValueChange,
 };
-use rusthorse::vault::FIELD_BROKER;
 
 #[derive(Clone, Default)]
 pub(crate) struct Form {
@@ -296,117 +295,58 @@ pub(crate) fn matches(entry: &EntryInfo, query: &str, group: Option<&str>) -> bo
             .any(|s| s.to_lowercase().contains(&query))
 }
 
-/// The command that gives an entry to a program. The entry is named by its
-/// UUID, which no rename or duplicate title can make ambiguous.
-///
-/// An entry with a usable broker profile (ADR 0013) is given through the
-/// credential broker: the command gets a temporary token and the broker's
-/// address, in the variables its preset's clients read
-/// ([`broker_variables`]), never the value. Any other entry is given by
-/// value, in a variable named after the entry when that is a valid variable
-/// name; for an API key with an endpoint, the command also gets the
-/// endpoint in a variable of its own ([`url_variable`]): it is not a secret.
-pub(crate) fn snippet(entry: &EntryInfo) -> String {
-    let quote = rusthorse::util::shell_quote;
-    // One option per line, joined by the shell's line continuation, so that
-    // it reads well and still pastes as one command.
-    if let Some(profile) = &entry.broker {
-        let (token, url) = broker_variables(profile.preset);
-        let token = quote(&format!("{token}={}", entry.id));
-        let url = quote(&format!("{url}={}", entry.id));
-        return format!(
-            "rusthorse run \\\n  --broker {token} \\\n  --url {url} \\\n  -- your-command"
-        );
-    }
+/// The variable of [`value_command`] for an entry whose name is not a valid
+/// variable name.
+pub(crate) const VALUE_VARIABLE_PLACEHOLDER: &str = "SECRET";
+
+/// The variable of [`broker_command`] that gets the token: the user names
+/// it after what the program reads.
+pub(crate) const TOKEN_VARIABLE_PLACEHOLDER: &str = "TOKEN_VAR";
+
+/// The variable of [`broker_command`] that gets the broker's address: the
+/// user names it after what the program reads.
+pub(crate) const BASE_URL_VARIABLE_PLACEHOLDER: &str = "BASE_URL_VAR";
+
+/// The destination of [`broker_command`], for the user to fill in. As it
+/// stands it is no destination — a host name is in lowercase — so the
+/// template is refused until it is filled in.
+pub(crate) const DESTINATION_PLACEHOLDER: &str = "https://HOST/BASE_PATH";
+
+/// The command that gives an entry's value to a program (`rusthorse run`):
+/// the value goes into a variable named after the entry when that is a
+/// valid variable name, [`VALUE_VARIABLE_PLACEHOLDER`] otherwise. The entry
+/// is named by its UUID, which no rename or duplicate title can make
+/// ambiguous. Nothing else is taken from the entry — not its kind, its URL
+/// or any other field.
+pub(crate) fn value_command(entry: &EntryInfo) -> String {
     let var = if is_variable_name(&entry.name) {
         entry.name.as_str()
     } else {
-        "SECRET"
+        VALUE_VARIABLE_PLACEHOLDER
     };
-    let secret = quote(&format!("{var}={}", entry.id));
-    if entry.fields.kind == Some(EntryKind::ApiKey) && entry.fields.url.is_some() {
-        let url = quote(&format!("{}={}", url_variable(var), entry.id));
-        format!("rusthorse run {secret} \\\n  --url {url} \\\n  -- your-command")
-    } else {
-        format!("rusthorse run {secret} -- your-command")
-    }
+    let secret = rusthorse::util::shell_quote(&format!("{var}={}", entry.id));
+    format!("rusthorse run {secret} -- your-command")
 }
 
-/// The variables that get the token and the broker's address in a command
-/// given an entry through the broker: those its preset's libraries read, as
-/// the recipes of `rusthorse guide ai` bind them. The Anthropic libraries
-/// take their key from `ANTHROPIC_API_KEY`, so the token goes there and
-/// `run` replaces whatever key that variable held in the environment (the
-/// `anthropic` preset takes the token as `x-api-key` or as `Authorization:
-/// Bearer`, however a library sends it); they read `ANTHROPIC_BASE_URL`. A
-/// library that also sends `ANTHROPIC_AUTH_TOKEN`, when the environment
-/// sets it, presents something other than the token and is refused, which
-/// the note says ([`broker_snippet_note`]), with Claude Code's own recipe.
-/// The OpenAI libraries read `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
-pub(crate) fn broker_variables(preset: Preset) -> (&'static str, &'static str) {
-    match preset {
-        Preset::Anthropic => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
-        Preset::Openai | Preset::OpenaiCompatible => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-    }
-}
-
-/// What the explanation of a command through the broker adds for a
-/// preset, if anything. For `anthropic`: the command suits the Anthropic
-/// libraries, which must not find another credential in
-/// `ANTHROPIC_AUTH_TOKEN`; and Claude Code, which reads the token from
-/// `ANTHROPIC_AUTH_TOKEN` and must not find a key in `ANTHROPIC_API_KEY`,
-/// has a recipe of its own in `rusthorse guide ai`.
-pub(crate) fn broker_snippet_note(preset: Preset) -> Option<&'static str> {
-    match preset {
-        Preset::Anthropic => Some(
-            "This command suits the Anthropic libraries. Unset ANTHROPIC_AUTH_TOKEN if your environment sets it: a library that sends it as well presents something other than the token, and the broker refuses the request. Claude Code has a recipe of its own in rusthorse guide ai: the token in ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_API_KEY unset.",
-        ),
-        Preset::Openai | Preset::OpenaiCompatible => None,
-    }
-}
-
-/// An entry's broker profile (ADR 0013) as the agent reports it: a usable
-/// one in [`EntryInfo::broker`], a protected one among the protected
-/// fields, one this Rusthorse cannot read among the other fields.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Profile<'a> {
-    /// Commands can get a grant for the entry.
-    Usable(&'a BrokerProfile),
-    /// The file marks the profile as protected: it is withheld like a
-    /// secret, and cannot be used.
-    Protected,
-    /// The stored profile cannot be read, so it cannot be used.
-    Unusable,
-    /// The entry has no profile.
-    Absent,
-}
-
-/// What the agent reports about `entry`'s broker profile.
-pub(crate) fn profile(entry: &EntryInfo) -> Profile<'_> {
-    let named = |fields: &[String]| fields.iter().any(|f| f == FIELD_BROKER);
-    match &entry.broker {
-        Some(profile) => Profile::Usable(profile),
-        None if named(&entry.protected_fields) => Profile::Protected,
-        None if named(&entry.other_fields) => Profile::Unusable,
-        None => Profile::Absent,
-    }
-}
-
-/// The rows an entry's details show for a usable profile: its preset and
-/// the revision of it the human approved, then what approval dialogs show
-/// ([`BrokerProfile::describe`]).
-pub(crate) fn profile_facts(profile: &BrokerProfile) -> Vec<(String, String)> {
-    let mut facts = vec![(
-        "Preset".to_string(),
-        format!(
-            "{} ({}), revision {}",
-            profile.preset.label(),
-            profile.preset,
-            profile.revision
-        ),
-    )];
-    facts.extend(profile.describe());
-    facts
+/// The template of a command that uses an entry through the credential
+/// broker (`rusthorse run --broker`, ADR 0013): the command gets a token
+/// for a grant, never the value, and the broker's address. The destination,
+/// the token's variable and the base URL's variable are placeholders for
+/// the user to fill in ([`DESTINATION_PLACEHOLDER`],
+/// [`TOKEN_VARIABLE_PLACEHOLDER`], [`BASE_URL_VARIABLE_PLACEHOLDER`]):
+/// nothing is inferred from the entry's kind, its URL or a profile stored by
+/// phase 1, and nothing is stored with the entry. The same for every entry
+/// but its UUID, which names it as in [`value_command`].
+pub(crate) fn broker_command(entry: &EntryInfo) -> String {
+    let quote = rusthorse::util::shell_quote;
+    let token = quote(&format!(
+        "{TOKEN_VARIABLE_PLACEHOLDER}={}@{DESTINATION_PLACEHOLDER}",
+        entry.id
+    ));
+    let url = quote(&format!("{BASE_URL_VARIABLE_PLACEHOLDER}={}", entry.id));
+    // One option per line, joined by the shell's line continuation, so that
+    // it reads well and still pastes as one command.
+    format!("rusthorse run \\\n  --broker {token} \\\n  --url {url} \\\n  -- your-command")
 }
 
 /// The label of the fact that says whether a grant's destination answered
@@ -450,67 +390,87 @@ impl GrantRow {
             Some(limit) => format!("{} of {limit}", grant.requests),
             None => format!("{} (no limit)", grant.requests),
         };
+        // The approval covers the whole origin; a base path only sets up the
+        // program's base URL, so it is shown apart, as the dialog shows it.
+        let mut facts = vec![
+            ("Entry", grant.entry.clone()),
+            (APPROVED_ORIGIN, grant.destination.clone()),
+        ];
+        if let Some(base_path) = grant.base_path.as_deref().filter(|p| !p.is_empty()) {
+            facts.push((BASE_PATH, base_path_text(base_path)));
+        }
+        facts.extend([
+            ("Command", grant.command.clone()),
+            // Process names, which any program chooses: labelled as the
+            // agent's dialogs label them.
+            ("Requested by (unverified)", grant.requester.clone()),
+            ("Token variable", grant.var.clone()),
+            (
+                "State",
+                if gone {
+                    "Ended: the agent no longer lists it".to_string()
+                } else {
+                    grant_state(&grant.state)
+                },
+            ),
+            ("Started", grant.started.clone()),
+            (
+                "Ends",
+                if revoked || gone {
+                    "It has ended.".to_string()
+                } else {
+                    ends_in(grant.ends_in_secs)
+                },
+            ),
+            (
+                "Requests",
+                if gone {
+                    format!("{used} when last listed")
+                } else {
+                    format!("{used}; {} in flight", grant.in_flight)
+                },
+            ),
+            // Always there, whatever the count: the page then sets its
+            // text in place.
+            (
+                KEY_REFUSED,
+                key_refused_text(grant.unauthorized, revoked || gone, gone),
+            ),
+            (
+                "Automatic locks",
+                match grant.automatic_locks {
+                    AutomaticLocks::End => {
+                        "End it: the screen locking, suspend and the idle timeout".to_string()
+                    }
+                    AutomaticLocks::Continue => {
+                        "Do not end it: it keeps working while the screen or the vault is locked"
+                            .to_string()
+                    }
+                },
+            ),
+            ("ID", grant.id.clone()),
+        ]);
         Self {
             id: grant.id.clone(),
             revocable: !revoked && !gone,
             key_refused: grant.unauthorized.is_some_and(|n| n > 0),
-            facts: vec![
-                ("Entry", grant.entry.clone()),
-                (
-                    "Destination",
-                    format!("{} ({})", grant.destination, grant.preset.label()),
-                ),
-                ("Command", grant.command.clone()),
-                // Process names, which any program chooses: labelled as the
-                // agent's dialogs label them.
-                ("Requested by (unverified)", grant.requester.clone()),
-                ("Token variable", grant.var.clone()),
-                (
-                    "State",
-                    if gone {
-                        "Ended: the agent no longer lists it".to_string()
-                    } else {
-                        grant_state(&grant.state)
-                    },
-                ),
-                ("Started", grant.started.clone()),
-                (
-                    "Ends",
-                    if revoked || gone {
-                        "It has ended.".to_string()
-                    } else {
-                        ends_in(grant.ends_in_secs)
-                    },
-                ),
-                (
-                    "Requests",
-                    if gone {
-                        format!("{used} when last listed")
-                    } else {
-                        format!("{used}; {} in flight", grant.in_flight)
-                    },
-                ),
-                // Always there, whatever the count: the page then sets its
-                // text in place.
-                (
-                    KEY_REFUSED,
-                    key_refused_text(grant.unauthorized, revoked || gone, gone),
-                ),
-                (
-                    "Automatic locks",
-                    match grant.automatic_locks {
-                        AutomaticLocks::End => {
-                            "End it: the screen locking, suspend and the idle timeout".to_string()
-                        }
-                        AutomaticLocks::Continue => {
-                            "Do not end it: it keeps working while the screen or the vault is locked".to_string()
-                        }
-                    },
-                ),
-                ("ID", grant.id.clone()),
-            ],
+            facts,
         }
     }
+}
+
+/// The label of a grant's destination: the origin the human approved,
+/// where the broker may send the key at any path.
+pub(crate) const APPROVED_ORIGIN: &str = "Approved origin";
+
+/// The label of a grant's base path, shown apart from its origin.
+pub(crate) const BASE_PATH: &str = "Base path";
+
+/// What a grant's [`BASE_PATH`] fact says: the path, and that it is not a
+/// limit — it only sets up the program's base URL, and the approval does not
+/// stop at it. Said as the approval dialog says it.
+fn base_path_text(base_path: &str) -> String {
+    format!("{base_path} (not a limit)")
 }
 
 /// What a grant's [`KEY_REFUSED`] fact says: how many of its requests the
@@ -570,20 +530,6 @@ fn ends_in(secs: u64) -> String {
     }
 }
 
-/// The variable that gets an API key's endpoint: `OPENAI_API_KEY` →
-/// `OPENAI_BASE_URL` (what the OpenAI and Anthropic libraries read),
-/// `GITHUB_TOKEN` → `GITHUB_BASE_URL`, anything else → `NAME_URL`.
-pub(crate) fn url_variable(var: &str) -> String {
-    for suffix in ["_API_KEY", "_API_TOKEN", "_TOKEN", "_KEY"] {
-        if let Some(stem) = var.strip_suffix(suffix)
-            && !stem.is_empty()
-        {
-            return format!("{stem}_BASE_URL");
-        }
-    }
-    format!("{var}_URL")
-}
-
 fn is_variable_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -627,7 +573,6 @@ pub(crate) mod tests {
             has_notes: true,
             other_fields: vec![],
             modified: None,
-            broker: None,
         }
     }
 
@@ -966,232 +911,163 @@ pub(crate) mod tests {
         assert!(shows(api, Host, false, true));
     }
 
-    #[test]
-    fn an_api_key_snippet_also_passes_the_endpoint() {
-        let mut entry = entry();
-        entry.name = "OPENAI_API_KEY".into();
-        entry.fields.kind = Some(EntryKind::ApiKey);
-        // No endpoint (here the URL is withheld): nothing to pass.
-        assert!(!snippet(&entry).contains("--url"));
-        entry.fields.url = Some("https://api.example.invalid/v1".into());
-        assert_eq!(
-            snippet(&entry),
-            "rusthorse run OPENAI_API_KEY=11111111-2222-3333-4444-555555555555 \\\n  \
-             --url OPENAI_BASE_URL=11111111-2222-3333-4444-555555555555 \\\n  \
-             -- your-command"
-        );
-        // The shell reads the three lines as one command with these words.
-        let script = snippet(&entry).replacen("rusthorse run", "printf '%s\\n'", 1);
+    /// The words a shell makes of `command`, with `rusthorse run` replaced
+    /// by `printf`, which prints each on a line of its own.
+    fn shell_words(command: &str) -> Vec<String> {
+        let script = command.replacen("rusthorse run", "printf '%s\\n'", 1);
         let words = std::process::Command::new("sh")
             .args(["-c", &script])
             .output()
             .expect("sh");
-        assert!(words.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&words.stdout),
-            "OPENAI_API_KEY=11111111-2222-3333-4444-555555555555\n--url\n\
-             OPENAI_BASE_URL=11111111-2222-3333-4444-555555555555\n--\nyour-command\n"
-        );
-        // Other kinds keep the plain snippet.
-        entry.fields.kind = Some(EntryKind::Login);
-        assert!(!snippet(&entry).contains("--url"));
-        for (var, url) in [
-            ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-            ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
-            ("GITHUB_TOKEN", "GITHUB_BASE_URL"),
-            ("STRIPE_KEY", "STRIPE_BASE_URL"),
-            ("SECRET", "SECRET_URL"),
-            ("_KEY", "_KEY_URL"),
-        ] {
-            assert_eq!(url_variable(var), url);
-        }
+        assert!(words.status.success(), "{command}");
+        String::from_utf8(words.stdout)
+            .expect("text")
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
-    /// A usable broker profile of `preset`, with the defaults of its latest
-    /// revision.
-    pub fn usable(preset: Preset) -> BrokerProfile {
-        let mut request = rusthorse::broker_profile::ProfileRequest::new(preset);
-        if preset == Preset::OpenaiCompatible {
-            request.origin = Some("https://api.deepseek.example".into());
+    /// The characters of `command` that redirect or expand (`<`, `>`, `$`
+    /// and backticks) where a shell reads them outside single quotes; a
+    /// character escaped by a backslash is left out, as the shell reads it
+    /// literally.
+    fn unquoted_specials(command: &str) -> Vec<char> {
+        let mut found = Vec::new();
+        let mut quoted = false;
+        let mut chars = command.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => quoted = !quoted,
+                _ if quoted => {}
+                '\\' => {
+                    chars.next();
+                }
+                '<' | '>' | '$' | '`' => found.push(c),
+                _ => {}
+            }
         }
-        request.resolve().expect("a valid profile")
+        assert!(!quoted, "a quote is left open in {command}");
+        found
     }
 
     #[test]
-    fn an_entry_with_a_usable_profile_is_given_through_the_broker() {
-        let mut entry = entry();
-        entry.name = "ANTHROPIC_API_KEY".into();
-        entry.fields.kind = Some(EntryKind::ApiKey);
-        entry.fields.url = Some("https://api.anthropic.com".into());
-        entry.broker = Some(usable(Preset::Anthropic));
-        // The token in the variable the Anthropic libraries take their key
-        // from: `run` replaces any key the environment holds there.
+    fn the_broker_command_is_a_template_to_fill_in() {
+        use rusthorse::broker_grant::Destination;
+        let entry = entry();
+        let id = entry.id.as_str();
+        let template = broker_command(&entry);
         assert_eq!(
-            snippet(&entry),
-            "rusthorse run \\\n  \
-             --broker ANTHROPIC_API_KEY=11111111-2222-3333-4444-555555555555 \\\n  \
-             --url ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555 \\\n  \
-             -- your-command"
-        );
-        // The shell reads the four lines as one command with these words.
-        let script = snippet(&entry).replacen("rusthorse run", "printf '%s\\n'", 1);
-        let words = std::process::Command::new("sh")
-            .args(["-c", &script])
-            .output()
-            .expect("sh");
-        assert!(words.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&words.stdout),
-            "--broker\nANTHROPIC_API_KEY=11111111-2222-3333-4444-555555555555\n--url\n\
-             ANTHROPIC_BASE_URL=11111111-2222-3333-4444-555555555555\n--\nyour-command\n"
-        );
-        // The variables are those the preset's clients read, whatever the
-        // entry is called, and whatever its kind.
-        for (preset, token, url) in [
-            (Preset::Openai, "OPENAI_API_KEY", "OPENAI_BASE_URL"),
-            (
-                Preset::OpenaiCompatible,
-                "OPENAI_API_KEY",
-                "OPENAI_BASE_URL",
-            ),
-        ] {
-            entry.name = "with space".into();
-            entry.fields.kind = None;
-            entry.broker = Some(usable(preset));
-            let text = snippet(&entry);
-            assert!(
-                text.starts_with(&format!(
-                    "rusthorse run \\\n  --broker {token}={} ",
-                    entry.id
-                )),
-                "{text}"
-            );
-            assert!(
-                text.contains(&format!("--url {url}={} ", entry.id)),
-                "{text}"
-            );
-        }
-        // The entry's UUID is quoted for the shell like any other.
-        entry.id = "a'$(echo fake)".into();
-        let text = snippet(&entry);
-        assert!(
-            text.contains("--broker 'OPENAI_API_KEY=a'\\''$(echo fake)'"),
-            "{text}"
-        );
-        assert!(
-            text.contains("--url 'OPENAI_BASE_URL=a'\\''$(echo fake)'"),
-            "{text}"
-        );
-    }
-
-    /// `rusthorse guide ai`, the guide for AI agents, whose recipes the
-    /// commands through the broker and their note follow.
-    const AI_GUIDE: &str = include_str!("../../src/guide/ai.md");
-
-    #[test]
-    fn commands_through_the_broker_follow_the_guide_for_ai_agents() {
-        // The guide's commands for the libraries bind the same variables.
-        let (token, url) = broker_variables(Preset::Anthropic);
-        assert!(
-            AI_GUIDE.contains(&format!(
-                "--broker {token}=anthropic --url {url}=anthropic -- python app.py"
-            )),
-            "{token}, {url}"
-        );
-        let (token, url) = broker_variables(Preset::Openai);
-        assert!(
-            AI_GUIDE.contains(&format!(
-                "--broker {token} --url {url}={token} -- python app.py"
-            )),
-            "{token}, {url}"
-        );
-        assert_eq!(
-            broker_variables(Preset::OpenaiCompatible),
-            broker_variables(Preset::Openai)
-        );
-        // The note says what would compete with the token in the
-        // libraries' command, and that Claude Code's is the guide's own: where,
-        // and how it differs, as the guide does.
-        let note = broker_snippet_note(Preset::Anthropic).expect("a note for Anthropic");
-        for said in [
-            "Unset ANTHROPIC_AUTH_TOKEN if your environment sets it",
-            "the broker refuses the request",
-            "rusthorse guide ai",
-            "the token in ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_API_KEY unset",
-        ] {
-            assert!(note.contains(said), "{said}: {note}");
-        }
-        assert!(AI_GUIDE.contains("### Claude Code through the broker"));
-        assert!(AI_GUIDE.contains(
-            "env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \\\n  \
-             --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude"
-        ));
-        assert_eq!(broker_snippet_note(Preset::Openai), None);
-        assert_eq!(broker_snippet_note(Preset::OpenaiCompatible), None);
-    }
-
-    #[test]
-    fn an_entry_without_a_usable_profile_keeps_the_snippet_by_value() {
-        let mut entry = entry();
-        entry.name = "OPENAI_API_KEY".into();
-        let by_value = "rusthorse run OPENAI_API_KEY=11111111-2222-3333-4444-555555555555 \
-                        -- your-command";
-        assert_eq!(profile(&entry), Profile::Absent);
-        assert_eq!(snippet(&entry), by_value);
-        // Protected, or unreadable: the agent cannot use it either.
-        entry.protected_fields.push(FIELD_BROKER.into());
-        assert_eq!(profile(&entry), Profile::Protected);
-        assert_eq!(snippet(&entry), by_value);
-        entry.protected_fields.retain(|f| f != FIELD_BROKER);
-        entry.other_fields.push(FIELD_BROKER.into());
-        assert_eq!(profile(&entry), Profile::Unusable);
-        assert_eq!(snippet(&entry), by_value);
-        // Fields of other names say nothing about the profile.
-        entry.other_fields = vec!["Rusthorse.Other".into(), "Broker".into()];
-        entry.protected_fields = vec!["rusthorse.broker".into()];
-        assert_eq!(profile(&entry), Profile::Absent);
-        // The agent reports a usable one in `broker`.
-        let anthropic = usable(Preset::Anthropic);
-        entry.broker = Some(anthropic.clone());
-        assert_eq!(profile(&entry), Profile::Usable(&anthropic));
-        assert!(snippet(&entry).starts_with("rusthorse run \\\n  --broker "));
-    }
-
-    #[test]
-    fn the_details_describe_the_whole_profile() {
-        let anthropic = usable(Preset::Anthropic);
-        let facts = profile_facts(&anthropic);
-        assert_eq!(
-            facts[0],
-            (
-                "Preset".to_string(),
-                "Anthropic (anthropic), revision 1".to_string()
+            template,
+            format!(
+                "rusthorse run \\\n  \
+                 --broker TOKEN_VAR={id}@https://HOST/BASE_PATH \\\n  \
+                 --url BASE_URL_VAR={id} \\\n  \
+                 -- your-command"
             )
         );
-        // Then exactly what an approval dialog shows.
-        assert_eq!(facts[1..], anthropic.describe()[..]);
-        let labels: Vec<&str> = facts.iter().map(|(label, _)| label.as_str()).collect();
+        // The shell reads the four lines as one command with these words.
+        let words = shell_words(&template);
         assert_eq!(
-            labels,
-            ["Preset", "Destination", "Allows", "Ends", "Requests"]
+            words,
+            [
+                "--broker".to_string(),
+                format!("TOKEN_VAR={id}@https://HOST/BASE_PATH"),
+                "--url".into(),
+                format!("BASE_URL_VAR={id}"),
+                "--".into(),
+                "your-command".into(),
+            ]
         );
-        let compatible = profile_facts(&usable(Preset::OpenaiCompatible));
+        // Read as `rusthorse run` reads a binding — the variable ends at the
+        // first `=`, the URL starts after the last `@` — it names the entry
+        // by its UUID, and a destination that is none: left unfilled, the
+        // command is refused.
+        let (var, rest) = words[1].split_once('=').expect("a variable");
+        let (named, url) = rest.rsplit_once('@').expect("a destination");
         assert_eq!(
-            compatible[0].1,
-            "OpenAI-compatible (openai-compatible), revision 1"
+            (var, named, url),
+            (TOKEN_VARIABLE_PLACEHOLDER, id, DESTINATION_PLACEHOLDER)
         );
-        assert_eq!(compatible[1].1, "https://api.deepseek.example/v1");
+        assert!(Destination::parse(url).is_err(), "{url}");
+        // Only the placeholder makes it so: with a host, the same shape is
+        // a destination, with or without the base path.
+        let host = url.replace("HOST", "api.example.com");
+        for filled in [host.as_str(), "https://api.example.com"] {
+            assert_eq!(
+                Destination::parse(filled).map(|d| d.origin),
+                Ok("https://api.example.com".to_string()),
+                "{filled}"
+            );
+        }
+        // No redirection or expansion outside single quotes.
+        assert!(unquoted_specials(&template).is_empty(), "{template}");
+        // A UUID of another form is quoted for the shell like any other
+        // word, and named as it is.
+        let mut odd = entry.clone();
+        odd.id = "a'$(echo fake)`echo fake`<fake>@x".into();
+        let template = broker_command(&odd);
+        assert!(unquoted_specials(&template).is_empty(), "{template}");
+        let words = shell_words(&template);
+        assert_eq!(
+            words[1],
+            format!("TOKEN_VAR={}@https://HOST/BASE_PATH", odd.id)
+        );
+        assert_eq!(words[3], format!("BASE_URL_VAR={}", odd.id));
+        // Its `@` does not move the destination, which starts after the
+        // last one.
+        let (_, rest) = words[1].split_once('=').expect("a variable");
+        assert_eq!(
+            rest.rsplit_once('@').expect("a destination"),
+            (odd.id.as_str(), DESTINATION_PLACEHOLDER)
+        );
     }
 
-    /// A grant as a current agent of protocol 8 lists it: its destination
-    /// answered none of its requests with `401 Unauthorized`.
+    #[test]
+    fn nothing_is_inferred_from_the_kind_the_url_or_a_phase_1_profile() {
+        let mut entry = entry();
+        entry.name = "OPENAI_API_KEY".into();
+        entry.protected_fields.clear();
+        let by_value = value_command(&entry);
+        let through_broker = broker_command(&entry);
+        assert_eq!(
+            by_value,
+            "rusthorse run OPENAI_API_KEY=11111111-2222-3333-4444-555555555555 -- your-command"
+        );
+        // A profile stored by phase 1 is a custom field like any other,
+        // which the agent lists by name among the other fields. Listed among
+        // the protected fields instead, it changes nothing either.
+        let phase_1 = || vec!["Rusthorse.Broker".to_string()];
+        for kind in KIND_CHOICES {
+            for url in [None, Some("https://api.openai.com/v1")] {
+                for (other, protected) in
+                    [(vec![], vec![]), (phase_1(), vec![]), (vec![], phase_1())]
+                {
+                    let mut e = entry.clone();
+                    e.fields.kind = kind;
+                    e.fields.url = url.map(str::to_string);
+                    e.other_fields = other;
+                    e.protected_fields = protected;
+                    assert_eq!(value_command(&e), by_value, "{kind:?} {url:?}");
+                    assert_eq!(broker_command(&e), through_broker, "{kind:?} {url:?}");
+                }
+            }
+        }
+        // The template through the broker does not take the entry's name
+        // either: the user names the variables.
+        entry.name = "with space".into();
+        assert_eq!(broker_command(&entry), through_broker);
+    }
+
+    /// A grant as a current agent of protocol 9 lists it: an approved
+    /// origin without a base path, and no request its destination answered
+    /// with `401 Unauthorized`.
     pub fn grant(id: &str, state: &str) -> GrantInfo {
         GrantInfo {
             id: id.into(),
             entry: "AI/ANTHROPIC_API_KEY (11111111)".into(),
             var: "ANTHROPIC_AUTH_TOKEN".into(),
             destination: "https://api.anthropic.com".into(),
-            preset: Preset::Anthropic,
+            base_path: None,
             command: "claude --print hello".into(),
             requester: "bash ← claude".into(),
             state: state.into(),
@@ -1216,7 +1092,7 @@ pub(crate) mod tests {
             facts,
             [
                 ("Entry", "AI/ANTHROPIC_API_KEY (11111111)"),
-                ("Destination", "https://api.anthropic.com (Anthropic)"),
+                ("Approved origin", "https://api.anthropic.com"),
                 ("Command", "claude --print hello"),
                 ("Requested by (unverified)", "bash ← claude"),
                 ("Token variable", "ANTHROPIC_AUTH_TOKEN"),
@@ -1367,6 +1243,7 @@ pub(crate) mod tests {
     fn a_grant_no_longer_listed_is_shown_as_ended_in_the_same_rows() {
         let mut listed = grant("g0123456789abcdef", "active");
         listed.max_requests = Some(10);
+        listed.base_path = Some("/v1".into());
         let keys = |row: &GrantRow| row.facts.iter().map(|(k, _)| *k).collect::<Vec<_>>();
         let fact = |row: &GrantRow, key: &str| {
             row.facts
@@ -1388,42 +1265,100 @@ pub(crate) mod tests {
             // Its counts are those last listed; nothing is said of requests
             // in flight, which the agent no longer reports.
             assert_eq!(fact(&ended, "Requests"), "3 of 10 when last listed");
-            for key in ["Entry", "Destination", "Command", "Started", "ID"] {
+            for key in [
+                "Entry",
+                "Approved origin",
+                "Base path",
+                "Command",
+                "Started",
+                "ID",
+            ] {
                 assert_eq!(fact(&ended, key), fact(&now, key), "{key}");
             }
         }
     }
 
     #[test]
-    fn editing_an_entry_with_a_profile_never_touches_the_profile() {
-        let mut entry = entry();
-        entry.broker = Some(usable(Preset::Anthropic));
-        let mut form = Form::from_entry(&entry);
-        form.name = "RENAMED".into();
-        form.tags = String::new();
-        let sent = changes(&form, &entry).expect("edit");
-        // A plain edit: one that sets or clears a profile is a broker_edit,
-        // which this app never sends.
-        assert!(!sent.touches_broker());
-        assert!(sent.broker.is_none() && !sent.clear.contains(&Field::Broker));
+    fn a_grant_shows_its_base_path_apart_from_its_approved_origin() {
+        use rusthorse::broker_grant::{Destination, GrantLimits, describe};
+        let keys = |row: &GrantRow| row.facts.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let mut listed = grant("g0123456789abcdef", "active");
+        listed.destination = "https://api.openai.com".into();
+        listed.base_path = Some("/v1".into());
+        let row = GrantRow::new(&listed);
+        let shown: Vec<(String, String)> = row.facts[1..3]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "Approved origin".to_string(),
+                    "https://api.openai.com".into()
+                ),
+                ("Base path".into(), "/v1 (not a limit)".into()),
+            ]
+        );
+        // Labelled and said as the approval dialog says them.
+        let destination = Destination::parse("https://api.openai.com/v1").expect("valid");
+        assert_eq!(
+            shown[..],
+            describe(&destination, &GrantLimits::default())[..2]
+        );
+        // The rest follows as for any grant, and an ended grant keeps it.
+        let mut without = keys(&row);
+        without.remove(2);
+        listed.base_path = None;
+        assert_eq!(without, keys(&GrantRow::new(&listed)));
+        listed.base_path = Some("/v1".into());
+        assert_eq!(keys(&GrantRow::ended(&listed)), keys(&row));
+        // An empty one, which an agent leaves out, is no base path.
+        listed.base_path = Some(String::new());
+        assert!(!keys(&GrantRow::new(&listed)).contains(&"Base path"));
     }
 
     #[test]
-    fn command_snippet_never_uses_the_title_as_shell_code() {
+    fn an_entry_with_a_phase_1_profile_is_edited_like_any_other() {
+        // Phase 1's profile is a custom field, which the agent lists by name
+        // only and an edit leaves as it is: the edit names no such field.
+        let mut entry = entry();
+        entry.other_fields = vec!["Rusthorse.Broker".into()];
+        let mut form = Form::from_entry(&entry);
+        form.name = "RENAMED".into();
+        form.tags = String::new();
+        let sent = form.request(Some(&entry), ValueMode::Keep).expect("edit");
+        let json = serde_json::to_string(&sent).expect("json");
+        assert!(!json.to_lowercase().contains("broker"), "{json}");
+    }
+
+    #[test]
+    fn the_value_command_never_uses_the_title_as_shell_code() {
         let mut entry = entry();
         assert_eq!(
-            snippet(&entry),
+            value_command(&entry),
             "rusthorse run FAKE_KEY=11111111-2222-3333-4444-555555555555 -- your-command"
+        );
+        assert_eq!(
+            shell_words(&value_command(&entry)),
+            [
+                "FAKE_KEY=11111111-2222-3333-4444-555555555555",
+                "--",
+                "your-command"
+            ]
         );
         for name in ["$(touch /tmp/no); 'fake'", "9LIVES", "with space", "", "ÇA"] {
             entry.name = name.into();
             assert_eq!(
-                snippet(&entry),
+                value_command(&entry),
                 "rusthorse run SECRET=11111111-2222-3333-4444-555555555555 -- your-command",
                 "{name}"
             );
         }
         entry.id = "a'$(echo fake)".into();
-        assert!(snippet(&entry).contains("'SECRET=a'\\''$(echo fake)'"));
+        let command = value_command(&entry);
+        assert!(command.contains("'SECRET=a'\\''$(echo fake)'"));
+        assert!(unquoted_specials(&command).is_empty(), "{command}");
+        assert_eq!(shell_words(&command)[0], "SECRET=a'$(echo fake)");
     }
 }

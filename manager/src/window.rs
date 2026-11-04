@@ -16,7 +16,7 @@ use rusthorse::protocol::{
 };
 
 use crate::connection::{Failure, Job};
-use crate::model::{self, Form, GrantRow, Profile, ValueMode};
+use crate::model::{self, Form, GrantRow, ValueMode};
 
 /// How long a shown value stays on screen.
 const REVEAL_SECONDS: u64 = 30;
@@ -425,7 +425,7 @@ impl Manager {
         let grants_locked = group(
             "The vault is locked",
             Some(
-                "Grants whose profile lets them continue after the automatic locks — the screen locking, suspend, the idle timeout — keep working while the vault is locked, until they end. They are listed here, and you can revoke them.",
+                "Unless its run asked otherwise (rusthorse run --broker-locks end), a grant is not ended by the automatic locks — the screen locking, suspend, the idle timeout — and keeps working while the vault is locked, until it ends. Grants are listed here, and you can revoke them.",
             ),
         );
         grants_locked.set_visible(false);
@@ -433,7 +433,7 @@ impl Manager {
         let grants_group = group(
             "Grants of the credential broker",
             Some(
-                "A command started with rusthorse run --broker gets a temporary token for each entry it uses that way, never the entry's value: the broker adds the value to the command's requests, only to the destination of the entry's profile and only for the routes it allows. A grant ends when its command ends or its lifetime passes, or earlier: when you revoke it, on Lock now, when its entry changes, on an automatic lock if its profile says so, and in a few other cases, such as a failed save. Revoking ends it at once and closes its open requests, though one already sent may still take effect; the command keeps running, without that access. Refreshed every five seconds while shown; a grant that ends meanwhile keeps its place, marked as ended, until you leave the page.",
+                "A command started with rusthorse run --broker gets a temporary token for each entry it uses that way, never the entry's value. The broker puts the value where the command puts its token, in a request header, only in requests to the grant's approved origin — the one the agent's dialog showed you — at any path there. A grant ends when its command ends or its lifetime passes, or earlier: when you revoke it, on Lock now, when its entry changes, on an automatic lock if its run asked for that, and in a few other cases, such as a failed save. Revoking ends it at once and closes its open requests, though one already sent may still take effect; the command keeps running, without that access. Refreshed every five seconds while shown; a grant that ends meanwhile keeps its place, marked as ended, until you leave the page.",
             ),
         );
         let revoke_all = button("Revoke all", None);
@@ -582,11 +582,11 @@ impl Manager {
             ),
             (
                 "Use it from a command",
-                "Copy the command snippet and replace your-command. The command receives the secret in its environment after your approval; its output is redacted. For an entry with a broker profile, it receives a temporary token instead, and the key goes only to the profile's destination. This is the way to give an AI agent a secret without showing it.",
+                "An entry's details hold two commands to copy. The first gives the command the secret in its environment after your approval; its output is redacted. The second is a template to fill in, through the credential broker: the command gets a temporary token instead, and the broker puts the key only in its requests to the origin you name and approve. Either is the way to give an AI agent a secret without showing it.",
             ),
             (
                 "Grants of the credential broker",
-                "An entry with a broker profile is given to a command through the broker (rusthorse run --broker): after your approval the command gets a temporary token for a grant, never the value, and the broker adds the value only to its requests to the profile's destination. The Grants page lists the grants in use and revokes them, also while the vault is locked. The entry's details show its profile; profiles are set and removed in a terminal, with rusthorse edit ENTRY --broker PRESET and --clear broker.",
+                "A command started with rusthorse run --broker names, for each entry it uses that way, where the key goes, and the agent's dialog shows you that origin to approve. After your approval the command gets a temporary token for a grant, never the value, and the broker puts the value only in its requests to that origin, at any path there. The Grants page lists the grants in use and revokes them, also while the vault is locked.",
             ),
             (
                 "If something is uncertain",
@@ -1991,66 +1991,67 @@ impl Manager {
             }
         }
         self.detail.append(&details);
-        if let Some(broker) = broker_group(&entry) {
-            self.detail.append(&broker);
-        }
 
-        let endpoint = entry.fields.kind == Some(EntryKind::ApiKey) && entry.fields.url.is_some();
-        let by_value = if endpoint {
-            "Replace your-command. The command gets the secret in the first variable after your approval; its output is redacted. It gets the endpoint URL in the second one: that is not a secret, and your program may read it under another name. The snippet holds the entry's UUID, never the value."
-        } else {
-            "Replace your-command. The command gets the secret in this environment variable after your approval; its output is redacted. The snippet holds the entry's UUID, never the value."
-        };
-        let usage = group(
-            "Use it from a command",
-            Some(&match model::profile(&entry) {
-                Profile::Usable(profile) => {
-                    let mut text = "Replace your-command. After your approval the command gets a temporary token in the first variable — never the key — and the broker's local address in the second, and its output is redacted. The broker adds the key only to the command's requests to the profile's destination, and the token stops working when the command ends. The snippet holds the entry's UUID, never the value.".to_string();
-                    if let Some(note) = model::broker_snippet_note(profile.preset) {
-                        text.push(' ');
-                        text.push_str(note);
-                    }
-                    text
-                }
-                Profile::Protected | Profile::Unusable => format!(
-                    "The entry's broker profile cannot be used, so this command gets the value itself. {by_value}"
-                ),
-                Profile::Absent => by_value.to_string(),
-            }),
-        );
-        let snippet = model::snippet(&entry);
-        let code = gtk::Label::builder()
-            // Filtered line by line: the line breaks are the snippet's own.
-            .label(
-                snippet
-                    .lines()
-                    .map(rusthorse::ui::dialog_text)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .use_markup(false)
-            .selectable(true)
-            .wrap(true)
-            .wrap_mode(pango::WrapMode::WordChar)
-            .attributes(&no_hyphens())
-            .xalign(0.0)
-            .css_classes(["monospace"])
-            .build();
-        let card = column(10);
-        card.add_css_class("card");
-        let inner = column(10);
-        margins(&inner, 12, 14);
-        inner.append(&code);
-        let copy = button("Copy command snippet", Some("edit-copy-symbolic"));
-        copy.set_halign(gtk::Align::Start);
-        self.connect_button(&copy, move |s| {
-            s.window.clipboard().set_text(&snippet);
-            s.feedback("Command snippet copied. It contains no secret.", false);
-        });
-        inner.append(&copy);
-        card.append(&inner);
-        usage.add(&card);
-        self.detail.append(&usage);
+        // The two ways to give the entry to a command, each labelled with
+        // what the command gets. Nothing in them comes from the entry but
+        // its name and UUID, and nothing is stored with it (ADR 0013). The
+        // descriptions are markup: these texts are fixed and hold no markup
+        // characters.
+        for (name, title, description, command, copy_label, copied) in [
+            (
+                "value-command",
+                "Give the value to a command",
+                "Replace your-command. After your approval the command gets the entry's value in this environment variable; its output is redacted. The command names the entry by its UUID and holds no secret.",
+                model::value_command(&entry),
+                "Copy command",
+                "Command copied. It contains no secret.",
+            ),
+            (
+                "broker-command",
+                "Give a token to a command, through the broker",
+                "A template to fill in: replace HOST with the destination's host (with :PORT if it needs one) and BASE_PATH with your program's base path, or remove /BASE_PATH; name TOKEN_VAR and BASE_URL_VAR after the variables your program reads its key and its base URL from; and replace your-command. Until the destination is filled in, the command is refused. After your approval the command gets a temporary token in TOKEN_VAR, never the value, and the broker's local address with the base path in BASE_URL_VAR; its output is redacted. The broker puts the value where the command puts its token, in a request header, only in requests to the destination's origin — its scheme, host and port, which the agent's dialog shows you to approve — at any path there. The base path only sets up BASE_URL_VAR; it is not a limit. The token stops working when the command ends. A program that encodes the token or sends it in the URL or the body, or an API that signs its requests with the key, cannot be used through the broker: give the program the value. The command names the entry by its UUID and holds no secret.",
+                model::broker_command(&entry),
+                "Copy command template",
+                "Command template copied. It contains no secret; fill it in before you run it.",
+            ),
+        ] {
+            let usage = group(title, Some(description));
+            usage.set_widget_name(name);
+            let code = gtk::Label::builder()
+                // Filtered line by line: the line breaks are the command's
+                // own.
+                .label(
+                    command
+                        .lines()
+                        .map(rusthorse::ui::dialog_text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .use_markup(false)
+                .selectable(true)
+                .wrap(true)
+                .wrap_mode(pango::WrapMode::WordChar)
+                .attributes(&no_hyphens())
+                .xalign(0.0)
+                .css_classes(["monospace"])
+                .build();
+            let card = column(10);
+            card.add_css_class("card");
+            let inner = column(10);
+            margins(&inner, 12, 14);
+            inner.append(&code);
+            let copy = button(copy_label, Some("edit-copy-symbolic"));
+            copy.set_widget_name(&format!("copy-{name}"));
+            copy.set_halign(gtk::Align::Start);
+            self.connect_button(&copy, move |s| {
+                s.window.clipboard().set_text(&command);
+                s.feedback(copied, false);
+            });
+            inner.append(&copy);
+            card.append(&inner);
+            usage.add(&card);
+            self.detail.append(&usage);
+        }
         self.detail.set_sensitive(self.job.borrow().is_none());
     }
 
@@ -2463,13 +2464,10 @@ impl Manager {
                 "Editing notes comes in a later version.",
                 &["caption", "dim-label"],
             ));
-        }
-        if old
-            .as_ref()
-            .is_some_and(|e| matches!(model::profile(e), Profile::Usable(_)))
-        {
+            // Any entry can be used through the broker, and the agent ends
+            // an entry's grants when it changes (`entry_changed`).
             body.append(&styled(
-                "Any change to this entry ends its grants of the credential broker. Its broker profile is changed in a terminal: rusthorse edit ENTRY --broker PRESET.",
+                "Any change to this entry ends its grants of the credential broker, if it has any.",
                 &["caption", "dim-label"],
             ));
         }
@@ -2663,50 +2661,6 @@ fn answer_of(job: &Job) -> Option<Result<Response, Failure>> {
         Err(std::sync::mpsc::TryRecvError::Empty) => None,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(Failure::lost())),
     }
-}
-
-/// The details' group about the entry's broker profile (ADR 0013): the
-/// profile, read-only, or that it cannot be used; for an API key without
-/// one, how to give it one. Profiles are set and removed in a terminal
-/// (phase 1). `None` for other entries without a profile.
-fn broker_group(entry: &EntryInfo) -> Option<adw::PreferencesGroup> {
-    // Group descriptions are markup: these texts are fixed and hold no
-    // markup characters. The rows are plain text.
-    const CANNOT: &str = "Commands cannot use this entry through the credential broker. Set a new profile in a terminal with rusthorse edit ENTRY --broker PRESET, or remove it with rusthorse edit ENTRY --clear broker; the agent shows it and asks you.";
-    let (description, facts): (&str, Vec<(String, String)>) = match model::profile(entry) {
-        Profile::Usable(profile) => (
-            "Commands started with rusthorse run --broker get a temporary token for this entry, never its value: the broker adds the value to their requests, only to this destination and only for these routes. Any change to the entry ends its grants. The profile is changed in a terminal, with rusthorse edit ENTRY --broker PRESET and its options, or removed with --clear broker; the agent shows it and asks you.",
-            model::profile_facts(profile),
-        ),
-        Profile::Protected => (
-            CANNOT,
-            vec![(
-                "Profile".into(),
-                "Withheld: the file marks it as protected, so it is treated like a secret and cannot be used.".into(),
-            )],
-        ),
-        Profile::Unusable => (
-            CANNOT,
-            vec![(
-                "Profile".into(),
-                "Unusable: this version of Rusthorse cannot read it (written by another program, or by a newer version), and does not guess.".into(),
-            )],
-        ),
-        Profile::Absent if entry.fields.kind == Some(EntryKind::ApiKey) => (
-            "For the Anthropic or OpenAI API, or one compatible with OpenAI's, give the entry a profile in a terminal, with rusthorse edit ENTRY --broker PRESET (anthropic, openai or openai-compatible): commands then get a temporary token instead of the key, and the key goes only to that API.",
-            vec![(
-                "Profile".into(),
-                "None: commands get the value itself.".into(),
-            )],
-        ),
-        Profile::Absent => return None,
-    };
-    let g = group("Credential broker", Some(description));
-    g.set_widget_name("credential-broker");
-    for (key, value) in facts {
-        g.add(&fact_row(&key, &value));
-    }
-    Some(g)
 }
 
 /// Empty every label under `root`, so GTK drops its copy of the text now.

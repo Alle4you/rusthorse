@@ -84,43 +84,63 @@ from the vault straight into the approved program.
 
 ## HTTP APIs through the credential broker
 
-Prefer `run --broker` when the entry has a usable profile and the operation
-fits its routes. You set the profile in an edit the agent asks you to approve:
-
-```sh
-rusthorse edit ANTHROPIC_API_KEY --broker anthropic
-rusthorse edit OPENAI_API_KEY --broker openai
-rusthorse edit DEEPSEEK_API_KEY --broker openai-compatible --broker-origin https://api.deepseek.com
-```
-
-The program must use the token and the broker's base URL together:
+For an HTTPS API that takes its key in a request header, the agent can ask
+for `run --broker` instead of giving the command the value. Nothing is set
+up in the entry beforehand: the agent names, in the run, where the key may
+go, and you approve that in the dialog. The program gets a token and the
+broker's base URL, and must use them together:
 
 ```sh
 env -u ANTHROPIC_AUTH_TOKEN rusthorse run \
-  --broker ANTHROPIC_API_KEY --url ANTHROPIC_BASE_URL=ANTHROPIC_API_KEY -- python app.py
-rusthorse run --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
-rusthorse run --broker OPENAI_API_KEY=DEEPSEEK_API_KEY --url OPENAI_BASE_URL=DEEPSEEK_API_KEY -- python app.py
+  --broker ANTHROPIC_API_KEY@https://api.anthropic.com --url ANTHROPIC_BASE_URL=ANTHROPIC_API_KEY -- python app.py
+rusthorse run --broker OPENAI_API_KEY@https://api.openai.com/v1 --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
+rusthorse run --broker OPENAI_API_KEY=DEEPSEEK_API_KEY@https://api.deepseek.com \
+  --broker-requests 50 --broker-lifetime 60 --url OPENAI_BASE_URL=DEEPSEEK_API_KEY -- python app.py
 ```
 
+What you approve is the URL's **origin** — `https://api.openai.com` in the
+second line. The dialog shows the base path (`/v1`) apart from it, marked
+"not a limit": it only goes into the program's base URL, and the key may go
+to any path at the origin, for whatever the key allows there. Nothing fills
+the destination in — not the entry's URL, not a default — so check that the
+origin is the API you expect: the agent chose it. The limits
+(`--broker-requests`, `--broker-lifetime`, `--broker-locks`) are in the
+dialog too; without them a grant has no request limit, lasts 12 hours and
+goes on through a screen lock.
+
 These are recipes for programs that read those variables, not a claim that
-every SDK does. The Anthropic preset accepts either `x-api-key` or
-`Authorization: Bearer`; if both appear they must both hold the grant's token.
-Leave competing key variables out, and check SDK configuration that may
-override the environment. Use the same entry spelling for `--broker` and
-`--url`. Never send the token to the provider's own URL or fall back to an
-ordinary value binding after a broker refusal.
+every SDK does. The program presents the token where it would present the
+key, in a request header (`Authorization: Bearer TOKEN`, `x-api-key: TOKEN`,
+…), and the broker puts the key in its place; it refuses a request with no
+header holding the token, with another token, or with the key itself. Any
+other key the program sends in another header beside the token goes to the
+origin as it came, so leave competing key variables out (`env -u`), and check SDK
+configuration that may override the environment. Use the same entry
+spelling for `--broker` and `--url`. Never send the token to the provider's
+own URL or fall back to an ordinary value binding after a broker refusal.
+An API that signs its requests with the key, or takes it in the URL or the
+body, cannot be used through the broker: that needs ordinary `run`, which
+gives the command the value.
 
 Claude Code is interactive and uses the terminal through `--no-redact`; the
 [built-in guide](../src/guide/ai.md#claude-code-through-the-broker) gives its
-separate recipe and settings checks. The manual check with a real key (ADR
-0013, answer 9) began on 2026-11-04: the Anthropic Python SDK 2.4.0 worked
-through the broker for the requests tried; Claude Code's requests went
-through it, and the API answered them `400`, as it answered SDK requests
-with some of Claude Code's parameters sent with the key by value, so no
-Claude Code answer through the broker has been seen yet. If Claude Code
-shows `Credit balance is too low` while other requests with the same key
-work, the account refuses Claude Code's requests (with the key used in
-that test, its beta `claude-code-20250219` alone drew that answer, with or
+separate recipe and settings checks:
+
+```sh
+env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \
+  --broker ANTHROPIC_AUTH_TOKEN=anthropic@https://api.anthropic.com --url ANTHROPIC_BASE_URL=anthropic -- claude
+```
+
+The manual check with a real key (ADR 0013, answer 9) began on 2026-11-04,
+with phase 1's broker: the Anthropic Python SDK 2.4.0 worked through the
+broker for the requests tried; Claude Code's requests went through it, and
+the API answered them `400`, as it answered SDK requests with some of
+Claude Code's parameters sent with the key by value, so no Claude Code
+answer through the broker has been seen yet. The broker without profiles
+has not been tried by hand yet. If Claude Code shows
+`Credit balance is too low` while other requests with the same key work,
+the account refuses Claude Code's requests (with the key used in that
+test, its beta `claude-code-20250219` alone drew that answer, with or
 without the broker): check the account, not Rusthorse. No client version
 is called supported yet. You approve each use; the automated
 tests use fake destinations and keys only.
@@ -133,7 +153,7 @@ provider: a request count cannot bound the cost of one request.
 When the destination does not accept the key stored in the entry, it answers
 `401 Unauthorized`, and the program sees that answer as it came, which can
 read like a problem with its token. `rusthorse run` then says, after the
-command, which entry's key the destination refused and how to replace it
+command, which approved origin refused which entry's key and how to replace it
 (`rusthorse edit NAME --value`, where you type the new key in a dialog);
 `rusthorse grants` and the Grants page show the count while the command runs.
 The JSON errors the broker writes itself start their message with
@@ -141,10 +161,11 @@ The JSON errors the broker writes itself start their message with
 
 Inspect `rusthorse grants` or the manager's Grants page, and end one with
 `rusthorse grants revoke ID` or all with `rusthorse grants revoke --all`.
-Explicit `rusthorse lock` also ends them all. AI profiles default to
-`automatic_locks: continue` and 12 hours, so screen lock, suspend or idle lock
-can leave active grants running. Choose `end` or a shorter lifetime for
-profiles that should stop sooner. Entry changes, failed saves, command end,
+Explicit `rusthorse lock` also ends them all. A run's grants default to
+`--broker-locks continue` and 12 hours, so screen lock, suspend or idle lock
+can leave active grants running. Deny a run whose limits you find too wide,
+and ask the agent for `--broker-locks end` or a shorter `--broker-lifetime`
+when its grants should stop sooner. Entry changes, failed saves, command end,
 broker failure and expiry also end grants. Already-sent requests may still
 take effect even after revocation has been confirmed.
 
@@ -162,7 +183,7 @@ these lines:
 | **Command** | Is this what I expected the agent to do right now? Does it send data anywhere (`curl`, `nc`, `ssh`, `git push`)? |
 | **Program** | Is this the real tool (`/usr/bin/gh`), or something in a project or temporary directory? |
 | **Directory** | Is the agent working where I think it is? |
-| **Broker grants** | Is the destination correct, is every route needed, and are the lifetime, automatic-lock policy, request count and concurrency acceptable? The dialog warns that bodies are opaque and calls can spend credit. Mixed runs still deliver real values for ordinary bindings. |
+| **Broker grants** | Is the **approved origin** the API you expect (the agent named it), and may the key do anything it allows there? The key may go to any path at that origin: the **base path**, shown apart, is not a limit. Are the end (lifetime, automatic locks) and the requests (limit, concurrency) acceptable? The dialog warns that bodies are not inspected and calls can spend credit. Mixed runs still deliver real values for ordinary bindings. |
 | **Secrets** | Does this command need *these* secrets? An API key for a model has no business in `git push`. |
 | **Requested by (unverified)** | Is it the AI's shell, or something unexpected? These are process names, which any program can choose, so they inform but do not prove who asked. |
 | **Destinations (environment)** | Is every host one you expect — the provider's real API, your own database? An AI agent can set `OPENAI_BASE_URL` or `DATABASE_URL` to a server of its own, and the approved program would send the secret there. |
@@ -193,7 +214,7 @@ requests — same command line, program, directory, secrets, environment and
 vault state — but not for what the command reads: an agent can change a
 script, a config file or the command's input between runs. Enable them only
 for commands whose inputs you control, and use `rusthorse lock` when you step
-away. Remembering never applies to `broker_run`.
+away. Remembering never applies to a run with `--broker`.
 
 **Sandboxed agents.** If the AI agent runs in a sandbox (restricted network,
 read-only file system, container), remember that the command you approve is
@@ -217,10 +238,10 @@ cooperative-but-fallible agents:
 For ordinary bindings, default redaction catches literal copies on
 stdout/stderr; encodings, files and network writes can bypass it (L5). For
 each broker binding the command instead receives a token, never the source
-credential. The broker fixes the credential's destination and routes, and
+credential. The broker sends the credential to the approved origin only, and
 redacts literal copies returned in response bodies. A grant is a capability
-you approve once: allowed calls can spend credit or access data without
-another dialog. Each admission is recorded before forwarding; completion
+you approve once: calls to any path at that origin can spend credit or
+access data without another dialog. Each admission is recorded before forwarding; completion
 records are best effort and abrupt process death can leave an unfinished audit
 trail.
 
@@ -234,12 +255,13 @@ does not detect them for you. To resist a hostile agent, run it isolated from
 your session (separate user, no access to your display or processes) — see
 [threat model §8](threat-model.md#8-running-ai-agents-in-isolation).
 
-A stolen broker token works through its listener within the grant's routes and
-limits until it ends. The loopback hop is clear text HTTP; request bodies are
-not inspected, and transformed copies of a credential returned by the
-destination escape literal redaction. `--no-redact` exposes anything the
-command prints, including tokens. See L21–L24 of the
-[threat model](threat-model.md) for these broker-specific limits.
+A stolen broker token works through its listener, for any path at the
+grant's approved origin and within its limits, until it ends. The loopback
+hop is clear text HTTP; request bodies are not inspected, and transformed
+copies of a credential returned by the destination escape literal
+redaction. `--no-redact` exposes anything the command prints, including
+tokens. See L21–L25 of the [threat model](threat-model.md) for these
+broker-specific limits.
 
 ## Tips
 

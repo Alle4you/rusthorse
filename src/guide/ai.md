@@ -4,8 +4,8 @@ Rusthorse keeps this computer's secrets (API keys, passwords, tokens) in an
 encrypted KeePass vault. You never see a value. You find entries by their
 metadata and run commands through `rusthorse run`. The human approves each
 use in a dialog on their screen, and the command gets the secret in its
-environment, or, for an API key with a broker profile, a temporary token
-that works only through Rusthorse.
+environment, or, through the broker, a temporary token that works only
+through Rusthorse.
 
 The secret in an entry is its value. Its URL, username, host, port and
 tags are context, for you to understand what it is for; its notes and any
@@ -56,10 +56,9 @@ rusthorse show NAME --json        # one entry's metadata
 ```
 
 The JSON objects have `name`, `group`, `kind`, `username`, `url`, `host`,
-`port`, `tags`, `has_password`, `broker` and `id`. The `id` is a UUID, which
-also works as `NAME`. Fields without a value are left out. A field named in
-`protected_fields` is withheld like a secret. An entry with `broker` has a
-broker profile: use it through the broker (below).
+`port`, `tags`, `has_password` and `id`. The `id` is a UUID, which also
+works as `NAME`. Fields without a value are left out. A field named in
+`protected_fields` is withheld like a secret.
 
 The text output (`list` and `show` without `--json`) shows control and
 invisible characters in what the vault holds as `\u{…}` escapes, so that a
@@ -128,94 +127,103 @@ not a secret and is not redacted.
 
 ## Using an API key through the broker: `run --broker`
 
-An entry with a broker profile (`broker` in `rusthorse show NAME --json`)
-can be used without the command ever getting its key. When an entry has
-one, prefer `--broker` to giving the command the value: the command gets a
-temporary token instead of the key, the profile fixes where its requests go
-and which ones it may make, and the grant ends with the command.
+For an HTTPS API that takes its key in a request header, prefer `--broker`
+to giving the command the value: the command gets a temporary token instead
+of the key, you name where the key may go, the human approves that in the
+dialog, and the grant ends with the command.
 
 ```sh
-rusthorse run --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
-rusthorse run --broker ANTHROPIC_API_KEY=anthropic --url ANTHROPIC_BASE_URL=anthropic -- python app.py
-rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py   # one by value, one through the broker
+rusthorse run --broker OPENAI_API_KEY@https://api.openai.com/v1 --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py
+env -u ANTHROPIC_AUTH_TOKEN rusthorse run --broker ANTHROPIC_API_KEY=anthropic@https://api.anthropic.com --url ANTHROPIC_BASE_URL=anthropic -- python app.py
+rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY@https://api.openai.com/v1 --url OPENAI_BASE_URL=OPENAI_API_KEY -- python app.py   # one by value, one through the broker
+rusthorse run --broker DEEPSEEK_API_KEY=deepseek@https://api.deepseek.com --broker-requests 50 --broker-lifetime 60 --url DEEPSEEK_BASE_URL=deepseek -- python app.py
 ```
 
-- `--broker VAR=NAME` puts the token in `VAR`, never the key, and
-  `--broker NAME` puts it in a variable named like the entry. `--url` for
-  the same entry puts the broker's address in its variable
-  (`http://127.0.0.1:PORT` and the profile's base path) instead of the
-  entry's URL. Always give it, for the variable the program reads its base
-  URL from: without it, the program sends the token to the API's own
-  address, where it does not work.
-- Rusthorse adds the key to each request it forwards, sends it only to the
-  profile's destination, and forwards only the requests the profile's
-  routes allow: everything else is refused.
+- `--broker VAR=NAME@URL` puts the token in `VAR`, never the key, and
+  `--broker NAME@URL` puts it in a variable named like the entry. The
+  variable ends at the first `=` and the URL starts after the last `@`, so
+  a name may hold either. The URL is `https://`, a host name, an optional
+  port and an optional base path, with no user, query or fragment: the
+  API the program calls. Nothing fills it in for you, not even the entry's
+  `url`: say it, and the human checks it in the dialog.
+- `--url` for the same entry, named the same way, puts the broker's
+  address in its variable (`http://127.0.0.1:PORT` and the URL's base path)
+  instead of the entry's URL. Always give it, for the variable the program
+  reads its base URL from: without it, the program sends the token to the
+  API's own address, where it does not work.
+- The human approves the URL's origin: scheme, host and port. The broker
+  may send the key to any path there; the base path only sets up the
+  program's base URL, and limits nothing.
+- The program presents the token where it would present the key, in a
+  request header, as it is: `Authorization: Bearer TOKEN`,
+  `x-api-key: TOKEN`, `x-goog-api-key: TOKEN` or any other. The broker puts
+  the key in its place and sends the request to the approved origin. It
+  refuses with its own `401`, before anything is sent, a request with no
+  header holding the token, with the token anywhere else (the URL, a
+  header's name, `Host`), with any other token or a token whose case was
+  changed, or with the key itself. A program that signs its requests with
+  the key, encodes or derives from the token, or sends the key in the URL
+  or the body cannot use the broker: tell the human, who decides whether
+  to give it the value with `run`.
+- `--broker-requests N` (no limit unless given),
+  `--broker-lifetime MINUTES` (720, 12 hours, unless given) and
+  `--broker-locks end` or `continue` (`continue` unless given: the grants go
+  on through a screen lock, a suspend and the idle lock) set the limits of
+  every grant of the run, each counted on its own. Explicit
+  `rusthorse lock` ends all grants.
 - The grant ends when the command ends, or before: for example on
   `rusthorse lock`, when the human revokes it, when the entry changes or when
-  its lifetime is over. Requests after that fail. AI profiles default to
-  continuing through screen lock, suspend and idle lock for up to 12 hours;
-  explicit `rusthorse lock` ends all grants. A profile can instead choose
-  `automatic_locks: end`.
+  its lifetime is over. Requests after that fail.
 - The token is a secret too. Do not print, log or store it, and send it only
   to the broker's address. Output is redacted as with `run`, the token
   included. With `--no-redact` it is not, and whoever reads the token can use
   the grant until it ends.
-- The dialog says what the grant allows: the destination, every route, when it
-  ends and how many requests it admits. A request limit is not a spending
-  limit, and the broker does not inspect request bodies: within those routes,
-  the command can still spend credit and send what it wants.
+- The dialog shows each grant's entry, the approved origin and the base path
+  apart from it, when it ends and how many requests it admits. A request
+  limit is not a spending limit, and the broker does not inspect request
+  bodies: at that origin, the command can still spend credit and send what
+  it wants.
 - With zenity, two or more grants in one run may make the approval too tall,
   so the agent refuses it. `rusthorse-dialog` scrolls; character limits still
   apply. Never work around a refusal by passing the real key.
-- There is no fallback. When a grant cannot be served (no broker program, no
-  profile, a value the broker cannot send), `rusthorse run` exits with `125`
-  and nothing ran. Never retry with the key by value: tell the human.
+- There is no fallback. When a grant cannot be served (no broker program, an
+  invalid URL, a value the broker cannot send), `rusthorse run` exits with
+  `125` and nothing ran. Never retry with the key by value: tell the human.
 - After the command, a note that starts with `rusthorse: note:` and says
-  that the destination answered `401 Unauthorized` means that it did not
+  that the approved origin answered `401 Unauthorized` means that it did not
   accept the key stored in the entry; the broker accepted the command's
   token. Tell the human: replacing the key is theirs to do, in a dialog
   where they type it (`rusthorse edit NAME --value`). Never ask for the key,
   and never try another entry or the key by value.
 - The broker's own errors have the type `rusthorse_broker` and a message
-  that starts with `rusthorse-broker:` (a missing or wrong token, a route the
-  profile does not allow, a grant that has ended: `403`). An error in the
-  destination's own form comes from the destination. The broker's HTTP
-  parser can answer a malformed request with an empty `400` or `431`; a
-  destination can answer so too, so such an answer alone does not say who
-  answered.
+  that starts with `rusthorse-broker:` (a missing or wrong token: `401`; a
+  grant that has ended: `403`). An error in the destination's own form comes
+  from the destination. The broker's HTTP parser can answer a malformed
+  request with an empty `400` or `431`; a destination can answer so too, so
+  such an answer alone does not say who answered.
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
-- A program that uses an Anthropic SDK takes its key from
-  `ANTHROPIC_API_KEY`: give it the token there, as above.
 - A key that your own environment holds in another variable the program
   reads reaches the command like the rest of your environment: leave it out
   of the run with `env -u NAME` before `rusthorse run`. For an Anthropic
-  SDK, that is `ANTHROPIC_AUTH_TOKEN`: an SDK that finds both variables may
-  send both, and the broker refuses a request that presents anything but
-  the token.
+  SDK given the token in `ANTHROPIC_API_KEY`, that is
+  `ANTHROPIC_AUTH_TOKEN`: an SDK that finds both variables may send both.
+  The broker puts the entry's key in place of the token and forwards any
+  other key as it is, so the destination may take the other one; without
+  the token in any header, the broker refuses the request.
 - `rusthorse grants` lists the grants, each with its state, never a token:
-  their ID, entry, destination, command, requester, requests and when they
-  end. A revoked grant can stay in the list until its command ends. Under
-  the table, a note names each grant whose destination answered `401`, as
-  after a run. `rusthorse grants revoke ID` ends one.
-
-Setting a profile is the human's decision, in a dialog that shows the whole
-profile: suggest one of these, and do not run it unasked.
-`openai-compatible` has no destination of its own: give its origin with
-`--broker-origin`.
-
-```sh
-rusthorse edit anthropic --broker anthropic
-rusthorse edit OPENAI_API_KEY --broker openai
-rusthorse edit deepseek --broker openai-compatible --broker-origin https://api.deepseek.com
-```
+  their ID, entry, approved origin, base path, command, requester, requests
+  and when they end. A revoked grant can stay in the list until its command
+  ends. Under the table, a note names each grant whose approved origin
+  answered `401`, as after a run. `rusthorse grants revoke ID` ends one.
 
 ### Claude Code through the broker
 
 This recipe follows what Claude Code's documentation says. Tried with Claude
-Code 2.1.317, its requests went through the broker, but no answer from
-Claude Code through it has been seen yet: the account used answered `400`
+Code 2.1.317 and an earlier version of the broker (with profiles), its
+requests went through the broker, but no answer from Claude Code through it
+has been seen yet, and this version has not been tried with it: the account used answered `400`
 ("credit balance is too low") to every request tried that carried Claude
 Code's beta `claude-code-20250219` — Claude Code's own, through the broker,
 and SDK requests, with the key by value as through the broker — while other
@@ -226,14 +234,15 @@ back to the key, and do not try another key or other betas on your own.
 
 ```sh
 env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse run --no-redact \
-  --broker ANTHROPIC_AUTH_TOKEN=anthropic --url ANTHROPIC_BASE_URL=anthropic -- claude
+  --broker ANTHROPIC_AUTH_TOKEN=anthropic@https://api.anthropic.com --url ANTHROPIC_BASE_URL=anthropic -- claude
 ```
 
 - `ANTHROPIC_AUTH_TOKEN` makes Claude Code send the token as
   `Authorization: Bearer`, and `ANTHROPIC_BASE_URL` sends its requests to the
   broker. `env -u ANTHROPIC_API_KEY` keeps a key your environment may hold
-  out of the command: Claude Code may send it with the token or instead of
-  it, and the broker refuses a request that presents anything but the token.
+  out of the command: Claude Code may send it instead of the token, which
+  the broker refuses, or beside it, which the broker forwards as it is, so
+  that the destination may take that key instead of the entry's.
 - `--no-redact` gives Claude Code the terminal; with redaction it would get
   pipes. The dialog warns that its output is not filtered.
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns off its non-essential

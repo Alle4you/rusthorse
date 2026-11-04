@@ -13,17 +13,14 @@
 //! | port       | `Port`             | no        |
 //! | tags       | `Tags`             | —         |
 //! | kind       | `Kind`             | no        |
-//! | broker     | `Rusthorse.Broker` | no        |
 //!
 //! `Kind` holds `api-key`, `login`, `server` or `device`
 //! ([`EntryKind::as_str`]). Any other text there is left alone: the entry
 //! has no kind, and `Kind` is listed with the other fields.
-//! `Rusthorse.Broker` holds the entry's broker profile (ADR 0013) as one
-//! line of JSON ([`BrokerProfile::to_stored`]), set and cleared only by an
-//! edit, and removed when the entry is replaced. It is read strictly
-//! ([`BrokerProfile::parse`]): a profile that does not parse is unusable
-//! and listed with the other fields, and a protected one is withheld like
-//! any protected field.
+//! Every other field is listed by name only, its value never read: among
+//! them `Rusthorse.Broker`, where phase 1 of the credential broker stored a
+//! profile (ADR 0013, scope amendment), which is kept as it is, like any
+//! custom field, and never interpreted.
 //! Entries in the recycle bin are ignored. Files written by Rusthorse open in
 //! KeePassXC and other KDBX4 clients.
 //!
@@ -45,7 +42,6 @@ use keepass::db::{EntryId, GroupId, Times, fields};
 use keepass::error::{DatabaseKeyError, DatabaseOpenError, DatabaseSaveError};
 use keepass::{Database, DatabaseKey};
 
-use crate::broker_profile::{BrokerProfile, ProfileRequest};
 use crate::protocol::{
     EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, SecretString,
 };
@@ -57,8 +53,6 @@ pub const FIELD_HOST: &str = "Host";
 pub const FIELD_PORT: &str = "Port";
 /// Custom KDBX field holding the entry's kind.
 pub const FIELD_KIND: &str = "Kind";
-/// Custom KDBX field holding the entry's broker profile (ADR 0013).
-pub const FIELD_BROKER: &str = "Rusthorse.Broker";
 
 /// Shown instead of a title that the KeePass file marks as protected.
 pub const PROTECTED_TITLE: &str = "[protected title]";
@@ -66,7 +60,7 @@ pub const PROTECTED_TITLE: &str = "[protected title]";
 /// Vault files larger than this are refused before anything is decrypted.
 pub const MAX_VAULT_BYTES: u64 = 128 * 1024 * 1024;
 
-const KNOWN_FIELDS: [&str; 9] = [
+const KNOWN_FIELDS: [&str; 8] = [
     fields::TITLE,
     fields::USERNAME,
     fields::PASSWORD,
@@ -75,7 +69,6 @@ const KNOWN_FIELDS: [&str; 9] = [
     FIELD_HOST,
     FIELD_PORT,
     FIELD_KIND,
-    FIELD_BROKER,
 ];
 
 /// Errors from vault operations.
@@ -818,12 +811,6 @@ impl Vault {
         let port = text(FIELD_PORT).and_then(|p| p.trim().parse().ok());
         let stored_kind = text(FIELD_KIND);
         let kind = stored_kind.as_deref().and_then(EntryKind::parse);
-        // Read strictly: a profile that does not parse is unusable, never
-        // guessed at.
-        let stored_broker = text(FIELD_BROKER);
-        let broker = stored_broker
-            .as_deref()
-            .and_then(|stored| BrokerProfile::parse(stored).ok());
         let name = match entry.fields.get(fields::TITLE) {
             Some(v) if v.is_protected() => {
                 protected_fields.insert(0, fields::TITLE.to_string());
@@ -843,10 +830,6 @@ impl Vault {
         // own (its value undisclosed, like any other field's).
         if stored_kind.is_some() && kind.is_none() {
             other_fields.push(FIELD_KIND.to_string());
-        }
-        // So does an unusable broker profile.
-        if stored_broker.is_some() && broker.is_none() {
-            other_fields.push(FIELD_BROKER.to_string());
         }
         other_fields.sort();
         EntryInfo {
@@ -869,7 +852,6 @@ impl Vault {
                 t.and_utc()
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             }),
-            broker,
         }
     }
 
@@ -992,10 +974,8 @@ impl Vault {
     ///
     /// [`EntryChanges::group`] moves the entry to the group at that path
     /// (created if missing; empty or `/` is the top level) unless it is
-    /// already in a group with that path. [`EntryChanges::broker`] sets the
-    /// broker profile that [`ProfileRequest::resolve`] makes, stored with
-    /// every field written out. Everything is checked before anything
-    /// changes.
+    /// already in a group with that path. Everything is checked before
+    /// anything changes.
     pub fn edit(
         &mut self,
         id: EntryId,
@@ -1018,12 +998,6 @@ impl Vault {
             username: changes.username.clone(),
             ..EntryFields::default()
         })?;
-        let broker = changes
-            .broker
-            .as_ref()
-            .map(ProfileRequest::resolve)
-            .transpose()
-            .map_err(|e| VaultError::Invalid(format!("broker profile: {e}")))?;
         // An entry already in the group the path leads to stays where it
         // is (compared by identity). `ensure_group` checks the path — the
         // recycle bin, groups of the same name — before it creates anything:
@@ -1054,7 +1028,6 @@ impl Vault {
                 Field::Port => FIELD_PORT,
                 Field::Notes => fields::NOTES,
                 Field::Kind => FIELD_KIND,
-                Field::Broker => FIELD_BROKER,
             };
             e.fields.remove(key);
         }
@@ -1066,9 +1039,6 @@ impl Vault {
         }
         if let Some(kind) = changes.kind {
             e.set_unprotected(FIELD_KIND, kind.as_str());
-        }
-        if let Some(profile) = &broker {
-            e.set_unprotected(FIELD_BROKER, profile.to_stored());
         }
         match changes.notes.as_deref() {
             Some("") => {
@@ -1321,9 +1291,8 @@ fn set_text(entry: &mut keepass::db::Entry, key: &str, value: Option<&str>) {
 }
 
 /// Write a new entry's fields over `entry`. Replacing an entry (`add
-/// --replace`, `import --replace`) also removes its broker profile: a new
-/// entry never comes with one ([`NewEntry`] cannot carry it), and a profile
-/// is set only by an edit the human approves.
+/// --replace`, `import --replace`) keeps its custom fields, as KeePass
+/// clients do.
 fn write_fields(entry: &mut keepass::db::Entry, new: &NewEntry, value: &SecretString) {
     entry.set_unprotected(fields::TITLE, new.name.as_str());
     entry.set_protected(fields::PASSWORD, value.as_str());
@@ -1333,7 +1302,6 @@ fn write_fields(entry: &mut keepass::db::Entry, new: &NewEntry, value: &SecretSt
         FIELD_HOST,
         FIELD_PORT,
         FIELD_KIND,
-        FIELD_BROKER,
         fields::NOTES,
     ] {
         entry.fields.remove(key);
@@ -1356,7 +1324,6 @@ fn write_fields(entry: &mut keepass::db::Entry, new: &NewEntry, value: &SecretSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker_profile::{MAX_PROFILE_CHARS, Preset};
 
     fn secret(s: &str) -> SecretString {
         SecretString::new(s.to_string())
@@ -2124,235 +2091,73 @@ mod tests {
         assert!(info.other_fields.is_empty());
     }
 
-    fn deepseek() -> ProfileRequest {
-        ProfileRequest {
-            origin: Some("https://api.deepseek.com".into()),
-            max_requests: Some(200),
-            ..ProfileRequest::new(Preset::OpenaiCompatible)
-        }
-    }
+    /// Where phase 1 of the credential broker stored a profile.
+    const PHASE_1_PROFILE: &str = "Rusthorse.Broker";
 
-    fn set_broker(request: ProfileRequest) -> EntryChanges {
-        EntryChanges {
-            broker: Some(request),
-            ..EntryChanges::default()
-        }
-    }
-
-    /// The `Rusthorse.Broker` field as stored: its text and whether it is
-    /// protected.
-    fn stored_broker(vault: &Vault, id: EntryId) -> Option<(String, bool)> {
+    /// The field as stored: its text and whether it is protected.
+    fn stored_field(vault: &Vault, id: EntryId, key: &str) -> Option<(String, bool)> {
         let entry = vault.db.entry(id).expect("entry");
         entry
             .fields
-            .get(FIELD_BROKER)
+            .get(key)
             .map(|v| (v.get().clone(), v.is_protected()))
     }
 
+    /// A profile stored by phase 1 is an ordinary custom field (ADR 0013,
+    /// scope amendment): listed by name only, whatever it holds, and kept
+    /// as it is through edits, saves and replacements.
     #[test]
-    fn the_broker_profile_is_set_changed_and_cleared() {
+    fn a_phase_1_profile_is_an_ordinary_field_kept_as_it_is() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut vault, path) = new_vault(&dir);
-        vault
-            .add(&entry("key"), &secret("abcd"), false)
-            .expect("add");
-        let id = vault.find("key").expect("find");
-        assert_eq!(vault.info(id).broker, None);
-        let set = set_broker(ProfileRequest::new(Preset::Anthropic));
-        assert!(set.touches_metadata());
-        vault.edit(id, &set, None).expect("set");
-        let anthropic = ProfileRequest::new(Preset::Anthropic)
-            .resolve()
-            .expect("resolve");
-        assert_eq!(vault.info(id).broker, Some(anthropic.clone()));
-        // Stored with every field written out, as a plain field that other
-        // KeePass clients show as it is.
-        assert_eq!(
-            stored_broker(&vault, id),
-            Some((anthropic.to_stored(), false))
-        );
-        assert!(vault.info(id).other_fields.is_empty());
-
-        // Changed: the whole profile is replaced; the previous state is in
-        // the entry's history, and nothing else changed.
-        vault
-            .edit(id, &set_broker(deepseek()), None)
-            .expect("change");
-        let changed = deepseek().resolve().expect("resolve");
-        assert_eq!(vault.info(id).broker, Some(changed.clone()));
-        assert_eq!(history_len(&vault, id), 2);
-        assert_eq!(vault.info(id).fields, entry("key").fields);
-        assert_eq!(
-            vault.secret(id).as_deref().map(String::as_str),
-            Some("abcd")
-        );
-        vault.save().expect("save");
-        let reopened = Vault::open(&path, secret("correct horse")).expect("reopen");
-        assert_eq!(reopened.info(id).broker, Some(changed));
-
-        // Cleared: the field is gone.
-        let clear = EntryChanges {
-            clear: vec![Field::Broker],
-            ..EntryChanges::default()
-        };
-        vault.edit(id, &clear, None).expect("clear");
-        let info = vault.info(id);
-        assert_eq!(info.broker, None);
-        assert!(info.other_fields.is_empty());
-        assert_eq!(stored_broker(&vault, id), None);
-    }
-
-    #[test]
-    fn an_invalid_profile_is_refused_before_anything_changes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut vault, _) = new_vault(&dir);
-        let id = add_in(&mut vault, "router", "Home");
-        let groups = vault.db.num_groups();
-        for bad in [
-            // The compatible preset has no origin of its own.
-            ProfileRequest::new(Preset::OpenaiCompatible),
-            ProfileRequest {
-                origin: Some("http://api.example.com".into()),
-                ..ProfileRequest::new(Preset::Openai)
-            },
-            ProfileRequest {
-                origin: Some("https://127.0.0.1".into()),
-                ..ProfileRequest::new(Preset::Openai)
-            },
-            ProfileRequest {
-                base_path: Some("/v1/".into()),
-                ..ProfileRequest::new(Preset::Openai)
-            },
-            ProfileRequest {
-                max_lifetime_minutes: Some(0),
-                ..ProfileRequest::new(Preset::Anthropic)
-            },
-            ProfileRequest {
-                max_requests: Some(0),
-                ..ProfileRequest::new(Preset::Anthropic)
-            },
-        ] {
-            let changes = EntryChanges {
-                rename: Some("renamed".into()),
-                host: Some("10.0.0.9".into()),
-                broker: Some(bad),
-                ..move_to("Brand/New")
-            };
-            match vault.edit(id, &changes, Some(&secret("new-value"))) {
-                Err(VaultError::Invalid(message)) => {
-                    assert!(message.starts_with("broker profile: "), "{message}")
-                }
-                other => panic!("{:?}", other.map(|_| ())),
-            }
-        }
-        // Nothing changed: no group, no name, no field, no value, no
-        // history.
-        assert_eq!(vault.db.num_groups(), groups);
-        let info = vault.info(id);
-        assert_eq!(info.name, "router");
-        assert_eq!(info.group.as_deref(), Some("Home"));
-        assert_eq!(info.fields, entry("router").fields);
-        assert_eq!(info.broker, None);
-        assert_eq!(stored_broker(&vault, id), None);
-        assert_eq!(
-            vault.secret(id).as_deref().map(String::as_str),
-            Some("abcd")
-        );
-        assert_eq!(history_len(&vault, id), 0);
-    }
-
-    #[test]
-    fn replacing_an_entry_removes_its_profile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut vault, _) = new_vault(&dir);
-        vault
-            .add(&entry("key"), &secret("abcd"), false)
-            .expect("add");
-        let id = vault.find("key").expect("find");
-        vault.edit(id, &set_broker(deepseek()), None).expect("set");
-        assert!(vault.info(id).broker.is_some());
-        // `add --replace` and `import --replace` replace through `add`.
-        assert!(
-            vault
-                .add(&entry("key"), &secret("efgh"), true)
-                .expect("replace")
-        );
-        let id = vault.find("key").expect("find");
-        assert_eq!(vault.info(id).broker, None);
-        assert_eq!(stored_broker(&vault, id), None);
-        // A new entry never has one.
-        vault
-            .add(&entry("fresh"), &secret("ijkl"), false)
-            .expect("add");
-        let fresh = vault.find("fresh").expect("find");
-        assert_eq!(vault.info(fresh).broker, None);
-        assert_eq!(stored_broker(&vault, fresh), None);
-    }
-
-    #[test]
-    fn a_profile_written_by_someone_else_is_read_strictly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut vault, _) = new_vault(&dir);
         vault.add(&entry("x"), &secret("abcd"), false).expect("add");
         let id = vault.find("x").expect("find");
-        let set = |vault: &mut Vault, value: &str, protected: bool| {
-            let mut e = vault.db.entry_mut(id).expect("entry");
-            if protected {
-                e.set_protected(FIELD_BROKER, value);
-            } else {
-                e.set_unprotected(FIELD_BROKER, value);
+        let stored = r#"{"version":1,"preset":"anthropic","revision":1,"origin":"https://api.anthropic.com","base_path":"","automatic_locks":"continue","max_lifetime_minutes":720}"#;
+        for (value, protected) in [(stored, false), ("not json", false), (stored, true)] {
+            {
+                let mut e = vault.db.entry_mut(id).expect("entry");
+                if protected {
+                    e.set_protected(PHASE_1_PROFILE, value);
+                } else {
+                    e.set_unprotected(PHASE_1_PROFILE, value);
+                }
             }
-        };
-        let valid = ProfileRequest::new(Preset::Anthropic)
-            .resolve()
-            .expect("resolve");
-        let stored = valid.to_stored();
-        // As Rusthorse writes it, or with spaces and in another order.
-        set(&mut vault, &stored, false);
-        assert_eq!(vault.info(id).broker, Some(valid.clone()));
-        let spaced = r#"{ "preset": "anthropic", "version": 1, "revision": 1, "origin": "https://api.anthropic.com", "base_path": "", "automatic_locks": "continue", "max_lifetime_minutes": 720 }"#;
-        set(&mut vault, spaced, false);
-        assert_eq!(vault.info(id).broker, Some(valid.clone()));
-        // Anything unexpected: unusable, and listed by name like any field
-        // whose value is not disclosed.
-        let long = stored.replacen(
-            r#""base_path":"""#,
-            &format!(r#""base_path":"/{}""#, "a".repeat(MAX_PROFILE_CHARS)),
-            1,
-        );
-        for bad in [
-            stored.replacen(r#""version":1"#, r#""version":2"#, 1),
-            stored.replacen(r#""preset":"anthropic""#, r#""preset":"gemini""#, 1),
-            stored.replacen(r#""revision":1"#, r#""revision":2"#, 1),
-            stored.replacen("720}", r#"720,"routes":["POST /v1/files"]}"#, 1),
-            stored.replacen("720}", "1441}", 1),
-            stored.replacen(
-                "https://api.anthropic.com",
-                "https://api.anthropic.com.evil.example/",
-                1,
-            ),
-            stored.replacen(',', ",\n", 1),
-            long,
-            "not json".into(),
-        ] {
-            assert_ne!(bad, stored);
-            set(&mut vault, &bad, false);
             let info = vault.info(id);
-            assert_eq!(info.broker, None, "{bad}");
-            assert_eq!(info.other_fields, vec!["Rusthorse.Broker"], "{bad}");
-            assert!(info.protected_fields.is_empty());
+            assert_eq!(info.other_fields, vec![PHASE_1_PROFILE], "{value}");
+            assert!(info.protected_fields.is_empty(), "{value}");
+            let json = serde_json::to_value(&info).expect("json");
+            assert!(!json.to_string().contains("anthropic.com"), "{json}");
+            assert!(json.get("broker").is_none(), "{json}");
         }
-        // Protected: withheld like any protected field, and unusable.
-        set(&mut vault, &stored, true);
-        let info = vault.info(id);
-        assert_eq!(info.broker, None);
-        assert_eq!(info.protected_fields, vec!["Rusthorse.Broker"]);
-        assert!(info.other_fields.is_empty());
-        // Empty: no profile at all.
-        set(&mut vault, "", false);
-        let info = vault.info(id);
-        assert_eq!(info.broker, None);
-        assert!(info.other_fields.is_empty() && info.protected_fields.is_empty());
+
+        // An edit keeps it, byte for byte, whatever else it changes.
+        let changes = EntryChanges {
+            rename: Some("renamed".into()),
+            username: Some("me".into()),
+            clear: vec![Field::Url, Field::Kind],
+            ..EntryChanges::default()
+        };
+        vault
+            .edit(id, &changes, Some(&secret("efgh")))
+            .expect("edit");
+        assert_eq!(
+            stored_field(&vault, id, PHASE_1_PROFILE),
+            Some((stored.to_string(), true))
+        );
+        // So do a save and a replacement, as for any custom field.
+        vault.save().expect("save");
+        let mut vault = Vault::open(&path, secret("correct horse")).expect("reopen");
+        assert!(
+            vault
+                .add(&entry("renamed"), &secret("ijkl"), true)
+                .expect("replace")
+        );
+        let id = vault.find("renamed").expect("find");
+        assert_eq!(
+            stored_field(&vault, id, PHASE_1_PROFILE),
+            Some((stored.to_string(), true))
+        );
+        assert_eq!(vault.info(id).other_fields, vec![PHASE_1_PROFILE]);
     }
 
     #[test]

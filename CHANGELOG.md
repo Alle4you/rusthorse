@@ -11,26 +11,37 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Added
 
-- **HTTP credential broker, phase 1**
+- **HTTP credential broker**
   ([ADR 0013](docs/adr/0013-credential-broker.md)):
-  `run --broker VAR=ENTRY --url URLVAR=ENTRY` gives the approved command a
-  temporary token and local base URL. One broker per grant authenticates to
-  the profile's fixed HTTPS destination and exact routes, supports SSE,
-  redacts literal copies of the credential in response bodies, drops headers
-  containing it, and records each admission durably before forwarding.
-  Presets: Anthropic, OpenAI and OpenAI-compatible. Grants have a maximum
-  lifetime, an optional request limit and a policy for automatic locks; the
-  explicit lock and command end always end them. No automatic fallback to the
-  real key; no remembered broker approvals.
-- **Profiles and grants**: `edit --broker PRESET` and its `--broker-*`
-  settings, `edit --clear broker`, `grants [--json]` and
-  `grants revoke ID|--all`. `show` displays profiles; `status` reports the
-  broker and live grant count; `doctor` checks the broker and the CA file;
-  `audit` shows grant and request records. `rusthorse guide ai` includes SDK
-  recipes and a Claude Code recipe; in the manual test with a real key, the
-  Python SDK worked through the broker for the requests tried, and Claude
-  Code has not answered through it yet.
-- **A key the destination refused is named**: when a grant's destination
+  `run --broker VAR=ENTRY@URL --url URLVAR=ENTRY` gives the approved command
+  a temporary token instead of the key, and a local base URL. The run names
+  where the key may go — `https://`, a host name, an optional port and base
+  path; there is no default and no fallback to the entry's URL — and the
+  dialog shows the approved origin, the base path apart from it (not a
+  limit: the key may go to any path at the origin) and the grant's limits.
+  The program presents the token in a request header, as it would the key;
+  one broker per grant puts the key in its place and forwards the request to
+  the approved origin only, over verified TLS, streams server-sent events,
+  redacts literal copies of the key in response bodies, drops response
+  headers carrying it or a token, refuses a request with the token misplaced, another
+  token or the key itself, and records each admission durably before
+  forwarding, with the method's label, never the path. The broker knows
+  nothing about any API: there are no profiles, presets or routes (phase
+  1's, set with `edit --broker`, were removed before any release; a
+  `Rusthorse.Broker` field it stored stays in the entry as an ordinary
+  field, never read). `--broker-requests`, `--broker-lifetime` and
+  `--broker-locks` set the run's limits (no request limit, 12 hours and
+  `continue` unless given); the explicit lock and command end always end
+  grants. No automatic fallback to the real key; no remembered broker
+  approvals.
+- **Grants**: `grants [--json]`, with the approved origin and the base path
+  in columns of their own, and `grants revoke ID|--all`. `status` reports
+  the broker and live grant count; `doctor` checks the broker and the CA
+  file; `audit` shows grant and request records. `rusthorse guide ai`
+  includes SDK recipes and a Claude Code recipe; in the manual test with a
+  real key and phase 1's broker, the Python SDK worked through the broker
+  for the requests tried, and Claude Code has not answered through it yet.
+- **A key the destination refused is named**: when a grant's approved origin
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
   its exit status unchanged; `grants` (a note under the table, and
@@ -39,11 +50,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   destination. The JSON errors the broker writes itself now start their
   message with `rusthorse-broker:`, and that of a grant that has ended says
   to run the command again.
-- **Manager broker controls**: a Grants page lists and revokes one or all
-  grants, also while locked. Ended rows retain their place while the page is
-  shown. Entry details show profiles read-only and offer broker command
-  snippets; edit and import notes explain grant revocation and profile removal
-  on replacement.
+- **Manager broker controls**: a Grants page lists the grants, each with its
+  approved origin and its base path apart, and revokes one or all, also
+  while locked. Ended rows retain their place while the page is shown.
+  Entry details offer two labelled command templates: one gives the value
+  to the command (`run`), the other goes through the broker and leaves the
+  destination and the variables for you to fill in. Edit and import notes
+  explain grant revocation.
 - **Broker distribution**: the package installs `/usr/bin/rusthorse-broker` as
   its fourth program and recommends `ca-certificates`. The build script checks
   both the built broker and every broker in the packages it produces, and
@@ -192,10 +205,16 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
-- **Protocol 8**: separate `broker_run` and `broker_edit` requests prevent an
-  older agent from silently ignoring broker bindings or profile edits. Added
-  `grants`, `revoke_grant` and optional profile/status fields, and later the
-  optional `GrantInfo.unauthorized` and `exited.unauthorized`.
+- **Protocol 9** (protocol 8, with broker profiles, existed only during
+  development): a run through the broker is a request of its own,
+  `broker_run_v2`, whose bindings each name their destination and whose
+  `limits` set the grants' limits, with unknown fields refused, so that an
+  older agent refuses it whole instead of ignoring them; a refused request
+  is never sent again as another type. Added `grants`, `revoke_grant`,
+  optional broker status fields, `GrantInfo.unauthorized` and
+  `exited.unauthorized`; `GrantInfo.destination` is the approved origin, and
+  `GrantInfo.base_path` the base path apart. The control channel between
+  the agent and a broker is at version 2.
 - An edit's answer names the entry (`NAME updated`) even when the request
   names it by its UUID, as the manager does: the manager showed the UUID.
 - The CLI shows what the vault, the agent or a keyring supplies with control
