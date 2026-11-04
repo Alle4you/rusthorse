@@ -145,8 +145,10 @@ token in its URL was refused by the broker itself, and nothing was sent. The
 Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
 worked through it for a message and two streams. Claude Code 2.1.318, run in
 print mode (`claude -p`) with a home directory of its own, and so no login,
-answered through it, in one request; its interactive mode, as the recipe
-runs it, has not been tried through it. If Claude Code shows
+answered through it, in one request, and the maintainer then used Claude
+Code interactively through it with the recipe of the built-in guide; the
+`Credit balance is too low` answer of the earlier test did not recur. If
+Claude Code shows
 `Credit balance is too low` while other requests with the same key work, the
 account refuses Claude Code's requests (with the key used in that test, its
 beta `claude-code-20250219` alone drew that answer, with or without the

@@ -311,7 +311,7 @@ the Python SDK worked through the broker, and Claude Code's check was left
 for later. The broker without profiles was then tried by hand with `curl` (a
 GET and a POST answered, a misplaced token refused) and the Python SDK (a
 message and two streams), and Claude Code answered through it in print mode
-(`claude -p`); its interactive mode has not been tried through it.
+(`claude -p`) and, run by the maintainer, interactively.
 Screen-lock and suspend locking are implemented too. No other connector is
 planned: `rusthorse run` serves databases, devices and SSH. Published
 packages remain planned. See [docs/roadmap.md](docs/roadmap.md).

@@ -668,11 +668,11 @@ broker to the API, which answered `400` ("credit balance is too low"); SDK
 requests with some of Claude Code's parameters drew the same answer with the
 key by value as through the broker. Claude Code 2.1.318, run in print mode
 (`claude -p`) with a home directory of its own, and so no login, then
-answered through the broker without profiles, in one request; its
-interactive mode, as above, has not been tried through it. The Anthropic
-Python SDK 2.4.0 worked through phase 1's broker, for the requests and
-streams tried; the broker without profiles was tried by hand with `curl` (a
-GET and a POST answered, a token in the URL refused) and with that SDK (a
+answered through the broker without profiles, in one request, and the
+maintainer then used it interactively through it with the recipe above. The
+Anthropic Python SDK 2.4.0 worked through phase 1's broker, for the requests
+and streams tried; the broker without profiles was tried by hand with `curl`
+(a GET and a POST answered, a token in the URL refused) and with that SDK (a
 message and two streams). `ANTHROPIC_AUTH_TOKEN` makes Claude Code send the
 token as `Authorization: Bearer`; `env -u ANTHROPIC_API_KEY` keeps a key
 your environment may hold out of the command (Claude Code may send it

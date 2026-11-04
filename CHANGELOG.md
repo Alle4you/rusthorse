@@ -43,8 +43,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   for the requests tried, and Claude Code did not answer through it; the
   broker without profiles was then tried with `curl` (a GET and a POST
   answered, a token in the URL refused), with the Python SDK (a message and
-  two streams) and with Claude Code 2.1.318 in print mode (`claude -p`),
-  which answered.
+  two streams) and with Claude Code 2.1.318, which answered in print mode
+  (`claude -p`) and interactively.
 - **A key the destination refused is named**: when a grant's approved origin
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),

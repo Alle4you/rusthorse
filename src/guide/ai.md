@@ -229,8 +229,8 @@ through the broker, and SDK requests, with the key by value as through the
 broker — while other requests with the same key worked. Claude Code
 2.1.318, run in print mode (`claude -p`) with a home directory of its own,
 and so no login, then answered through this version of the broker, in one
-request; its interactive mode, as below, has not been tried through it. If
-Claude Code shows
+request, and the maintainer then used it interactively through it with the
+recipe below; the earlier `400` did not recur. If Claude Code shows
 `Credit balance is too low`, tell the human that the account refused the
 request, not the broker. If it does not work, tell the human: never fall
 back to the key, and do not try another key or other betas on your own.
