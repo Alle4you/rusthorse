@@ -669,7 +669,8 @@ requests with some of Claude Code's parameters drew the same answer with the
 key by value as through the broker. No answer from Claude Code through the
 broker has been seen yet. The Anthropic Python SDK 2.4.0 worked through
 phase 1's broker, for the requests and streams tried; the broker without
-profiles has not been tried by hand yet. `ANTHROPIC_AUTH_TOKEN` makes Claude
+profiles was tried by hand with `curl` only (a GET and a POST answered, a
+token in the URL refused). `ANTHROPIC_AUTH_TOKEN` makes Claude
 Code send the token as `Authorization: Bearer`; `env -u ANTHROPIC_API_KEY`
 keeps a key your environment may hold out of the command (Claude Code may
 send it instead of the token, which the broker refuses, or beside it, in

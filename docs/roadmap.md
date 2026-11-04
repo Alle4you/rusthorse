@@ -31,13 +31,19 @@ broker without profiles that replaced it on 2026-11-04.
 phases are dropped, and its
 [scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)
 (2026-11-04) replaced phase 1's profiles and presets with a destination named
-in each run (below). The manual check with the maintainer's credentials began on
-2026-11-04, with phase 1's broker: the Anthropic Python SDK worked through
+in each run (below). The manual check with the maintainer's credentials began
+on 2026-11-04, with phase 1's broker: the Anthropic Python SDK worked through
 the broker for the requests tried; Claude Code's requests went through it,
 and the API answered them `400`, as it answered SDK requests with some of
-Claude Code's parameters sent with the key by value; the maintainer left
-its check for later. The broker without profiles has not been tried by
-hand yet. No client version is claimed supported yet.
+Claude Code's parameters sent with the key by value; the maintainer left its
+check for later. On 2026-11-04 the maintainer also tried the broker without
+profiles by hand, with a real key and `curl` through
+`https://api.anthropic.com`, the token in `x-api-key`: a `GET /v1/models` was
+answered `200`, as the audit recorded with the method's label only, and a
+`POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
+token in its URL was refused by the broker itself, and nothing was sent.
+SDKs and Claude Code have not been tried through it yet.
+No client version is claimed supported yet.
 
 ### Why
 
@@ -171,8 +177,9 @@ the agent serializes counted admissions; the destination and DNS are
 constrained; and the local hop authenticates a token, not a process
 identity. Phase 1 was implemented and reviewed; in its manual check the
 Python SDK worked, and Claude Code's check was left for later. The broker
-without profiles or presets (above) replaced it; a manual check of it with
-real clients remains. Nothing else is planned for the broker.
+without profiles or presets (above) replaced it; tried by hand with `curl`,
+it served a GET and a POST and refused a misplaced token, and a check of it
+with SDKs and Claude Code remains. Nothing else is planned for the broker.
 
 ## Desktop and usability
 

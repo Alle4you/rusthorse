@@ -617,7 +617,8 @@ with a real key (2026-11-04) and phase 1's broker, the Anthropic Python SDK
 requests went through it, and the API answered them `400`, as it answered
 SDK requests with some of Claude Code's parameters sent with the key by
 value, so no Claude Code answer through the broker has been seen yet. The
-broker without profiles has not been tried by hand yet. A program works
+broker without profiles was then tried by hand with `curl` only: a GET and
+a POST answered, a token in the URL refused by the broker. A program works
 through it only if it presents the token literally in a header: one that
 encodes the token or derives its credential from it, and an API that signs
 requests with the key or takes it in the URL or the body, cannot use it.

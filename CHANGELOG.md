@@ -40,7 +40,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   file; `audit` shows grant and request records. `rusthorse guide ai`
   includes SDK recipes and a Claude Code recipe; in the manual test with a
   real key and phase 1's broker, the Python SDK worked through the broker
-  for the requests tried, and Claude Code has not answered through it yet.
+  for the requests tried, and Claude Code has not answered through it yet;
+  the broker without profiles was then tried with `curl` (a GET and a POST
+  answered, a token in the URL refused).
 - **A key the destination refused is named**: when a grant's approved origin
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
