@@ -679,7 +679,8 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
 | 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `d8f2eb9` and `e86e6bd`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `7a1d63b`. |
 | 2026-11-04 | Confirmation of `7a1d63b` and its history at `4ef519f` (Codex, AI-assisted). | Ready: U01–U03 confirmed resolved and the history accurate; V01 low and V02 low, fixed in `49bf590`. |
-| 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `c0aebc0` and `4fefa4c`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; all three fixed in `2fafe05`. The count of 401 answers held under every probe. |
+| 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `c0aebc0` and `4fefa4c`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; W01 and W02 fixed in `2fafe05`, W03 partly, completed in `f51391c` (X02). The count of 401 answers held under every probe. |
+| 2026-11-04 | Confirmation of `2fafe05` and its history at `db0af0e` (Codex, AI-assisted). | Not ready: W01 and W02 confirmed resolved, W03 partly; X01 medium (older than this work: `list` and `show` printed what the vault holds unescaped), X02 and X03 low; all three fixed in `f51391c`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2446,14 +2447,18 @@ Code's requests went through the broker, and the API answered two
 change of the entry's value, the manager's message named the entry's UUID.
 Fourth, at the maintainer's request and with the maintainer's approval of
 each run, the maintainer's agent compared the Anthropic Python SDK 2.4.0
-with the key by value and through the broker: create and streaming
-requests to Sonnet 5.5 and Haiku 5.5 gave the same answers, usage,
-rate-limit values and similar times, and the broker relayed 16–17 of the
-API's 29–30 response headers, as its list allows. Requests with Claude
-Code's parameters got the same `400` both ways, and with this key the beta
-`claude-code-20250219` alone drew it. So the Python SDK works through the
-broker for these requests, and Claude Code's requests go through it, but no
-answer from Claude Code through the broker has been seen yet.
+with the key by value and through the broker. With Sonnet 5.5 — create with
+`max_tokens` 200, streaming with 200 and 32000 — the answers, usage and
+rate-limit values matched, with similar times, and the broker relayed 16–17
+of the API's 29–30 response headers, as its list allows. Separate scripts
+sent Haiku 5.5 streaming requests with a minimal input: plain ones worked
+both ways; with some of Claude Code 2.1.317's parameters (its betas,
+adaptive thinking, context management, effort) they drew the same `400`
+both ways, and with this key the beta `claude-code-20250219` alone drew it.
+These were not full reproductions of Claude Code's requests. So the tested
+Python SDK requests work through the broker, and Claude Code's own requests
+reach the API through it, but no answer from Claude Code through the
+broker has been seen yet.
 
 `4fefa4c` names the entry in an edit's answer (its title, or the new name
 after a rename). `c0aebc0` counts per grant the requests whose destination
@@ -2474,9 +2479,9 @@ thread's records, and the broker's own `401` was never counted.
 
 | Finding | Disposition |
 |---|---|
-| Medium — W01: since `4fefa4c`, an edit's answer names the entry by the title stored in the vault, which another KeePass program can write with terminal controls in it, and the CLI printed the agent's messages as they came: editing by UUID an entry titled `SAFE\u{1b}[2J\rFORGED` sent ESC and CR to the terminal. | **Fixed in `2fafe05`:** the CLI prints everything the agent says — answers, errors, a run's errors, an import's results — with control and invisible characters escaped, as it already printed the grants; the vault keeps the title as it is. Tested with such a title written into the file, then edited and removed by UUID, and with a fake agent's answer, error and run error; without the escaping, both tests fail. |
+| Medium — W01: since `4fefa4c`, an edit's answer names the entry by the title stored in the vault, which another KeePass program can write with terminal controls in it, and the CLI printed the agent's messages as they came: editing by UUID an entry titled `SAFE\u{1b}[2J\rFORGED` sent ESC and CR to the terminal. | **Fixed in `2fafe05`:** the CLI escapes the messages of the agent's answers and errors, a run's errors and an import's per-batch results, as it already escaped the grants; the vault keeps the title as it is. Tested with such a title written into the file, then edited and removed by UUID, and with a fake agent's answer, error and run error; without the escaping, both tests fail. The rest of what the CLI shows from the vault, the agent or a keyring was escaped in `f51391c` (X01, below). |
 | Low — W02: the command the note suggests, `rusthorse edit NAME --value`, reads a name that starts with `-` as an option (for `--help`, it shows the help). | **Fixed in `2fafe05`:** for such a name the note suggests `rusthorse edit --value -- NAME`; a test parses the suggested command for `KEY`, a name the shell would split, `-k` and `--help`, and fails without the fix. |
-| Low — W03: the CLI's documentation and the guide said that every error without the broker's prefix comes from the destination, but the broker's HTTP parser answers a malformed request itself, with `400` or `431` and an empty body, and a connection can close with no answer. | **Fixed in `2fafe05`:** `docs/cli.md`, the guide, `docs/ai-agents.md`, the ADR's amendment and the CHANGELOG limit the prefix to the JSON errors the broker writes, and name these exceptions. |
+| Low — W03: the CLI's documentation and the guide said that every error without the broker's prefix comes from the destination, but the broker's HTTP parser answers a malformed request itself, with `400` or `431` and an empty body, and a connection can close with no answer. | **Partly fixed in `2fafe05`:** `docs/cli.md`, the guide, `docs/ai-agents.md`, the ADR's amendment and the CHANGELOG limit the prefix to the JSON errors the broker writes, and name these exceptions; but the guide then said that every empty `400` or `431` is the broker's, which a destination can send too. Completed in `f51391c` (X02, below). |
 
 Codex's checks: an isolated export with offline builds and fake
 credentials; targeted tests of the destination's and the broker's `401`, a
@@ -2493,3 +2498,31 @@ name, no grants note, the edit's answer echoing the request's name, no
 prefix, no hint — and three of the manager's (a fact that always says *No*,
 the warning never added, never removed); then `2fafe05` with all of the checks
 again and the mutations of W01 and W02, each failing its test.
+
+**2026-11-04 — Confirmation of the fixes at `db0af0e`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `2fafe05`
+and of the history above, in `db0af0e`. W01 and W02 were confirmed
+resolved: the agent's messages are escaped, the title stays as stored, and
+the suggested command parses as an edit of the named entry for `-k` and
+`--help`; reverting either fix fails its tests. W03 was confirmed partly
+resolved (X02).
+
+| Finding | Disposition |
+|---|---|
+| Medium — X01, older than this work: `list` and `show` printed what the vault holds as it came, so a title or a username another KeePass program wrote with terminal controls reached the terminal: the review's probe with the title `SAFE\u{1b}[2J\rFORGED\u{202e}` sent ESC and CR to the standard output of both. The import preview and the text of `status` did the same with what a keyring or the agent supplies. | **Fixed in `f51391c`:** everything the CLI shows to people from the vault, the agent or a keyring — `list` and `show` (before a table's widths are measured), `status`, `doctor`'s lines, the import preview and the CLI's own errors (names given twice in a keyring import, for one) — has its control and invisible characters escaped; `--json` gives the values as they are, and what `reveal` prints and a command's output are not touched. Tested with a title and a username written into the file (`list`, `show`, and `show --json` as stored), a status with controls in its vault, dialogs and program, keyring names in a dry run and in the error that refuses names given twice, and `doctor`'s lines; without the escaping in any one of these places, a test fails. |
+| Low — X02: the guide said that an empty `400` or `431` is the broker's answer to a malformed request; the review's probe had a destination send both, relayed by the real broker with one admission and its status in the request's end, besides the broker's own empty `400` with no admission. | **Fixed in `f51391c`:** the guide says that the broker's HTTP parser can answer that way and that a destination can too, so such an answer alone does not tell who answered; `docs/cli.md` says the same. |
+| Low — X03: the documents said that the account refused "the same requests" of Claude Code with the key by value, and grouped the Sonnet and Haiku comparisons. Claude Code's own requests went through the broker only; the comparisons both ways were SDK requests: create and streaming to Sonnet 5.5, and streaming to Haiku 5.5 with a minimal input, plain or with some of Claude Code's parameters. | **Fixed in `f51391c`:** answer 9 of ADR 0013 and its amendment, `docs/cli.md`, the guide, `docs/ai-agents.md`, the roadmap, the threat model and the CHANGELOG say what was tried, and the fourth paragraph of the entry above was reworded the same way. |
+
+Codex's checks: the diff and the commit messages; the escaping tests, the
+binary's tests (the suggested command, the guide), the edit test; its own
+probes of a title written elsewhere (edit escaped, title kept; `list` and
+`show` raw, X01), of an import's success, error, denial and unknown result
+and of an unknown error of `run` (escaped, statuses `0`, `1`, `4` and
+`124` kept), and of empty `400` and `431` answers from the broker and from
+a destination (X02); the reverted escape and `--` form, each failing its
+tests; formatting and `git diff --check`. It did not rerun the comparison
+scripts, which need the maintainer's key and dialogs. The maintainer's
+agent then checked `f51391c` with all of AGENTS.md's checks, and with six
+mutations — no escaping in `list`, `show`, `status`, the import preview,
+the main error printer or `doctor`'s lines — each failing a test.
