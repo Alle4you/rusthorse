@@ -369,9 +369,12 @@ impl Client {
             join_within(worker, Duration::from_millis(500));
         }
         if broken.load(Ordering::SeqCst) {
+            // The agent's answer is dropped, notes included: 141 comes
+            // without a message.
             return Ok(Response::Exited {
                 code: None,
                 signal: Some(SIGPIPE),
+                unauthorized: Vec::new(),
             });
         }
         result

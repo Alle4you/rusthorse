@@ -409,6 +409,10 @@ pub(crate) fn profile_facts(profile: &BrokerProfile) -> Vec<(String, String)> {
     facts
 }
 
+/// The label of the fact that says whether a grant's destination answered
+/// requests with `401 Unauthorized`; every grant has it.
+pub(crate) const KEY_REFUSED: &str = "Key refused";
+
 /// How the grants page shows one grant of the credential broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantRow {
@@ -417,6 +421,10 @@ pub(crate) struct GrantRow {
     /// Whether revoking it would end anything: a revoked grant is listed
     /// until its command ends, but has ended already.
     pub revocable: bool,
+    /// Whether its destination answered some of its requests with `401
+    /// Unauthorized`, as last listed: the page draws that fact
+    /// ([`KEY_REFUSED`]) as a warning.
+    pub key_refused: bool,
     /// Label and value pairs, in the order shown.
     pub facts: Vec<(&'static str, String)>,
 }
@@ -445,6 +453,7 @@ impl GrantRow {
         Self {
             id: grant.id.clone(),
             revocable: !revoked && !gone,
+            key_refused: grant.unauthorized.is_some_and(|n| n > 0),
             facts: vec![
                 ("Entry", grant.entry.clone()),
                 (
@@ -481,6 +490,12 @@ impl GrantRow {
                         format!("{used}; {} in flight", grant.in_flight)
                     },
                 ),
+                // Always there, whatever the count: the page then sets its
+                // text in place.
+                (
+                    KEY_REFUSED,
+                    key_refused_text(grant.unauthorized, revoked || gone, gone),
+                ),
                 (
                     "Automatic locks",
                     match grant.automatic_locks {
@@ -496,6 +511,33 @@ impl GrantRow {
             ],
         }
     }
+}
+
+/// What a grant's [`KEY_REFUSED`] fact says: how many of its requests the
+/// destination answered with `401 Unauthorized` — it did not accept the
+/// value the broker sent from the entry — and what to do about it. The
+/// agent counts only requests the broker forwarded: the broker's own `401`,
+/// for a request without the grant's token, never reaches the destination.
+/// `unauthorized` is `None` from an agent that does not count them; `ended`
+/// says that the grant has ended already, so that a change of the value no
+/// longer ends it; `gone`, that the count is the one last listed.
+fn key_refused_text(unauthorized: Option<u64>, ended: bool, gone: bool) -> String {
+    let requests = match unauthorized {
+        None => return "Not reported".into(),
+        Some(0) if gone => return "No, when last listed".into(),
+        Some(0) => return "No".into(),
+        Some(1) => "1 request".to_string(),
+        Some(n) => format!("{n} requests"),
+    };
+    format!(
+        "{requests} answered 401 Unauthorized{}: the destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with Change the value… in the entry's details{}",
+        if gone { " when last listed" } else { "" },
+        if ended {
+            "."
+        } else {
+            "; that ends this grant."
+        },
+    )
 }
 
 /// A grant's state for people; a state this build does not know is shown
@@ -1141,7 +1183,8 @@ pub(crate) mod tests {
         assert_eq!(compatible[1].1, "https://api.deepseek.example/v1");
     }
 
-    /// A grant as an agent of protocol 8 lists it.
+    /// A grant as a current agent of protocol 8 lists it: its destination
+    /// answered none of its requests with `401 Unauthorized`.
     pub fn grant(id: &str, state: &str) -> GrantInfo {
         GrantInfo {
             id: id.into(),
@@ -1157,6 +1200,7 @@ pub(crate) mod tests {
             requests: 3,
             max_requests: None,
             in_flight: 1,
+            unauthorized: Some(0),
             automatic_locks: AutomaticLocks::Continue,
         }
     }
@@ -1166,6 +1210,7 @@ pub(crate) mod tests {
         let row = GrantRow::new(&grant("g0123456789abcdef", "active"));
         assert_eq!(row.id, "g0123456789abcdef");
         assert!(row.revocable);
+        assert!(!row.key_refused);
         let facts: Vec<(&str, &str)> = row.facts.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(
             facts,
@@ -1180,6 +1225,7 @@ pub(crate) mod tests {
                 // 11h42m30s: rounded up, so that it is at the latest.
                 ("Ends", "in 11h43m at the latest"),
                 ("Requests", "3 (no limit); 1 in flight"),
+                ("Key refused", "No"),
                 (
                     "Automatic locks",
                     "Do not end it: it keeps working while the screen or the vault is locked"
@@ -1241,6 +1287,80 @@ pub(crate) mod tests {
         let row = GrantRow::new(&grant("g4", "paused"));
         assert!(row.revocable);
         assert_eq!(fact(&row, "State"), "paused");
+    }
+
+    #[test]
+    fn a_grant_says_how_many_requests_its_destination_answered_401() {
+        let keys = |row: &GrantRow| row.facts.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let refused = |row: &GrantRow| {
+            row.facts
+                .iter()
+                .find(|(k, _)| *k == "Key refused")
+                .map(|(_, v)| v.clone())
+                .expect("the fact")
+        };
+        let mut listed = grant("g0123456789abcdef", "active");
+        // Every grant has it, right after its requests, whatever the count:
+        // the page sets its text in place.
+        let reference = keys(&GrantRow::new(&listed));
+        let at = reference
+            .iter()
+            .position(|k| *k == "Requests")
+            .expect("requests");
+        assert_eq!(reference[at + 1], "Key refused");
+        // Said in full once: what to do, and that it ends the grant.
+        listed.unauthorized = Some(1);
+        assert_eq!(
+            refused(&GrantRow::new(&listed)),
+            "1 request answered 401 Unauthorized: the destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with Change the value… in the entry's details; that ends this grant."
+        );
+        let advice = "the destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with Change the value… in the entry's details";
+        for (count, now, ended, warned) in [
+            // An agent that does not count them.
+            (
+                None,
+                "Not reported".to_string(),
+                "Not reported".to_string(),
+                false,
+            ),
+            (Some(0), "No".into(), "No, when last listed".into(), false),
+            (
+                Some(1),
+                format!("1 request answered 401 Unauthorized: {advice}; that ends this grant."),
+                format!("1 request answered 401 Unauthorized when last listed: {advice}."),
+                true,
+            ),
+            (
+                Some(3),
+                format!("3 requests answered 401 Unauthorized: {advice}; that ends this grant."),
+                format!("3 requests answered 401 Unauthorized when last listed: {advice}."),
+                true,
+            ),
+        ] {
+            listed.unauthorized = count;
+            let (row, gone) = (GrantRow::new(&listed), GrantRow::ended(&listed));
+            assert_eq!(refused(&row), now, "{count:?}");
+            assert_eq!(row.key_refused, warned, "{count:?}");
+            // Ended, the grant keeps the count last listed, and says so.
+            assert_eq!(refused(&gone), ended, "{count:?}");
+            assert_eq!(gone.key_refused, warned, "{count:?}");
+            assert_eq!(keys(&row), reference, "{count:?}");
+            assert_eq!(keys(&gone), reference, "{count:?}");
+            for r in [&row, &gone] {
+                assert!(r.facts.iter().all(|(_, v)| !v.contains('\n')), "{r:?}");
+            }
+        }
+        // A revoked grant has ended already: a change of the value does not
+        // end it.
+        listed.state = "revoked".into();
+        listed.unauthorized = Some(2);
+        let row = GrantRow::new(&listed);
+        assert_eq!(
+            refused(&row),
+            format!("2 requests answered 401 Unauthorized: {advice}.")
+        );
+        assert!(row.key_refused);
+        assert_eq!(keys(&row), reference);
     }
 
     #[test]

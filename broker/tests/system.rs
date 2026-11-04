@@ -1830,14 +1830,89 @@ fn requests_without_their_grants_token_get_401_and_reach_nothing() {
     for (started, refused) in [(&a, cases.len() as u64), (&b, 1)] {
         let grant = sys.grant(&started.id).expect("listed");
         assert_eq!(grant.requests, 1);
+        // The broker's own 401s are not the destination's: none counts.
+        assert_eq!(grant.unauthorized, Some(0));
         sys.go(if started.id == a.id { "a" } else { "b" });
-        assert_eq!(started.running.exit_code(), Some(0));
+        assert!(matches!(
+            started.running.wait(),
+            Response::Exited { code: Some(0), unauthorized, .. } if unauthorized.is_empty()
+        ));
         let end = sys.end_of(&started.id);
         assert_eq!(
             end["requests"],
             serde_json::json!({"admitted": 1, "finished": 1, "unknown": 0, "refused": refused}),
             "{end}"
         );
+    }
+}
+
+/// A destination that does not accept the key answers `401`: the command
+/// gets that answer as the destination wrote it, the grant counts it while
+/// the command runs, and the run's answer names the grant when the command
+/// ends — even when it ends at once after its last request, before anything
+/// else could look.
+#[test]
+fn a_destinations_401_is_relayed_counted_and_reported_when_the_run_ends() {
+    let sys = System::new();
+    let destination = Destination::new(
+        &sys.ca,
+        answer(
+            401,
+            &[("content-type", "application/json")],
+            br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        ),
+    );
+    sys.seed(&[("KEY", CREDENTIAL)]);
+    sys.set_profile("KEY", anthropic(&destination));
+    sys.install_broker(&[]);
+    let refused = |endpoint: &Endpoint| {
+        let response = endpoint.send(&endpoint.request("POST", "/v1/messages", &[], b"{}"));
+        assert_eq!(response.status, 401, "{response:?}");
+        // The destination's answer, not one of the broker's own.
+        assert_eq!(
+            response.json()["error"]["type"],
+            "authentication_error",
+            "{response:?}"
+        );
+    };
+    let a = sys.start_grant("KEY", "a");
+    refused(&a.endpoint);
+    refused(&a.endpoint);
+    // Counted once the broker reports each request's end, which comes after
+    // the command has the answer.
+    let grant = eventually("both 401 answers to be counted", || {
+        sys.grant(&a.id).filter(|g| g.unauthorized == Some(2))
+    });
+    assert_eq!(grant.requests, 2);
+    sys.go("a");
+    let Response::Exited {
+        code, unauthorized, ..
+    } = a.running.wait()
+    else {
+        panic!("the run did not end with the command")
+    };
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        unauthorized,
+        [protocol::UnauthorizedGrant {
+            var: "ANTHROPIC_API_KEY".into(),
+            entry: grant.entry.clone(),
+            destination: grant.destination.clone(),
+            requests: 2,
+        }]
+    );
+    // The command ends as soon as it has its answer: the count is complete
+    // in the run's answer all the same.
+    let b = sys.start_grant("KEY", "b");
+    refused(&b.endpoint);
+    sys.go("b");
+    let Response::Exited { unauthorized, .. } = b.running.wait() else {
+        panic!("the run did not end with the command")
+    };
+    assert_eq!(unauthorized.len(), 1, "{unauthorized:?}");
+    assert_eq!(unauthorized[0].requests, 1);
+    for id in [&a.id, &b.id] {
+        assert_eq!(sys.end_of(id)["reason"], "command_ended");
     }
 }
 

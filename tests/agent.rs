@@ -3645,8 +3645,11 @@ fn write_program(path: &Path, text: &str) {
 ///   `LOG.ready`;
 /// - anything else: answers ready; `bad_number` then asks for request 5
 ///   first, and `admit` for requests 1 and 2 (finishing 1 between them),
-///   once the command has created `LOG.go`; `ignore_revoke` never confirms
-///   a revocation, the others confirm at once.
+///   once the command has created `LOG.go`; `unauthorized` asks for
+///   requests 1 to 3 one at a time and, once each is admitted, reports its
+///   end with the destination's status 401, 200 and 401 (the last one
+///   closed by the client), then creates `LOG.done`; `ignore_revoke` never
+///   confirms a revocation, the others confirm at once.
 ///
 /// It logs every message it receives and exits when its channel ends.
 const FAKE_BROKER: &str = r#"#!/usr/bin/python3 -I
@@ -3751,6 +3754,17 @@ if MODE == "admit":
     send({"type": "admit", "request": 2, "method": "GET", "route": "GET /v1/models"})
     answer, _ = read_frame()
     log({"event": "answer", "message": answer})
+    open(LOG + ".done", "w").close()
+if MODE == "unauthorized":
+    wait_for(LOG + ".go")
+    for request, status, outcome in [(1, 401, "completed"), (2, 200, "completed"),
+                                      (3, 401, "client_closed")]:
+        send({"type": "admit", "request": request, "method": "POST",
+              "route": "POST /v1/messages"})
+        answer, _ = read_frame()
+        log({"event": "answer", "message": answer})
+        send({"type": "finished", "request": request, "outcome": outcome, "status": status,
+              "bytes_sent": 10, "bytes_received": 20})
     open(LOG + ".done", "w").close()
 
 while True:
@@ -5981,7 +5995,11 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         &h,
         broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
     );
-    assert!(matches!(running.wait(), Response::Exited { .. }));
+    // Its one request answered 200: nothing to report.
+    assert!(matches!(
+        running.wait(),
+        Response::Exited { unauthorized, .. } if unauthorized.is_empty()
+    ));
     let answers: Vec<serde_json::Value> = broker_log(&log)
         .into_iter()
         .filter(|e| e["event"] == "answer")
@@ -6024,6 +6042,66 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         grant_ends(&h)[&id]["requests"],
         serde_json::json!({"admitted": 1, "finished": 1, "unknown": 0, "refused": 1})
     );
+}
+
+/// The requests a grant's destination answered with `401 Unauthorized` are
+/// counted — whatever became of them after their head — and shown in
+/// `grants` while the command runs; when it ends, the run's answer names
+/// the grant, its entry and its destination, with the count, so that
+/// `rusthorse run` can say that the destination refused the key. Other
+/// statuses are not counted.
+#[test]
+fn a_run_reports_the_grants_whose_destination_answered_401() {
+    use rusthorse::protocol::{Response, UnauthorizedGrant};
+    if !python3() {
+        return;
+    }
+    let h = Harness::new();
+    seed(&h, &[("KEY", FAKE_KEY, Some(anthropic()))]);
+    let log = fake_broker(&h, "unauthorized");
+    h.decide(&[Decision::AllowOnce]);
+    let go_file = log.with_extension("jsonl.go");
+    let script = format!("touch {}; {WAITS}", go_file.display());
+    let running = start(
+        &h,
+        broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
+    );
+    // While the command runs: the stand-in reports its three requests, two
+    // of them answered 401.
+    let listed = eventually("the 401 answers to be counted", || {
+        grants(&h).into_iter().find(|g| g.unauthorized == Some(2))
+    });
+    assert_eq!(listed.requests, 3);
+    go(&h);
+    let Response::Exited {
+        code, unauthorized, ..
+    } = running.wait()
+    else {
+        panic!("the run did not end with the command")
+    };
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        unauthorized,
+        [UnauthorizedGrant {
+            var: "K".into(),
+            entry: listed.entry.clone(),
+            destination: listed.destination.clone(),
+            requests: 2,
+        }]
+    );
+    assert!(listed.entry.starts_with("KEY ("), "{}", listed.entry);
+    let id = logged(&log, "install")["install"]["grant"]
+        .as_str()
+        .expect("grant")
+        .to_string();
+    assert_eq!(listed.id, id);
+    assert_eq!(ended_with(&h, &id), "command_ended");
+    let statuses: Vec<serde_json::Value> = audit_records(&h)
+        .into_iter()
+        .filter(|r| r["action"] == "broker_request" && r["outcome"] != "admitted")
+        .map(|r| r["status"].clone())
+        .collect();
+    assert_eq!(statuses, [401, 200, 401]);
 }
 
 /// When the command's leader exits, its grants are revoked at once — before
@@ -7966,7 +8044,7 @@ mod broker_cli {
     use rusthorse::broker_profile::{AutomaticLocks, Preset, ProfileRequest};
     use rusthorse::protocol::{
         EntryFields, EntryInfo, ErrorCode, GrantInfo, PROTOCOL_VERSION, Request, Response,
-        StatusInfo, recv_frame, send_frame,
+        StatusInfo, UnauthorizedGrant, recv_frame, send_frame,
     };
     use serde_json::{Value, json};
     use std::sync::atomic::AtomicBool;
@@ -8134,6 +8212,7 @@ mod broker_cli {
         Some(Response::Exited {
             code: Some(code),
             signal: None,
+            unauthorized: Vec::new(),
         })
     }
 
@@ -8344,6 +8423,7 @@ mod broker_cli {
                     Some(Response::Exited {
                         code: None,
                         signal: Some(9),
+                        unauthorized: Vec::new(),
                     })
                 }),
                 137,
@@ -8359,6 +8439,130 @@ mod broker_cli {
             assert!(stderr.contains(message), "{stderr}");
             assert_eq!(agent.only_sent().0["type"], "broker_run");
         }
+    }
+
+    fn refused_grant(var: &str, entry: &str, requests: u64) -> UnauthorizedGrant {
+        UnauthorizedGrant {
+            var: var.into(),
+            entry: entry.into(),
+            destination: "https://api.anthropic.com".into(),
+            requests,
+        }
+    }
+
+    /// When the agent reports that a grant's destination answered `401`,
+    /// `rusthorse run` says so after the command, which keeps its own
+    /// status, with or without redaction: the command ran, the broker
+    /// accepted its token, and the destination did not accept the key of
+    /// the entry the command line named — and how to replace it.
+    #[test]
+    fn a_refused_key_is_named_after_the_command_which_keeps_its_status() {
+        const NOTE: &str = "rusthorse: note: the command ran, and the broker accepted its \
+                            token, but https://api.anthropic.com answered 401 Unauthorized \
+                            to 2 requests: it did not accept the key stored in AI/k. If that \
+                            key is wrong, revoked, or not of the kind the destination \
+                            expects, replace it: rusthorse edit AI/k --value\n";
+        for (no_redact, code, signal, expected) in [
+            (false, Some(7), None, 7),
+            (true, Some(7), None, 7),
+            (false, None, Some(9), 137),
+            // The command's own 125: the note says that it ran.
+            (false, Some(125), None, 125),
+        ] {
+            let agent = run_agent(move || {
+                Some(Response::Exited {
+                    code,
+                    signal,
+                    unauthorized: vec![refused_grant("T", "AI/k (8d2f6c1e)", 2)],
+                })
+            });
+            let mut args = vec!["run"];
+            if no_redact {
+                args.push("--no-redact");
+            }
+            args.extend(["--broker", "T=AI/k", "--", "true"]);
+            let out = agent.run(&args);
+            assert_eq!(out.status.code(), Some(expected), "{}", text(&out.stderr));
+            assert_eq!(text(&out.stderr), NOTE);
+        }
+        // A note for each grant the agent names, in its order; a name the
+        // shell would split is quoted; one request is singular.
+        let agent = run_agent(|| {
+            Some(Response::Exited {
+                code: Some(0),
+                signal: None,
+                unauthorized: vec![
+                    refused_grant("B", "my key (11111111)", 1),
+                    refused_grant("A", "AI/k (8d2f6c1e)", 3),
+                ],
+            })
+        });
+        let out = agent.run(&[
+            "run", "--broker", "A=AI/k", "--broker", "B=my key", "--", "true",
+        ]);
+        assert_eq!(out.status.code(), Some(0));
+        let stderr = text(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        assert!(
+            lines[0].contains("to 1 request: it did not accept the key stored in my key.")
+                && lines[0].ends_with("replace it: rusthorse edit 'my key' --value"),
+            "{stderr}"
+        );
+        assert!(
+            lines[1].contains("to 3 requests: it did not accept the key stored in AI/k."),
+            "{stderr}"
+        );
+        // A grant the command line did not give is named as the agent
+        // reports it, escaped, without a command to run.
+        let agent = run_agent(|| {
+            Some(Response::Exited {
+                code: Some(0),
+                signal: None,
+                unauthorized: vec![UnauthorizedGrant {
+                    var: "OTHER".into(),
+                    entry: "AI/k\u{1b}[2J (8d2f6c1e)".into(),
+                    destination: "https://api.example\u{202e}.com".into(),
+                    requests: 1,
+                }],
+            })
+        });
+        let stderr = text(
+            &agent
+                .run(&["run", "--broker", "T=AI/k", "--", "true"])
+                .stderr,
+        );
+        assert!(
+            !stderr.contains('\u{1b}') && !stderr.contains('\u{202e}'),
+            "{stderr:?}"
+        );
+        assert!(
+            stderr.contains("but https://api.example\\u{202e}.com answered")
+                && stderr.contains("stored in AI/k\\u{1b}[2J (8d2f6c1e).")
+                && stderr.trim_end().ends_with("replace the entry's value"),
+            "{stderr}"
+        );
+        // An answer with neither a code nor a signal is an unknown outcome:
+        // no note says that the command ran.
+        let agent = run_agent(|| {
+            Some(Response::Exited {
+                code: None,
+                signal: None,
+                unauthorized: vec![refused_grant("T", "AI/k (8d2f6c1e)", 1)],
+            })
+        });
+        let out = agent.run(&["run", "--broker", "T=AI/k", "--", "true"]);
+        assert_eq!(out.status.code(), Some(124));
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("may or may not have run") && !stderr.contains("note:"),
+            "{stderr}"
+        );
+        // Nothing reported (or an older agent): nothing said.
+        let agent = run_agent(|| exited(3));
+        let out = agent.run(&["run", "--broker", "T=AI/k", "--", "true"]);
+        assert_eq!(out.status.code(), Some(3));
+        assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     }
 
     #[test]
@@ -8691,6 +8895,7 @@ mod broker_cli {
             requests: 3,
             max_requests: Some(200),
             in_flight: 1,
+            unauthorized: Some(0),
             automatic_locks: AutomaticLocks::Continue,
         }
     }
@@ -8775,6 +8980,50 @@ mod broker_cli {
         let out = agent.run(&["grants"]);
         assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
         assert!(text(&out.stderr).contains("broker grants are not available"));
+    }
+
+    /// `rusthorse grants` keeps its table, and says under it, on standard
+    /// error, which grants' destination answered `401`; its JSON has the
+    /// counts as the agent reported them (none from an older agent).
+    #[test]
+    fn grants_whose_destination_answered_401_get_a_note_under_the_table() {
+        let listed = vec![
+            grant("g0123456789abcdef"),
+            GrantInfo {
+                unauthorized: Some(2),
+                ..grant("gfedcba9876543210")
+            },
+            GrantInfo {
+                unauthorized: None,
+                ..grant("g1111111111111111")
+            },
+        ];
+        let shown = listed.clone();
+        let agent = FakeAgent::new(plain_status(), move |request| match request {
+            Request::Grants => Some(Response::Grants {
+                grants: shown.clone(),
+            }),
+            other => panic!("unexpected {other:?}"),
+        });
+        let out = agent.run(&["grants"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(
+            text(&out.stdout).lines().count(),
+            4,
+            "{}",
+            text(&out.stdout)
+        );
+        assert_eq!(
+            text(&out.stderr),
+            "rusthorse: note: grant gfedcba9876543210: https://api.anthropic.com answered 401 \
+             Unauthorized to 2 requests: it did not accept the key stored in AI/anthropic \
+             (8d2f6c1e). If that key is wrong, revoked, or not of the kind the destination \
+             expects, replace the entry's value (rusthorse edit NAME --value)\n"
+        );
+        let out = agent.run(&["grants", "--json"]);
+        assert!(out.status.success() && out.stderr.is_empty());
+        let back: Vec<GrantInfo> = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(back, listed);
     }
 
     #[test]

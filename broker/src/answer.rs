@@ -1,8 +1,9 @@
 //! What the broker answers itself, and the bodies of every response it
 //! gives a client.
 //!
-//! A local answer carries a short JSON error with a fixed message that never
-//! echoes the request, `x-should-retry: false` unless retrying can help
+//! A local answer carries a short JSON error, of type `rusthorse_broker`,
+//! with a fixed message that never echoes the request and starts with
+//! [`MESSAGE_PREFIX`], `x-should-retry: false` unless retrying can help
 //! (`429`, `503`, and a `502` sent before anything reached the destination),
 //! `retry-after: 1` where ADR 0013 says so, and `connection: close` where
 //! the connection cannot safely continue: after a framing error, a body
@@ -23,6 +24,11 @@ use crate::server::BusyGuard;
 
 /// The header that tells the clients' SDKs not to retry.
 pub const SHOULD_RETRY: &str = "x-should-retry";
+
+/// How the message of every local answer starts: a program that shows only
+/// the message of an API error (Claude Code shows `API Error: 403` and the
+/// message) still says that the broker answered, not the destination.
+pub const MESSAGE_PREFIX: &str = "rusthorse-broker: ";
 
 /// Why the broker answered a request itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,9 +135,16 @@ impl Refusal {
             Route => "this route is not allowed by the grant",
             BodyTooLarge => "the request body is larger than 16 MiB",
             NoRoom => "the broker holds too many request bodies; retry later",
-            Revoked => "the grant has ended",
-            Expired => "the grant has expired",
-            Exhausted => "the grant's request limit is reached",
+            Revoked => {
+                "the grant has ended; run the command again with rusthorse run for a new grant"
+            }
+            Expired => {
+                "the grant has expired; run the command again with rusthorse run for a new grant"
+            }
+            Exhausted => {
+                "the grant's request limit is reached; run the command again with rusthorse run \
+                 for a new grant"
+            }
             TooManyInFlight => "the grant has too many requests in flight; retry later",
             AuditFailed => "the request could not be recorded; it was not sent",
             BodyTimeout => "the request body did not arrive in time; it was not sent",
@@ -205,7 +218,7 @@ impl From<AdmissionRefusal> for Refusal {
 /// declared a body that was not read: the connection is then closed too.
 pub fn local(refusal: Refusal, unread_body: bool) -> Response<ResponseBody> {
     let json = format!(
-        r#"{{"type":"error","error":{{"type":"rusthorse_broker","message":"{}"}}}}"#,
+        r#"{{"type":"error","error":{{"type":"rusthorse_broker","message":"{MESSAGE_PREFIX}{}"}}}}"#,
         refusal.message()
     );
     let mut response = Response::new(ResponseBody::local(Bytes::from(json)));
@@ -446,8 +459,19 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
             assert_eq!(json["type"], "error");
             assert_eq!(json["error"]["type"], "rusthorse_broker");
-            assert_eq!(json["error"]["message"], refusal.message());
+            assert_eq!(
+                json["error"]["message"],
+                format!("rusthorse-broker: {}", refusal.message())
+            );
             assert!(body.len() < 200, "{refusal:?}: {} bytes", body.len());
+            // A grant that has ended says how to get a new one.
+            assert_eq!(
+                refusal
+                    .message()
+                    .contains("run the command again with rusthorse run"),
+                refusal.status() == 403,
+                "{refusal:?}"
+            );
         }
         // Any refusal of a request whose body was not read closes.
         let response = local(Refusal::Token, true);

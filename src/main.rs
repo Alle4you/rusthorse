@@ -16,7 +16,7 @@ use rusthorse::generate::{Alphabet, Spec};
 use rusthorse::protocol::{
     Binding, BrokerBinding, BrokerRunRequest, EntryChanges, EntryFields, EntryInfo, EntryKind,
     ErrorCode, Field, GrantInfo, ImportSource, NewEntry, Request, Response, RunRequest,
-    SecretString, StatusInfo, ValueChange,
+    SecretString, StatusInfo, UnauthorizedGrant, ValueChange,
 };
 use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
@@ -1671,6 +1671,13 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
         let RunPlan {
             bindings, brokered, ..
         } = plan;
+        // Each grant's variable and entry, as this command line gave them:
+        // what a note after the command names (the agent reports the entry
+        // as dialogs identify it, which `edit` does not take).
+        let typed: Vec<(String, String)> = brokered
+            .iter()
+            .map(|b| (b.var.clone(), b.entry.clone()))
+            .collect();
         let request = RunRequest {
             bindings,
             argv: args.command,
@@ -1692,14 +1699,29 @@ fn run(client: &Client, args: RunArgs) -> anyhow::Result<u8> {
         };
         match response {
             Response::Exited {
-                code: Some(code), ..
-            } => Ok(code.clamp(0, 255) as u8),
-            Response::Exited {
-                signal: Some(sig), ..
-            } => Ok((128 + sig).clamp(0, 255) as u8),
-            Response::Exited { .. } => Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
-                "an exit status with neither a code nor a signal".into(),
-            ))),
+                code,
+                signal,
+                unauthorized,
+            } => {
+                let status = match (code, signal) {
+                    (Some(code), _) => code.clamp(0, 255) as u8,
+                    (None, Some(sig)) => (128 + sig).clamp(0, 255) as u8,
+                    (None, None) => {
+                        return Err(anyhow::Error::new(rusthorse::client::OutcomeUnknown(
+                            "an exit status with neither a code nor a signal".into(),
+                        )));
+                    }
+                };
+                // After everything the command wrote, and with its status.
+                for grant in &unauthorized {
+                    let name = typed
+                        .iter()
+                        .find(|(var, _)| *var == grant.var)
+                        .map(|(_, entry)| entry.as_str());
+                    eprintln!("{}", unauthorized_note(grant, name));
+                }
+                Ok(status)
+            }
             Response::Error {
                 code: ErrorCode::OutcomeUnknown,
                 message,
@@ -1771,7 +1793,65 @@ fn grants(client: &Client, args: GrantsArgs) -> anyhow::Result<u8> {
         return Ok(0);
     }
     print!("{}", grants_table(&grants));
+    for grant in &grants {
+        if let Some(requests @ 1..) = grant.unauthorized {
+            eprintln!("{}", grant_unauthorized_note(grant, requests));
+        }
+    }
     Ok(0)
+}
+
+/// "1 request", "2 requests".
+fn requests_count(requests: u64) -> String {
+    match requests {
+        1 => "1 request".to_string(),
+        n => format!("{n} requests"),
+    }
+}
+
+/// The note `run` prints on standard error after a command whose grant's
+/// destination answered `401 Unauthorized` (ADR 0013): the command ran,
+/// with its own exit status; the broker accepted its token; the destination
+/// did not accept the key stored in the entry. `name` is the entry as the
+/// command line gave it, for the command that replaces the key; what the
+/// agent reports is shown with control and invisible characters escaped.
+fn unauthorized_note(grant: &UnauthorizedGrant, name: Option<&str>) -> String {
+    use rusthorse::util::{shell_quote, visible};
+    let (entry, fix) = match name {
+        Some(name) => (
+            visible(name),
+            format!(
+                "replace it: rusthorse edit {} --value",
+                visible(&shell_quote(name))
+            ),
+        ),
+        None => (
+            visible(&grant.entry),
+            "replace the entry's value".to_string(),
+        ),
+    };
+    format!(
+        "rusthorse: note: the command ran, and the broker accepted its token, but {} answered \
+         401 Unauthorized to {}: it did not accept the key stored in {entry}. If that key is \
+         wrong, revoked, or not of the kind the destination expects, {fix}",
+        visible(&grant.destination),
+        requests_count(grant.requests),
+    )
+}
+
+/// The note `rusthorse grants` prints on standard error for a grant whose
+/// destination answered `401 Unauthorized`; the table stays as it is.
+fn grant_unauthorized_note(grant: &GrantInfo, requests: u64) -> String {
+    use rusthorse::util::visible;
+    format!(
+        "rusthorse: note: grant {}: {} answered 401 Unauthorized to {}: it did not accept the \
+         key stored in {}. If that key is wrong, revoked, or not of the kind the destination \
+         expects, replace the entry's value (rusthorse edit NAME --value)",
+        visible(&grant.id),
+        visible(&grant.destination),
+        requests_count(requests),
+        visible(&grant.entry),
+    )
 }
 
 /// The grants as `rusthorse grants` prints them: a table with a line per
@@ -3373,6 +3453,7 @@ mod tests {
             requests: 3,
             max_requests: None,
             in_flight: 1,
+            unauthorized: Some(0),
             automatic_locks: AutomaticLocks::Continue,
         }
     }

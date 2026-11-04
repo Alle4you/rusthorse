@@ -24,6 +24,12 @@
   explain each change; the review history records the findings, fixes and
   coverage gaps. Manual SDK validation with the maintainer is still pending.
 
+- Amended: 2026-11-04, after the maintainer's first manual test with a real
+  key: `run` names the grants whose destination answered `401
+  Unauthorized`, `grants` and the manager show the count, and the broker's
+  own answers say that they are its own
+  ([2026-11-04 amendments](#implementation-amendments-2026-11-04)).
+
 ## Context
 
 ### The problem
@@ -213,6 +219,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    command starts, the run fails (125, nothing ran) — it never gives the
    real key instead. After the command has started, `run` reports its exit
    status as today; the outcome of each HTTP request is in the audit log.
+   (Amended 2026-11-04: after the command, `run` also names each grant
+   whose destination answered `401 Unauthorized`, its status unchanged.)
    `run` without `--broker` stays as it is, with its documented limits.
 
 7. **The dialog says what the grant allows**, from the profile and the
@@ -501,7 +509,10 @@ without spaces, or the entry cannot be used with the broker. This minimum
 exceeds the output redactor's minimum, and the credential must be
 representable in an HTTP header.
 
-Local answers produced by the broker carry a short JSON error and, except
+Local answers produced by the broker carry a short JSON error (amended
+2026-11-04: of type `rusthorse_broker`, with a fixed message that starts
+with `rusthorse-broker:`; that of a grant that has ended says to run the
+command again with `rusthorse run`) and, except
 `429` and `503`, `x-should-retry: false`, so that the clients' own retries do
 not repeat what cannot succeed. A failure to resolve, connect or complete TLS,
 before anything was sent, is a `502` without that header: nothing reached the
@@ -666,9 +677,10 @@ nothing more (it is revoked with reason `audit_failed`).
   as Claude Code needs, since `run` gives it the terminal only without
   redaction.
 - `rusthorse grants [--json]` lists retained grants (ID, entry, destination,
-  command, requester, start, end, requests used and allowed, policy) — never a
-  token — and `rusthorse grants revoke ID|--all` ends them. Neither needs an
-  approval, like `lock`.
+  command, requester, start, end, requests used and allowed, policy, and —
+  amended 2026-11-04 — the requests the destination answered with `401`) —
+  never a token — and `rusthorse grants revoke ID|--all` ends them. Neither
+  needs an approval, like `lock`.
 - `rusthorse status` reports the broker program and the number of active
   grants (starting and exhausted included, revoked excluded);
   `rusthorse doctor` checks the broker program and the certificate file.
@@ -691,7 +703,8 @@ nothing more (it is revoked with reason `audit_failed`).
 ### The manager
 
 The manager's grants page lists the retained grants with their entry,
-destination, command, start, end and requests, and revokes one or all — also
+destination, command, start, end and requests (amended 2026-11-04: and the
+requests their destination answered with `401`), and revokes one or all — also
 while the vault is locked, which the page says, since grants can outlive a
 lock. It shows an entry's profile, read-only. Editing a profile stays in the
 CLI until phase 2.
@@ -860,3 +873,21 @@ that only checked packages leave (R01–R04).
 
 The review history records remaining coverage gaps and accepted limitations; a
 passing fake-destination test is not evidence of live SDK compatibility.
+
+## Implementation amendments (2026-11-04)
+
+The maintainer's first manual test with a real key, on 2026-11-04, began with
+a key the destination did not accept: `run --broker` passed on the
+destination's `401` (`authentication_error`, `invalid x-api-key`), which a
+command that presented a token reads as the token's fault, and only the audit
+log's `status 401` said otherwise. The same test showed that Claude Code shows
+the broker's message after its own `Please run /login · API Error: 403`.
+
+| Area amended | Why and implementation evidence |
+|---|---|
+| `run`'s report after the command (decision 6) | The agent counts, per grant, the admitted requests whose destination answered `401` — from the status in `FromBroker::Finished`, whatever the request's outcome, under the registry's lock (`broker_host.rs`); the broker's own `401`, before admission, never reaches that count. `exited` gains an optional `unauthorized` list, filled once the run's grants are gone; every request whose end a broker reported before it confirmed its revocation or exited is in it. `rusthorse run` prints a `rusthorse: note:` for each after the command, its exit status unchanged; `141` made by the client stays without one. The note comes from the status alone, never from the body, so it is the same for every destination; a destination that answers a bad key with another status is not detected. No error code is added and the protocol version is unchanged: both fields are optional. |
+| `grants`, `status` and the manager | `GrantInfo.unauthorized` (optional; a current agent always reports it, `0` included). `rusthorse grants` keeps its table and adds a note on standard error; the manager shows a fact for it. A grant leaves the list when its command ends, so after a short command only `run`'s note and the audit log show it. |
+| Local answers | Their message starts with `rusthorse-broker:`, so that a program that shows only an error's message (Claude Code) still says that the broker answered, and the `403` of a grant that has ended says to run the command again with `rusthorse run`. Statuses, headers and the JSON shape are unchanged. |
+
+Answer 9's manual check with Claude Code and the SDKs is still pending: a key
+the destination refused does not show that a client works through the broker.

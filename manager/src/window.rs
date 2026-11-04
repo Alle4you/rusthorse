@@ -303,6 +303,17 @@ impl GrantSlot {
                 self.rows.push((key, r, value));
             }
         }
+        // Requests the destination answered with 401: their count is drawn
+        // as a warning while there are some, in the same label.
+        for (key, _, value) in &self.rows {
+            if *key == model::KEY_REFUSED {
+                if row.key_refused {
+                    value.add_css_class("warning");
+                } else {
+                    value.remove_css_class("warning");
+                }
+            }
+        }
         self.revocable = row.revocable;
     }
 

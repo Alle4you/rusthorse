@@ -157,6 +157,16 @@ rusthorse run PGPASSWORD=app-db --broker OPENAI_API_KEY --url OPENAI_BASE_URL=OP
 - There is no fallback. When a grant cannot be served (no broker program, no
   profile, a value the broker cannot send), `rusthorse run` exits with `125`
   and nothing ran. Never retry with the key by value: tell the human.
+- After the command, a note that starts with `rusthorse: note:` and says
+  that the destination answered `401 Unauthorized` means that it did not
+  accept the key stored in the entry; the broker accepted the command's
+  token. Tell the human: replacing the key is theirs to do, in a dialog
+  where they type it (`rusthorse edit NAME --value`). Never ask for the key,
+  and never try another entry or the key by value.
+- The broker's own errors have the type `rusthorse_broker` and a message
+  that starts with `rusthorse-broker:` (a missing or wrong token, a route the
+  profile does not allow, a grant that has ended: `403`). Any other error
+  comes from the destination.
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
@@ -215,6 +225,9 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
   Claude Code use another key, or send the token past the broker.
 - Claude Code retries failed requests by itself; each retry counts as a
   request of the grant.
+- Once the grant has ended (revoked, locked, expired), Claude Code shows
+  `Please run /login · API Error: 403` and the broker's message. Its
+  `/login` does not apply: the human starts it again with `rusthorse run`.
 
 ## Exit statuses
 
@@ -226,8 +239,10 @@ and any other number the command chooses, `1`, `2`, `4`, `124` and `125`
 included. Rusthorse's own statuses are the four below. When standard error
 can be written, `125` and `124` come with a message that starts with
 `rusthorse:`, and `2` with `error:` and the usage; `141` comes with no
-message. (A crash of `rusthorse` itself, status `101` with a `panicked`
-message, tells as little as `124`.)
+message. A note that starts with `rusthorse: note:` comes only after a
+command that ran, whatever its status, which is then the command's own.
+(A crash of `rusthorse` itself, status `101` with a `panicked` message,
+tells as little as `124`.)
 
 | Status | Meaning | What to do |
 |---|---|---|

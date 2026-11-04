@@ -2716,10 +2716,12 @@ impl Agent {
             let _ = watcher.join();
         }
         // The command is over: its brokers are stopped and its ports
-        // released.
-        if let Some(run_grants) = run_grants.take() {
-            run_grants.finish(EndReason::CommandEnded);
-        }
+        // released. What they reported of the destinations' answers is
+        // complete now, unlike their records (written by another thread).
+        let unauthorized = match run_grants.take() {
+            Some(run_grants) => run_grants.finish(EndReason::CommandEnded),
+            None => Vec::new(),
+        };
         let unknown = |e: &dyn std::fmt::Display| {
             let _ = self
                 .audit
@@ -2747,6 +2749,7 @@ impl Agent {
         Ok(Response::Exited {
             code: status.code(),
             signal: status.signal(),
+            unauthorized,
         })
     }
 

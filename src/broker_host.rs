@@ -62,7 +62,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread;
@@ -75,7 +75,7 @@ use crate::broker_protocol::{
     MAX_IN_FLIGHT, REVOKE_CONFIRM_TIMEOUT, RequestOutcome, ToBroker,
 };
 use crate::peer::Peer;
-use crate::protocol::GrantInfo;
+use crate::protocol::{GrantInfo, UnauthorizedGrant};
 use crate::supervise::{Exit, Supervised, write_all_by};
 
 /// How long a broker has to take an answer to one of its admissions off the
@@ -94,6 +94,10 @@ const EXPIRY_CHECK: Duration = Duration::from_secs(1);
 /// How long, beyond [`EXIT_KILL_DELAY`], the end of a run waits for its
 /// brokers' threads to see them gone before it kills what is left.
 const STOP_MARGIN: Duration = Duration::from_secs(1);
+
+/// The status with which an HTTP API refuses the credentials of a request,
+/// whatever the API: the destination did not accept the broker's key.
+const UNAUTHORIZED: u16 = 401;
 
 /// Most messages of one broker waiting for its audit thread. A broker that
 /// keeps to its own limits never has more than a few dozen there (one per
@@ -436,6 +440,11 @@ struct Grant {
     admitted: u64,
     /// Admitted requests whose end the broker reported.
     finished: u64,
+    /// Of those, the requests the destination answered with `401
+    /// Unauthorized`: counted under the registry's lock, and shared with the
+    /// run, which reports them once the grant is gone
+    /// ([`RunGrants::finish`]).
+    unauthorized: Arc<AtomicU64>,
     /// Requests the agent refused.
     refused: u64,
     /// Requests the broker refused before asking, as its confirmation of a
@@ -772,6 +781,7 @@ impl Registry {
                 requests: g.admitted,
                 max_requests: g.profile.max_requests,
                 in_flight: u32::try_from(g.in_flight()).unwrap_or(u32::MAX),
+                unauthorized: Some(g.unauthorized.load(Ordering::Relaxed)),
                 automatic_locks: g.profile.automatic_locks,
             })
             .collect()
@@ -797,10 +807,18 @@ impl Registry {
         let now = BootInstant::now();
         let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         let mut ids = Vec::with_capacity(grants.len());
+        let mut reports = Vec::with_capacity(grants.len());
         for new in grants {
             let seq = inner.next_seq;
             inner.next_seq += 1;
             ids.push(new.id.clone());
+            let unauthorized = Arc::new(AtomicU64::new(0));
+            reports.push(GrantReport {
+                var: new.var.clone(),
+                entry: new.entry.clone(),
+                destination: new.profile.destination(),
+                unauthorized: Arc::clone(&unauthorized),
+            });
             let grant = Grant {
                 meta: Arc::new(GrantMeta {
                     id: new.id.clone(),
@@ -820,6 +838,7 @@ impl Registry {
                 ended_by: None,
                 admitted: 0,
                 finished: 0,
+                unauthorized,
                 refused: 0,
                 broker_refused: None,
                 waiting: BTreeSet::new(),
@@ -840,6 +859,7 @@ impl Registry {
             registry: Arc::clone(self),
             run,
             ids,
+            reports,
             listeners: Vec::new(),
             done: false,
         })
@@ -1336,6 +1356,13 @@ impl Registry {
             } => {
                 let route = grant.open.remove(&request).ok_or(())?;
                 grant.finished += 1;
+                // The destination's answer, whatever became of the request
+                // after its head arrived: the broker's own statuses are 408,
+                // 502 and 504, and its own `401` (no token, or not this
+                // grant's) comes before admission, with no end to report.
+                if status == Some(UNAUTHORIZED) {
+                    grant.unauthorized.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(Next::Job(Job::Finished {
                     request,
                     route,
@@ -1631,8 +1658,21 @@ pub(crate) struct RunGrants {
     registry: Arc<Registry>,
     run: u64,
     ids: Vec<String>,
+    /// What the run reports of each grant when it ends, in the order of
+    /// `ids`.
+    reports: Vec<GrantReport>,
     listeners: Vec<TcpListener>,
     done: bool,
+}
+
+/// What a run reports of one of its grants when it ends
+/// ([`RunGrants::finish`]): kept by the run, since the grant leaves the
+/// registry once its broker has exited.
+struct GrantReport {
+    var: String,
+    entry: String,
+    destination: String,
+    unauthorized: Arc<AtomicU64>,
 }
 
 impl RunGrants {
@@ -1768,9 +1808,24 @@ impl RunGrants {
     /// The command is over: end the grants not ended yet for `reason`, stop
     /// their brokers (each exits once its channel ends; its group is killed
     /// if it is still there [`EXIT_KILL_DELAY`] later), and release the
-    /// ports.
-    pub(crate) fn finish(mut self, reason: EndReason) {
+    /// ports. Returns the grants whose destination answered requests with
+    /// `401 Unauthorized`, and how many: each request whose end a broker
+    /// reported before it confirmed its revocation or exited is counted
+    /// (one killed before that may leave some out, as its end record does).
+    pub(crate) fn finish(mut self, reason: EndReason) -> Vec<UnauthorizedGrant> {
         self.stop(reason);
+        self.reports
+            .iter()
+            .filter_map(|report| {
+                let requests = report.unauthorized.load(Ordering::Relaxed);
+                (requests > 0).then(|| UnauthorizedGrant {
+                    var: report.var.clone(),
+                    entry: report.entry.clone(),
+                    destination: report.destination.clone(),
+                    requests,
+                })
+            })
+            .collect()
     }
 
     fn stop(&mut self, reason: EndReason) {
@@ -2182,10 +2237,14 @@ mod tests {
         }
 
         fn finish(&self, request: u64, outcome: RequestOutcome) {
+            self.finish_with(request, outcome, Some(200));
+        }
+
+        fn finish_with(&self, request: u64, outcome: RequestOutcome, status: Option<u16>) {
             self.send(&FromBroker::Finished {
                 request,
                 outcome,
-                status: Some(200),
+                status,
                 bytes_sent: 100 + request,
                 bytes_received: 1000 + request,
             });
@@ -2258,6 +2317,67 @@ mod tests {
             .into_iter()
             .find(|g| g.id == id)
             .expect("listed")
+    }
+
+    /// The destination's `401` answers are counted, whatever became of the
+    /// request after its head arrived; other statuses are not, nor is the
+    /// report of a request that was never admitted (a violation). The run
+    /// reports the count once its grant is gone, and only for a grant that
+    /// has some.
+    #[test]
+    fn the_destinations_401_answers_are_counted_and_reported_by_the_run() {
+        let s = setup();
+        let route = "POST /v1/messages";
+        for n in 1..=5 {
+            assert_eq!(format!("{:?}", s.broker.admit(n, route)), admitted(n));
+        }
+        assert_eq!(info(&s.registry, &s.id).unauthorized, Some(0));
+        s.broker
+            .finish_with(1, RequestOutcome::Completed, Some(UNAUTHORIZED));
+        s.broker
+            .finish_with(2, RequestOutcome::Completed, Some(200));
+        s.broker
+            .finish_with(3, RequestOutcome::ClientClosed, Some(UNAUTHORIZED));
+        s.broker
+            .finish_with(4, RequestOutcome::NotForwarded, Some(502));
+        s.broker
+            .finish_with(5, RequestOutcome::Unknown, Some(UNAUTHORIZED));
+        wait_for(|| (info(&s.registry, &s.id).in_flight == 0).then_some(()));
+        assert_eq!(info(&s.registry, &s.id).unauthorized, Some(3));
+        // A request never admitted: the broker is cut off, and its report
+        // counts for nothing.
+        s.broker
+            .finish_with(9, RequestOutcome::Completed, Some(UNAUTHORIZED));
+        assert!(s.broker.sees_the_end());
+        let Setup {
+            registry,
+            mut run,
+            id,
+            ..
+        } = s;
+        let reported = run.take().expect("run").finish(EndReason::CommandEnded);
+        assert_eq!(registry.count(), 0, "{id} is still listed");
+        assert_eq!(
+            reported,
+            [UnauthorizedGrant {
+                var: "ANTHROPIC_API_KEY".into(),
+                entry: "KEY (uuid-of-)".into(),
+                destination: "https://api.anthropic.com".into(),
+                requests: 3,
+            }]
+        );
+        // A run whose destination answered no 401 reports nothing.
+        let s = setup();
+        assert_eq!(format!("{:?}", s.broker.admit(1, route)), admitted(1));
+        s.broker.finish(1, RequestOutcome::Completed);
+        wait_for(|| (info(&s.registry, &s.id).in_flight == 0).then_some(()));
+        let Setup { mut run, .. } = s;
+        assert!(
+            run.take()
+                .expect("run")
+                .finish(EndReason::CommandEnded)
+                .is_empty()
+        );
     }
 
     #[test]

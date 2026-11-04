@@ -1920,6 +1920,8 @@ fn grants_page() {
         "2026-11-02T10:15:00-03:00",
         "in 11h43m at the latest",
         "3 (no limit); 1 in flight",
+        "Key refused",
+        "No",
         "Do not end it: it keeps working while the screen or the vault is locked",
         "g0123456789abcdef",
         "https://api.openai.com/v1 (OpenAI)",
@@ -1943,7 +1945,7 @@ fn grants_page() {
         .into_iter()
         .filter_map(|w| w.downcast::<adw::PreferencesRow>().ok())
         .collect();
-    assert_eq!(rows.len(), 22, "eleven rows a grant");
+    assert_eq!(rows.len(), 24, "twelve rows a grant");
     assert!(rows.iter().all(|row| {
         descendants(row)
             .into_iter()
@@ -2521,6 +2523,195 @@ fn grants_keep_their_place() {
         "No grants now; 3 ended while this page was shown."
     );
     assert!(!s.revoke_all.is_sensitive());
+    s.window.close();
+}
+
+/// A grant whose destination answered requests with `401 Unauthorized`
+/// says so in a row of its own, drawn as a warning, with what to do. Every
+/// grant has that row, so the count is set in place like any other text:
+/// nothing else is drawn anew, and the keyboard focus and a selection stay.
+/// A grant that ends keeps the count last listed.
+#[test]
+fn grants_say_when_their_destination_refused_the_key() {
+    if !on_xvfb("grants_say_when_their_destination_refused_the_key") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let state = fake_state(false);
+    let ids = [
+        "gaaaaaaaaaaaaaaaa",
+        "gbbbbbbbbbbbbbbbb",
+        "gcccccccccccccccc",
+    ];
+    // As a current agent lists them: no request answered with 401 yet.
+    state.lock().unwrap().grants = ids
+        .iter()
+        .map(|id| crate::model::tests::grant(id, "active"))
+        .collect();
+    fake_agent(&socket, &state);
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket);
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    show_page(&s, "grants");
+    spin_until(|| {
+        s.grants_job.borrow().is_none() && has_button(&s.grants_list, "revoke-gcccccccccccccccc")
+    });
+    let pause = |ms| {
+        let until = Instant::now() + Duration::from_millis(ms);
+        spin_until(|| Instant::now() >= until);
+    };
+    spin_until(|| s.window.width() > 0);
+    let revoke = |id: &str| named(&s.grants_list, &format!("revoke-{id}"));
+    let group_of = |b: &gtk::Button| {
+        b.ancestor(adw::PreferencesGroup::static_type())
+            .and_downcast::<adw::PreferencesGroup>()
+            .expect("its group")
+    };
+    // The value of the Key refused row in the group of this Revoke button.
+    let refused = |b: &gtk::Button| {
+        descendants(&group_of(b))
+            .into_iter()
+            .filter_map(|w| w.downcast::<adw::PreferencesRow>().ok())
+            .find(|r| r.title() == "Key refused")
+            .and_then(|r| {
+                descendants(&r)
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                    .find(|l| l.is_selectable())
+            })
+            .expect("its Key refused row")
+    };
+    // The labels of the page drawn as a warning.
+    let warned = || {
+        descendants(&s.grants_list)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.has_css_class("warning"))
+            .collect::<Vec<_>>()
+    };
+    let rows = || {
+        descendants(&s.grants_list)
+            .into_iter()
+            .filter(|w| w.is::<adw::PreferencesRow>())
+            .count()
+    };
+    let (a, b, c) = (revoke(ids[0]), revoke(ids[1]), revoke(ids[2]));
+    for grant in [&a, &b, &c] {
+        assert_eq!(refused(grant).text(), "No");
+    }
+    assert!(warned().is_empty());
+    assert_eq!(rows(), 36, "twelve rows a grant");
+    // The keyboard focus on B's Revoke, and part of B's command selected.
+    assert!(b.grab_focus());
+    let command = descendants(&group_of(&b))
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .find(|l| l.text() == "claude --print hello")
+        .expect("B's command");
+    command.select_region(0, 6);
+    pause(300);
+    let at = |w: &gtk::Button| {
+        let p = w
+            .compute_point(&s.window, &gtk::graphene::Point::new(4.0, 4.0))
+            .expect("in the window");
+        (f64::from(p.x()), f64::from(p.y()))
+    };
+    let (a_at, b_at) = (at(&a), at(&b));
+    let value = refused(&b);
+
+    // B's destination answers two of its requests with 401.
+    let warning = "2 requests answered 401 Unauthorized: the destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with Change the value… in the entry's details; that ends this grant.";
+    state.lock().unwrap().grants[1].unauthorized = Some(2);
+    s.list_grants();
+    spin_until(|| s.grants_job.borrow().is_none() && refused(&b).text() == warning);
+    pause(300);
+    // Said in B's group only, in the same label, which alone is drawn as a
+    // warning.
+    assert_eq!(refused(&b), value);
+    assert_eq!(warned(), std::slice::from_ref(&value));
+    for other in [&a, &c] {
+        assert_eq!(refused(other).text(), "No");
+        assert!(!texts(&group_of(other)).iter().any(|t| t.contains("401")));
+    }
+    // Nothing else drawn anew: the same Revoke buttons, usable, the same
+    // rows, the focus and the selection. A and B's buttons stay where they
+    // were (B's rows grow below its button).
+    assert_eq!(
+        (revoke(ids[0]), revoke(ids[1]), revoke(ids[2])),
+        (a.clone(), b.clone(), c.clone())
+    );
+    assert!(a.is_sensitive() && b.is_sensitive() && c.is_sensitive());
+    assert_eq!(rows(), 36);
+    assert_eq!(
+        gtk::prelude::RootExt::focus(&s.window).as_ref(),
+        Some(b.upcast_ref())
+    );
+    assert_eq!(command.selection_bounds(), Some((0, 6)));
+    assert_eq!((at(&a), at(&b)), (a_at, b_at));
+    // The line above the grants stays as it was.
+    assert_eq!(s.grants_summary.text(), "3 grants, oldest first.");
+    // For reviewers: the warning in view, in the light and dark styles.
+    let scroll = s
+        .grants_list
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+        .expect("the page scrolls");
+    let y = value
+        .compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0))
+        .expect("in the page")
+        .y();
+    let adjustment = scroll.vadjustment();
+    adjustment.set_value(adjustment.value() + f64::from(y) - 300.0);
+    pause(250);
+    snapshot(&s, "grants-refused.png");
+    if std::env::var_os("MANAGER_TEST_SCREENSHOTS").is_some() {
+        let styles = adw::StyleManager::default();
+        styles.set_color_scheme(adw::ColorScheme::ForceDark);
+        pause(250);
+        snapshot(&s, "grants-refused-dark.png");
+        styles.set_color_scheme(adw::ColorScheme::Default);
+    }
+
+    // Should the count go back to none, or not be reported, the warning
+    // goes, from the same label.
+    for (count, text) in [(Some(0), "No"), (None, "Not reported")] {
+        state.lock().unwrap().grants[1].unauthorized = count;
+        s.list_grants();
+        spin_until(|| s.grants_job.borrow().is_none() && refused(&b).text() == text);
+        assert_eq!(refused(&b), value);
+        assert!(warned().is_empty(), "{count:?}");
+    }
+    state.lock().unwrap().grants[1].unauthorized = Some(2);
+    s.list_grants();
+    spin_until(|| s.grants_job.borrow().is_none() && refused(&b).text() == warning);
+    assert_eq!(warned(), std::slice::from_ref(&value));
+
+    // B's command ends: B keeps its place and the count last listed, still
+    // drawn as a warning, and no longer says that a change of the value
+    // ends it.
+    state.lock().unwrap().grants.remove(1);
+    s.list_grants();
+    spin_until(|| s.grants_job.borrow().is_none() && group_of(&b).has_css_class("dim-label"));
+    assert_eq!(
+        refused(&b).text(),
+        "2 requests answered 401 Unauthorized when last listed: the destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with Change the value… in the entry's details."
+    );
+    assert_eq!(refused(&b), value);
+    assert_eq!(warned(), [value]);
+    assert!(!b.is_sensitive() && a.is_sensitive() && c.is_sensitive());
+    assert_eq!(rows(), 36);
+    assert_eq!(
+        s.grants_summary.text(),
+        "2 grants, oldest first; 1 more ended while this page was shown."
+    );
     s.window.close();
 }
 

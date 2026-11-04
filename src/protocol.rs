@@ -734,6 +734,11 @@ pub enum Response {
         code: Option<i32>,
         /// Signal number, when the command was killed by a signal.
         signal: Option<i32>,
+        /// The run's grants whose destination answered requests with
+        /// `401 Unauthorized`; left out when there are none, and by agents
+        /// that do not report them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unauthorized: Vec<UnauthorizedGrant>,
     },
     /// The request failed.
     Error {
@@ -800,8 +805,34 @@ pub struct GrantInfo {
     pub max_requests: Option<u64>,
     /// Requests being forwarded now.
     pub in_flight: u32,
+    /// Requests the destination answered with `401 Unauthorized`: it did
+    /// not accept the credential the broker sent from the entry. `None`
+    /// when the agent does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unauthorized: Option<u64>,
     /// Whether the automatic locks end it.
     pub automatic_locks: AutomaticLocks,
+}
+
+/// A grant of a run whose destination answered requests with `401
+/// Unauthorized` (ADR 0013), reported when the run ends: the destination
+/// did not accept the credential the broker sent from the entry — a wrong,
+/// revoked or expired key, or one of another kind than the destination
+/// expects. The broker's own `401`, for a request without the grant's
+/// token, is not counted: such a request never reaches the destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnauthorizedGrant {
+    /// The environment variable of the grant's token: `VAR` of
+    /// `--broker VAR=ENTRY`.
+    pub var: String,
+    /// The entry, as dialogs and the audit log identify it
+    /// ([`EntryInfo::identity`]).
+    pub entry: String,
+    /// The destination: the profile's origin and base path.
+    pub destination: String,
+    /// How many of the grant's requests the destination answered with
+    /// `401`; at least 1.
+    pub requests: u64,
 }
 
 /// Answer to [`Request::Status`].
@@ -1983,6 +2014,7 @@ mod tests {
             requests: 3,
             max_requests: None,
             in_flight: 1,
+            unauthorized: None,
             automatic_locks: AutomaticLocks::Continue,
         };
         let response = Response::Grants {
@@ -1993,6 +2025,9 @@ mod tests {
         assert_eq!(json["type"], "grants");
         let listed = &json["grants"][0];
         assert!(listed.get("max_requests").is_none(), "{listed}");
+        // The count of 401 answers is left out when not reported (an older
+        // agent), and is a number, 0 included, when it is (below).
+        assert!(listed.get("unauthorized").is_none(), "{listed}");
         assert_eq!(listed["preset"], "anthropic");
         assert_eq!(listed["automatic_locks"], "continue");
         assert_eq!(listed["state"], "active");
@@ -2009,5 +2044,67 @@ mod tests {
             serde_json::to_value(&limited).expect("json")["max_requests"],
             200
         );
+        for count in [0, 2] {
+            let reported = GrantInfo {
+                unauthorized: Some(count),
+                ..grants[0].clone()
+            };
+            let json = serde_json::to_value(&reported).expect("json");
+            assert_eq!(json["unauthorized"], count, "{json}");
+            let back: GrantInfo = serde_json::from_value(json).expect("back");
+            assert_eq!(back, reported);
+        }
+    }
+
+    #[test]
+    fn an_exited_answer_names_the_grants_whose_destination_answered_401_only_when_there_are_some() {
+        // None: the answer is the one older clients know, without the field.
+        let plain = Response::Exited {
+            code: Some(0),
+            signal: None,
+            unauthorized: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).expect("json"),
+            serde_json::json!({"type": "exited", "code": 0, "signal": null})
+        );
+        let refused = Response::Exited {
+            code: Some(1),
+            signal: None,
+            unauthorized: vec![UnauthorizedGrant {
+                var: "ANTHROPIC_AUTH_TOKEN".into(),
+                entry: "AI/ANTHROPIC_API_KEY (8d2f6c1e)".into(),
+                destination: "https://api.anthropic.com".into(),
+                requests: 2,
+            }],
+        };
+        let json = serde_json::to_value(&refused).expect("json");
+        assert_eq!(
+            json["unauthorized"],
+            serde_json::json!([{
+                "var": "ANTHROPIC_AUTH_TOKEN",
+                "entry": "AI/ANTHROPIC_API_KEY (8d2f6c1e)",
+                "destination": "https://api.anthropic.com",
+                "requests": 2
+            }])
+        );
+        let back: Response = serde_json::from_value(json).expect("back");
+        let Response::Exited { unauthorized, .. } = back else {
+            panic!("not an exited answer")
+        };
+        assert_eq!(unauthorized.len(), 1);
+        assert_eq!(unauthorized[0].requests, 2);
+        // An older agent's answer, and a newer one's with fields this client
+        // does not know, still decode.
+        for json in [
+            serde_json::json!({"type": "exited", "code": 3, "signal": null}),
+            serde_json::json!({"type": "exited", "code": 3, "signal": null, "later": [1]}),
+        ] {
+            let decoded: Response = serde_json::from_value(json).expect("decodes");
+            assert!(matches!(
+                decoded,
+                Response::Exited { code: Some(3), signal: None, unauthorized } if unauthorized.is_empty()
+            ));
+        }
     }
 }

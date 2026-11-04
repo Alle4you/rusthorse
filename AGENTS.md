@@ -147,9 +147,11 @@ Breaking one of these is a security bug, whatever the tests say.
    dialog was denied, cancelled or not answered, outside `run`; `1` other
    errors.
    A command started by `run` can exit with 124 or 125 itself; a `rusthorse:`
-   message tells them apart. `141`, without a message: `run` could not write
-   the redacted output and asked the agent to stop the command, which may
-   still be running (`src/guide/ai.md` must say so too).
+   message tells them apart — but a note that starts with `rusthorse: note:`
+   comes only after a command that ran, whose status is its own (a grant's
+   destination answered `401`). `141`, without a message: `run` could not
+   write the redacted output and asked the agent to stop the command, which
+   may still be running (`src/guide/ai.md` must say so too).
 8. **Protocol changes**: removing or changing the meaning of a field or error
    code — including what an error guarantees — or changing framing bumps
    `PROTOCOL_VERSION` ([docs/protocol.md](docs/protocol.md#compatibility)).

@@ -33,7 +33,10 @@ terminal; `rusthorse --help` ends by pointing AI agents to
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141, without a message, when `rusthorse run` could not write the command's output — see [`run`](#rusthorse-run)). |
 
 Messages go to standard error; data (listings, JSON, revealed values) goes to
-standard output.
+standard output. For `run`, a message that starts with `rusthorse:` comes with
+`124` or `125` and says what went wrong — except a note that starts with
+`rusthorse: note:`, which comes only after a command that ran, whose exit
+status is then its own ([`--broker`](#through-the-credential-broker---broker)).
 
 ## Entry names
 
@@ -602,6 +605,39 @@ end when the command ends, and before on `rusthorse lock`,
 [`rusthorse grants revoke`](#rusthorse-grants), a change to the entry, the
 end of their lifetime, and the automatic locks if the profile says `end`.
 
+When a grant's destination answered requests with `401 Unauthorized`,
+`rusthorse run` says so on standard error once the command has ended, after
+everything the command wrote: one note per grant, with or without
+`--no-redact`, whatever the command's exit status, which stays its own.
+
+```
+rusthorse: note: the command ran, and the broker accepted its token, but https://api.anthropic.com answered 401 Unauthorized to 1 request: it did not accept the key stored in anthropic. If that key is wrong, revoked, or not of the kind the destination expects, replace it: rusthorse edit anthropic --value
+```
+
+A `401` means that the destination did not accept the credential the broker
+sent from the entry: the key may be wrong, revoked or expired, or not of the
+kind the destination expects in the profile's header (a subscription's OAuth
+token where the preset sends an API key, say), or an `openai-compatible`
+origin may want another header. It is the same for every destination: the
+note comes from the status alone, never from the body. Only requests the
+broker forwarded count — its own `401`, for a request without the grant's
+token, never reaches the destination — and only that status: a destination
+that answers a bad key with another one is not detected. `rusthorse edit
+NAME --value` asks you for the new key in a dialog and keeps the profile (it
+ends the entry's other grants). The note is printed by `rusthorse run` from
+the agent's answer, so a command can print a look-alike; the
+[audit log](#rusthorse-audit) has each request's status. While the command
+runs, [`rusthorse grants`](#rusthorse-grants) shows the same count.
+
+The broker's own answers — a missing or wrong token, a route the profile
+does not allow, a grant that has ended — are short JSON errors of type
+`rusthorse_broker`, whose message starts with `rusthorse-broker:`; any other
+error comes from the destination, passed on as it came. A grant that has
+ended answers `403`, with a message that says to run the command again with
+`rusthorse run`. A program that shows only the message still says who
+answered: Claude Code showed the broker's message after its own
+`Please run /login · API Error: 403`, and its `/login` does not apply here.
+
 With redaction (the default), the tokens are redacted from the output like
 the values. `--no-redact` is allowed, and the dialog warns about it: the
 output is then not filtered, and whoever reads a token can use its grant
@@ -651,8 +687,20 @@ admitted finish); or `revoked` (it has ended; its broker normally answers
 `403` until the command ends, and it stays in the list until then unless its
 broker exits sooner). What the agent reports is shown with control and
 invisible characters escaped (`\u{…}`), so that a command line or a process
-name cannot rewrite the terminal. `--json` prints the agent's list as it is
-([protocol](protocol.md)).
+name cannot rewrite the terminal. `--json` prints the agent's list
+([protocol](protocol.md)), with the fields this version of `rusthorse` knows.
+
+When a grant's destination has answered requests with `401 Unauthorized`, a
+note under the table, on standard error, says so, and `--json` has the count
+in `unauthorized`:
+
+```
+rusthorse: note: grant g3f9a0c1d2e4b5a67: https://api.anthropic.com answered 401 Unauthorized to 2 requests: it did not accept the key stored in AI/anthropic (8d2f6c1e). If that key is wrong, revoked, or not of the kind the destination expects, replace the entry's value (rusthorse edit NAME --value)
+```
+
+A grant is listed only until its command ends: after a short command, the
+note of [`rusthorse run`](#through-the-credential-broker---broker) and the
+audit log say it.
 
 ```
 ID                 ENTRY                    DESTINATION                STATE   STARTED                    ENDS IN  REQUESTS      IN FLIGHT  AUTOMATIC LOCKS  REQUESTER                     COMMAND

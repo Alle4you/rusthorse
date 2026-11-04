@@ -28,6 +28,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   broker and live grant count; `doctor` checks the broker and the CA file;
   `audit` shows grant and request records. `rusthorse guide ai` includes SDK
   recipes and a Claude Code recipe awaiting a manual compatibility test.
+- **A key the destination refused is named**: when a grant's destination
+  answers `401 Unauthorized`, `rusthorse run` says so after the command
+  (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
+  its exit status unchanged; `grants` (a note under the table, and
+  `unauthorized` in `--json`) and the manager's Grants page show the count
+  while the command runs. Status only, never the body: the same for every
+  destination. The broker's own errors now start with `rusthorse-broker:`,
+  and that of a grant that has ended says to run the command again.
 - **Manager broker controls**: a Grants page lists and revokes one or all
   grants, also while locked. Ended rows retain their place while the page is
   shown. Entry details show profiles read-only and offer broker command
@@ -183,7 +191,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 - **Protocol 8**: separate `broker_run` and `broker_edit` requests prevent an
   older agent from silently ignoring broker bindings or profile edits. Added
-  `grants`, `revoke_grant` and optional profile/status fields.
+  `grants`, `revoke_grant` and optional profile/status fields, and later the
+  optional `GrantInfo.unauthorized` and `exited.unauthorized`.
 - An edit's answer names the entry (`NAME updated`) even when the request
   names it by its UUID, as the manager does: the manager showed the UUID.
 - Human-readable `audit` output escapes control and invisible characters

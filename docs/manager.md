@@ -322,7 +322,8 @@ its ID: the entry, the destination and preset, the command, who asked for it
 (process names, which any program chooses: unverified, as in the agent's
 dialogs), the variable that holds its token, its state, when it started, when
 it ends at the latest (its maximum lifetime, in whole minutes rounded up), the
-requests admitted (of the limit, if there is one) and those in flight now, and
+requests admitted (of the limit, if there is one) and those in flight now,
+whether its destination refused the key (**Key refused**, below), and
 whether the automatic locks end it. Never the token: the agent does not send
 it. The states are *Starting*, while the run it belongs to is prepared (no
 request is admitted yet); *Active*; *Exhausted*, when its request limit is
@@ -343,6 +344,31 @@ what was last listed and nothing to revoke, so that the grants below it do
 not move up and put another grant's **Revoke** button under the pointer. It
 goes when you leave the page. The line above the grants counts those that
 ended while the page was shown.
+
+**Key refused** counts the grant's requests that its destination answered
+with `401 Unauthorized`: the destination did not accept the entry's value,
+which the broker sent with them — a wrong, revoked or expired key, for
+example, or one of another kind than the destination expects. It says *No*
+while there are none, and *Not reported* with an agent that does not count
+them. When there are some, it says how many, in the warning colour, and what
+to do: if the value is wrong, revoked, or not of the kind the destination
+expects, replace it with **Change the value…** in the entry's details. That
+ends the entry's grants, this one included; run the command again for a
+grant that uses the new value. What the count leaves out:
+
+- Only requests the broker forwarded are counted. The broker's own `401`,
+  for a request without the grant's token, is not: such a request never
+  reaches the destination.
+- A destination that answers a key it does not accept with another status
+  (`403`, say) is not detected.
+- The count is the one of the page's last listing, which names only the
+  grants the agent still has. The agent stops listing a grant when its
+  command ends; the page keeps an ended grant, with the count last listed,
+  only if it listed that grant while it was shown, and only until you leave
+  the page. So the page may never show the count of a short command, or of
+  one that ended while the page was not shown: `rusthorse run` notes such
+  answers on standard error when the command ends, and the `broker_request`
+  records of `rusthorse audit` show each request's status.
 
 **Revoke** ends one grant, **Revoke all** every grant, at once and without a
 dialog, as **Lock now** does: the token stops working and the open requests
@@ -476,6 +502,7 @@ the new password in its own dialogs. The manager never receives them.
 | A dialog stays open after you closed the manager | Closing the manager does not cancel a dialog the agent already shows: answer it there (Deny or Cancel). |
 | "Incompatible agent protocol" | The agent and the manager come from different versions. Upgrade both and restart the agent yourself. |
 | A message in red on the Grants page, in place of the list | The agent could not list the grants, or did not answer within 30 seconds (for example "No complete answer arrived from the agent"); the message says why. **Revoke all** still tries, and **Lock now** ends every grant. |
+| **Key refused** on the Grants page, in the warning colour ("… answered 401 Unauthorized …") | The grant's destination did not accept the entry's value. If it is wrong, revoked, or not of the kind the destination expects, replace it with **Change the value…** in the entry's details, which ends the entry's grants, and run the command again. [Grants](#grants-of-the-credential-broker) says what the count leaves out. |
 | "Restart needed" on the Status page | The agent's program file was replaced after it started (an upgrade). Restart the service before using dialogs. |
 | "The vault was locked while the agent was asking you, so the value was neither shown nor copied" | The manager saw the vault locked while a Show or Copy was waiting — for example, the vault locked itself just before you clicked and the agent asked for the master password first. For safety, a value that arrives after a lock is dropped. Your approval was used up; click Show or Copy again. |
 
@@ -512,5 +539,5 @@ tested against a fake agent in the test process instead, since a test agent
 cannot start a broker: it answers from a script, records every request, and
 can hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
 screenshots of the window in the light and dark styles, of the Show window,
-of the Grants page (also with a grant that ended while it was shown) and of
-a profile in the details.
+of the Grants page (also with a grant that ended while it was shown, and
+with a key the destination refused) and of a profile in the details.

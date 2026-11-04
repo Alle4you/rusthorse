@@ -16,7 +16,7 @@ Protocol version: **8** (`PROTOCOL_VERSION` in
 | 5 | The entry `kind` (see [Entry kinds](#entry-kinds)): in `NewEntry.fields`, `EntryInfo`, `EntryChanges.kind`, and `"kind"` in `EntryChanges.clear`. An agent of version 4 would silently drop it, so the version changed. |
 | 6 | `create_vault`: the agent creates the vault and asks for its master password in its own dialogs. `already_exists` also means that the vault file exists. Imports read by the agent: `keyring_items`, `dotenv_names`, `import_from` (see [Imports read by the agent](#imports-read-by-the-agent)). |
 | 7 | `EntryChanges.group` moves an entry to another group (see [EntryChanges](#entrychanges)). An agent of version 6 would silently drop it and report the edit done, so the version changed. |
-| 8 | `broker_run`, `broker_edit`, `grants`, `revoke_grant`; optional entry profile and broker status fields. Separate request tags make a protocol-7 agent refuse broker operations whole even if the agent changes between the version check and the request. |
+| 8 | `broker_run`, `broker_edit`, `grants`, `revoke_grant`; optional entry profile and broker status fields. Separate request tags make a protocol-7 agent refuse broker operations whole even if the agent changes between the version check and the request. Added later, optional: `GrantInfo.unauthorized`, `exited.unauthorized`. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -410,6 +410,7 @@ credential. Each element has:
 | `started`, `ends_in_secs` | Creation time in RFC 3339 with local offset; seconds left to the maximum lifetime. |
 | `requests`, `max_requests` | Admitted count; optional maximum, omitted for no limit. |
 | `in_flight` | Occupied request slots, including reservations waiting for their admission record. |
+| `unauthorized` | Optional: admitted requests the destination answered with `401 Unauthorized` — it did not accept the credential the broker sent from the entry. Counted when the broker reports a request's end, whatever its outcome; the broker's own `401` (no token, or another grant's) is never counted. A current agent always reports it, `0` included; omitted by an older agent. |
 | `automatic_locks` | `end` or `continue`. |
 
 Revoked grants can remain listed until their command ends, still occupying one
@@ -429,7 +430,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 | `secret` | `value` (string) |
 | `keyring_items` | `items`: array of `{id, label, attributes, locked}`, sorted by label |
 | `names` | `names`: array of strings; `empty` (array, optional): names with an empty value |
-| `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome |
+| `exited` | `code` (integer or `null`), `signal` (integer or `null`); exactly one is set — a client treats an answer with neither as an unknown outcome. `unauthorized` (optional, omitted when empty): the run's grants whose destination answered requests with `401 Unauthorized`, each `{var, entry, destination, requests}` — the token's variable, the entry's identity as dialogs show it, the destination, and how many requests (at least 1). It counts every request whose end the grant's broker reported before it confirmed its revocation or exited; one killed before that may leave some out. The `rusthorse` CLI prints a note for each after the command ([cli.md](cli.md#through-the-credential-broker---broker)). |
 | `error` | `code` (see [Errors](#errors)), `message` (string) |
 
 ### StatusInfo

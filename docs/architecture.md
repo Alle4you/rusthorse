@@ -587,7 +587,11 @@ tokens or credentials. Refusals are counted through revocation confirmation
 rather than logged individually. An admission revoked while its record is
 written gets a `not_forwarded` follow-up and counts as refused. Last
 request/end records may arrive after the run's reply; a grant's end record is
-its last record. See [cli.md](cli.md#rusthorse-audit) and
+its last record. The requests a destination answered with `401 Unauthorized`
+are counted apart from these records, as the broker reports each request's
+end: `grants` shows the count, and the run's reply names the grants that have
+one, so that `rusthorse run` can say that the destination did not accept the
+key. See [cli.md](cli.md#rusthorse-audit) and
 [protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-1).
 
 ## Code map
@@ -680,7 +684,9 @@ its own dialog.
   request, without a dialog; listing and revocation each have a 30-second job
   deadline. Rows are keyed by grant ID, updated in place and retained as Ended
   until the page is left, to keep another Revoke button from moving into a
-  removed row's place. No token reaches this page.
+  removed row's place. Each grant says whether its destination answered
+  requests with `401` (**Key refused**, in the warning colour when it did),
+  as of the last listing. No token reaches this page.
 - **Profiles.** Entry details show usable profiles read-only and distinguish
   protected/unusable ones. Snippets use broker token and URL bindings;
   Anthropic SDK and Claude Code recipes keep competing key variables out.
