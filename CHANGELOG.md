@@ -200,9 +200,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   names it by its UUID, as the manager does: the manager showed the UUID.
 - The CLI shows what the vault, the agent or a keyring supplies with control
   and invisible characters escaped everywhere it shows text to people
-  (`list`, `show`, `status`, `doctor`, import previews, messages and
-  errors), so that a title another program wrote cannot rewrite the
-  terminal; `--json` is unchanged.
+  (`list`, `show`, `status`, `doctor`, `open`, import previews, messages
+  and errors), so that a title another program wrote cannot rewrite the
+  terminal; `--json` and `reveal` are unchanged.
 - Human-readable `audit` output escapes control and invisible characters
   throughout each record. JSON output remains machine-readable.
 - The manager's entry form shows how the value is made as one row per

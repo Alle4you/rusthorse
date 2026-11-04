@@ -2713,6 +2713,129 @@ fn open_hands_only_http_links_to_the_browser() {
     );
 }
 
+/// `open` shows the URL it opens escaped — one that another KeePass client
+/// wrote can hold terminal controls — and gives the browser the URL as
+/// stored.
+#[test]
+fn open_shows_a_url_written_elsewhere_escaped() {
+    use keepass::db::fields;
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    seed(&h, &[("SITE", "value-1234", None)]);
+    let url = "https://example.invalid/\u{1b}[2J\rFORGED";
+    set_field_elsewhere(&h, "SITE", fields::URL, url, false);
+    let bin = h.dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("mkdir");
+    let opened = h.dir.path().join("opened");
+    let fake = bin.join("xdg-open");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n", opened.display()),
+    )
+    .expect("write");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let out = h.cmd(&["open", "SITE"]).env("PATH", &path).finish();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stderr),
+        "Opening https://example.invalid/\\u{1b}[2J\\u{d}FORGED\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&opened).expect("opened"),
+        format!("{url}\n")
+    );
+}
+
+/// A raw agent for a client's whole conversation: it answers `status` as a
+/// current agent does, and each other request with the raw JSON given for
+/// its type, until it has answered `last`.
+fn scripted_raw_agent(
+    socket: &Path,
+    replies: Vec<(&'static str, &'static str)>,
+    last: &'static str,
+) -> std::thread::JoinHandle<()> {
+    use rusthorse::protocol::{PROTOCOL_VERSION, Response, StatusInfo, recv_frame, send_frame};
+    use std::io::Write;
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind");
+    std::thread::spawn(move || {
+        loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let Ok((body, _fds)) = recv_frame(&stream) else {
+                continue;
+            };
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let kind = request["type"].as_str().unwrap_or_default().to_string();
+            if kind == "status" {
+                let status = Response::Status(StatusInfo {
+                    protocol_version: PROTOCOL_VERSION,
+                    agent_version: "fake".into(),
+                    vault: "/nonexistent".into(),
+                    vault_exists: true,
+                    audit_log: String::new(),
+                    locked: false,
+                    idle_timeout_secs: 0,
+                    locks_in_secs: None,
+                    remembered_approvals: 0,
+                    agent_executable: String::new(),
+                    agent_executable_id: None,
+                    agent_executable_replaced: None,
+                    dialogs: None,
+                    lock_triggers: vec![],
+                    broker: None,
+                    grants: None,
+                });
+                let _ = send_frame(&stream, &status, &[]);
+                continue;
+            }
+            let reply = replies
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .unwrap_or_else(|| panic!("unexpected {kind}"))
+                .1;
+            let mut frame = (reply.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(reply.as_bytes());
+            let _ = stream.write_all(&frame);
+            if kind == last {
+                return;
+            }
+        }
+    })
+}
+
+/// An import whose answer cannot be read is an unknown outcome (124), and
+/// the error that quotes the answer is shown escaped.
+#[test]
+fn an_import_answer_that_cannot_be_read_is_shown_escaped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("fake.sock");
+    let file = dir.path().join("app.env");
+    std::fs::write(&file, "A_KEY=aaaa1111\n").expect("write");
+    let fake = scripted_raw_agent(
+        &socket,
+        vec![
+            ("dotenv_names", r#"{"type":"names","names":["A_KEY"]}"#),
+            ("import_from", r#"{"type":"\u001b[2J\rFORGED"}"#),
+        ],
+        "import_from",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+        .args(["import", "dotenv", file.to_str().expect("utf8")])
+        .env("RUSTHORSE_SOCKET", &socket)
+        .stdin(Stdio::null())
+        .finish();
+    within(TEST_LIMIT, move || fake.join()).expect("fake");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(124), "{stderr}");
+    assert!(
+        !stderr.contains('\u{1b}') && !stderr.contains('\r'),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("\\u{1b}[2J\\u{d}FORGED"), "{stderr}");
+}
+
 #[test]
 fn generate_completions_and_doctor_work_offline() {
     let h = Harness::new();

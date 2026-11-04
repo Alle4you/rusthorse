@@ -2190,16 +2190,18 @@ fn import_cmd(client: &Client, command: ImportCommand) -> anyhow::Result<u8> {
                 return unsure("could not confirm");
             }
             // The request was sent but no answer came back.
+            // An answer that could not be read is quoted in the error:
+            // shown escaped, like everything the agent supplies.
             Err(e)
                 if e.downcast_ref::<rusthorse::client::OutcomeUnknown>()
                     .is_some() =>
             {
-                eprintln!("rusthorse: {e:#}");
+                eprintln!("rusthorse: {}", printable(&format!("{e:#}")));
                 return unsure("lost the connection during");
             }
             // The request was never sent (the agent stopped, say).
             Err(e) => {
-                eprintln!("rusthorse: {e:#}");
+                eprintln!("rusthorse: {}", printable(&format!("{e:#}")));
                 return not_imported(1);
             }
         }
@@ -2276,7 +2278,8 @@ fn open(client: &Client, name: String) -> anyhow::Result<u8> {
     if !matches!(scheme.as_deref(), Some("http" | "https")) {
         bail!("{url}: only http:// and https:// links are opened");
     }
-    eprintln!("Opening {url}");
+    // Shown escaped; the browser gets the URL as stored.
+    eprintln!("Opening {}", printable(&url));
     let status = std::process::Command::new("xdg-open")
         .arg(&url)
         .stdin(std::process::Stdio::null())

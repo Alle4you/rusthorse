@@ -40,7 +40,8 @@ status is then its own ([`--broker`](#through-the-credential-broker---broker)).
 Text that the vault, the agent or a keyring supplies — names, fields,
 paths, messages — is shown with control and invisible characters escaped
 (`\u{…}`), so that a title another program wrote cannot rewrite your
-terminal; `--json` gives the values as they are.
+terminal; `--json` and `reveal` give the values as they are, and `open`
+hands the browser the URL as stored.
 
 ## Entry names
 
