@@ -148,6 +148,16 @@ rusthorse run SSHPASS=NAME -- sshpass -e ssh -o PubkeyAuthentication=no USER@HOS
   SSH passwords may differ, and repeated failures can lock the account.
 - An interactive session is the human's to start, with `--no-redact`.
 
+With a private key stored as an entry's value, a temporary ssh-agent holds
+it for the command only:
+
+```sh
+rusthorse run SSH_KEY=NAME -- ssh-agent sh -c 'printf "%s\n" "$SSH_KEY" | ssh-add -q - && ssh USER@HOST uptime; s=$?; ssh-agent -k >/dev/null; exit $s'
+```
+
+`ssh-agent -k` ends the agent at once. Without it, the agent outlives the
+command by a few seconds, in a session of its own that `run` does not stop.
+
 ## Using an API key through the broker: `run --broker`
 
 For an HTTPS API that takes its key in a request header, prefer `--broker`
