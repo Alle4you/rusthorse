@@ -687,6 +687,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-04 | Confirmation of `f51391c` and its history at `5dd639a` (Codex, AI-assisted). | Not ready: X02 and X03 confirmed resolved, X01 partly; Y01 medium (`open` printed a URL from the vault unescaped) and Y02 low, both older than this work, fixed in `f20d7d0`. |
 | 2026-11-04 | Confirmation of `f20d7d0` and its history at `df52e23`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `2a4549d`. |
 | 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `013262d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
+| 2026-11-04 | The product's scope and the broker's dropped phases, at `443be7c` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `ccf7f5b`, on the documents as `19bce15` and `3e349c9` had rewritten them. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2587,3 +2588,29 @@ of the output and its contracts and of both of an import's errors; the
 mutations that remove Y01's and Y02's fixes, each caught; the `open` test
 with a TMPDIR holding a space (Z01); formatting and `git diff --check`.
 The maintainer's agent then checked `2a4549d` with all of AGENTS.md's checks.
+
+**2026-11-04 — The product's scope at `443be7c`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `443be7c`,
+which stated the product's scope after phase 1's manual test and dropped
+the broker's later phases (documents only). Before the review ended, the
+maintainer defined the product more precisely — the only secret is a
+credential's value, the agent says where it uses it, the human approves —
+and `19bce15` and `3e349c9` rewrote several of the passages reviewed
+(ADR 0013 now specifies a broker without profiles or presets); the
+findings were fixed on those documents.
+
+| Finding | Disposition |
+|---|---|
+| Medium — S01: "Rusthorse controls who uses a credential, when, for how long and how often, and records each use" was stronger than ordinary `run`, which gives the approved command the value: Rusthorse approves and records the run but cannot limit or count what the command does with the value, and a later lock does not stop it; limits of time and requests, revocation and per-request records belong to broker grants, and the requester's process chain is not verified. | **Fixed in `ccf7f5b`:** the README, AGENTS.md, `docs/ai-agents.md` and ADR 0013's scope amendment say what each mode does: the approval decides which command uses a credential and is recorded; with `run` the command has the value while it runs; through the broker it has a token limited in time and requests, revocable and recorded request by request; the process chain is shown, not verified. |
+| Low — S02: dropped plans still read as future work: ADR 0005's typed operations and SSH agent, ADR 0013's WebSocket, Unix socket listener, phase 3's `ssh-agent` and sandboxed clients, the roadmap's Unix socket, and an entry of the manager guide's "Comes later" column. | **Fixed in `ccf7f5b`:** each is marked as superseded (not planned) or moved out of the column. |
+| Low — S03: the roadmap and ADR 0013 said the dropped items could be proposed again on a concrete need, against AGENTS.md and CONTRIBUTING.md. | **Fixed in `ccf7f5b`:** both say they are outside the product's scope and not on the roadmap. |
+| Low — S04: "any HTTP API" was stronger than a broker that presents the key in a request header: an API that signs its requests with the key, or takes it in the URL or the body, cannot use it. | **Fixed in `ccf7f5b`:** the roadmap, the README, the threat model and ADR 0013 limit it to APIs that take the key in a request header, and send the others to `run`. |
+
+Codex's checks: the commit's diff, a search of the 106 tracked text files
+(ADRs, the design prototype, the code, the tests and the guide), the code
+that gives a value to a command, admits broker requests and identifies the
+requester, `git diff --check`, and the summary of all of AGENTS.md's
+checks on that tree. The maintainer's agent then checked `ccf7f5b`: the
+documents only changed, the formatting check and the packaging tests (the
+links of the packaged documents) passed.
