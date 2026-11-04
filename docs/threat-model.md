@@ -672,6 +672,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remains pending. |
 | 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
 | 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
+| 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2279,16 +2280,19 @@ changed documentation; the history's 42 commit references resolved.
 The fix was implemented by a Claude subagent (AI-assisted) and was not
 separately verified by another; Codex's re-review of it follows. Its
 mutation checks: 33 mutations of the guards, each caught by the 24
-packaging tests; two survive, harmless by design: removing the `fsync` of a
-copy between file systems (durability across a crash, which no test can
-observe), and copying on any rename error rather than only `EXDEV` (the copy
-also writes only a new `O_EXCL` file and renames it over the final name, and
-removes it if that fails). Residual assumptions, stated in §4 and ADR 0010:
-no other process of the user changes the private staging directory between
-the check and the move; a `SIGKILL` leaves the staging directory until the
-next run, which removes `target/release/packaging` (and, during a copy
-between file systems, a hidden `.check-broker-*.tmp` in DIR); two runs at
-once on one target directory are not supported.
+packaging tests; two survived: removing the `fsync` of a copy between file
+systems, recorded here at first as harmless (durability across a crash,
+which no test can observe) — the re-review below showed it also loses the
+detection of a write that fails late, and a test now catches it (S01) —
+and copying on any rename error rather than only `EXDEV`, harmless by
+design (the copy also writes only a new `O_EXCL` file and renames it over
+the final name, and removes it if that fails). Residual assumptions, stated
+in §4 and ADR 0010: no other process of the user changes the private
+staging directory between the check and the move; a `SIGKILL` leaves the
+staging directory until the next run, which removes
+`target/release/packaging` (and, during a copy between file systems, a
+hidden `.check-broker-*.tmp` in DIR); two runs at once on one target
+directory are not supported.
 
 Checks after the merge (`dbf6a4b`), whole output read: every check of
 AGENTS.md passed — fmt; clippy with all features and as released; `cargo
@@ -2296,3 +2300,41 @@ test --all-features` and `--no-default-features` (packaging 24, system 35,
 `tests/agent.rs` 158 and 139); rustdoc with warnings denied; MSRV 1.89 both
 ways; the dialog's and the manager's clippy and tests; the KeePassXC round
 trip.
+
+**2026-11-03 — Re-review of private staging at `88b9ea4`.**
+
+Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
+maintainer to verify the staging design in `17c1965` (merged in `dbf6a4b`)
+and its history in `88b9ea4`. The reviewed range was `4b0186d..88b9ea4`. No
+medium or higher finding remained.
+
+R01–R04 are confirmed resolved: cargo-deb writes into a fresh private
+staging directory, every package is checked before it is published, and
+publishing replaces directory entries without following a link at the
+final name. The cleanup no longer classifies or empties files outside the
+staging directory, and listing that directory keeps names that hold a
+newline whole. The `--manifest-path` escape was reproduced with cargo-deb
+3.8.0, and both forms of the script's refusal were confirmed.
+
+| Finding | Disposition |
+|---|---|
+| Low — S01: the surviving mutation that removes the `fsync` was justified only as durability across a crash, which no test can observe. Without the `fsync` a write that fails late also goes unnoticed: with an injected `EIO`, the current code refused the copy, while the mutation published the package. | **Fixed in `3ca5ebb`:** a test runs `check-broker.py --staged` with an `fsync` that fails, copying to another file system: nothing is published, the file already at the package's name is unchanged, the copy's new file and the staging directory are deleted. Without the `fsync` the test fails (mutation check on a copy with its own target directory). The final review's section above now says so. |
+
+The other surviving mutation, copying after any rename error and not only
+`EXDEV`, keeps the check before publication and the publication without
+following links under the stated assumptions, although it is not
+behaviourally identical; the code falls back to a copy only on `EXDEV`.
+
+A `SIGTERM` sent to `check-broker.py` during a copy between file systems
+left a hidden, partial `.check-broker-*.tmp` in DIR; the script's traps
+removed the staging directory and no package was published. So an abrupt
+end of the helper, not only a `SIGKILL`, can leave that file of a checked
+copy, as the helper's documentation says of an interrupted copy.
+
+Codex's checks: the 24 packaging tests in an isolated export; probes with
+the real cargo-deb 3.8.0 and dpkg-deb 1.22.6 (another manifest, version
+overrides with path separators, a repeated `--output`, names with a
+newline, accepted and refused runs, links and files in DIR left as they
+were); the injected `EIO` against the mutation; the copy fallback after
+`EPERM`; `git diff --check`. The maintainer's agent then ran the 25
+packaging tests, clippy and the MSRV check on `3ca5ebb`.
