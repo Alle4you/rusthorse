@@ -421,6 +421,10 @@ watchers exist only with the `session-lock` Cargo feature (on by default).
 The vault is a standard KeePass **KDBX 4** file, written with the
 [`keepass`](https://crates.io/crates/keepass) crate:
 
+- Written as KDBX 4.1, the only version the crate writes. A KDBX 4.0 file,
+  which KeePassXC writes when nothing in it needs 4.1, is written back as
+  4.1; a newer KDBX 4, and KDBX3 or older, are read but not written.
+
 - Outer encryption AES-256, inner stream ChaCha20, GZip compression.
 - Key derivation for new vaults: Argon2id, 64 MiB, 20 passes, 2 lanes
   (about 0.7 s per unlock on a desktop CPU). Existing files keep their own

@@ -22,7 +22,9 @@
 //! profile (ADR 0013, scope amendment), which is kept as it is, like any
 //! custom field, and never interpreted.
 //! Entries in the recycle bin are ignored. Files written by Rusthorse open in
-//! KeePassXC and other KDBX4 clients.
+//! KeePassXC and other KDBX4 clients. They are KDBX 4.1, the only version
+//! the `keepass` library writes: a KDBX 4.0 file is written back as 4.1, and
+//! a newer KDBX 4 is read but not written.
 //!
 //! A vault opened or created with a [`FingerprintKey`] also fingerprints the
 //! encrypted bytes of its file as it reads and writes them
@@ -56,6 +58,10 @@ pub const FIELD_KIND: &str = "Kind";
 
 /// Shown instead of a title that the KeePass file marks as protected.
 pub const PROTECTED_TITLE: &str = "[protected title]";
+
+/// The minor version of the KDBX 4 files Rusthorse writes: 4.1, the only one
+/// the `keepass` library writes. A KDBX 4.0 file is written back as 4.1.
+const WRITTEN_KDBX4_MINOR: u16 = 1;
 
 /// Vault files larger than this are refused before anything is decrypted.
 pub const MAX_VAULT_BYTES: u64 = 128 * 1024 * 1024;
@@ -551,13 +557,30 @@ impl Vault {
     }
 
     fn write_file(&mut self, check_unchanged: bool) -> Result<(), VaultError> {
-        if !matches!(self.db.config.version, DatabaseVersion::KDB4(_)) {
-            return Err(VaultError::Invalid(
-                "this vault uses an older KeePass format (KDBX3 or earlier); Rusthorse can read \
-                 it but only writes KDBX4. Convert it once in KeePassXC (Database → Database \
-                 Settings → Encryption → Database format: KDBX 4) and try again"
-                    .into(),
-            ));
+        match self.db.config.version {
+            // KDBX 4.0, as KeePassXC saves a file that needs nothing of 4.1:
+            // written back as 4.1, the only version the library writes. 4.1
+            // only adds to 4.0, so this loses nothing that writing 4.0 would
+            // keep.
+            DatabaseVersion::KDB4(minor) if minor < WRITTEN_KDBX4_MINOR => {
+                self.db.config.version = DatabaseVersion::KDB4(WRITTEN_KDBX4_MINOR);
+            }
+            DatabaseVersion::KDB4(WRITTEN_KDBX4_MINOR) => {}
+            DatabaseVersion::KDB4(minor) => {
+                return Err(VaultError::Invalid(format!(
+                    "this vault uses KDBX 4.{minor}, a newer KeePass format than Rusthorse \
+                     writes (KDBX 4.{WRITTEN_KDBX4_MINOR}); it can read it, but saving it would \
+                     lose what the newer format holds. Nothing was saved"
+                )));
+            }
+            _ => {
+                return Err(VaultError::Invalid(
+                    "this vault uses an older KeePass format (KDBX3 or earlier); Rusthorse can \
+                     read it but only writes KDBX4. Convert it once in KeePassXC (Database → \
+                     Database Settings → Encryption → Database format: KDBX 4) and try again"
+                        .into(),
+                ));
+            }
         }
         if check_unchanged {
             let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
@@ -2089,6 +2112,35 @@ mod tests {
         assert_eq!(info.fields.kind, None);
         assert_eq!(info.protected_fields, vec!["Kind"]);
         assert!(info.other_fields.is_empty());
+    }
+
+    /// A vault in a newer KDBX 4 than the one Rusthorse writes is not saved:
+    /// it would lose what the newer format holds. The file is left as it
+    /// was, and the message says why.
+    #[test]
+    fn a_newer_kdbx_4_is_read_but_never_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        let before = fs::read(&path).expect("read");
+        vault.db.config.version = DatabaseVersion::KDB4(2);
+        vault
+            .add(&entry("key"), &secret("abcd"), false)
+            .expect("add");
+        match vault.save() {
+            Err(VaultError::Invalid(message)) => {
+                assert!(message.contains("KDBX 4.2"), "{message}");
+                assert!(message.contains("Nothing was saved"), "{message}");
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        assert_eq!(fs::read(&path).expect("read"), before);
+        // KDBX 4.0 is written as 4.1 (with a real file of KeePassXC's in
+        // tests/keepassxc_compat.rs).
+        vault.db.config.version = DatabaseVersion::KDB4(0);
+        vault.save().expect("save");
+        assert_eq!(vault.db.config.version, DatabaseVersion::KDB4(1));
+        let head = fs::read(&path).expect("read");
+        assert_eq!(&head[8..12], &[1, 0, 4, 0]);
     }
 
     /// Where phase 1 of the credential broker stored a profile.

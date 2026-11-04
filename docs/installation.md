@@ -271,6 +271,9 @@ Any KDBX4 file protected by a password works. Point the agent at it with
   writes KDBX4. Convert the file once in KeePassXC (*Database → Database
   Settings → Encryption → Database format: KDBX 4*). KeePassXC 2.7+ and
   current KeePass clients read KDBX4.
+- Rusthorse writes KDBX 4.1. A KDBX 4.0 file, which KeePassXC writes when
+  nothing in it needs 4.1, is saved as 4.1, which KeePassXC 2.7+ reads; a
+  file in a newer KDBX 4 is read but not modified.
 
 ## 4. Check that it works
 

@@ -6,7 +6,13 @@ from [keepass-rs](https://github.com/sseemayer/keepass-rs) (commit
 KeePassXC 2.7.12, protected with the password `demopass`. It contains only
 test data.
 
-It is distributed under the MIT License of keepass-rs:
+`keepassxc-2.7.6-kdbx40.kdbx` was made for this repository: a vault of two
+entries of fake test data, written by Rusthorse's library (KDBX 4.1, with
+the insecure key derivation parameters of its tests), then edited and saved
+by `keepassxc-cli` 2.7.6, which wrote it as KDBX 4.0. Its password is
+`demopass`.
+
+The first file is distributed under the MIT License of keepass-rs:
 
 > Copyright (c) 2019 Stefan Seemayer
 >

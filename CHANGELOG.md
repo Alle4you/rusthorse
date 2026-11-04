@@ -300,6 +300,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   11-point font), so a long or crafted value cannot push the rest of a dialog
   out of sight. `import` batches are sized to fit (24 lines of names).
 
+### Fixed
+
+- A vault that KeePassXC saved as KDBX 4.0 (as it does when nothing in the
+  file needs 4.1) can be saved again: Rusthorse writes it back as KDBX 4.1,
+  the version it writes. Before, every change to it failed with an
+  unexplained error. A vault in a newer KDBX 4 is read but not written, and
+  the message says why.
+
 ### Security
 
 Changes from the adversarial review of 2026-10-31 (details in

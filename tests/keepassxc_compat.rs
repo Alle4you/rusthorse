@@ -2,8 +2,8 @@
 //! fields, history and groups that Rusthorse did not touch stay exactly as
 //! they were, and the file still opens with the keepass reader afterwards.
 //!
-//! The fixture is a real KDBX 4.1 file written by KeePassXC 2.7.12 (see
-//! tests/fixtures/NOTICE.md).
+//! The fixtures are a real KDBX 4.1 file written by KeePassXC 2.7.12, and a
+//! KDBX 4.0 file that KeePassXC 2.7.6 saved (see tests/fixtures/NOTICE.md).
 
 use std::path::PathBuf;
 
@@ -12,7 +12,18 @@ use rusthorse::protocol::{EntryChanges, EntryFields, NewEntry, SecretString};
 use rusthorse::vault::{KdfParams, Vault};
 
 const FIXTURE: &str = "tests/fixtures/keepassxc-2.7.12-kdbx41.kdbx";
+/// Saved as KDBX 4.0 by KeePassXC 2.7.6, which writes 4.0 when nothing in
+/// the file needs 4.1.
+const FIXTURE_KDBX40: &str = "tests/fixtures/keepassxc-2.7.6-kdbx40.kdbx";
 const PASSWORD: &str = "demopass";
+
+/// The KDBX version in a file's header: major and minor.
+fn kdbx_version(path: &PathBuf) -> (u16, u16) {
+    let head = std::fs::read(path).expect("read");
+    let minor = u16::from_le_bytes([head[8], head[9]]);
+    let major = u16::from_le_bytes([head[10], head[11]]);
+    (major, minor)
+}
 
 fn copy_fixture(dir: &tempfile::TempDir) -> PathBuf {
     let path = dir.path().join("vault.kdbx");
@@ -254,9 +265,10 @@ fn a_phase_1_profile_is_kept_byte_for_byte_through_rusthorses_edits() {
 
 /// A profile stored by phase 1 survives Rusthorse and KeePassXC itself
 /// saving the file (ADR 0013, scope amendment): in a vault written through
-/// the library, with the field on one entry, Rusthorse edits that entry and
-/// then `keepassxc-cli` another, each saving the file; the field reads back
-/// byte for byte, unprotected, and Rusthorse lists it by name only.
+/// the library, with the field on one entry, Rusthorse edits that entry,
+/// then `keepassxc-cli` another, then Rusthorse again, each saving the file;
+/// the field reads back byte for byte, unprotected, and Rusthorse lists it
+/// by name only.
 ///
 /// It needs `keepassxc-cli`, so it is ignored by default: run `cargo test
 /// --test keepassxc_compat -- --ignored` where it is installed. The program
@@ -373,14 +385,77 @@ fn a_phase_1_profile_survives_rusthorse_and_keepassxc_cli_saving_the_vault() {
     );
     assert_eq!(field(&db, key, PHASE_1_PROFILE), stored);
     // And Rusthorse still lists it by name only.
-    let vault = Vault::open(&path, SecretString::new(password.into())).expect("reopen");
-    let info = vault.info(vault.find("KEY").expect("find"));
+    let mut vault = Vault::open(&path, SecretString::new(password.into())).expect("reopen");
+    let id = vault.find("KEY").expect("find");
+    let info = vault.info(id);
     assert_eq!(info.other_fields, [PHASE_1_PROFILE]);
     assert!(
         info.protected_fields.is_empty(),
         "{:?}",
         info.protected_fields
     );
+    // KeePassXC may have written KDBX 4.0, as it does when nothing in the
+    // file needs 4.1: Rusthorse saves it again all the same, and the field
+    // is still as it was.
+    let changes = EntryChanges {
+        username: Some("changed-by-rusthorse-again".into()),
+        ..EntryChanges::default()
+    };
+    vault.edit(id, &changes, None).expect("edit");
+    vault.save().expect("save after keepassxc-cli");
+    drop(vault);
+    assert_eq!(kdbx_version(&path), (4, 1));
+    assert_eq!(field(&open(), key, PHASE_1_PROFILE), stored);
+}
+
+/// A vault that KeePassXC saved as KDBX 4.0 is written back as KDBX 4.1,
+/// the version Rusthorse writes, with everything in it kept: Rusthorse
+/// edits it like any other vault, and KeePassXC reads the result.
+#[test]
+fn a_kdbx_4_0_vault_is_written_back_as_kdbx_4_1() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.kdbx");
+    std::fs::copy(FIXTURE_KDBX40, &path).expect("copy fixture");
+    assert_eq!(kdbx_version(&path), (4, 0));
+    let before = raw(&path);
+
+    let mut vault = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("open");
+    let id = vault.find("API_KEY").expect("find");
+    let changes = EntryChanges {
+        username: Some("edited-by-rusthorse".into()),
+        ..EntryChanges::default()
+    };
+    vault.edit(id, &changes, None).expect("edit");
+    vault.save().expect("a KDBX 4.0 vault is saved");
+    drop(vault);
+    assert_eq!(kdbx_version(&path), (4, 1));
+
+    // Everything else as it was; the edited entry changed only where asked.
+    let after = raw(&path);
+    for title in ["API_KEY", "OTHER"] {
+        let find = |db: &Database| {
+            db.iter_all_entries()
+                .find(|e| e.get_title() == Some(title))
+                .map(|e| {
+                    (
+                        e.get_username().map(str::to_string),
+                        e.get_url().map(str::to_string),
+                        e.get_password().map(str::to_string),
+                    )
+                })
+                .unwrap_or_else(|| panic!("no entry {title}"))
+        };
+        let (username, url, password) = find(&before);
+        let (username_after, url_after, password_after) = find(&after);
+        assert_eq!((url_after, password_after), (url, password), "{title}");
+        if title == "API_KEY" {
+            assert_eq!(username_after.as_deref(), Some("edited-by-rusthorse"));
+        } else {
+            assert_eq!(username_after, username, "{title}");
+        }
+    }
+    let reopened = Vault::open(&path, SecretString::new(PASSWORD.into())).expect("reopen");
+    assert_eq!(reopened.list().len(), 2);
 }
 
 #[test]
