@@ -7,6 +7,12 @@ use in a dialog on their screen, and the command gets the secret in its
 environment, or, for an API key with a broker profile, a temporary token
 that works only through Rusthorse.
 
+The only secret in an entry is its value. Its URL, username, host, port,
+tags and notes are context, for you to understand what it is for. The
+human sees in the dialog the command you will run with a credential and,
+through the broker, where the key goes, and decides: make the command do
+exactly what you say.
+
 This guide is built into the `rusthorse` that printed it, so it matches that
 version. Each command also has `--help`, for example `rusthorse run --help`.
 

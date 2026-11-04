@@ -11,14 +11,19 @@ programs — AI agents above all — **use** a secret without **seeing** it, aft
 a human approves each use in a dialog. Status: 0.1.0, pre-release, not
 published.
 
-**Scope.** Rusthorse is a credential vault prepared for AI agents: it stores
-credentials so that an agent can use them without seeing them, and it
-controls who uses a credential, when, for how long and how often. What a
-credential can do at its destination is not its concern — that is scoped
-where the credential is issued. Do not propose or build API authorization
-(routes, operations), per-provider logic, or connectors for other protocols:
-`rusthorse run` serves non-HTTP uses. See ADR 0013's scope amendment
-(2026-11-04).
+**Scope — the product is defined; do not add to it.** Rusthorse is a
+credential vault prepared for AI agents (README, "What it is"). The only
+secret in an entry is its value; everything else is context for the human
+and the agent. An agent says where it will use a credential — the command,
+and through the broker the destination — and the human sees it in a dialog
+and approves; that approval is the control. Rusthorse controls who uses a
+credential, when, for how long and how often, and records it. It does not
+control what a credential can do, and it knows nothing about APIs or
+providers. Do not propose or build more controls: no authorization of
+routes or operations, no per-provider logic (presets, headers), no
+destinations or policies stored with an entry, no connectors for other
+protocols — `rusthorse run` serves every other use. Phase 1's broker
+profiles and presets are being removed for this reason (ADR 0013).
 
 Read before changing anything: [README.md](README.md),
 [docs/architecture.md](docs/architecture.md) and

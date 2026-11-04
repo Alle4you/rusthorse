@@ -638,12 +638,13 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 ## 10. Planned improvements
 
-- **A generic HTTP profile** for the broker: any HTTP API, by its
-  destination and how the key is presented, without route lists. Phase 1's
-  Anthropic/OpenAI-compatible HTTP broker is implemented. Other connectors
-  (`ssh-agent`, databases, private devices with pinned TLS) are not
-  planned: `run` serves those uses, with L3–L5
-  ([ADR 0013, scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
+- **The broker without profiles or presets**: the agent names the
+  destination in the run and the human approves it in the dialog; the
+  broker puts the key wherever the program put the token, for any HTTP API,
+  over verified TLS. Phase 1's broker, with its presets and stored profiles,
+  is implemented. Other connectors (`ssh-agent`, databases, private devices
+  with pinned TLS) are not planned: `run` serves those uses, with L3–L5
+  ([ADR 0013](adr/0013-credential-broker.md)).
 - **Isolation support** (§8): uid allow-list on the socket and documentation
   for running agents as a separate user.
 - **One cgroup per approved command** (L17), with resource limits.

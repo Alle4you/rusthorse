@@ -27,8 +27,7 @@ features not yet implemented.
 
 **Phase 1 implemented, tested and reviewed READY (2026-11-03), unreleased.**
 [ADR 0013](adr/0013-credential-broker.md) defines the implemented HTTP broker;
-its scope amendment of 2026-11-04 replaces the later phases with one
-generic HTTP profile. The manual check with the maintainer's credentials
+its later phases are dropped, and the broker is next made simpler (below). The manual check with the maintainer's credentials
 began on 2026-11-04: the Anthropic Python SDK worked through the broker
 for the requests tried; Claude Code's requests went through it, and the
 API answered them `400`, as it answered SDK requests with some of Claude
@@ -85,25 +84,28 @@ credential on the command's behalf.
    vault is locked. Profiles are edited through an approved CLI request; there
    is no fallback to the real key when a grant cannot start.
 
-### Next: one profile for any HTTP API
+### Next: no profiles, no presets
 
-Rusthorse controls who uses a credential, when, for how long and how often;
-what a credential can do at its destination is scoped where it is issued (a
-read-only key, a key dedicated to production). So the broker's next step is
-a single **generic HTTP profile**: the destination (origin and base path)
-and how the broker presents the key (an `Authorization` scheme or a named
-header), for any HTTP API whose client can take another base URL — Gemini,
-Deepgram, Hugging Face and the rest, with no preset of their own. Profiles
-stop listing routes; the presets' route lists go too, and the presets
-become shortcuts for a destination and a header. A stored profile is never
-widened by an upgrade: dropping its routes takes an approved edit. It gets
-its own design and review before any code
-([ADR 0013, scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
+The only secret in an entry is its value; the rest is context. An agent that
+uses an API key through the broker says where it will use it, and the human
+approves that in the dialog. So the broker loses what phase 1 stores and
+knows: entries no longer carry a broker profile, and the code no longer
+knows presets, routes or headers. The agent names the destination in
+`run --broker`, with the request limit and lifetime it wants (within
+defaults); the dialog shows them; the program presents the token wherever
+it would present the key, and the broker puts the key in its place and
+forwards the request to the approved destination, over verified TLS,
+redacting the key from what comes back. Phase 1's stored profiles stop
+being used — a profile is never widened without an approval — and nothing
+replaces them. This gets its own design, as an amendment to ADR 0013, and a
+review before any code.
 
 ### Not planned
 
-Operations narrowed for administration APIs, presets per provider, private
-devices with pinned TLS, and connectors for other protocols (`ssh-agent`,
+Operations narrowed for administration APIs, presets per provider,
+destinations or policies stored with an entry, configuration of how a key
+is presented, private devices with pinned TLS, and connectors for other
+protocols (`ssh-agent`,
 PostgreSQL, MySQL, WebSocket, request signing, a Unix socket listener,
 grants for sandboxed clients). Ordinary `rusthorse run` already serves
 databases, devices, SSH and web logins: the approved command gets the value,
@@ -159,9 +161,9 @@ ADR 0013 answers phase 1's original questions: revocation cuts open streams;
 the agent serializes counted admissions; routing and DNS are constrained; and
 the local hop authenticates a token, not a process identity. Phase 1 is
 implemented and reviewed; in its manual check the Python SDK worked, and
-Claude Code's check was left for later. Next is the generic HTTP profile
-(above), designed and reviewed before any code; nothing else is planned for
-the broker.
+Claude Code's check was left for later. Next is the broker without
+profiles or presets (above), designed and reviewed before any code; nothing
+else is planned for the broker.
 
 ## Desktop and usability
 

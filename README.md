@@ -16,12 +16,28 @@ command a temporary token: a separate broker adds the real key only to the
 profile's destination and routes. The caller gets the result, never the
 secret. Neither mode sandboxes the command.
 
-**What it is, and is not.** Rusthorse is a credential vault prepared for AI
-agents: it stores keys, passwords, logins and certificates so that an agent
-can use them without seeing them, and it decides who uses a credential,
-when, for how long and how often, and records each use. What a credential
-can do at its destination is set where it is issued: give an agent the
-narrowest key that does the job, and production its own key.
+**What it is.** Rusthorse is a credential vault prepared for AI agents. The
+only secret in an entry is its value — a key, a password, a token, a
+certificate. Everything else an entry holds (URL, username, host, port,
+tags, notes) is context, for you and for an AI agent to understand what the
+credential is for. When an agent needs a credential, it asks Rusthorse to
+use it and says where: the command it will run and, for an API key through
+the broker, the destination the key goes to. You see that in a dialog and
+allow it or not; that approval is the control. The agent itself never sees
+the value: the approved command gets it, or, through the broker, only a
+temporary token. Rusthorse decides who uses a credential, when, for how long
+and how often, and records each use.
+
+**What it is not.** It does not decide what a credential can do: that is set
+where the credential is issued — give an agent the narrowest key that does
+the job, and production its own key. It knows nothing about the APIs it is
+used with: the agent knows how to call them, Rusthorse only supplies the
+secret. A credential you take out of the vault to run something elsewhere is
+your choice, outside what it protects. No other controls are planned: no
+authorization of routes or operations, no knowledge of providers, no
+destinations or policies stored with an entry, no connectors for other
+protocols. (Phase 1's broker profiles and presets are being removed for this
+reason; see the [roadmap](docs/roadmap.md).)
 
 ```console
 $ rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
@@ -278,9 +294,11 @@ The HTTP **credential broker's phase 1 is implemented and reviewed READY**
 profiles and grant revocation in the CLI and manager. In the manual test
 with a real key, the Python SDK worked through the broker; Claude Code's
 check was left for later. Screen-lock and suspend locking are implemented
-too. Next is one generic HTTP profile, so that any HTTP API key can be used
-through the broker; no other connector is planned, since `rusthorse run`
-serves databases, devices and SSH. Published packages remain planned. See
+too. Next, the broker drops its stored profiles and presets: the agent names
+the destination in the `run`, you approve it in the dialog, and the broker
+puts the key wherever the program put the token, knowing nothing about the
+API. No other connector is planned: `rusthorse run` serves databases,
+devices and SSH. Published packages remain planned. See
 [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing
