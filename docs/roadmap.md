@@ -68,8 +68,8 @@ credential on the command's behalf.
 3. **The broker listens on loopback TCP (`127.0.0.1`)**, requiring the token.
    The supported clients can select a base URL but not a Unix socket from
    their environment. TCP carries no peer credentials; a same-user process can
-   steal a command's token and use it while valid. A Unix socket is a later
-   option, not phase 1's listener.
+   steal a command's token and use it while valid. A Unix socket listener is
+   not planned.
 4. **Every admitted request is audited** under the grant's public ID, before
    forwarding — never the token itself. The record contains the method and
    route template, not a raw path, query or body. The agent serializes
@@ -92,13 +92,14 @@ approves that in the dialog. So the broker loses what phase 1 stores and
 knows: entries no longer carry a broker profile, and the code no longer
 knows presets, routes or headers. The agent names the destination in
 `run --broker`, with the request limit and lifetime it wants (within
-defaults); the dialog shows them; the program presents the token wherever
-it would present the key, and the broker puts the key in its place and
-forwards the request to the approved destination, over verified TLS,
-redacting the key from what comes back. Phase 1's stored profiles stop
-being used — a profile is never widened without an approval — and nothing
-replaces them. This gets its own design, as an amendment to ADR 0013, and a
-review before any code.
+defaults); the dialog shows them; the program presents the token in the
+request header where it would present the key, and the broker puts the key
+in its place and forwards the request to the approved destination, over
+verified TLS, redacting the key from what comes back. An API that signs its
+requests with the key, or takes it in the URL or the body, is used with
+`run` instead. Phase 1's stored profiles stop being used — a profile is
+never widened without an approval — and nothing replaces them. This is
+specified in ADR 0013's scope amendment and reviewed before any code.
 
 ### Not planned
 
@@ -110,8 +111,8 @@ PostgreSQL, MySQL, WebSocket, request signing, a Unix socket listener,
 grants for sandboxed clients). Ordinary `rusthorse run` already serves
 databases, devices, SSH and web logins: the approved command gets the value,
 its output is redacted, and the use is approved and recorded, with the
-limits the [threat model](threat-model.md) states (L3–L5). Any of these can
-be proposed again on a concrete need, with an ADR of its own.
+limits the [threat model](threat-model.md) states (L3–L5). These are
+outside the product's scope and are not on the roadmap.
 
 ### Prior art: Secretless Broker
 

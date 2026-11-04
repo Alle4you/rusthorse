@@ -22,13 +22,16 @@ awaiting an independent review: try it with fake entries first.
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
 | The command that gives a value to a program (`rusthorse run`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
-| Import from GNOME Keyring or a `.env` file; the agent reads the values | Editing broker profiles: in a terminal, with `rusthorse edit` ([ADR 0013](adr/0013-credential-broker.md)) |
+| Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
 | An entry's broker profile, read-only, and the command that gives a program a temporary token instead of the value (`rusthorse run --broker`) | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
 
 Pages for the later features are in the window already; they say what is
-missing and what to do meanwhile.
+missing and what to do meanwhile. Broker profiles are set in a terminal
+(`rusthorse edit`), never in the manager, and they are to be removed: in
+the planned broker, the destination is named in the run and approved in
+the dialog ([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 
 ## Before you start
 

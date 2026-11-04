@@ -8,8 +8,10 @@ to approve requests safely.
 The only secret in an entry is its value; the rest is context, for you and
 for the agent. The agent says where it will use a credential — the command,
 and through the broker the destination — and you approve that in a dialog:
-read it before you allow it. Rusthorse decides who uses a credential, when
-and how often; what the credential can do is set where it is issued. Give
+read it before you allow it. With `run` the approved command gets the
+value for as long as it runs; through the broker it gets a token that
+Rusthorse limits in time and requests and can revoke. What the credential
+can do is set where it is issued. Give
 an AI agent the narrowest key that does the job, and keep production on
 keys of its own.
 

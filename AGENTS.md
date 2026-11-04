@@ -16,10 +16,11 @@ credential vault prepared for AI agents (README, "What it is"). The only
 secret in an entry is its value; everything else is context for the human
 and the agent. An agent says where it will use a credential — the command,
 and through the broker the destination — and the human sees it in a dialog
-and approves; that approval is the control. Rusthorse controls who uses a
-credential, when, for how long and how often, and records it. It does not
-control what a credential can do, and it knows nothing about APIs or
-providers. Do not propose or build more controls: no authorization of
+and approves; that approval is the control, and Rusthorse records it. With
+`run` the approved command gets the value; through the broker it gets a
+token that Rusthorse limits in time and requests, revokes and records per
+request. Rusthorse does not control what a credential can do, and it knows
+nothing about APIs or providers. Do not propose or build more controls: no authorization of
 routes or operations, no per-provider logic (presets, headers), no
 destinations or policies stored with an entry, no connectors for other
 protocols — `rusthorse run` serves every other use. Phase 1's broker

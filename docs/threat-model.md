@@ -640,8 +640,8 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 - **The broker without profiles or presets**: the agent names the
   destination in the run and the human approves it in the dialog; the
-  broker puts the key wherever the program put the token, for any HTTP API,
-  over verified TLS. Phase 1's broker, with its presets and stored profiles,
+  broker puts the key in the request header where the program put the
+  token, for an HTTP API that takes its key in a header, over verified TLS. Phase 1's broker, with its presets and stored profiles,
   is implemented. Other connectors (`ssh-agent`, databases, private devices
   with pinned TLS) are not planned: `run` serves those uses, with L3–L5
   ([ADR 0013](adr/0013-credential-broker.md)).

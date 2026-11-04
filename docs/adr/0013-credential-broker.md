@@ -106,7 +106,8 @@ threat model and the maintainer's real uses concluded:
 - **HTTP first, AI APIs first.** Anthropic and the OpenAI-compatible APIs
   (OpenAI, DeepSeek, Experiential Labs) accept another base URL; Claude
   Code documents LLM gateways. Streaming (server-sent events) is needed from
-  the start. WebSocket (Deepgram's streaming) comes later.
+  the start. WebSocket (Deepgram's streaming) comes later (superseded
+  2026-11-04: not planned).
 - **Private devices need pinned TLS** (superseded: not planned, see the
   [scope amendment](#scope-amendment-2026-11-04)). The FortiGate's REST API on the LAN
   has a self-signed certificate: the broker must trust that certificate (or
@@ -221,7 +222,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    the response, server-sent events included, unbuffered. No `CONNECT`, no
    generic forward proxy, no upgrades, no automatic retries (a lost answer
    is an unknown outcome, as elsewhere in Rusthorse), no TLS interception,
-   no cookies or cache. A Unix socket listener is left for later: no
+   no cookies or cache. A Unix socket listener is left for later
+   (superseded 2026-11-04: not planned): no
    supported client can use one from its environment.
 
 6. **`run` asks for it explicitly.** `rusthorse run --broker VAR=ENTRY
@@ -302,7 +304,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
     password is what `ssh` sends, so whoever runs `ssh` must have it.
     Devices reached by SSH should use keys (phase 3, `ssh-agent`); until
     then, `run` with `SSH_ASKPASS` remains possible, with the limits of
-    `run` (L3–L5). The maintainer's routers move to SSH keys.
+    `run` (L3–L5). The maintainer's routers move to SSH keys. (Superseded
+    2026-11-04: the `ssh-agent` connector is not planned; SSH uses `run`,
+    with L3–L5.)
 
 12. **Before real credentials**, end-to-end tests with a fake destination
     and fake keys must show everything listed under
@@ -781,7 +785,8 @@ second review's corrections are folded in):
    request count is not a spending limit, the bodies are not inspected.
 4. **Where does the client run?** The command is still started by the
    agent, outside the requester's sandbox (L16 unchanged in phase 1).
-   Grants for a client that stays in its own sandbox come later.
+   Grants for a client that stays in its own sandbox come later
+   (superseded 2026-11-04: not planned).
 5. **How does a client find the broker after a restart?** It does not: a
    grant dies with its broker and with the agent, and a new run asks again.
    The address is `127.0.0.1` with a port the agent holds while the command
@@ -951,9 +956,13 @@ its value — a key, a password, a token, a certificate; everything else an
 entry holds is context, for the human and the agent. An agent that uses a
 credential says where: the command it runs and, through the broker, the
 destination the key goes to. The human sees that in a dialog and approves;
-that approval is the control. Rusthorse controls who uses a credential,
-when, for how long and how often, and records each use. It does not control
-what a credential can do — that is scoped where the credential is issued —
+that approval is the control, and Rusthorse records it. With ordinary `run`
+the approved command gets the value, and Rusthorse cannot limit or count
+what the command does with it; through the broker the command gets a token
+that Rusthorse limits in time and requests, revokes, and records request by
+request. The requester's process chain is shown, not verified. Rusthorse
+does not control what a credential can do — that is scoped where the
+credential is issued —
 and it knows nothing about APIs or providers. A credential taken out of the
 vault to run something elsewhere is the human's choice, outside what
 Rusthorse protects. No further controls are planned.
@@ -989,7 +998,9 @@ code, and phase 1 stays as it is until it is built.
   grant's token in the request's header values with the key, and changes
   nothing else. A request is refused (`401`, nothing forwarded) when no
   header value holds the token; when a header name, the request target or
-  another grant's token holds it; or when the key itself appears in it.
+  another grant's token holds it; or when the key itself appears in it. An
+  API that signs its requests with the key, or takes the key in the URL or
+  the body, cannot be used through the broker: `run` serves it.
 - **Any request goes to the approved destination**, under phase 1's
   framing, body, admission and forwarding rules — HTTP/1.1; no `CONNECT`,
   `TRACE`, `OPTIONS`, upgrades or `Origin`; bodies within 16 MiB; verified
@@ -1019,8 +1030,8 @@ phases 3 and 4 and of the "Later" row (`ssh-agent`, PostgreSQL, MySQL,
 WebSocket, request signing, a Unix socket listener, grants for sandboxed
 clients); profile editing in the manager. Ordinary `rusthorse run` serves
 databases, devices, SSH and web logins, with its documented limits (threat
-model L3–L5). Any of these can be proposed again on a concrete need, with
-an ADR of its own.
+model L3–L5). These are outside the product's scope and are not on the
+roadmap.
 
 Superseded where they say otherwise: decisions 3, 5 and 7 (profiles and
 routes), decision 8's device defaults, decision 10's table, answers 2 and

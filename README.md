@@ -25,8 +25,11 @@ use it and says where: the command it will run and, for an API key through
 the broker, the destination the key goes to. You see that in a dialog and
 allow it or not; that approval is the control. The agent itself never sees
 the value: the approved command gets it, or, through the broker, only a
-temporary token. Rusthorse decides who uses a credential, when, for how long
-and how often, and records each use.
+temporary token. Your approval decides which command uses a credential, and
+Rusthorse records it. With `run`, the command has the value for as long as
+it runs, and Rusthorse cannot limit or count what the command does with it.
+Through the broker, the command has only a token, which Rusthorse limits in
+time and in requests and can revoke, and each request is recorded.
 
 **What it is not.** It does not decide what a credential can do: that is set
 where the credential is issued — give an agent the narrowest key that does
@@ -296,8 +299,8 @@ with a real key, the Python SDK worked through the broker; Claude Code's
 check was left for later. Screen-lock and suspend locking are implemented
 too. Next, the broker drops its stored profiles and presets: the agent names
 the destination in the `run`, you approve it in the dialog, and the broker
-puts the key wherever the program put the token, knowing nothing about the
-API. No other connector is planned: `rusthorse run` serves databases,
+puts the key in the request header where the program put the token,
+knowing nothing about the API. No other connector is planned: `rusthorse run` serves databases,
 devices and SSH. Published packages remain planned. See
 [docs/roadmap.md](docs/roadmap.md).
 

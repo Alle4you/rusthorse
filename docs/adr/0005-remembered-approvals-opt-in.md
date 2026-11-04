@@ -60,4 +60,7 @@ decision per use.
   reason about.
 - The typed operations planned for the HTTP broker and SSH agent (destination
   and method bound to the approval) are the long-term answer to repetitive
-  use without blank cheques.
+  use without blank cheques. (Amended 2026-11-04: broker grants allow
+  repeated HTTP requests within their lifetime and optional request limit;
+  typed operations and an SSH-agent connector are not planned — see ADR
+  0013's scope amendment. Ordinary `run` keeps the limits L3–L5.)
