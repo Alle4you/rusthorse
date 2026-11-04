@@ -2,8 +2,8 @@
 
 - Status: Proposed
 - Implementation: phase 1 implemented and reviewed ready, unreleased, then
-  replaced by the broker without profiles or presets, implemented on
-  2026-11-04, unreleased, under review; the other phases dropped
+  replaced by the broker without profiles or presets, implemented and
+  reviewed ready on 2026-11-04, unreleased; the other phases dropped
   ([scope amendment](#scope-amendment-2026-11-04))
 - Date: 2026-11-02
 - Refines: the "Credential broker" sketch in [the roadmap](../roadmap.md#credential-broker-secrets-that-never-enter-the-client).

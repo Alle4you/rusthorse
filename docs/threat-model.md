@@ -744,6 +744,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-04 | Confirmation of the broker design at `8813b19` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `3a6af38`, with D05 completed by E02. Design and documents only. |
 | 2026-11-04 | Confirmation of E01–E04 at `3b38924` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
 | 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `2df51fd` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `d84f014`. |
+| 2026-11-04 | Confirmation of G01 and G02 and their record, `2df51fd..4f8c00b` (Codex, AI-assisted). | Ready: G01 and G02 confirmed resolved, no new finding; `2df51fd`'s tree is the one reviewed as `9c069d4`, and the record is accurate. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2763,3 +2764,24 @@ key. Noted by the end-to-end tests' implementer, older than this work and
 outside it: a vault that KeePassXC 2.7 saved as KDBX 4.0 cannot be saved by
 Rusthorse again (`keepass` 0.17 writes KDBX 4.1 only), and the error does not
 say so; left for the maintainer to decide.
+
+**2026-11-04 — Confirmation of G01 and G02, `2df51fd..4f8c00b`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `d84f014` and
+the record in `4f8c00b`. G01 is resolved: every `Connection` header of a
+response, its comma-separated members trimmed and compared without regard
+to case, names headers that are dropped in every occurrence, at the only
+place where response headers are relayed, bodiless responses included; the
+framing refuses a client's `Connection` with any member but `close` and
+`keep-alive`. G02 is resolved: `Binding` refuses unknown fields in
+`broker_run_v2` and in `run`, and the CLI and the manager's templates send
+only `var` and `entry`. `2df51fd`'s tree is `9c069d4`'s; the record above and
+the sentence added to L21 are accurate.
+
+Codex's checks, offline in an isolated copy with its own target and
+temporary directories: `cargo test --all-features` (170 tests of the agent,
+78 of the broker, 35 system tests) and `--no-default-features` (150 and
+29), the manager's 38 tests, `cargo fmt --all --check`, `git diff --check`;
+and four mutations, each fix removed in turn, which failed the unit and
+integration tests of G01 and the protocol and end-to-end tests of G02 by
+their assertions.

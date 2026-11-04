@@ -305,9 +305,10 @@ presets: the agent names the destination in the `run`, you approve its
 origin in the dialog, and the broker puts the key in the request header
 where the program put the token, knowing nothing about the API. It relays
 streamed responses, and the CLI and the manager list and revoke its grants.
-Phase 1, with profiles and presets, was reviewed READY; in its manual test
-with a real key, the Python SDK worked through the broker, and Claude
-Code's check was left for later. Screen-lock and suspend locking are
+Phase 1, with profiles and presets, was reviewed READY, and so was the
+broker without them (2026-11-04); in phase 1's manual test with a real key,
+the Python SDK worked through the broker, and Claude Code's check was left
+for later. The broker without profiles has not been tried by hand yet. Screen-lock and suspend locking are
 implemented too. No other connector is planned: `rusthorse run` serves
 databases, devices and SSH. Published packages remain planned. See
 [docs/roadmap.md](docs/roadmap.md).

@@ -25,7 +25,8 @@ features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
 
-**Done, unreleased.** Phase 1 was reviewed READY on 2026-11-03.
+**Done, unreleased.** Phase 1 was reviewed READY on 2026-11-03, and the
+broker without profiles that replaced it on 2026-11-04.
 [ADR 0013](adr/0013-credential-broker.md) defines the HTTP broker; its later
 phases are dropped, and its
 [scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)
