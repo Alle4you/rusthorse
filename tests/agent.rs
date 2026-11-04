@@ -5987,6 +5987,10 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         .as_str()
         .expect("grant")
         .to_string();
+    // The records of a grant's requests and its end are written in order by
+    // one thread, possibly after the run's answer (request 2 was refused
+    // without it): once the end is there, so are they.
+    assert_eq!(ended_with(&h, &id), "command_ended");
     let records: Vec<serde_json::Value> = audit_records(&h)
         .into_iter()
         .filter(|r| r["action"] == "broker_request")
@@ -6005,7 +6009,6 @@ fn admissions_are_recorded_before_the_broker_forwards_anything() {
         !audit.contains(FAKE_KEY) && !audit.contains("rh_"),
         "{audit}"
     );
-    assert_eq!(ended_with(&h, &id), "command_ended");
     assert_eq!(
         grant_ends(&h)[&id]["requests"],
         serde_json::json!({"admitted": 1, "finished": 1, "unknown": 0, "refused": 1})
@@ -6307,6 +6310,11 @@ fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
 #[test]
 fn the_run_dialog_shows_destination_settings_without_credentials() {
     let h = Harness::new();
+    // A dialog that scrolls, as rusthorse-dialog's does: this one shows the
+    // test's own environment, directory and process chain, and with a
+    // longer TMPDIR (41 characters) zenity's estimate of its height passed
+    // the limit, which is tested elsewhere.
+    h.ui.scrolls.store(true, Ordering::SeqCst);
     h.add_secret(
         "OPENAI_API_KEY",
         "sk-dest-test-123456",
