@@ -557,7 +557,10 @@ replacement process cannot claim that port while the grant is retained. A
 client can put its token in an opaque request body, which is forwarded; in
 the request's head the broker never sends it upstream: it replaces it with
 the credential in the header values it forwards and refuses a request that
-holds it anywhere else there.
+holds it anywhere else there. Whoever holds the token can also learn the
+key's length, by padding requests until the broker refuses one as too large
+once the key is in; never the key itself, which the grant already lets them
+use.
 
 ### L22 — Automatic locks can leave grant credentials in brokers
 
@@ -740,6 +743,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `443be7c..de88005` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low. D01–D04, D06 and D07 were fixed in `14bfe0c`; D05 was partly fixed there, and completed by E02 (below). These are design and documentation changes; the code is unchanged. |
 | 2026-11-04 | Confirmation of the broker design at `8813b19` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `3a6af38`, with D05 completed by E02. Design and documents only. |
 | 2026-11-04 | Confirmation of E01–E04 at `3b38924` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
+| 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `2df51fd` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `d84f014`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2715,3 +2719,47 @@ text files; `git diff --check`; two deserialisation probes and the guide's
 tests in an isolated copy; the summary of all of AGENTS.md's checks. The
 maintainer's agent then ran the packaging tests on `3a6af38`; the code is
 unchanged.
+
+**2026-11-04 — The implementation of the broker without profiles at
+`9c069d4`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of the whole
+implementation of the scope amendment against `broker-phase1`: the core
+crate (`src/broker_grant.rs` in place of `src/broker_profile.rs`, client
+protocol 9, control channel 2, the agent, the registry, the audit, the
+vault, the CLI and the guide), the broker crate (`broker/src/token.rs`, the
+header rules, the server and the exchange), the manager, the tests and the
+documents, the removed lines of the documents included. The work commits
+were then squashed into `2df51fd`, whose tree is `9c069d4`'s.
+
+| Finding | Disposition |
+|---|---|
+| Medium — G01: the broker dropped a fixed list of hop-by-hop headers from a response but relayed the headers its `Connection` names, which are hop-by-hop too (RFC 9110, section 7.6.1): a probe with `Connection: X-Hop` and `X-Hop: private-to-this-hop` saw `X-Hop` reach the client. | **Fixed in `d84f014`:** the names in every `Connection` header of a response, whatever their case and spacing, are dropped with the other hop-by-hop headers; a unit test and the broker's test of relayed response headers cover them, and the latter fails without the fix (mutation on a copy with its own target directory). A client's `Connection` that names anything but `close` and `keep-alive` was already refused by the framing (`400`). |
+| Low — G02: `broker_run_v2` refused unknown fields in its broker bindings and its limits, but not in its bindings by value: a binding there with a `destination` and a `max_requests` was read as a plain binding, and the entry would have been given by value, contrary to `docs/protocol.md`. | **Fixed in `d84f014`:** `Binding` refuses unknown fields, in `run` too, before any dialog; the protocol's test and the agent's end-to-end test of refused requests cover it, and both fail without the fix (mutation). |
+
+Codex's checks, in an isolated copy with its own target and temporary
+directories: `cargo test --all-features` and `--no-default-features` of the
+workspace (170 tests of the agent, 78 of the broker, 35 system tests), the
+manager's and the dialog's tests, `cargo fmt --all --check`, `git diff
+--check`, and two probes that reproduced G01 and G02; a mutation that
+replaced only the first occurrence of the token was caught by the existing
+tests. It found no other defect in the approved origin, `Host`, SNI and
+port, the base path, the limits shown and installed, the one-pass
+substitution and the refusals, admission and audit before forwarding,
+protocols 9 and 2 and the refusal of the old requests, the CLI's refusal to
+resend a request as another type, the phase 1 field, the manager's
+templates, the guide and the documents.
+
+The implementers' own checks before the review: the broker's agent killed
+15 mutations of its rules (single-pass substitution, each refusal class,
+response header filtering, the method label, bodies on any method); the
+end-to-end tests' agent killed 5 (destinations and limits checked before the
+dialog, no resend as another type, the phase 1 field kept, the origin and
+the base path apart, no alias for `broker_run`), and ran `tests/agent.rs`
+under load; the manager's agent killed 8. Noted by the broker's
+implementer and recorded in L21: a token holder can learn the key's length
+from the size limit; accepted, since the grant already lets them use the
+key. Noted by the end-to-end tests' implementer, older than this work and
+outside it: a vault that KeePassXC 2.7 saved as KDBX 4.0 cannot be saved by
+Rusthorse again (`keepass` 0.17 writes KDBX 4.1 only), and the error does not
+say so; left for the maintainer to decide.
