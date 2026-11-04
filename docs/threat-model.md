@@ -691,6 +691,7 @@ outside the product's scope and not planned; L3 and L4 remain limits.
 | 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `013262d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
 | 2026-11-04 | The product's scope and the broker's dropped phases, at `443be7c` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `ccf7f5b`, on the documents as `19bce15` and `3e349c9` had rewritten them. |
 | 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `443be7c..de88005` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low. D01–D04, D06 and D07 were fixed in `14bfe0c`; D05 was partly fixed there, and completed by E02 (below). These are design and documentation changes; the code is unchanged. |
+| 2026-11-04 | Confirmation of the broker design at `8813b19` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `3a6af38`, with D05 completed by E02. Design and documents only. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2644,3 +2645,25 @@ accepted by the framing, a refused `PATCH` body, a length change after
 redaction), which test phase 1, not a broker without profiles; `git diff
 --check`. The maintainer's agent then ran all of AGENTS.md's checks on
 `14bfe0c`; the code is unchanged.
+
+**2026-11-04 — Confirmation of the broker design at `8813b19`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `14bfe0c`
+and its record in `8813b19`. D01–D04, D06 and D07 were confirmed resolved
+in the design; D05 partly. It checked, without finding a new defect, how
+`--url` pairs with `VAR=ENTRY@URL`, several entries in one run, the same
+entry twice, the run's limits, the phase 1 profile field and the error
+contracts.
+
+| Finding | Disposition |
+|---|---|
+| Medium — E01: adding the destination and the limits to protocol 8's `broker_run` would let an agent of protocol 8, met after the client's version check, accept the request and ignore them: a probe showed that its parser drops the new fields, and that it refuses an unknown request type. | **Fixed in `3a6af38`:** a run through the broker is a new request, `broker_run_v2`; agents of protocol 9 refuse `broker_run` and `broker_edit` before any approval; a client never retries a refused request as an older type or an ordinary `run`; a test must switch the agent's version between the client's two connections. |
+| Low — E02 (completes D05): "a token-shaped string" had no grammar, and its case and the duplicate header values were not stated. | **Fixed in `3a6af38`:** `rh_` and 64 hexadecimal digits, in any ASCII case, at any byte position of the method, the target, the header names and every header value; each must equal the grant's token byte for byte, so a case variant is refused, not replaced; no other grant's token is looked up. |
+| Low — E03: the design did not say what the manager's command for an entry becomes without a profile. | **Fixed in `3a6af38`:** two labelled templates, one giving the value (`run`), one through the broker with the destination and the variables left to fill in; nothing is inferred and nothing is stored. |
+| Low — E04: listings, the manager and the `401` note showed the origin with the base path, as if the base path limited the requests. | **Fixed in `3a6af38`:** they show the approved origin; a base path is shown apart, as setup of the program's base URL; `GrantInfo` gets an optional `base_path` and loses `preset`. |
+
+Codex's checks: the diff, the related code and the record; the 106 tracked
+text files; `git diff --check`; two deserialisation probes and the guide's
+tests in an isolated copy; the summary of all of AGENTS.md's checks. The
+maintainer's agent then ran the packaging tests on `3a6af38`; the code is
+unchanged.
