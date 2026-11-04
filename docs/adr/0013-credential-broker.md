@@ -1,6 +1,8 @@
 # 0013. A credential broker: approved programs get a grant, not the secret
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-04, by the maintainer, after the broker without profiles
+  or presets was reviewed ready
 - Implementation: phase 1 implemented and reviewed ready, unreleased, then
   replaced by the broker without profiles or presets, implemented and
   reviewed ready on 2026-11-04, unreleased; the other phases dropped
