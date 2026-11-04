@@ -110,7 +110,15 @@ jobs:
       - name: Clippy
         run: cargo clippy -p rusthorse-dialog -p rusthorse-manager --all-targets
       - name: Tests (widgets on Xvfb)
-        run: cargo test -p rusthorse-dialog -p rusthorse-manager
+        run: |
+          cargo test -p rusthorse-dialog -p rusthorse-manager --no-run
+          export TMPDIR=$(mktemp -d)
+          cargo test -p rusthorse-dialog -p rusthorse-manager
+          if [ -n "$(ls -A "$TMPDIR")" ]; then
+            echo "::error::the tests left files in TMPDIR"
+            find "$TMPDIR" | head -50
+            exit 1
+          fi
 
   msrv:
     name: minimum supported Rust version

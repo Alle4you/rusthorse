@@ -60,7 +60,8 @@ cargo +1.89 check --all-targets                  # MSRV; CI runs the same,
 cargo +1.89 check --all-targets --all-features   # and with the code for tests
 
 # rusthorse-dialog (dialog/): needs libgtk-4-dev and libadwaita-1-dev; its
-# widget tests run on a virtual display (xvfb, xdotool), never on yours.
+# widget tests run on a virtual display (xvfb, xdotool, dbus-run-session),
+# never on yours.
 cargo clippy -p rusthorse-dialog --all-targets -- -D warnings
 cargo test -p rusthorse-dialog
 
@@ -208,8 +209,12 @@ not guaranteed.
   the client is done with it — the client killed, the connection closed or
   broken off — waits for the run's end record (`wait_for_run_end`) before
   it returns: written later, that record would make the test's removed
-  directory again in `TMPDIR`. The CI runs the tests with a `TMPDIR` of
-  their own and fails if anything is left in it.
+  directory again in `TMPDIR`. The GTK clients' widget tests run on a D-Bus
+  session of their own on which nothing can be activated
+  (`session-bus.conf`), with GVfs, the accessibility bus, the settings
+  portal and Mesa's shader cache turned off: no desktop service starts for
+  them, outlives them or writes into their directory. The CI runs the tests
+  with a `TMPDIR` of their own and fails if anything is left in it.
 - **The broker's tests** (`broker/tests/`) run the real `rusthorse-broker`,
   driven by a fake agent (`broker.rs`) or the real agent (`system.rs`), in
   front of a fake HTTPS destination in the test process, with a certificate

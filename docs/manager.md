@@ -499,7 +499,10 @@ the new password in its own dialogs. The manager never receives them.
 
 `cargo test -p rusthorse-manager` runs logic tests, and runs its widget test
 again under `xvfb-run` with a private D-Bus session, a UTF-8 locale and a
-private runtime directory — never on your display. The widget test starts a
+private runtime directory — never on your display. Nothing can be activated
+on that session, and GVfs, the accessibility bus, the settings portal and
+Mesa's shader cache are turned off, so that no desktop service starts for
+the test, outlives it or writes into its directory. The widget test starts a
 real agent in the test process, on a fake vault, socket and audit log, with
 scripted dialogs; it drives the window, reads the clipboard with `xclip` as
 another program would, and focuses windows with `xdotool`. Missing tools

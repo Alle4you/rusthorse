@@ -583,13 +583,17 @@ mod tests {
     /// The detail rows as GTK builds them, on a virtual display: keys break
     /// between words only, qualifiers sit under their key, and no label
     /// draws a hyphen that is not in the text. (Re-runs itself under
-    /// xvfb-run; skipped when it is missing, like the tests in `tests/`.)
+    /// xvfb-run, in a D-Bus session of its own; skipped when either is
+    /// missing, like the tests in `tests/`.)
     #[test]
     fn detail_rows_never_alter_what_they_show() {
         if std::env::var_os("RUSTHORSE_DIALOG_XVFB_CHILD").is_none() {
             use std::os::unix::process::CommandExt;
-            if !std::path::Path::new("/usr/bin/xvfb-run").exists() {
-                eprintln!("skipped: xvfb-run is not installed");
+            if !["/usr/bin/xvfb-run", "/usr/bin/dbus-run-session"]
+                .iter()
+                .all(|p| std::path::Path::new(p).exists())
+            {
+                eprintln!("skipped: xvfb-run or dbus-run-session is not installed");
                 return;
             }
             let dir = tempfile::tempdir().expect("runtime");
@@ -598,8 +602,20 @@ mod tests {
                 std::os::unix::fs::PermissionsExt::from_mode(0o700),
             )
             .expect("private");
+            // A D-Bus session on which nothing can be activated, as in
+            // tests/xvfb.rs (`SESSION_BUS`): no desktop service starts for
+            // the test, outlives it or writes into its directory.
+            let bus = dir.path().join("session-bus.conf");
+            std::fs::write(&bus, include_str!("../tests/session-bus.conf")).expect("bus");
             let output = std::process::Command::new("/usr/bin/xvfb-run")
-                .args(["-a", "-s", "-screen 0 800x600x24"])
+                .args([
+                    "-a",
+                    "-s",
+                    "-screen 0 800x600x24",
+                    "/usr/bin/dbus-run-session",
+                ])
+                .arg(format!("--config-file={}", bus.display()))
+                .arg("--")
                 .arg(std::env::current_exe().expect("test binary"))
                 .args(["--exact", "tests::detail_rows_never_alter_what_they_show"])
                 .env_clear()
@@ -610,6 +626,12 @@ mod tests {
                 .env("GDK_BACKEND", "x11")
                 .env("GSK_RENDERER", "cairo")
                 .env("GSETTINGS_BACKEND", "memory")
+                // Nor asks for them, and Xvfb writes no shader cache into
+                // the directory (`QUIET` there).
+                .env("GIO_USE_VFS", "local")
+                .env("GTK_A11Y", "test")
+                .env("ADW_DISABLE_PORTAL", "1")
+                .env("MESA_SHADER_CACHE_DISABLE", "true")
                 .env("RUSTHORSE_DIALOG_XVFB_CHILD", "1")
                 .stdin(std::process::Stdio::null())
                 .process_group(0)

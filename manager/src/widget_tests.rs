@@ -280,7 +280,13 @@ fn snapshot_window(window: &impl IsA<gtk::Window>, name: &str) {
 
 /// Run the test `name` again in a child process, on a private Xvfb display
 /// and D-Bus session with an empty environment; returns true in that child,
-/// where the test itself runs. `systemctl` on the child's `PATH` is a
+/// where the test itself runs. Nothing can be activated on that session
+/// (`session-bus.conf`), and GIO, GTK and libadwaita do not ask for GVfs,
+/// the accessibility bus (GTK's own test backend keeps the accessible
+/// properties and relations the tests check) or the settings portal: no
+/// desktop service starts for the test, outlives it or writes into its
+/// directory. Nor does Xvfb, which xvfb-run stops without waiting for it,
+/// write Mesa's shader cache there. `systemctl` on the child's `PATH` is a
 /// stand-in that only records its arguments in `$HOME/systemctl.calls` (and
 /// fails while `$HOME/systemctl.fails` exists, hangs while
 /// `$HOME/systemctl.hangs` does): no test starts a real service.
@@ -313,14 +319,17 @@ fn on_xvfb(name: &str) -> bool {
     )
     .unwrap();
     let log = std::fs::File::create(dir.path().join("test.log")).unwrap();
+    let bus = dir.path().join("session-bus.conf");
+    std::fs::write(&bus, include_str!("session-bus.conf")).unwrap();
     let mut cmd = Command::new("/usr/bin/xvfb-run");
     cmd.args([
         "-a",
         "-s",
         "-screen 0 1400x1000x24",
         "/usr/bin/dbus-run-session",
-        "--",
     ])
+    .arg(format!("--config-file={}", bus.display()))
+    .arg("--")
     .arg(std::env::current_exe().unwrap())
     .args(["--exact", &format!("window::tests::{name}"), "--nocapture"])
     .env_clear()
@@ -339,6 +348,10 @@ fn on_xvfb(name: &str) -> bool {
     .env("GDK_BACKEND", "x11")
     .env("GSK_RENDERER", "cairo")
     .env("GSETTINGS_BACKEND", "memory")
+    .env("GIO_USE_VFS", "local")
+    .env("GTK_A11Y", "test")
+    .env("ADW_DISABLE_PORTAL", "1")
+    .env("MESA_SHADER_CACHE_DISABLE", "true")
     .env("RUSTHORSE_MANAGER_XVFB_CHILD", "1")
     .stdin(Stdio::null())
     .stdout(log.try_clone().unwrap())

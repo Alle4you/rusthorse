@@ -1,11 +1,15 @@
 //! The dialog program's widgets, driven on a virtual display (Xvfb) with
 //! xdotool: default button, Escape, keyboard approval, the approval gate,
 //! the timeout and the password field. Never the real display: the program
-//! gets only the virtual one. Skipped when xvfb-run or xdotool is missing.
+//! gets only the virtual one, and a D-Bus session of its own on which no
+//! service can be activated ([`SESSION_BUS`]), so that no desktop service
+//! starts for a test, outlives it or writes into its directory. Skipped
+//! when xvfb-run, Xvfb, xdotool or dbus-run-session is missing.
 
 #![allow(clippy::unwrap_used)] // test code
 
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -20,12 +24,38 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const TITLE: &str = "Rusthorse dialog test";
 
+/// The configuration of the dialog's D-Bus session: nothing can be
+/// activated on it. On a session bus of the usual kind, the dialog's start
+/// activates the portals (the document portal mounts a FUSE file system in
+/// the runtime directory, which then cannot be removed), GVfs (another FUSE
+/// mount) and the accessibility bus; they outlive the test, write into its
+/// directory, and their output lands where the dialog's answer goes.
+const SESSION_BUS: &str = include_str!("session-bus.conf");
+
+/// What keeps GIO, GTK and libadwaita from asking for those services at
+/// all — GVfs; the accessibility bus (GTK's own test backend still keeps
+/// every accessible property and relation); the settings portal — and the
+/// virtual display from writing Mesa's shader cache into `HOME`: xvfb-run
+/// stops Xvfb without waiting for it, so it could write there after the
+/// test.
+const QUIET: [(&str, &str); 4] = [
+    ("GIO_USE_VFS", "local"),
+    ("GTK_A11Y", "test"),
+    ("ADW_DISABLE_PORTAL", "1"),
+    ("MESA_SHADER_CACHE_DISABLE", "true"),
+];
+
 fn tools_present() -> bool {
-    let present = ["/usr/bin/xvfb-run", "/usr/bin/Xvfb", "/usr/bin/xdotool"]
-        .iter()
-        .all(|p| Path::new(p).exists());
+    let present = [
+        "/usr/bin/xvfb-run",
+        "/usr/bin/Xvfb",
+        "/usr/bin/xdotool",
+        "/usr/bin/dbus-run-session",
+    ]
+    .iter()
+    .all(|p| Path::new(p).exists());
     if !present {
-        eprintln!("skipped: xvfb-run, Xvfb or xdotool is not installed");
+        eprintln!("skipped: xvfb-run, Xvfb, xdotool or dbus-run-session is not installed");
     }
     present
 }
@@ -77,11 +107,16 @@ fn entry() -> Request {
 fn drive(request: &Request, actions: &str) -> Option<Reply> {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let runtime = tempfile::tempdir().unwrap();
+    // A runtime directory must be private, whatever the umask.
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bus = runtime.path().join("session-bus.conf");
+    std::fs::write(&bus, SESSION_BUS).unwrap();
     let (mut ours, theirs) = UnixStream::pair().unwrap();
     // A background job of a non-interactive shell reads /dev/null unless told
     // otherwise: the socket is handed over through descriptor 3. xvfb-run
     // sends the command's standard error to its standard output — the
-    // socket — so everything but the dialog's answer goes to /dev/null.
+    // socket — so everything but the dialog's answer goes to /dev/null. The
+    // dialog runs in a D-Bus session of its own, which ends with it.
     // The actions start 2 seconds after the window appears, once its layout
     // has opened the approval gate even on a busy machine (a human is never
     // faster). xdotool gets a time limit, and so does the dialog (its
@@ -93,7 +128,7 @@ fn drive(request: &Request, actions: &str) -> Option<Reply> {
         .collect();
     let script = format!(
         "exec 3<&0\n\
-         \"$1\" <&3 3<&- 2>/dev/null & pid=$!\n\
+         /usr/bin/dbus-run-session --config-file=\"$2\" -- \"$1\" <&3 3<&- 2>/dev/null & pid=$!\n\
          timeout 45 xdotool search --sync --onlyvisible --name '^{TITLE}$' windowfocus --sync sleep 2 \
          {first} </dev/null >/dev/null 2>&1\n\
          {rest}\
@@ -110,6 +145,7 @@ fn drive(request: &Request, actions: &str) -> Option<Reply> {
         "sh",
     ])
     .arg(env!("CARGO_BIN_EXE_rusthorse-dialog"))
+    .arg(&bus)
     .env_clear()
     .env("PATH", "/usr/bin:/bin")
     .env("HOME", runtime.path())
@@ -117,6 +153,7 @@ fn drive(request: &Request, actions: &str) -> Option<Reply> {
     .env("GDK_BACKEND", "x11")
     .env("GSK_RENDERER", "cairo")
     .env("GSETTINGS_BACKEND", "memory")
+    .envs(QUIET)
     .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
     .stdout(Stdio::from(OwnedFd::from(theirs)))
     .stderr(Stdio::null());
