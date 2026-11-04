@@ -142,9 +142,11 @@ without profiles by hand, with a real key and `curl` through
 was answered `200`, as the audit recorded with the method's label only, and
 a `POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
 token in its URL was refused by the broker itself, and nothing was sent.
-SDKs and Claude Code have not been tried through it yet. If Claude Code
-shows `Credit balance is too low` while other requests with the same key
-work, the account refuses Claude Code's requests (with the key used in that
+The Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
+worked through it for a message and two streams. Claude Code has not been
+tried through it yet. If Claude Code shows `Credit balance is too low`
+while other requests with the same key work, the account refuses Claude
+Code's requests (with the key used in that
 test, its beta `claude-code-20250219` alone drew that answer, with or
 without the broker): check the account, not Rusthorse. No client version is
 called supported yet. You approve each use; the automated tests use fake
