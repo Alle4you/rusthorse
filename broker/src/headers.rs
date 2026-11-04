@@ -9,13 +9,17 @@
 //! the forwarded values is replaced with the key (`token`).
 //!
 //! Responses: every header of the destination is relayed but the hop-by-hop
-//! ones, `Content-Length` and `Transfer-Encoding` — the broker frames the
+//! ones — those above, and those its `Connection` headers name, which are
+//! meant for the destination's connection to the broker only —,
+//! `Content-Length` and `Transfer-Encoding` — the broker frames the
 //! body itself, chunked where HTTP allows a body, since redaction changes
 //! its length — and any header whose name or value carries the key
 //! (ignoring ASCII case) or a token-shaped string (`rh_` and 64 hexadecimal
 //! digits, in any case: the grant's token, or any other).
 
-use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use http::header::{
+    ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use rusthorse::broker_grant::token_shaped;
 
@@ -70,14 +74,34 @@ fn carries_secret(name: &HeaderName, value: &HeaderValue, key: &[u8]) -> bool {
         .any(|part| contains_ignoring_case(part, key) || token_shaped(part).next().is_some())
 }
 
+/// The connection options that the `Connection` headers of `headers` name
+/// (RFC 9110, section 7.6.1), in every occurrence and every member,
+/// lowercased: the headers meant for that connection only. (The broker
+/// refuses a client's `Connection` that names anything but `close` and
+/// `keep-alive` while it checks the framing; a destination's may name any
+/// header.)
+fn connection_options(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|b| *b == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|option| !option.is_empty())
+        .map(|option| String::from_utf8_lossy(option).to_ascii_lowercase())
+        .collect()
+}
+
 /// The destination's headers that the broker relays to the client: all but
-/// the hop-by-hop ones, `Content-Length` and `Transfer-Encoding` (the body
-/// goes out framed by the broker), and any that carries `key` or a
-/// token-shaped string.
+/// the hop-by-hop ones (with those its `Connection` headers name),
+/// `Content-Length` and `Transfer-Encoding` (the body goes out framed by the
+/// broker), and any that carries `key` or a token-shaped string.
 pub fn relayed(destination: &HeaderMap, key: &[u8]) -> HeaderMap {
+    let options = connection_options(destination);
     let mut out = HeaderMap::new();
     for (name, value) in destination {
-        let framing = is_hop_by_hop(name.as_str()) || name.as_str() == "content-length";
+        let framing = is_hop_by_hop(name.as_str())
+            || options.iter().any(|option| option == name.as_str())
+            || name.as_str() == "content-length";
         if !framing && !carries_secret(name, value, key) {
             out.append(name.clone(), value.clone());
         }
@@ -267,6 +291,33 @@ mod tests {
                 "x-ratelimit-remaining: 10",
                 "retry-after: 1",
             ]
+        );
+    }
+
+    /// The headers a destination's `Connection` names are meant for its
+    /// connection to the broker only: dropped, in every occurrence, whatever
+    /// the case and the spacing of their names in the list.
+    #[test]
+    fn the_headers_a_responses_connection_names_are_not_relayed() {
+        let destination = map(&[
+            ("connection", "X-Hop, close"),
+            ("Connection", " x-Other ,,X-THIRD "),
+            ("x-hop", "private-to-this-hop"),
+            ("x-hop", "again"),
+            ("x-other", "1"),
+            ("x-third", "2"),
+            ("x-kept", "3"),
+            ("request-id", "req_1"),
+        ]);
+        assert_eq!(
+            names(&relayed(&destination, CREDENTIAL.as_bytes())),
+            vec!["x-kept: 3", "request-id: req_1"]
+        );
+        // Without a `Connection`, the same names are ordinary headers.
+        let plain = map(&[("x-hop", "1"), ("x-other", "2")]);
+        assert_eq!(
+            names(&relayed(&plain, CREDENTIAL.as_bytes())),
+            vec!["x-hop: 1", "x-other: 2"]
         );
     }
 

@@ -1631,7 +1631,8 @@ fn response_headers_are_relayed_but_their_framing_and_any_secret() {
             "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\nlocation: /v1/files/f_1\r\n\
              set-cookie: a=b\r\nwww-authenticate: Bearer\r\nx-ratelimit-remaining: 9\r\n\
              connection: keep-alive\r\nkeep-alive: timeout=5\r\nproxy-authenticate: Basic\r\n\
-             trailer: x-sum\r\nx-key: {CREDENTIAL}\r\nx-key-lower: k {}\r\n\
+             trailer: x-sum\r\nconnection: X-Hop\r\nx-hop: private-to-this-hop\r\n\
+             x-key: {CREDENTIAL}\r\nx-key-lower: k {}\r\n\
              x-token: Bearer {token}\r\nx-token-upper: {}\r\nx-other: {}\r\nx-{token}: 1\r\n\
              content-length: 2\r\n\r\n{{}}",
             CREDENTIAL.to_lowercase(),

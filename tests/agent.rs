@@ -6702,6 +6702,15 @@ fn the_agent_refuses_protocol_8s_broker_requests_and_unknown_fields_before_any_a
         &serde_json::json!({"type": "edit", "name": "KEY", "changes": {"clear": ["broker"]}}),
         "unknown variant `broker`",
     );
+    // A plain edit that carries protocol 8's profile: refused whole, its
+    // other changes with it.
+    refused(
+        &serde_json::json!({
+            "type": "edit", "name": "KEY",
+            "changes": {"username": "me", "broker": {"preset": "anthropic"}}
+        }),
+        "unknown field `broker`",
+    );
 
     // This protocol's run, with a field it does not know, or without one it
     // needs.
@@ -6733,6 +6742,17 @@ fn the_agent_refuses_protocol_8s_broker_requests_and_unknown_fields_before_any_a
         (
             spoiled(&|r| r["limits"]["max_in_flight"] = 1.into()),
             "unknown field `max_in_flight`",
+        ),
+        // A binding by value that carries a broker binding's destination is
+        // refused, not given by value without it.
+        (
+            spoiled(&|r| {
+                r["bindings"] = serde_json::json!([{
+                    "var": "SECOND", "entry": "KEY",
+                    "destination": "https://other.example", "max_requests": 1
+                }])
+            }),
+            "unknown field `destination`",
         ),
         (
             spoiled(&|r| {

@@ -593,8 +593,9 @@ credential of the program's own in another header included. The broker
 connects only to that origin, over TLS verified against the system's
 certificate authorities, to public addresses only; it follows no redirect,
 refuses a compressed response and keeps no cookies. Response headers come
-back except the hop-by-hop ones, `Content-Length`, `Transfer-Encoding` and
-any whose name or value carries the key or a token, and literal copies of
+back except the hop-by-hop ones (with those the response's `Connection`
+names), `Content-Length`, `Transfer-Encoding` and any whose name or value
+carries the key or a token, and literal copies of
 the key in a response body are redacted. The full rules are in
 [ADR 0013](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets).
 

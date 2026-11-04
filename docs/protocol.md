@@ -361,9 +361,10 @@ with every edit.
 `broker_run_v2` has the fields of `run` (`bindings`, `argv`, `cwd`, `env`,
 `redact`, optional `forward_stdin`), plus a non-empty `brokered` array of
 `{var, entry, destination, url_var?}` and `limits`. Nothing else is
-accepted: an unknown field in the request, in a binding or in `limits` — a
-`profile`, a `preset`, `routes` — makes it `invalid_request`, before any
-dialog. `bindings` may be empty or give other entries by value. The agent
+accepted: an unknown field in the request, in a binding of either list
+(a `destination` in `bindings` too) or in `limits` — a `profile`, a
+`preset`, `routes` — makes it `invalid_request`, before any dialog. A plain
+`run` refuses an unknown field in a binding the same way. `bindings` may be empty or give other entries by value. The agent
 resolves entries by UUID: an entry cannot be brokered twice or be given both
 ways. All value, token and URL variables must be distinct; `NO_PROXY` and
 `no_proxy` are reserved. `url_var` is omitted when absent.

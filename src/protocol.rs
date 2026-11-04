@@ -584,7 +584,11 @@ impl EntryInfo {
 }
 
 /// Exposes an entry's password to a command as an environment variable.
+/// A field this build does not know is refused (since protocol 9): a broker
+/// binding's `destination` in `bindings` would otherwise be dropped, and
+/// the entry given by value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     /// Environment variable name.
     pub var: String,
@@ -1785,6 +1789,10 @@ mod tests {
         refused(&|j| j["brokered"][0]["preset"] = "anthropic".into());
         refused(&|j| j["brokered"][0]["routes"] = serde_json::json!(["POST /v1/messages"]));
         refused(&|j| j["limits"]["max_in_flight"] = 1.into());
+        // A binding by value with a field of a broker binding: refused, not
+        // given by value without its destination and limits.
+        refused(&|j| j["bindings"][0]["destination"] = "https://other.example".into());
+        refused(&|j| j["bindings"][0]["max_requests"] = 1.into());
         refused(&|j| j["limits"]["automatic_locks"] = "never".into());
         let err = refused(&|j| j["later"] = true.into());
         assert!(err.to_string().contains("unknown field `later`"), "{err}");
@@ -1802,6 +1810,13 @@ mod tests {
             };
             assert_eq!(run.bindings, mixed_run().run.bindings);
         }
+        // Nor does a plain run take a binding with a field it does not know.
+        plain["bindings"][0]["destination"] = "https://other.example".into();
+        let err = serde_json::from_value::<Request>(plain.clone()).expect_err("refused");
+        assert!(
+            err.to_string().contains("unknown field `destination`"),
+            "{err}"
+        );
         // A plain run never sends the field.
         let json = serde_json::to_value(Request::Run(mixed_run().run)).expect("json");
         assert_eq!(json["type"], "run");
