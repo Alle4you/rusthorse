@@ -674,6 +674,7 @@ a small extension (an allow-list of uids) that is on the roadmap.
 | 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
 | 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
 | 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `d8f2eb9` and `e86e6bd`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `7a1d63b`. |
+| 2026-11-04 | Confirmation of `7a1d63b` and its history at `4ef519f` (Codex, AI-assisted). | Ready: U01–U03 confirmed resolved and the history accurate; V01 low and V02 low, fixed in `49bf590`. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -2396,3 +2397,32 @@ each with its message; without the idle lock's record, the polling test
 fails. Twelve loaded runs (four copies next to eight CPU burners) passed
 with nothing left; formatting, both clippy runs, the end-to-end tests
 without default features and the MSRV checks passed.
+
+**2026-11-04 — Confirmation of the test fixes at `4ef519f`.**
+
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `7a1d63b` and
+of the history entry above, in `4ef519f`. U01–U03 were confirmed resolved:
+a retained listener fails the port check; replacing the `grant/ended`
+outcome fails the six tests that wait for it, and replacing
+`lock/idle_timeout` fails the polling test. `BlockedAudit::wait_for_end_of`
+needs a complete record of that grant read from the FIFO, so it does not
+pass on the broker's confirmation alone; a missing record makes it fail
+after its time limit instead of hanging, and making the FIFO's reader
+non-blocking does not affect the agent's own opening of the FIFO. The
+history entry was found accurate. No product defect was found.
+
+| Finding | Disposition |
+|---|---|
+| Low — V01: `admissions_are_recorded_before_the_broker_forwards_anything` read the records of the grant's requests before waiting for the grant's end. The second request is refused without the agent's audit thread, so the first one's `completed` record can come after the run's answer: a 500 ms pause before it left the test with only `admitted`, and the late records recreated its directory. Found by extending the probe to the records of requests' ends and of automatic locks. | **Fixed in `49bf590`:** it waits for the grant's end record first, which the same thread writes after the records of the grant's requests. |
+| Low — V02 (from a note of the review's): `the_run_dialog_shows_destination_settings_without_credentials` shows the test's own environment, directory and process chain, and with a 41-character TMPDIR zenity's height estimate of its dialog was 889 pixels, over the 880-pixel limit, so the agent refused the request (as it must) and the test failed. | **Fixed in `49bf590`:** the test, which is about what the dialog shows, uses a dialog that scrolls, as `rusthorse-dialog`'s does; the height limit keeps tests of its own. |
+
+Codex's checks: an isolated export; the 158 end-to-end tests without
+pauses, with the earlier pauses and with the extended probe (with V01's
+fix applied in its copy); the mutations above; a probe of the FIFO's
+behaviour; formatting and `git diff --check`. The maintainer's agent then
+checked `49bf590`: with pauses before the records of a grant's end, a
+request's end, the idle lock and an automatic lock, two runs passed and
+left nothing; with TMPDIRs of 19, 41 and 75 characters, and three more
+shell levels in the process chain, the suite passed; eight loaded runs
+passed with nothing left; both clippy runs, the end-to-end tests without
+default features and the MSRV checks passed.
