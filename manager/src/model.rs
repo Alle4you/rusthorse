@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use rusthorse::audit::AuditEvent;
 use rusthorse::broker_grant::AutomaticLocks;
 use rusthorse::generate::Spec;
 use rusthorse::protocol::{
@@ -528,6 +529,218 @@ fn ends_in(secs: u64) -> String {
             rusthorse::util::format_duration(Duration::from_secs(minutes.saturating_mul(60)))
         ),
     }
+}
+
+/// How the history page draws a record's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    /// As any text.
+    Plain,
+    /// Approved, once or remembered.
+    Allowed,
+    /// Denied, cancelled or not answered.
+    Refused,
+}
+
+/// Outcomes of a request the human did not approve: denied, cancelled, or
+/// not answered before the dialog's time ran out.
+fn refused(outcome: &str) -> bool {
+    matches!(outcome, "denied" | "cancelled" | "timed_out")
+}
+
+/// How the history page shows one record of the audit log: plain text for
+/// labels that filter it as the dialogs do. Any program of the user can
+/// write the log (threat model L13), so all of it is shown as it is
+/// written, never parsed further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryRow {
+    /// When the record was written, as it says.
+    pub time: String,
+    pub action: String,
+    pub outcome: String,
+    pub tone: Tone,
+    /// What else it says: label and value pairs, in the order shown.
+    pub facts: Vec<(&'static str, String)>,
+}
+
+impl HistoryRow {
+    /// The row for `event`: what `rusthorse audit` prints of it, one fact
+    /// per line.
+    pub(crate) fn new(event: &AuditEvent) -> Self {
+        let mut facts = vec![];
+        if !event.entries.is_empty() {
+            facts.push(("Entries", event.entries.join(", ")));
+        }
+        if let Some(grant) = &event.grant {
+            facts.push(("Grant", grant.clone()));
+        }
+        let mut request = vec![];
+        if let Some(number) = event.request {
+            request.push(format!("#{number}"));
+        }
+        if let Some(method) = &event.method {
+            request.push(method.clone());
+        }
+        if let Some(status) = event.status {
+            request.push(format!("status {status}"));
+        }
+        match (event.bytes_sent, event.bytes_received) {
+            (Some(sent), Some(received)) => {
+                request.push(format!("{sent} bytes sent, {received} received"));
+            }
+            (Some(sent), None) => request.push(format!("{sent} bytes sent")),
+            (None, Some(received)) => request.push(format!("{received} bytes received")),
+            (None, None) => {}
+        }
+        if !request.is_empty() {
+            facts.push(("Request", request.join(", ")));
+        }
+        for grant in event.grants.iter().flatten() {
+            facts.push((
+                "Creates grant",
+                match &grant.base_path {
+                    Some(base) => format!(
+                        "{} for {} to {} (base path {base}, not a limit)",
+                        grant.id, grant.entry, grant.destination
+                    ),
+                    None => format!("{} for {} to {}", grant.id, grant.entry, grant.destination),
+                },
+            ));
+        }
+        if let Some(argv) = &event.argv {
+            facts.push(("Command", rusthorse::util::shell_join(argv)));
+        }
+        if let Some(cwd) = &event.cwd {
+            facts.push(("Directory", cwd.clone()));
+        }
+        if let Some(reason) = &event.reason {
+            facts.push(("Reason", reason.clone()));
+        }
+        if let Some(r) = event.requests {
+            facts.push((
+                "Requests",
+                format!(
+                    "{} admitted ({} finished, {} unknown), {} refused",
+                    r.admitted, r.finished, r.unknown, r.refused
+                ),
+            ));
+        }
+        if let Some(detail) = &event.detail {
+            facts.push(("Detail", detail.clone()));
+        }
+        // Process names, which any program chooses: labelled as the agent's
+        // dialogs label them.
+        facts.push(("Requested by (unverified)", event.requester.clone()));
+        Self {
+            time: event.time.clone(),
+            action: event.action.clone(),
+            outcome: event.outcome.clone(),
+            tone: if event.outcome.starts_with("allowed_") {
+                Tone::Allowed
+            } else if refused(&event.outcome) {
+                Tone::Refused
+            } else {
+                Tone::Plain
+            },
+            facts,
+        }
+    }
+}
+
+/// Which records the history page shows, of those it has read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryFilter {
+    All,
+    /// Approved, once or remembered.
+    Allowed,
+    /// Denied, cancelled or not answered.
+    Refused,
+    /// Unlocks and locks, whatever their outcome.
+    UnlockAndLock,
+    /// The credential broker's: runs that create grants, grants, and their
+    /// requests.
+    Broker,
+}
+
+/// The history page's filters, in the order offered, with their labels.
+pub(crate) const HISTORY_FILTERS: [(HistoryFilter, &str); 5] = [
+    (HistoryFilter::All, "All records"),
+    (HistoryFilter::Allowed, "Allowed"),
+    (HistoryFilter::Refused, "Denied or not answered"),
+    (HistoryFilter::UnlockAndLock, "Unlock and lock"),
+    (HistoryFilter::Broker, "Credential broker"),
+];
+
+impl HistoryFilter {
+    pub(crate) fn matches(self, event: &AuditEvent) -> bool {
+        match self {
+            Self::All => true,
+            Self::Allowed => event.outcome.starts_with("allowed_"),
+            Self::Refused => refused(&event.outcome),
+            Self::UnlockAndLock => matches!(event.action.as_str(), "unlock" | "lock"),
+            Self::Broker => {
+                matches!(event.action.as_str(), "grant" | "broker_request")
+                    || event.grants.as_ref().is_some_and(|g| !g.is_empty())
+            }
+        }
+    }
+}
+
+/// What the history page has read of the audit log, for its summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HistoryCounts {
+    /// Records read.
+    pub read: usize,
+    /// Of those, records the filter shows.
+    pub shown: usize,
+    /// Lines read that are not records.
+    pub unreadable: usize,
+    /// Older records are left to read.
+    pub more: bool,
+    /// The reading stopped at a line too long to read.
+    pub too_long: bool,
+    /// The file changed under the last page read: what is shown may be
+    /// what it said before.
+    pub changed: bool,
+}
+
+/// The line above the history: what was read, and what is left.
+pub(crate) fn history_summary(c: HistoryCounts) -> String {
+    let mut text = match (c.read, c.more) {
+        (0, false) if !c.too_long => "The audit log has no records yet.".to_string(),
+        (0, _) => "No records read.".to_string(),
+        (n, _) => format!(
+            "{n} record{} read, newest first{}.",
+            if n == 1 { "" } else { "s" },
+            if c.shown == n {
+                String::new()
+            } else {
+                format!("; {} shown with this filter", c.shown)
+            }
+        ),
+    };
+    if c.unreadable > 0 {
+        text.push_str(&format!(
+            " {} line{} of the file {} not audit records and {} left out.",
+            c.unreadable,
+            if c.unreadable == 1 { "" } else { "s" },
+            if c.unreadable == 1 { "is" } else { "are" },
+            if c.unreadable == 1 { "is" } else { "are" },
+        ));
+    }
+    if c.changed {
+        text.push_str(" The file changed since it was read: it was rotated, truncated or rewritten. Refresh to read it again from its end.");
+    } else if c.too_long {
+        text.push_str(&format!(
+            " A line longer than {} KiB stops the reading there; in a terminal, rusthorse audit -n with a larger count reads past it.",
+            rusthorse::audit::PAGE_BYTES / 1024
+        ));
+    } else if c.more {
+        text.push_str(" Load older reads the records before them.");
+    } else if c.read > 0 {
+        text.push_str(" That is the whole log.");
+    }
+    text
 }
 
 fn is_variable_name(name: &str) -> bool {
@@ -1360,5 +1573,224 @@ pub(crate) mod tests {
         assert!(command.contains("'SECRET=a'\\''$(echo fake)'"));
         assert!(unquoted_specials(&command).is_empty(), "{command}");
         assert_eq!(shell_words(&command)[0], "SECRET=a'$(echo fake)");
+    }
+
+    /// A record of the audit log, from its JSON.
+    pub fn record(json: serde_json::Value) -> AuditEvent {
+        serde_json::from_value(json).expect("record")
+    }
+
+    #[test]
+    fn a_record_is_shown_fact_by_fact() {
+        let run = record(serde_json::json!({
+            "time": "2026-11-05T10:00:00-03:00",
+            "action": "run",
+            "outcome": "allowed_once",
+            "entries": ["AI/OPENAI (8d2f6c1e)", "GH (11111111)"],
+            "requester": "rusthorse[4300] ← bash[4242]",
+            "argv": ["sh", "-c", "echo 'fake'"],
+            "cwd": "/home/fake",
+            "detail": "OPENAI_API_KEY",
+            "grants": [
+                {"id": "g0123456789abcdef", "entry": "AI/OPENAI (8d2f6c1e)",
+                 "destination": "https://api.openai.com", "base_path": "/v1"},
+                {"id": "gfedcba9876543210", "entry": "GH (11111111)",
+                 "destination": "https://api.github.com"}
+            ]
+        }));
+        let row = HistoryRow::new(&run);
+        assert_eq!(row.time, "2026-11-05T10:00:00-03:00");
+        assert_eq!(
+            (row.action.as_str(), row.outcome.as_str()),
+            ("run", "allowed_once")
+        );
+        assert_eq!(row.tone, Tone::Allowed);
+        let facts: Vec<(&str, &str)> = row.facts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            facts,
+            [
+                ("Entries", "AI/OPENAI (8d2f6c1e), GH (11111111)"),
+                (
+                    "Creates grant",
+                    "g0123456789abcdef for AI/OPENAI (8d2f6c1e) to https://api.openai.com (base path /v1, not a limit)"
+                ),
+                (
+                    "Creates grant",
+                    "gfedcba9876543210 for GH (11111111) to https://api.github.com"
+                ),
+                (
+                    "Command",
+                    rusthorse::util::shell_join(&["sh", "-c", "echo 'fake'"]).as_str()
+                ),
+                ("Directory", "/home/fake"),
+                ("Detail", "OPENAI_API_KEY"),
+                ("Requested by (unverified)", "rusthorse[4300] ← bash[4242]"),
+            ]
+        );
+        let ended = record(serde_json::json!({
+            "time": "t", "action": "grant", "outcome": "ended", "requester": "agent",
+            "grant": "g0123456789abcdef", "reason": "command_ended",
+            "requests": {"admitted": 3, "finished": 2, "unknown": 1, "refused": 4}
+        }));
+        let row = HistoryRow::new(&ended);
+        assert_eq!(row.tone, Tone::Plain);
+        let facts: Vec<(&str, &str)> = row.facts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            facts,
+            [
+                ("Grant", "g0123456789abcdef"),
+                ("Reason", "command_ended"),
+                ("Requests", "3 admitted (2 finished, 1 unknown), 4 refused"),
+                ("Requested by (unverified)", "agent"),
+            ]
+        );
+        let request = |extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "time": "t", "action": "broker_request", "outcome": "completed",
+                "requester": "agent", "grant": "g0123456789abcdef", "request": 7, "method": "POST"
+            });
+            json.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            HistoryRow::new(&record(json)).facts[1].1.clone()
+        };
+        assert_eq!(
+            request(
+                serde_json::json!({"status": 200, "bytes_sent": 1450, "bytes_received": 38211})
+            ),
+            "#7, POST, status 200, 1450 bytes sent, 38211 received"
+        );
+        assert_eq!(
+            request(serde_json::json!({"bytes_sent": 5})),
+            "#7, POST, 5 bytes sent"
+        );
+        assert_eq!(
+            request(serde_json::json!({"bytes_received": 6})),
+            "#7, POST, 6 bytes received"
+        );
+        assert_eq!(request(serde_json::json!({})), "#7, POST");
+        // A record with nothing else names its requester only.
+        let lock = record(serde_json::json!({
+            "time": "t", "action": "lock", "outcome": "idle_timeout", "requester": "agent"
+        }));
+        assert_eq!(
+            HistoryRow::new(&lock).facts,
+            [("Requested by (unverified)", "agent".to_string())]
+        );
+    }
+
+    #[test]
+    fn history_filters_pick_their_records() {
+        let of = |action: &str, outcome: &str| {
+            record(serde_json::json!({
+                "time": "t", "action": action, "outcome": outcome, "requester": "r"
+            }))
+        };
+        let records = [
+            of("run", "allowed_once"),
+            of("reveal", "allowed_remembered"),
+            of("run", "denied"),
+            of("edit", "cancelled"),
+            of("run", "timed_out"),
+            of("unlock", "wrong_password"),
+            of("lock", "idle_timeout"),
+            of("grant", "created"),
+            of("broker_request", "completed"),
+            of("run", "exited"),
+        ];
+        let picked = |filter: HistoryFilter| -> Vec<usize> {
+            records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| filter.matches(r))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(
+            picked(HistoryFilter::All),
+            (0..records.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(picked(HistoryFilter::Allowed), [0, 1]);
+        assert_eq!(picked(HistoryFilter::Refused), [2, 3, 4]);
+        assert_eq!(picked(HistoryFilter::UnlockAndLock), [5, 6]);
+        assert_eq!(picked(HistoryFilter::Broker), [7, 8]);
+        // A run that creates grants is the broker's; one with an empty list
+        // is not.
+        let mut broker_run = of("run", "allowed_once");
+        broker_run.grants = Some(vec![]);
+        assert!(!HistoryFilter::Broker.matches(&broker_run));
+        broker_run.grants = Some(vec![rusthorse::audit::AuditGrant {
+            id: "g0123456789abcdef".into(),
+            entry: "e".into(),
+            destination: "https://fake.example".into(),
+            base_path: None,
+        }]);
+        assert!(HistoryFilter::Broker.matches(&broker_run));
+        // Tones follow the same outcomes.
+        let tones: Vec<Tone> = records.iter().map(|r| HistoryRow::new(r).tone).collect();
+        assert_eq!(
+            tones,
+            [
+                Tone::Allowed,
+                Tone::Allowed,
+                Tone::Refused,
+                Tone::Refused,
+                Tone::Refused,
+                Tone::Plain,
+                Tone::Plain,
+                Tone::Plain,
+                Tone::Plain,
+                Tone::Plain,
+            ]
+        );
+        assert_eq!(HISTORY_FILTERS[0].0, HistoryFilter::All);
+    }
+
+    #[test]
+    fn the_history_summary_says_what_is_left() {
+        let counts = |read, shown| HistoryCounts {
+            read,
+            shown,
+            ..HistoryCounts::default()
+        };
+        assert_eq!(
+            history_summary(counts(0, 0)),
+            "The audit log has no records yet."
+        );
+        assert_eq!(
+            history_summary(counts(1, 1)),
+            "1 record read, newest first. That is the whole log."
+        );
+        assert_eq!(
+            history_summary(HistoryCounts {
+                more: true,
+                ..counts(200, 12)
+            }),
+            "200 records read, newest first; 12 shown with this filter. Load older reads the records before them."
+        );
+        assert_eq!(
+            history_summary(HistoryCounts {
+                unreadable: 1,
+                too_long: true,
+                ..counts(3, 3)
+            }),
+            "3 records read, newest first. 1 line of the file is not audit records and is left out. A line longer than 256 KiB stops the reading there; in a terminal, rusthorse audit -n with a larger count reads past it."
+        );
+        assert_eq!(
+            history_summary(HistoryCounts {
+                too_long: true,
+                ..counts(0, 0)
+            }),
+            "No records read. A line longer than 256 KiB stops the reading there; in a terminal, rusthorse audit -n with a larger count reads past it."
+        );
+        assert_eq!(
+            history_summary(HistoryCounts {
+                unreadable: 2,
+                more: true,
+                changed: true,
+                ..counts(5, 5)
+            }),
+            "5 records read, newest first. 2 lines of the file are not audit records and are left out. The file changed since it was read: it was rotated, truncated or rewritten. Refresh to read it again from its end."
+        );
     }
 }

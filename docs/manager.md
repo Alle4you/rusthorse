@@ -20,11 +20,12 @@ awaiting an independent review: try it with fake entries first.
 | Browse, search and filter entries by group | Editing notes |
 | Create, edit, rename, move and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
-| Copy a value to the clipboard, after approval | A history view of the audit log (M2) |
+| Copy a value to the clipboard, after approval | |
 | Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
 | Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
+| The history: what the agent recorded in its audit log, newest first, while the vault is unlocked | |
 
 Pages for the later features are in the window already; they say what is
 missing and what to do meanwhile. An entry has no broker profile: the run
@@ -372,6 +373,42 @@ takes away. A listing or a revocation takes 30 seconds at most, from
 reaching the agent to its answer; after that the page says so, and can be
 used again. Since a revocation only takes away, trying it again is safe.
 
+### History
+
+The **History** page shows the agent's audit log: what the agent recorded —
+approvals and denials (and dialogs nobody answered), unlocks and locks, the
+commands it started and how they ended, the credential broker's grants and
+requests — newest first. Each record shows its time, action and outcome, in
+green when you approved, in the warning colour when you denied, cancelled
+or did not answer; then what else it says: the entries, the command line
+and directory, the grant, the detail, and the requester (process names,
+unverified). Values are never recorded; a command line holds whatever the
+requester put in it.
+
+The manager reads the file the agent names in its status ("Read from …"),
+as `rusthorse audit` reads it in a terminal; it asks the agent nothing for
+it, and you nothing. It reads 200 records at a time, from at most 256 KiB of
+the file: **Load older** reads the records before them, **Refresh** reads
+the newest again. The list (**All records**, **Allowed**, **Denied or not
+answered**, **Unlock and lock**, **Credential broker**) chooses among the
+records read. Lines that are not records are counted and left out. A line
+longer than 256 KiB stops the reading there; in a terminal, `rusthorse audit
+-n COUNT` reads past it. If, since it was read, the file was rotated or
+truncated, or the line where **Load older** would go on changed, the page
+says so and offers no Load older: **Refresh** reads it again from its end.
+Other changes to lines already read go unnoticed.
+
+The history is shown only while the vault is unlocked, and forgotten when
+it locks, like the entry list: at once on **Lock now**, and for a lock made
+elsewhere when the manager sees it, at its next status check (every five
+seconds). The log names your entries and the commands that used them. That keeps it off the screen, not out of reach:
+any program of yours can read the file, and write to it
+([threat model L13](threat-model.md#l13--the-audit-log-is-not-tamper-proof)),
+so it is a record of what happened, not proof. Times are when a record was
+written — for an approval, after you answered — by the system clock.
+Everything a record says is drawn as plain text, with control and invisible
+characters shown as `\u{…}`, as in the agent's dialogs.
+
 ### Show a value
 
 **Show…** in the Value row (or in the Notes row) asks the agent; its dialog says
@@ -515,10 +552,13 @@ real agent in the test process, on a fake vault, socket and audit log, with
 scripted dialogs; it drives the window, reads the clipboard with `xclip` as
 another program would, and focuses windows with `xdotool`. Missing tools
 (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather than
-pass untested. The Grants page and an entry's two commands are tested
-against a fake agent in the test process instead, since a test agent cannot
-start a broker: it answers from a script, records every request, and can
-hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
+pass untested. The widget test also checks that the History page shows the
+unlock that agent recorded. The Grants page, the History page and an entry's
+two commands are tested against a fake agent in the test process instead —
+a test agent cannot start a broker, and the history needs a log written for
+the test: it answers from a script, records every request, and can hold an
+answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
 screenshots of the window in the light and dark styles, of the Show window,
 of the Grants page (also with a grant that ended while it was shown, and
-with a key the destination refused) and of an entry's two commands.
+with a key the destination refused), of the History page and of an entry's
+two commands.

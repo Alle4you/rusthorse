@@ -6,6 +6,11 @@
   request: without it, long random keys had to be retyped. A first design
   served the value to a single paste; trying it on Cinnamon showed that the
   desktop itself defeats that, and the maintainer chose a plain copy.
+- Amended: 2026-11-05 — History (section 4), at the maintainer's choice: the
+  manager reads the audit log file the agent's status names, as
+  `rusthorse audit` does, instead of through a new agent request. Any
+  program of the user can read that file (L13), so a request would protect
+  nothing, and would add code to the agent and the protocol.
 
 ## Context
 
@@ -177,12 +182,28 @@ command, directory, expiry); process names remain unverified. Revocation is
 atomic with grant consumption, audited, and stops future uses, not commands
 already started. Lock remains the M1 way to forget all grants.
 
-History will use a bounded agent request, not a guessed client-side log path.
-Page by file identity plus byte offset, cap bytes and records per page, stop
-at the last complete JSONL record, and handle rotation/truncation explicitly.
-Do not load an unbounded file, hold the audit write lock while rendering, or
-claim audit timestamps cannot move backwards. Render command lines as plain
-escaped text; they can contain sensitive information the caller supplied.
+History reads the audit log at the path the agent reports in
+`status.audit_log`, not a path the manager guesses, as `rusthorse audit`
+reads it. (The first version of this section planned a bounded agent
+request; amended on 2026-11-05: the file is readable by every program of
+the user, L13, so a request would protect nothing.) The reading is bounded
+and lives in the library (`audit::read_page`): pages from the end of the
+file, at most 256 KiB and 200 records each, complete lines only. The next
+page goes on from a cursor that holds the file's identity (device and inode),
+its size, and the offset, length and hash of the oldest line read; a
+different file, a shorter file (the agent only appends), another line
+there, or no line ending just before it is reported as a changed file
+(rotated, truncated or rewritten), and the page offers to read it again from
+its end. A rewrite that keeps that line and the file's size goes unnoticed. A line longer than a page
+stops the reading, and the page says so. Opening does not wait (a FIFO would
+block) and only a regular file is read; the read runs on a thread of its
+own, never on the GTK thread. Do not load an unbounded file, hold the audit
+write lock while rendering, or claim audit timestamps cannot move backwards.
+Render command lines as plain escaped text; they can contain sensitive
+information the caller supplied. The page shows the history only while the
+vault is unlocked and forgets it on Lock now and on an observed lock, like
+the entries, dropping a page still being read: the log names entries and the
+commands that used them. That protects the screen, not the file.
 
 ### 5. Import, backup and restoration (M1/M3)
 
@@ -272,6 +293,9 @@ require allowed and denied end-to-end tests in `tests/agent.rs` as well.
 The first milestone is useful but does not reproduce every prototype control.
 No persistent settings, grants/history viewer, import UI, restoration,
 automatic screen/suspend lock or exclusive KeePassXC handoff is claimed yet.
+(Since then: the lock on screen lock and suspend, ADR 0009; the import
+windows, ADR 0012; the broker's Grants page, ADR 0013; the History page,
+section 4.)
 Copy puts a value where other programs and clipboard histories can keep it;
 the threat model (L14) records it.
 Before real credentials, the maintainer must review the reveal exposure,

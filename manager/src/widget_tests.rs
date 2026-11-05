@@ -450,6 +450,17 @@ fn desktop_flow() {
             l.text() == "suspend: not watched — turned off\nscreen lock: not watched — turned off"
         })
     }));
+    // The History page reads what the agent wrote, from the file its status
+    // names: the unlock, last.
+    show_page(&s, "history");
+    spin_until(|| s.history.borrow().loaded && s.history_job.borrow().is_none());
+    let newest = history_records(&s);
+    assert_eq!(
+        newest.first().map(|r| (r[1].as_str(), r[2].as_str())),
+        Some(("unlock", "unlocked")),
+        "{newest:?}"
+    );
+    show_page(&s, "entries");
 
     // Fill the real form; no manager password entry exists.
     button(&s.window, "New entry").emit_clicked();
@@ -1578,6 +1589,8 @@ fn import_windows() {
 /// What the fake agent answers, and what it was asked.
 struct FakeState {
     locked: bool,
+    /// The audit log its status names.
+    audit_log: String,
     /// The protocol version its status reports.
     protocol: u32,
     /// Whether its status reports the broker's program and the number of
@@ -1607,6 +1620,7 @@ struct FakeState {
 fn fake_state(locked: bool) -> Arc<Mutex<FakeState>> {
     Arc::new(Mutex::new(FakeState {
         locked,
+        audit_log: "/fake/audit.jsonl".into(),
         protocol: PROTOCOL_VERSION,
         report_broker: true,
         entries: vec![],
@@ -1685,7 +1699,7 @@ fn fake_answer(state: &Mutex<FakeState>, request: &serde_json::Value) -> (Respon
             agent_version: "fake".into(),
             vault: "/fake/vault.kdbx".into(),
             vault_exists: true,
-            audit_log: "/fake/audit.jsonl".into(),
+            audit_log: s.audit_log.clone(),
             locked: s.locked,
             idle_timeout_secs: 0,
             locks_in_secs: None,
@@ -1807,6 +1821,329 @@ fn has_button(root: &impl IsA<gtk::Widget>, name: &str) -> bool {
         .into_iter()
         .filter_map(|w| w.downcast::<gtk::Button>().ok())
         .any(|b| b.widget_name() == name)
+}
+
+/// The records the history page shows, top to bottom: each one's texts.
+fn history_records(s: &Manager) -> Vec<Vec<String>> {
+    let mut rows = vec![];
+    let mut child = s.history_list.first_child();
+    while let Some(row) = child {
+        rows.push(texts(&row));
+        child = row.next_sibling();
+    }
+    rows
+}
+
+/// A line of the audit log: a `run` record numbered `n`.
+fn history_line(n: usize, outcome: &str) -> String {
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "time": format!("2026-11-05T10:{:02}:{:02}-03:00", n / 60, n % 60),
+        "action": "run",
+        "outcome": outcome,
+        "entries": ["AI/FAKE_KEY (11111111)"],
+        "requester": "rusthorse[1] ← bash[2]",
+        "argv": ["fake-command", format!("#{n}")],
+        "cwd": "/fake"
+    }))
+    .unwrap();
+    line.push('\n');
+    line
+}
+
+/// The history page, driven by a fake agent whose status names a log made
+/// for the test: it reads the log only while the vault is unlocked and its
+/// page is shown, newest first, a page at a time; it draws what any program
+/// could have written as plain, filtered text; it filters, refreshes, says
+/// when the file changed, and forgets everything when the vault locks.
+#[test]
+fn history_page() {
+    if !on_xvfb("history_page") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let log = dir.path().join("state/audit.jsonl");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    // More records than a page holds, and one written by "any program":
+    // markup, a direction override and a line break, which must neither be
+    // drawn as such nor make two records of one.
+    let mut text: String = (0..230)
+        .map(|n| history_line(n, if n % 2 == 0 { "allowed_once" } else { "denied" }))
+        .collect();
+    let tricky = serde_json::json!({
+        "time": "2026-11-05T11:00:00-03:00",
+        "action": "lock",
+        "outcome": "requested",
+        "requester": "<b>fake</b>\u{202e}gpj.exe\nrusthorse[9]",
+        "detail": "not\nmarkup <i>at all</i>"
+    });
+    text.push_str(&format!("{tricky}\nnot a record\n"));
+    std::fs::write(&log, &text).unwrap();
+    let state = fake_state(true);
+    state.lock().unwrap().audit_log = log.display().to_string();
+    fake_agent(&socket, &state);
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket.clone());
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Locked");
+
+    // Locked: nothing is read, and the page says why.
+    show_page(&s, "history");
+    assert!(s.history_job.borrow().is_none());
+    assert!(!s.history.borrow().loaded);
+    assert_eq!(
+        s.history_summary.text(),
+        "Unlock the vault to see the history."
+    );
+    assert!(!s.history_list.is_visible());
+    assert!(!s.history_refresh.is_sensitive());
+    assert!(!s.history_more.is_visible());
+
+    // Unlocked: read at once, newest first, a page of 200 records.
+    s.toggle_lock();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Unlocked");
+    spin_until(|| s.history.borrow().loaded && s.history_job.borrow().is_none());
+    let shown = history_records(&s);
+    assert_eq!(shown.len(), 200);
+    assert_eq!(
+        s.history_summary.text(),
+        "200 records read, newest first. 1 line of the file is not audit records and is left out. Load older reads the records before them."
+    );
+    assert_eq!(
+        s.history_file.text(),
+        format!("Read from {}", log.display())
+    );
+    // The newest record, as written: escaped, on lines of its own.
+    assert_eq!(
+        shown[0],
+        [
+            "2026-11-05T11:00:00-03:00",
+            "lock",
+            "requested",
+            "Detail",
+            "not\\u{a}markup <i>at all</i>",
+            "Requested by (unverified)",
+            "<b>fake</b>\\u{202e}gpj.exe\\u{a}rusthorse[9]",
+        ]
+    );
+    assert_eq!(
+        shown[1],
+        [
+            "2026-11-05T10:03:49-03:00",
+            "run",
+            "denied",
+            "Entries",
+            "AI/FAKE_KEY (11111111)",
+            "Command",
+            "fake-command '#229'",
+            "Directory",
+            "/fake",
+            "Requested by (unverified)",
+            "rusthorse[1] ← bash[2]",
+        ]
+    );
+    assert_eq!(shown[199][6], "fake-command '#31'");
+    // Plain text: no label of a record draws markup.
+    let plain = descendants(&s.history_list)
+        .into_iter()
+        .filter_map(|w| w.downcast::<gtk::Label>().ok())
+        .all(|l| !l.uses_markup());
+    assert!(plain);
+    // The outcome says whether it was approved.
+    let outcome = |row: usize| {
+        descendants(&s.history_list.row_at_index(row as i32).unwrap())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .find(|l| l.text() == "denied" || l.text() == "allowed_once")
+            .unwrap()
+    };
+    assert!(outcome(1).has_css_class("warning"));
+    assert!(outcome(2).has_css_class("success"));
+    snapshot(&s, "history");
+
+    // Load older: the records before them, after them.
+    assert!(s.history_more.is_visible());
+    s.history_more.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none() && history_records(&s).len() == 231);
+    let shown = history_records(&s);
+    assert_eq!(shown[200][6], "fake-command '#30'");
+    assert_eq!(shown[230][6], "fake-command '#0'");
+    assert!(!s.history_more.is_visible());
+    assert_eq!(
+        s.history_summary.text(),
+        "231 records read, newest first. 1 line of the file is not audit records and is left out. That is the whole log."
+    );
+
+    // Filters pick among the records read.
+    let pick = |label: &str| {
+        let at = HISTORY_FILTERS
+            .iter()
+            .position(|(_, l)| *l == label)
+            .unwrap();
+        s.history_filter.set_selected(at as u32);
+    };
+    pick("Denied or not answered");
+    assert_eq!(history_records(&s).len(), 115);
+    assert!(
+        s.history_summary
+            .text()
+            .starts_with("231 records read, newest first; 115 shown with this filter.")
+    );
+    pick("Unlock and lock");
+    assert_eq!(history_records(&s).len(), 1);
+    pick("Credential broker");
+    assert!(history_records(&s).is_empty());
+    assert!(!s.history_list.is_visible());
+    pick("All records");
+    assert_eq!(history_records(&s).len(), 231);
+
+    // Refresh reads the newest records again; records appended meanwhile
+    // come first.
+    text.push_str(&history_line(500, "allowed_remembered"));
+    std::fs::write(&log, &text).unwrap();
+    s.history_refresh.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none());
+    let shown = history_records(&s);
+    assert_eq!(shown.len(), 200);
+    assert_eq!(shown[0][2], "allowed_remembered");
+
+    // The file rotated under Load older: the page says so, keeps what it
+    // read, and Refresh reads the new file from its end.
+    std::fs::rename(&log, dir.path().join("state/audit.jsonl.1")).unwrap();
+    std::fs::write(&log, history_line(600, "allowed_once")).unwrap();
+    s.history_more.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none() && s.history.borrow().changed);
+    assert_eq!(history_records(&s).len(), 200);
+    assert!(!s.history_more.is_visible());
+    assert!(
+        s.history_summary
+            .text()
+            .contains("The file changed since it was read")
+    );
+    s.history_refresh.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none() && !s.history.borrow().changed);
+    assert_eq!(history_records(&s).len(), 1);
+    assert!(s.history_summary.text().ends_with("That is the whole log."));
+
+    // A log that cannot be read says why.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    s.history_refresh.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none());
+    assert!(history_records(&s).is_empty());
+    assert!(
+        s.history_summary
+            .text()
+            .starts_with(&format!("Cannot read the audit log at {}: ", log.display())),
+        "{}",
+        s.history_summary.text()
+    );
+    assert!(s.history_summary.has_css_class("error"));
+    std::fs::remove_dir(&log).unwrap();
+    std::fs::write(&log, &text).unwrap();
+    s.history_refresh.emit_clicked();
+    spin_until(|| s.history_job.borrow().is_none());
+    assert_eq!(history_records(&s).len(), 200);
+    assert!(!s.history_summary.has_css_class("error"));
+
+    // Locked elsewhere (the CLI, the idle timer): forgotten at the next
+    // status check, and not read again until unlocked.
+    state.lock().unwrap().locked = true;
+    spin_until(|| s.pill.text() == "Locked");
+    assert!(history_records(&s).is_empty());
+    assert!(!s.history_list.is_visible());
+    assert!(!s.history.borrow().loaded);
+    assert_eq!(
+        s.history_summary.text(),
+        "Unlock the vault to see the history."
+    );
+    assert_eq!(s.history_file.text(), "");
+    s.history_refresh.emit_clicked();
+    assert!(s.history_job.borrow().is_none());
+    // A page being read when the vault locks is not shown: it is read, the
+    // lock is seen, and only then is the page handed over.
+    let unlocked_again = || {
+        state.lock().unwrap().locked = false;
+        spin_until(|| {
+            s.pill.text() == "Unlocked"
+                && s.history.borrow().loaded
+                && s.history_job.borrow().is_none()
+        });
+        assert_eq!(history_records(&s).len(), 200);
+        settle(&s);
+    };
+    // Process the window's events for a while.
+    let idle = |ms: u64| {
+        let until = Instant::now() + Duration::from_millis(ms);
+        spin_until(|| Instant::now() >= until);
+    };
+    unlocked_again();
+    let (open, gate) = mpsc::channel();
+    *s.history_gate.borrow_mut() = Some(gate);
+    s.history_refresh.emit_clicked();
+    assert!(s.history_job.borrow().is_some());
+    state.lock().unwrap().locked = true;
+    spin_until(|| s.pill.text() == "Locked");
+    open.send(()).unwrap();
+    idle(500);
+    assert!(history_records(&s).is_empty());
+    assert!(s.history.borrow().records.is_empty());
+    assert!(!s.history.borrow().loaded);
+    assert!(s.history_job.borrow().is_none());
+
+    // Lock now: the history goes at once, and is not read again while the
+    // agent's answer is awaited, though the last status said unlocked.
+    unlocked_again();
+    state.lock().unwrap().hold = Some("lock");
+    s.toggle_lock();
+    assert!(history_records(&s).is_empty());
+    assert!(!s.history_refresh.is_sensitive());
+    assert_eq!(
+        s.history_summary.text(),
+        "Unlock the vault to see the history."
+    );
+    s.history_refresh.emit_clicked();
+    show_page(&s, "entries");
+    show_page(&s, "history");
+    idle(300);
+    assert!(s.history_job.borrow().is_none());
+    assert!(history_records(&s).is_empty());
+    assert!(!s.history.borrow().loaded);
+    state.lock().unwrap().hold = None;
+    settle(&s);
+    spin_until(|| s.pill.text() == "Locked");
+    assert!(history_records(&s).is_empty());
+
+    // An agent that names no file, or a relative one: said, nothing read.
+    for (path, said) in [
+        ("", "The agent did not say where it writes its audit log."),
+        (
+            "state/audit.jsonl",
+            "The agent writes its audit log at a relative path, state/audit.jsonl, which this app cannot locate.",
+        ),
+    ] {
+        {
+            let mut state = state.lock().unwrap();
+            state.audit_log = path.into();
+            state.locked = false;
+        }
+        s.refresh();
+        settle(&s);
+        spin_until(|| s.history.borrow().loaded);
+        assert_eq!(s.history_summary.text(), said);
+        assert!(history_records(&s).is_empty());
+        s.toggle_lock();
+        settle(&s);
+    }
+    s.shutdown();
 }
 
 /// The grants page, driven by a fake agent: it lists what the agent lists,

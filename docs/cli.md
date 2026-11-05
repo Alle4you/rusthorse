@@ -906,7 +906,8 @@ the approved origin a request went to is not recorded. For example:
 Any program of yours can write to the log (threat model L13): control and
 invisible characters in a record are shown escaped (`\u{…}`), so that a
 record cannot rewrite the terminal or look like two. `--json` prints the
-records as they are.
+records as they are. The manager's **History** page shows the same records,
+from the file the agent names ([manager guide](manager.md#history)).
 
 ## `rusthorse doctor`
 

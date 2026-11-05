@@ -15,8 +15,9 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 groups, agent-approved edits, generated values, Show and Copy, command
 snippets, status, locking and verified backup; since then, first start,
 changing the value and moving entries between groups. M2: persistent agent
-configuration, bounded history, remembered-approval revocation, and
-screen/suspend locking (done in the agent,
+configuration, bounded history (done: the History page, which reads the
+audit log in pages while the vault is unlocked), remembered-approval
+revocation, and screen/suspend locking (done in the agent,
 [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). M3: import UI (done,
 [ADR 0012](adr/0012-import-read-by-the-agent.md)), safe restoration and
 exclusive KeePassXC handoff. The
@@ -196,7 +197,7 @@ interactively. Nothing else is planned for the broker.
 | **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
 | **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Designed with the credential broker, whose tokens would point to a field. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; broker Grants page done (ADR 0013); manager stays an agent client. |
+| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; broker Grants page done (ADR 0013); History page done; manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |

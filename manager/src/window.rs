@@ -6,17 +6,22 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gio, glib, pango};
+use rusthorse::audit::{self, AuditEvent, PageRead};
 use rusthorse::protocol::{
     EntryChanges, EntryInfo, EntryKind, Field, GrantInfo, Request, Response, RevealPurpose,
     SecretString, StatusInfo,
 };
 
 use crate::connection::{Failure, Job};
-use crate::model::{self, Form, GrantRow, ValueMode};
+use crate::model::{
+    self, Form, GrantRow, HISTORY_FILTERS, HistoryCounts, HistoryFilter, HistoryRow, Tone,
+    ValueMode,
+};
 
 /// How long a shown value stays on screen.
 const REVEAL_SECONDS: u64 = 30;
@@ -130,6 +135,56 @@ pub(crate) struct Manager {
     /// and show as active a grant that has ended since, so it is done
     /// again. (One answered before such an end shows what was true then.)
     grants_epoch: Cell<u64>,
+    /// The history page: the audit log, read from the file the agent names
+    /// in its status, and shown only while the vault is unlocked — it names
+    /// entries and the commands that used them.
+    history_file: gtk::Label,
+    history_summary: gtk::Label,
+    history_filter: gtk::DropDown,
+    history_refresh: gtk::Button,
+    history_list: gtk::ListBox,
+    history_more: gtk::Button,
+    /// What was read of the log.
+    history: RefCell<History>,
+    /// A page of the log being read, on a thread of its own: a file read,
+    /// not a request to the agent, so it waits for nothing else.
+    history_job: RefCell<Option<HistoryJob>>,
+    /// Lock now was sent, and no status has been applied since: until one
+    /// says otherwise, the vault counts as locked here, so that the history
+    /// it cleared is not read again meanwhile.
+    lock_sent: Cell<bool>,
+    /// For tests: the next page read waits, once read, until this receives
+    /// something (or its sender goes) before it is handed over.
+    #[cfg(test)]
+    history_gate: RefCell<Option<mpsc::Receiver<()>>>,
+}
+
+/// What the history page has read of the audit log since it was last
+/// cleared.
+#[derive(Default)]
+struct History {
+    /// A page was read, or the reading failed: the page does not read
+    /// again by itself.
+    loaded: bool,
+    /// The file the records come from.
+    path: Option<PathBuf>,
+    /// Newest first.
+    records: Vec<AuditEvent>,
+    unreadable: usize,
+    older: Option<audit::Cursor>,
+    too_long: bool,
+    /// The file changed under the last page read.
+    changed: bool,
+    /// Why the log could not be read.
+    problem: Option<String>,
+}
+
+/// A page of the audit log being read.
+struct HistoryJob {
+    result: mpsc::Receiver<std::io::Result<PageRead>>,
+    path: PathBuf,
+    /// Older records, after those read.
+    older: bool,
 }
 
 /// Plain text: never markup, and drawn through the same character filter
@@ -334,6 +389,54 @@ impl GrantSlot {
     }
 }
 
+/// One record on the history page: its time, action and outcome, then
+/// each fact on a line of its own, as plain text through the dialogs'
+/// filter (any program of the user can write the log).
+fn history_row(row: &HistoryRow) -> gtk::ListBoxRow {
+    let body = column(4);
+    margins(&body, 10, 14);
+    let head = row_box(10);
+    let time = styled(&row.time, &["caption", "monospace", "dim-label"]);
+    time.set_selectable(true);
+    head.append(&time);
+    let action = styled(&row.action, &["heading"]);
+    action.set_selectable(true);
+    head.append(&action);
+    let outcome = styled(&row.outcome, &[]);
+    outcome.set_selectable(true);
+    outcome.set_hexpand(true);
+    match row.tone {
+        Tone::Allowed => outcome.add_css_class("success"),
+        Tone::Refused => outcome.add_css_class("warning"),
+        Tone::Plain => {}
+    }
+    head.append(&outcome);
+    body.append(&head);
+    // Keys in a column of their own, so that the values line up.
+    let facts = gtk::Grid::builder()
+        .column_spacing(12)
+        .row_spacing(2)
+        .build();
+    for (at, (key, text)) in (0..).zip(&row.facts) {
+        let k = styled(key, &["caption", "dim-label"]);
+        k.set_wrap(false);
+        k.set_valign(gtk::Align::Start);
+        facts.attach(&k, 0, at, 1, 1);
+        let v = styled(text, &["caption"]);
+        v.set_selectable(true);
+        v.set_hexpand(true);
+        facts.attach(&v, 1, at, 1, 1);
+    }
+    body.append(&facts);
+    let r = gtk::ListBoxRow::builder()
+        .activatable(false)
+        .selectable(false)
+        .child(&body)
+        .build();
+    r.set_widget_name("history-record");
+    r
+}
+
 fn button(text: &str, icon: Option<&str>) -> gtk::Button {
     let Some(icon) = icon else {
         return gtk::Button::with_label(text);
@@ -451,6 +554,44 @@ impl Manager {
         let grants_list = column(18);
         grants_page.append(&grants_list);
 
+        // History: the agent's audit log, read from the file its status
+        // names, as rusthorse audit reads it. Only while the vault is
+        // unlocked: the log names entries and the commands that used them.
+        let history_page = column(18);
+        let history_group = group(
+            "Audit log",
+            Some(
+                "What the agent records: approvals and denials, unlocks and locks, the commands it started and how they ended, the credential broker's grants and requests. Values are never recorded. Any program of yours can write to this file, so it is a record, not proof. Times are when a record was written, after you answered for an approval, by the system clock. Shown only while the vault is unlocked: the log names your entries and the commands that used them.",
+            ),
+        );
+        let history_filter = gtk::DropDown::from_strings(&HISTORY_FILTERS.map(|(_, label)| label));
+        history_filter.set_valign(gtk::Align::Center);
+        history_filter.set_tooltip_text(Some("Which of the records read are shown"));
+        let history_refresh = button("Refresh", Some("view-refresh-symbolic"));
+        history_refresh.set_widget_name("history-refresh");
+        history_refresh.set_valign(gtk::Align::Center);
+        history_refresh.set_tooltip_text(Some("Read the newest records again"));
+        let history_controls = row_box(8);
+        history_controls.append(&history_filter);
+        history_controls.append(&history_refresh);
+        history_group.set_header_suffix(Some(&history_controls));
+        let history_summary = styled("", &["dim-label"]);
+        history_group.add(&history_summary);
+        let history_file = styled("", &["caption", "dim-label"]);
+        history_file.set_selectable(true);
+        history_group.add(&history_file);
+        history_page.append(&history_group);
+        let history_list = gtk::ListBox::new();
+        history_list.add_css_class("boxed-list");
+        history_list.set_selection_mode(gtk::SelectionMode::None);
+        history_list.set_visible(false);
+        history_page.append(&history_list);
+        let history_more = button("Load older", None);
+        history_more.set_widget_name("history-more");
+        history_more.set_halign(gtk::Align::Center);
+        history_more.set_visible(false);
+        history_page.append(&history_more);
+
         let pages: Vec<(&str, &str, &str, gtk::Widget)> = vec![
             (
                 "entries",
@@ -478,11 +619,7 @@ impl Manager {
                 "history",
                 "History",
                 "document-open-recent-symbolic",
-                Self::planned_page(
-                    "document-open-recent-symbolic",
-                    "History",
-                    "A history viewer comes in a later version. Until then, run rusthorse audit in a terminal. This app does not read the audit log.",
-                ),
+                page(&history_page).upcast(),
             ),
             (
                 "data",
@@ -587,6 +724,10 @@ impl Manager {
             (
                 "Grants of the credential broker",
                 "A command started with rusthorse run --broker names, for each entry it uses that way, where the key goes, and the agent's dialog shows you that origin to approve. After your approval the command gets a temporary token for a grant, never the value, and the broker puts the value only in its requests to that origin, at any path there. The Grants page lists the grants in use and revokes them, also while the vault is locked.",
+            ),
+            (
+                "History",
+                "The History page shows what the agent recorded in its audit log, newest first: approvals and denials, unlocks and locks, the commands it started and how they ended, the broker's grants and requests. Values are never recorded. It reads the file the agent names, only while the vault is unlocked, and forgets it when the vault locks. Any program of yours can write to that file: it is a record, not proof.",
             ),
             (
                 "If something is uncertain",
@@ -732,6 +873,17 @@ impl Manager {
             grants_job: RefCell::new(None),
             revoke_job: RefCell::new(None),
             grants_epoch: Cell::new(0),
+            history_file,
+            history_summary,
+            history_filter,
+            history_refresh,
+            history_list,
+            history_more,
+            history: RefCell::new(History::default()),
+            history_job: RefCell::new(None),
+            lock_sent: Cell::new(false),
+            #[cfg(test)]
+            history_gate: RefCell::new(None),
         });
         manager.actions.replace(vec![
             refresh.clone(),
@@ -762,7 +914,8 @@ impl Manager {
         });
         // The grants are listed when their page is shown, and every few
         // seconds while it is (see the timer below). Those that ended while
-        // it was shown go when it is left.
+        // it was shown go when it is left. The history is read when its page
+        // is first shown with the vault unlocked, and then on Refresh.
         let weak = Rc::downgrade(&manager);
         manager.stack.connect_visible_child_name_notify(move |_| {
             if let Some(s) = weak.upgrade() {
@@ -771,8 +924,31 @@ impl Manager {
                 } else {
                     s.forget_ended_grants();
                 }
+                if s.showing_history() && !s.history.borrow().loaded {
+                    s.read_history(false);
+                }
             }
         });
+        // Not `connect_button`: reading the log waits for no request.
+        let weak = Rc::downgrade(&manager);
+        manager.history_refresh.connect_clicked(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.read_history(false);
+            }
+        });
+        let weak = Rc::downgrade(&manager);
+        manager.history_more.connect_clicked(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.read_history(true);
+            }
+        });
+        let weak = Rc::downgrade(&manager);
+        manager.history_filter.connect_selected_notify(move |_| {
+            if let Some(s) = weak.upgrade() {
+                s.paint_history_rows();
+            }
+        });
+        manager.clear_history();
         let weak = Rc::downgrade(&manager);
         manager.rows.set_header_func(move |row, before| {
             let Some(s) = weak.upgrade() else { return };
@@ -854,6 +1030,7 @@ impl Manager {
         self.poll.borrow_mut().take();
         self.grants_job.borrow_mut().take();
         self.revoke_job.borrow_mut().take();
+        self.history_job.borrow_mut().take();
         self.hide_revealed();
         if let Some(editor) = self.editor.borrow_mut().take() {
             editor.close();
@@ -934,6 +1111,7 @@ impl Manager {
         if locked {
             self.submit(Request::Unlock, Pending::Change);
         } else {
+            self.lock_sent.set(true);
             self.hide_revealed();
             self.clear_entries();
             self.submit(Request::Lock, Pending::Change);
@@ -1261,6 +1439,240 @@ impl Manager {
         }
     }
 
+    /// Whether the history page is the one shown.
+    fn showing_history(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some("history")
+    }
+
+    /// Whether the last status said the vault is unlocked, and Lock now
+    /// was not sent since.
+    fn vault_unlocked(&self) -> bool {
+        !self.lock_sent.get()
+            && self
+                .status
+                .borrow()
+                .as_ref()
+                .is_some_and(|s| s.vault_exists && !s.locked)
+    }
+
+    /// Read a page of the audit log on a thread of its own: the newest
+    /// records, or with `older`, those before the records read. Only while
+    /// the vault is unlocked, from the file the agent's status names. One
+    /// page at a time.
+    fn read_history(self: &Rc<Self>, older: bool) {
+        if self.closed.get() || self.history_job.borrow().is_some() {
+            return;
+        }
+        if !self.vault_unlocked() {
+            self.paint_history_status();
+            return;
+        }
+        let path = PathBuf::from(
+            self.status
+                .borrow()
+                .as_ref()
+                .map(|s| s.audit_log.clone())
+                .unwrap_or_default(),
+        );
+        let problem = if path.as_os_str().is_empty() {
+            Some("The agent did not say where it writes its audit log.".to_string())
+        } else if !path.is_absolute() {
+            Some(format!(
+                "The agent writes its audit log at a relative path, {}, which this app cannot locate.",
+                path.display()
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            self.paint_history_rows_of(History {
+                loaded: true,
+                problem: Some(problem),
+                ..History::default()
+            });
+            return;
+        }
+        // Older records come from the file the others came from; if the
+        // agent names another, read it from its end.
+        let cursor = {
+            let history = self.history.borrow();
+            match &history.older {
+                Some(cursor) if older && history.path.as_ref() == Some(&path) => {
+                    Some(cursor.clone())
+                }
+                _ if older && history.path.as_ref() == Some(&path) => return,
+                _ => None,
+            }
+        };
+        let older = cursor.is_some();
+        let (tx, result) = mpsc::sync_channel(1);
+        let reading = path.clone();
+        #[cfg(test)]
+        let gate = self.history_gate.borrow_mut().take();
+        let started = std::thread::Builder::new()
+            .name("manager-history".into())
+            .spawn(move || {
+                let read = audit::read_page(&reading, cursor.as_ref());
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                let _ = tx.send(read);
+            });
+        match started {
+            Ok(_) => {
+                *self.history_job.borrow_mut() = Some(HistoryJob {
+                    result,
+                    path,
+                    older,
+                });
+                self.paint_history_status();
+            }
+            Err(e) => self.after_history(
+                &HistoryJob {
+                    result,
+                    path,
+                    older,
+                },
+                Err(format!("cannot start reading it: {e}")),
+            ),
+        }
+    }
+
+    /// Show a page read, or why it was not.
+    fn after_history(&self, job: &HistoryJob, read: Result<PageRead, String>) {
+        let mut history = std::mem::take(&mut *self.history.borrow_mut());
+        if !job.older {
+            history = History {
+                path: Some(job.path.clone()),
+                ..History::default()
+            };
+        }
+        history.loaded = true;
+        match read {
+            Ok(PageRead::Page(page)) => {
+                history.problem = None;
+                history.changed = false;
+                history.unreadable += page.unreadable;
+                history.older = page.older;
+                history.too_long = page.too_long;
+                let from = history.records.len();
+                history.records.extend(page.records);
+                if job.older {
+                    *self.history.borrow_mut() = history;
+                    self.append_history_rows(from);
+                    self.paint_history_status();
+                    return;
+                }
+            }
+            Ok(PageRead::Changed) => {
+                history.changed = true;
+                history.older = None;
+            }
+            Err(e) => {
+                history.problem = Some(format!(
+                    "Cannot read the audit log at {}: {e}.",
+                    job.path.display()
+                ));
+            }
+        }
+        if job.older {
+            *self.history.borrow_mut() = history;
+            self.paint_history_status();
+        } else {
+            self.paint_history_rows_of(history);
+        }
+    }
+
+    /// Forget what was read of the log, and say that the page shows it only
+    /// while the vault is unlocked. A page being read is not shown.
+    fn clear_history(&self) {
+        self.history_job.borrow_mut().take();
+        self.paint_history_rows_of(History::default());
+    }
+
+    /// Show `history` from its first record.
+    fn paint_history_rows_of(&self, history: History) {
+        *self.history.borrow_mut() = history;
+        self.paint_history_rows();
+    }
+
+    /// Show the records read that the filter picks, from the first.
+    fn paint_history_rows(&self) {
+        while let Some(row) = self.history_list.first_child() {
+            self.history_list.remove(&row);
+        }
+        self.append_history_rows(0);
+        self.paint_history_status();
+    }
+
+    /// The filter chosen.
+    fn history_filter(&self) -> HistoryFilter {
+        HISTORY_FILTERS
+            .get(self.history_filter.selected() as usize)
+            .map_or(HistoryFilter::All, |(filter, _)| *filter)
+    }
+
+    /// Add the rows of the records read from the `from`th on, that the
+    /// filter picks.
+    fn append_history_rows(&self, from: usize) {
+        let filter = self.history_filter();
+        for event in self.history.borrow().records.iter().skip(from) {
+            if filter.matches(event) {
+                self.history_list
+                    .append(&history_row(&HistoryRow::new(event)));
+            }
+        }
+    }
+
+    /// The summary, the file, and which controls are offered.
+    fn paint_history_status(&self) {
+        let unlocked = self.vault_unlocked();
+        let reading = self.history_job.borrow().is_some();
+        let history = self.history.borrow();
+        let filter = self.history_filter();
+        let shown = history
+            .records
+            .iter()
+            .filter(|event| filter.matches(event))
+            .count();
+        self.history_refresh.set_sensitive(unlocked && !reading);
+        self.history_filter.set_sensitive(unlocked);
+        self.history_list.set_visible(unlocked && shown > 0);
+        // A changed file has no older records to read: Refresh reads it.
+        self.history_more
+            .set_visible(unlocked && history.older.is_some());
+        self.history_more.set_sensitive(!reading);
+        set_plain(
+            &self.history_file,
+            &match (&history.path, unlocked) {
+                (Some(path), true) => format!("Read from {}", path.display()),
+                _ => String::new(),
+            },
+        );
+        self.history_summary.remove_css_class("error");
+        let text = if !unlocked {
+            "Unlock the vault to see the history.".to_string()
+        } else if let Some(problem) = &history.problem {
+            self.history_summary.add_css_class("error");
+            problem.clone()
+        } else if reading && !history.loaded {
+            "Reading the audit log…".to_string()
+        } else if !history.loaded {
+            String::new()
+        } else {
+            model::history_summary(HistoryCounts {
+                read: history.records.len(),
+                shown,
+                unreadable: history.unreadable,
+                more: history.older.is_some(),
+                too_long: history.too_long,
+                changed: history.changed,
+            })
+        };
+        set_plain(&self.history_summary, &text);
+    }
+
     fn submit(self: &Rc<Self>, request: Request, purpose: Pending) {
         if self.closed.get() || self.job.borrow().is_some() {
             return;
@@ -1360,6 +1772,24 @@ impl Manager {
                 });
             }
         }
+        let read = self
+            .history_job
+            .borrow()
+            .as_ref()
+            .and_then(|job| match job.result.try_recv() {
+                Ok(read) => Some(read.map_err(|e| e.to_string())),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("the reading stopped unexpectedly".into()))
+                }
+            });
+        if let Some(read) = read {
+            // Taken first: showing it looks at whether a page is being read.
+            let job = self.history_job.borrow_mut().take();
+            if let Some(job) = job {
+                self.after_history(&job, read);
+            }
+        }
         let revoked = self.revoke_job.borrow().as_ref().and_then(answer_of);
         if let Some(answer) = revoked {
             self.revoke_job.borrow_mut().take();
@@ -1452,6 +1882,7 @@ impl Manager {
 
     fn unreachable(self: &Rc<Self>, failure: &Failure) {
         self.status.borrow_mut().take();
+        self.lock_sent.set(false);
         // Whether the vault is locked is not known now.
         self.grants_locked.set_visible(false);
         self.agent_down.set(failure.not_running);
@@ -1530,6 +1961,7 @@ impl Manager {
 
     fn apply_status(self: &Rc<Self>, info: StatusInfo, list: bool) {
         self.agent_down.set(false);
+        self.lock_sent.set(false);
         // The grants page says when the vault is locked: grants can outlive
         // an automatic lock, and are listed and revoked all the same.
         self.grants_locked
@@ -1579,9 +2011,14 @@ impl Manager {
         if locked {
             self.hide_revealed();
             self.clear_entries();
-        } else if list || was_locked {
-            // Unlocked here or elsewhere (the CLI): listing asks nothing.
-            self.submit(Request::List, Pending::List);
+        } else {
+            if list || was_locked {
+                // Unlocked here or elsewhere (the CLI): listing asks nothing.
+                self.submit(Request::List, Pending::List);
+            }
+            if self.showing_history() && !self.history.borrow().loaded {
+                self.read_history(false);
+            }
         }
     }
 
@@ -1671,6 +2108,8 @@ impl Manager {
     }
 
     fn clear_entries(&self) {
+        // The history names entries too.
+        self.clear_history();
         self.entries.borrow_mut().clear();
         self.row_groups.borrow_mut().clear();
         self.selected.borrow_mut().take();

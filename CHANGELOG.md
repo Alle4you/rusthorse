@@ -61,6 +61,17 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   to the command (`run`), the other goes through the broker and leaves the
   destination and the variables for you to fill in. Edit and import notes
   explain grant revocation.
+- **History in the manager** ([ADR 0007](docs/adr/0007-visual-manager.md#4-remembered-approvals-and-history-m2)):
+  the **History** page shows the agent's audit log, newest first, 200
+  records at a time (**Load older** reads the ones before them), with a
+  filter: allowed, denied or not answered, unlock and lock, credential
+  broker. It reads the file the agent's status names, as `rusthorse audit`
+  does — complete lines only, at most 256 KiB a page — and says when the
+  file was rotated or truncated under it, and when a line longer than a page
+  stops the reading. Shown only while the vault is unlocked and
+  forgotten when it locks: the log names entries and the commands that used
+  them. Everything a record says is drawn as plain text through the
+  dialogs' character filter. No protocol change.
 - **Broker distribution**: the package installs `/usr/bin/rusthorse-broker` as
   its fourth program and recommends `ca-certificates`. The build script checks
   both the built broker and every broker in the packages it produces, and

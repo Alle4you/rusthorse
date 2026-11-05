@@ -420,6 +420,10 @@ itself keeps serving other requests.
 Any process of your user can edit or delete it. It helps you notice misuse by
 a cooperative-but-wrong agent; it is not evidence against a hostile one. It
 records command lines, which may contain sensitive data if you put it there.
+The manager's History page reads it at the path the agent reports, and shows
+it only while the vault is unlocked (that keeps it off the screen, not out
+of reach), drawing every text as plain text through the dialogs' character
+filter: no markup, and no line break or invisible character of its own.
 
 ### L14 — Some flows move values through the client
 
@@ -2815,3 +2819,73 @@ unchanged. Codex's checks, offline in an isolated copy: `cargo test
 --all-features` and `--no-default-features`, the ignored KeePassXC test,
 `cargo fmt --all --check`, `git diff --check`, a temporary probe, and the
 two mutations, which failed by their assertions.
+
+**2026-11-05 — The manager's History page.**
+
+Manager milestone item History (ADR 0007 section 4, amended on 2026-11-05
+at the maintainer's choice): the manager reads the audit log directly, as
+`rusthorse audit` does, at the path in `status.audit_log`. Any program of
+the user can read that file (L13), so a new agent request would protect
+nothing. The library's `audit::read_page` reads bounded pages from the end,
+at most 256 KiB and 200 records each, complete lines only. The manager
+shows them only while the vault is unlocked and clears them on Lock now
+or an observed lock; that protects the screen, not the file. No protocol
+change.
+
+Before review, the implementer's own widget test found a double
+`RefCell` borrow when a page read arrived: the job's mutable borrow lived
+through the `if let` that showed the result. Taking the job into a local
+first ends that borrow before the page is shown.
+
+First review (Codex, AI-assisted, 2026-11-05; verdict: not ready) of the
+uncommitted change found four defects:
+
+| Finding | Disposition |
+|---|---|
+| **Medium — Truncation keeping the cursor's line went unnoticed.** Truncating the same file after that line let Load older combine records already removed with the remaining log, without reporting a change. | Fixed: `Cursor.size` records the file's size at the read, and a smaller file gives `PageRead::Changed`; the agent only appends. The new case in `a_log_changed_under_a_cursor_is_read_again_from_its_end` truncates after the cursor's line. The reader's docs and the page's docs describe the checks and their limits: a rewrite keeping that line and the size goes unnoticed. |
+| **Medium — Refresh after Lock now could show history again while the lock answer was held.** Clearing the page left the last status unlocked, so Refresh or re-entering History could start another read. | Fixed: `lock_sent` is set before clearing, makes `vault_unlocked()` false, and is cleared by `apply_status` or `unreachable`. The widget test holds the lock answer, checks that Refresh is insensitive, and checks that clicking it or re-entering the page starts no read. |
+| **Low — The stale-result test did not prove that a pending read was discarded.** Removing the receiver's discard survived: the test did not make a result arrive after the manager saw the lock, nor process it then. | Fixed: the test-only `history_gate` holds the read thread after reading and before sending. The test waits for the manager to observe the lock, opens the gate, processes events for 500 ms, and checks that no records were shown or stored and no read remains pending. |
+| **Low — “Within five seconds” in the manager guide promised more than status polling guarantees.** A status answer can arrive after the polling interval. | Fixed: the guide says clearing happens “at once on **Lock now**, and for a lock made elsewhere when the manager sees it, at its next status check (every five seconds)”. This wording correction was checked by reading the docs against the code; it has no executable mutation test. |
+
+The implementer's mutation checks ran on a copy with its own target
+directory. Removing each guard in turn made a test fail by its assertion:
+the newline before the cursor, the line hash, file identity, ending the
+first page at the last complete line, the regular-file check, the
+non-blocking open, clearing history with the entries, reading only while
+unlocked, and drawing record values through the dialogs' character filter.
+For the first three review findings, four code mutations also failed by
+their assertions: removing the `size < cursor.size` check, the assignment
+`self.lock_sent.set(true)`, the `!self.lock_sent.get()` check, or the
+`history_job` discard in `clear_history`.
+
+Two earlier mutations survived and are harmless by design: removing the
+`fits` check before reading the cursor's line (a short file already gives
+`Changed` when that read fails), and removing `&& !history.changed` from
+Load older's visibility (a changed file clears the cursor). The redundant
+visibility condition was removed.
+
+Re-review (Codex, AI-assisted, 2026-11-05; verdict: ready): all four
+findings fixed, no new finding. Codex repeated the four code mutations
+above in separately compiled variants supplied through standard input,
+without editing repository files. Removing the size check failed the
+truncation assertion; removing either part of `lock_sent` failed the
+assertion that Refresh was insensitive; keeping the receiver failed the
+assertion that the history stayed empty after lock. Each failed by an
+assertion, not a compiler error or a timeout. The wording fix was checked
+separately.
+
+Codex's checks passed in both reviews: `cargo fmt --all --check`,
+`git diff HEAD --check`, `cargo test --locked -p rusthorse-manager`
+(42 tests, including History and the real-agent desktop flow on Xvfb with
+a private D-Bus session), and `cargo clippy --locked -p rusthorse-manager
+--all-targets -- -D warnings`. The first review also ran `cargo test
+--locked -p rusthorse --lib audit::tests` (10 passed), reader boundary
+probes (CRLF, empty lines, an exact byte limit and an incomplete last
+line), and the truncation and held-lock reproductions. The re-review ran
+`cargo test --locked -p rusthorse --lib --no-default-features --features
+fake-keyring audit::tests` (10 passed). Builds used a fresh temporary
+`CARGO_TARGET_DIR`; the temporary artifacts were removed.
+
+The implementer ran the full `AGENTS.md` check matrix before the review
+and again after the fixes, before the commit; both runs passed. Codex did
+not rerun the full matrix.

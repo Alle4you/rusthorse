@@ -625,6 +625,13 @@ one, so that `rusthorse run` can say that the destination did not accept the
 key. See [cli.md](cli.md#rusthorse-audit) and
 [protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-2).
 
+`rusthorse audit` and the manager's History page read the file directly:
+the CLI at its own configured path, the manager at the path the agent
+reports in `status.audit_log`. The manager reads it in pages from its end
+(`audit::read_page`: at most 256 KiB and 200 records a page, complete lines
+only, a cursor that notices a rotated or truncated file, or another line
+where the next page would end).
+
 ## Code map
 
 | Module | Responsibility |
@@ -721,6 +728,14 @@ its own dialog.
   whether its destination answered requests with `401` (**Key refused**, in
   the warning colour when it did), as of the last listing. No token reaches
   this page.
+- **History.** The page reads the audit log file the agent's status names,
+  on a thread of its own, a page at a time from its end
+  ([Audit log](#audit-log)), only while the vault is unlocked; Lock now and
+  an observed lock clear it, as they clear the entries, and a page still
+  being read is then dropped. After Lock now, the vault counts as locked
+  until the next status. Filters choose among the records read. Every text is drawn
+  as plain text through the dialogs' filter. It sends the agent no request
+  of its own.
 - **Command templates.** An entry offers two command templates, each
   labelled: one gives the value to the command (`run`), the other goes
   through the broker and leaves the destination, the token's variable and

@@ -247,6 +247,214 @@ pub fn tail(path: &Path, count: usize) -> io::Result<Vec<AuditEvent>> {
     Ok(events.into())
 }
 
+/// The most bytes [`read_page`] reads for one page, and so the longest line
+/// it can read: a longer one stops the reading there ([`Page::too_long`]).
+pub const PAGE_BYTES: u64 = 256 * 1024;
+
+/// The most records on one page of [`read_page`].
+pub const PAGE_RECORDS: usize = 200;
+
+/// Where the next page of older records ends: the oldest line a page read,
+/// in the file it read it from. [`read_page`] reads on from it only while
+/// that file still holds that line there and is no shorter than it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    device: u64,
+    inode: u64,
+    /// The file's size when the page was read: the agent only appends to
+    /// it, so a shorter file was truncated.
+    size: u64,
+    /// Where the line starts.
+    offset: u64,
+    /// Its length, with its newline.
+    length: u64,
+    /// A hash of its bytes, newline included.
+    hash: u64,
+}
+
+/// A page of the audit log, read by [`read_page`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Page {
+    /// Its records, newest first.
+    pub records: Vec<AuditEvent>,
+    /// Lines among them that are not audit records (not JSON, or JSON of
+    /// another shape): left out.
+    pub unreadable: usize,
+    /// Where the next page, of older records, ends; `None` once the start
+    /// of the file is reached, or when the reading stopped at a line too
+    /// long to read.
+    pub older: Option<Cursor>,
+    /// The reading stopped at a line longer than [`PAGE_BYTES`]: what comes
+    /// before it in the file is not read.
+    pub too_long: bool,
+}
+
+/// What [`read_page`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageRead {
+    /// The page.
+    Page(Page),
+    /// The file at the path is no longer the one the cursor came from, is
+    /// shorter than it was, no longer holds the cursor's line where it was,
+    /// or shrank while it was read: it was rotated, replaced, truncated or
+    /// rewritten. Read it again from its end. (A rewrite that keeps the
+    /// cursor's line and the file's size goes unnoticed.)
+    Changed,
+}
+
+/// Read a page of the audit log at `path`: its newest records, or with
+/// `before`, those before a page read earlier — at most [`PAGE_RECORDS`]
+/// records from at most [`PAGE_BYTES`] bytes, whatever the size of the file.
+///
+/// Only complete lines are read: the last one, without its newline yet, may
+/// still be being written. A missing file has no records. A file that is not
+/// a regular file is refused, and opening it does not wait (a FIFO would
+/// block). Any program of the user can write the file (threat model L13):
+/// what it reads is what the file says.
+pub fn read_page(path: &Path, before: Option<&Cursor>) -> io::Result<PageRead> {
+    read_page_within(path, before, PAGE_BYTES, PAGE_RECORDS)
+}
+
+/// [`read_page`], with other limits.
+fn read_page_within(
+    path: &Path,
+    before: Option<&Cursor>,
+    max_bytes: u64,
+    max_records: usize,
+) -> io::Result<PageRead> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(match before {
+                None => PageRead::Page(Page::default()),
+                Some(_) => PageRead::Changed,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let size = meta.len();
+    // Bytes the file no longer holds: it shrank since its size was taken.
+    let read_at = |buf: &mut [u8], offset: u64| match file.read_exact_at(buf, offset) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    };
+    let end = match before {
+        // The end of the last complete line: the last one, without its
+        // newline yet, may still be being written.
+        None => {
+            let from = size.saturating_sub(max_bytes.saturating_add(1));
+            let mut tail = vec![0; usize::try_from(size - from).map_err(io::Error::other)?];
+            if !read_at(&mut tail, from)? {
+                return Ok(PageRead::Changed);
+            }
+            match tail.iter().rposition(|&b| b == b'\n') {
+                Some(i) => from + i as u64 + 1,
+                // The file holds part of one line only.
+                None if from == 0 => return Ok(PageRead::Page(Page::default())),
+                // The last line is longer than a page.
+                None => {
+                    return Ok(PageRead::Page(Page {
+                        too_long: true,
+                        ..Page::default()
+                    }));
+                }
+            }
+        }
+        Some(cursor) => {
+            let same_file = (meta.dev(), meta.ino()) == (cursor.device, cursor.inode);
+            let fits = cursor
+                .offset
+                .checked_add(cursor.length)
+                .is_some_and(|line_end| line_end <= size);
+            if !same_file || size < cursor.size || !fits {
+                return Ok(PageRead::Changed);
+            }
+            let mut line = vec![0; usize::try_from(cursor.length).map_err(io::Error::other)?];
+            if !read_at(&mut line, cursor.offset)? || line_hash(&line) != cursor.hash {
+                return Ok(PageRead::Changed);
+            }
+            cursor.offset
+        }
+    };
+    let start = end.saturating_sub(max_bytes);
+    // With the byte before the window, when there is one: whether the
+    // window starts a line.
+    let from = start.saturating_sub(1);
+    let mut buf = vec![0; usize::try_from(end - from).map_err(io::Error::other)?];
+    if !read_at(&mut buf, from)? {
+        return Ok(PageRead::Changed);
+    }
+    // A line ends there: the last complete one, or the one before the
+    // cursor's (unless the file was rewritten).
+    if end > 0 && buf.last() != Some(&b'\n') {
+        return Ok(PageRead::Changed);
+    }
+    // Where the first line that starts in the window starts: the bytes
+    // before it are the end of a line that starts before the window.
+    let first = if from == start {
+        0
+    } else {
+        buf.iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1)
+    };
+    let mut page = Page::default();
+    if first == buf.len() {
+        // Not one line starts in the window (which then does not start the
+        // file): a line longer than the window ends here.
+        page.too_long = true;
+        return Ok(PageRead::Page(page));
+    }
+    let mut line_end = buf.len();
+    let mut oldest = None;
+    while line_end > first && page.records.len() < max_records {
+        let line_start = buf[first..line_end - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(first, |i| first + i + 1);
+        let line = &buf[line_start..line_end];
+        match serde_json::from_slice::<AuditEvent>(&line[..line.len() - 1]) {
+            Ok(event) => page.records.push(event),
+            Err(_) => page.unreadable += 1,
+        }
+        oldest = Some((from + line_start as u64, line));
+        line_end = line_start;
+    }
+    page.older = oldest
+        .filter(|(offset, _)| *offset > 0)
+        .map(|(offset, line)| Cursor {
+            device: meta.dev(),
+            inode: meta.ino(),
+            size,
+            offset,
+            length: line.len() as u64,
+            hash: line_hash(line),
+        });
+    Ok(PageRead::Page(page))
+}
+
+/// A hash of a line, to tell whether the file still holds it: not a
+/// protection, as any program of the user can write the file.
+fn line_hash(line: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(line);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +615,247 @@ mod tests {
             .map(String::from)
             .into()
         );
+    }
+
+    /// A record whose detail is `detail`, as a line of the log.
+    fn line(detail: &str) -> String {
+        let event = AuditEvent::new("run", &Peer::agent())
+            .outcome("denied")
+            .detail(detail);
+        let mut line = serde_json::to_string(&event).expect("json");
+        line.push('\n');
+        line
+    }
+
+    /// The details of `page`'s records, in its order.
+    fn details(page: &Page) -> Vec<&str> {
+        page.records
+            .iter()
+            .map(|r| r.detail.as_deref().unwrap_or_default())
+            .collect()
+    }
+
+    fn page_of(read: PageRead) -> Page {
+        match read {
+            PageRead::Page(page) => page,
+            PageRead::Changed => panic!("the file changed"),
+        }
+    }
+
+    /// Every page of the log at `path`, from its end, with these limits.
+    fn all_pages(path: &Path, max_bytes: u64, max_records: usize) -> Vec<Page> {
+        let mut pages = vec![page_of(
+            read_page_within(path, None, max_bytes, max_records).expect("read"),
+        )];
+        while let Some(cursor) = pages.last().and_then(|p| p.older.clone()) {
+            assert!(pages.len() < 10_000, "no end");
+            pages.push(page_of(
+                read_page_within(path, Some(&cursor), max_bytes, max_records).expect("read"),
+            ));
+        }
+        pages
+    }
+
+    #[test]
+    fn a_page_holds_the_newest_complete_records_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        // No file yet: no records.
+        assert_eq!(
+            read_page(&path, None).expect("read"),
+            PageRead::Page(Page::default())
+        );
+        // Lines that are not records are counted, not shown; the last line,
+        // without its newline, may still be being written, and is left out.
+        let text = format!(
+            "{}not json\n{}{{\"time\":\"x\"}}\n\n{}{}",
+            line("1"),
+            line("2"),
+            line("3"),
+            line("4").trim_end()
+        );
+        std::fs::write(&path, text).expect("write");
+        let page = page_of(read_page(&path, None).expect("read"));
+        assert_eq!(details(&page), ["3", "2", "1"]);
+        assert_eq!(page.unreadable, 3);
+        assert_eq!(page.older, None);
+        assert!(!page.too_long);
+        // An empty file has no records either.
+        std::fs::write(&path, "").expect("write");
+        assert_eq!(
+            read_page(&path, None).expect("read"),
+            PageRead::Page(Page::default())
+        );
+    }
+
+    #[test]
+    fn pages_read_every_record_once_whatever_their_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        // Lines of different lengths, so that windows start and end
+        // anywhere in them, and at their starts.
+        let lines: Vec<String> = (0..12).map(|i| line(&"x".repeat(i * 7 % 23))).collect();
+        std::fs::write(&path, lines.concat()).expect("write");
+        let longest = lines.iter().map(String::len).max().expect("lines") as u64;
+        let total = lines.iter().map(String::len).sum::<usize>() as u64;
+        let all: Vec<String> = lines
+            .iter()
+            .rev()
+            .map(|l| {
+                serde_json::from_str::<AuditEvent>(l)
+                    .expect("record")
+                    .detail
+                    .expect("detail")
+            })
+            .collect();
+        for max_bytes in longest..=total + 2 {
+            for max_records in 1..=lines.len() + 1 {
+                let pages = all_pages(&path, max_bytes, max_records);
+                let read: Vec<String> = pages
+                    .iter()
+                    .flat_map(|p| details(p).into_iter().map(String::from))
+                    .collect();
+                assert_eq!(read, all, "{max_bytes} bytes, {max_records} records");
+                assert!(pages.iter().all(|p| p.records.len() <= max_records));
+                assert!(pages.iter().all(|p| !p.too_long && p.unreadable == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_longer_than_a_page_stops_the_reading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let long = line(&"y".repeat(300));
+        let text = format!("{}{long}{}{}", line("old"), line("a"), line("b"));
+        std::fs::write(&path, text).expect("write");
+        let max_bytes = long.len() as u64 - 1;
+        let pages = all_pages(&path, max_bytes, 10);
+        assert_eq!(pages.len(), 2, "{pages:?}");
+        assert_eq!(details(&pages[0]), ["b", "a"]);
+        assert!(!pages[0].too_long);
+        assert!(pages[1].records.is_empty());
+        assert!(pages[1].too_long);
+        assert_eq!(pages[1].older, None);
+        // The last line, still without its newline, longer than a page.
+        let partial = long.trim_end();
+        std::fs::write(&path, format!("{}{partial}", line("a"))).expect("write");
+        let shorter = partial.len() as u64 - 1;
+        let page = page_of(read_page_within(&path, None, shorter, 10).expect("read"));
+        assert!(page.records.is_empty());
+        assert!(page.too_long);
+        assert_eq!(page.older, None);
+        // As long as a page: left out, and the records before it are read.
+        let page = page_of(read_page_within(&path, None, shorter + 1, 10).expect("read"));
+        assert_eq!(details(&page), ["a"]);
+        assert!(!page.too_long);
+        // The file holds part of a line only: no records, and nothing
+        // before it that the reading would miss, unless the window does not
+        // reach the start of the file.
+        std::fs::write(&path, partial).expect("write");
+        for (max_bytes, too_long) in [(shorter - 1, true), (shorter, false), (1 << 20, false)] {
+            assert_eq!(
+                read_page_within(&path, None, max_bytes, 10).expect("read"),
+                PageRead::Page(Page {
+                    too_long,
+                    ..Page::default()
+                }),
+                "{max_bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_log_changed_under_a_cursor_is_read_again_from_its_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let lines: Vec<String> = (0..6).map(|i| line(&format!("#{i}"))).collect();
+        let write = |text: &str| std::fs::write(&path, text).expect("write");
+        let first = |path: &Path| page_of(read_page_within(path, None, 1 << 20, 2).expect("read"));
+        write(&lines.concat());
+        let cursor = first(&path).older.expect("more");
+        // Records appended since do not change it.
+        std::fs::write(&path, format!("{}{}", lines.concat(), line("new"))).expect("write");
+        let page = page_of(read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"));
+        assert_eq!(details(&page), ["#3", "#2"]);
+        // Truncated.
+        write(&lines[..2].concat());
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // Truncated after the cursor's line, which is still there.
+        write(&lines[..5].concat());
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // Emptied and written again past the cursor: the line is not there.
+        write(&format!("{}{}", line("other"), lines.concat()));
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // The same lines, with the cursor's line rewritten in place.
+        let mut rewritten = lines.clone();
+        rewritten[4] = line("#X");
+        write(&rewritten.concat());
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // The line before the cursor's no longer ends where it starts.
+        write(&lines.concat());
+        let cursor = first(&path).older.expect("more");
+        let mut joined = lines.concat().into_bytes();
+        let before = lines[..4].concat().len() - 1;
+        assert_eq!(joined[before], b'\n');
+        joined[before] = b' ';
+        std::fs::write(&path, joined).expect("write");
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // Rotated: another file at the path, even with the same text.
+        write(&lines.concat());
+        let cursor = first(&path).older.expect("more");
+        let rotated = dir.path().join("audit.jsonl.1");
+        std::fs::rename(&path, &rotated).expect("rename");
+        write(&lines.concat());
+        assert_eq!(
+            read_page_within(&path, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+        // The rotated file is still the cursor's.
+        let page = page_of(read_page_within(&rotated, Some(&cursor), 1 << 20, 2).expect("read"));
+        assert_eq!(details(&page), ["#3", "#2"]);
+        // Removed.
+        std::fs::remove_file(&path).expect("remove");
+        let cursor = first(&rotated).older.expect("more");
+        std::fs::remove_file(&rotated).expect("remove");
+        assert_eq!(
+            read_page_within(&rotated, Some(&cursor), 1 << 20, 2).expect("read"),
+            PageRead::Changed
+        );
+    }
+
+    #[test]
+    fn only_a_regular_file_is_read_and_a_fifo_does_not_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_page(dir.path(), None).expect_err("a directory").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_page(&fifo, None).map_err(|e| e.kind()));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer");
+        assert_eq!(read, Err(io::ErrorKind::InvalidInput));
     }
 
     #[test]
