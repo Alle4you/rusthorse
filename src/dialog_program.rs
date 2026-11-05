@@ -276,23 +276,53 @@ fn pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
 
 /// The dialogs the agent shows: `rusthorse-dialog` when it is installed next
 /// to the agent, zenity when it is not.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DesktopUi {
+    /// How long "Allow for …" lasts and how long a dialog waits: settings
+    /// of the agent, which `configure` changes while it runs
+    /// ([`Ui::set_timing`]). Each dialog uses those of the moment it starts.
+    timing: std::sync::Mutex<Timing>,
+}
+
+/// See [`DesktopUi`].
+#[derive(Debug, Clone, Copy)]
+struct Timing {
     /// How long "Allow for …" lasts; zero hides that button.
-    pub remember_for: Duration,
+    remember_for: Duration,
     /// How long a dialog waits before giving up.
-    pub timeout: Duration,
+    timeout: Duration,
 }
 
 impl DesktopUi {
-    fn zenity(&self) -> ZenityUi {
-        ZenityUi {
-            remember_for: self.remember_for,
-            timeout: self.timeout,
+    /// Dialogs that offer "Allow for `remember_for`" (zero: not at all) and
+    /// wait `timeout` for an answer.
+    pub fn new(remember_for: Duration, timeout: Duration) -> Self {
+        DesktopUi {
+            timing: std::sync::Mutex::new(Timing {
+                remember_for,
+                timeout,
+            }),
         }
     }
 
-    fn show(&self, program: &Path, title: &str, dialog: Dialog) -> anyhow::Result<Reply> {
+    fn timing(&self) -> Timing {
+        *self.timing.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn zenity(timing: Timing) -> ZenityUi {
+        ZenityUi {
+            remember_for: timing.remember_for,
+            timeout: timing.timeout,
+        }
+    }
+
+    fn show(
+        &self,
+        program: &Path,
+        title: &str,
+        dialog: Dialog,
+        timeout: Duration,
+    ) -> anyhow::Result<Reply> {
         let session = dialog_env();
         let base = session
             .iter()
@@ -303,7 +333,7 @@ impl DesktopUi {
         let private =
             PrivateDir::create(&base).context("cannot create a directory for the dialog")?;
         let env = environment(&session, private.path());
-        let timeout = self.timeout.max(Duration::from_secs(1));
+        let timeout = timeout.max(Duration::from_secs(1));
         let request = Request {
             version: wire::VERSION,
             id: random_hex(16)?,
@@ -315,6 +345,7 @@ impl DesktopUi {
     }
 
     fn entry(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
+        let timing = self.timing();
         match locate() {
             Located::Absent(_) => {
                 // The agent checked the height only if it expected zenity:
@@ -322,7 +353,7 @@ impl DesktopUi {
                 if let Some(height) = crate::ui::prompt_too_tall(prompt) {
                     bail!("this dialog would be too tall to read at once ({height} pixels)");
                 }
-                self.zenity().master_password(prompt)
+                Self::zenity(timing).master_password(prompt)
             }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
@@ -334,7 +365,7 @@ impl DesktopUi {
                     field: dialog_text(&prompt.field),
                     confirm: dialog_text(&prompt.confirm),
                 };
-                typed(self.show(&program, &prompt.title, dialog)?)
+                typed(self.show(&program, &prompt.title, dialog, timing.timeout)?)
             }
         }
     }
@@ -350,6 +381,7 @@ impl Ui for DesktopUi {
     }
 
     fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
+        let timing = self.timing();
         match locate() {
             Located::Absent(_) => {
                 // The agent checked the height only if it expected zenity:
@@ -357,13 +389,13 @@ impl Ui for DesktopUi {
                 if let Some(height) = crate::ui::approval_too_tall(request) {
                     bail!("this dialog would be too tall to read at once ({height} pixels)");
                 }
-                self.zenity().approve(request)
+                Self::zenity(timing).approve(request)
             }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
-                let offered = request.can_remember && !self.remember_for.is_zero();
-                let label = format!("Allow for {}", format_duration(self.remember_for));
-                let note = remember_note(&label, self.remember_for);
+                let offered = request.can_remember && !timing.remember_for.is_zero();
+                let label = format!("Allow for {}", format_duration(timing.remember_for));
+                let note = remember_note(&label, timing.remember_for);
                 let dialog = Dialog::Approval {
                     headline: dialog_text(&request.summary),
                     explanation: dialog_text(&request.explanation),
@@ -376,14 +408,21 @@ impl Ui for DesktopUi {
                         note: dialog_text(note.trim()),
                     }),
                 };
-                let reply = self.show(&program, &request.title, dialog)?;
-                decision(reply, offered, self.remember_for)
+                let reply = self.show(&program, &request.title, dialog, timing.timeout)?;
+                decision(reply, offered, timing.remember_for)
             }
         }
     }
 
     fn limits_height(&self) -> bool {
         !matches!(locate(), Located::Program(_))
+    }
+
+    fn set_timing(&self, remember_for: Duration, timeout: Duration) {
+        *self.timing.lock().unwrap_or_else(|p| p.into_inner()) = Timing {
+            remember_for,
+            timeout,
+        };
     }
 }
 

@@ -14,12 +14,13 @@ use gtk::{gio, glib, pango};
 use rusthorse::audit::{self, AuditEvent, PageRead};
 use rusthorse::protocol::{
     EntryChanges, EntryInfo, EntryKind, Field, GrantInfo, Request, Response, RevealPurpose,
-    SecretString, StatusInfo,
+    SecretString, SettingsInfo, StatusInfo,
 };
+use rusthorse::settings::{Key, Source};
 
 use crate::connection::{Failure, Job};
 use crate::model::{
-    self, Form, GrantRow, HISTORY_FILTERS, HistoryCounts, HistoryFilter, HistoryRow, Tone,
+    self, Chosen, Form, GrantRow, HISTORY_FILTERS, HistoryCounts, HistoryFilter, HistoryRow, Tone,
     ValueMode,
 };
 
@@ -157,6 +158,53 @@ pub(crate) struct Manager {
     /// something (or its sender goes) before it is handed over.
     #[cfg(test)]
     history_gate: RefCell<Option<mpsc::Receiver<()>>>,
+    /// The Settings page's rows (ADR 0007, section 3).
+    settings: SettingsRows,
+    /// The settings the rows were last set from, as the agent reported
+    /// them; `None` when it reports none. The rows are set again only when
+    /// the agent reports something else, so that a status check does not
+    /// undo what the human is choosing.
+    settings_shown: RefCell<Option<SettingsInfo>>,
+    /// The rows are being set from a report, not by the human.
+    settings_filling: Cell<bool>,
+}
+
+/// The rows of the Settings page: one per setting, and Apply and Revert.
+struct SettingsRows {
+    note: gtk::Label,
+    file: gtk::Label,
+    idle: adw::ComboRow,
+    remember: adw::ComboRow,
+    dialog: adw::ComboRow,
+    suspend: adw::SwitchRow,
+    screen: adw::SwitchRow,
+    apply: gtk::Button,
+    revert: gtk::Button,
+    /// The seconds each duration row offers, in its order.
+    choices: RefCell<[Vec<u64>; 3]>,
+}
+
+impl SettingsRows {
+    fn durations(&self) -> [(&adw::ComboRow, Key); 3] {
+        [
+            (&self.idle, Key::IdleTimeout),
+            (&self.remember, Key::Remember),
+            (&self.dialog, Key::DialogTimeout),
+        ]
+    }
+
+    /// What the rows hold now.
+    fn chosen(&self) -> Option<Chosen> {
+        let choices = self.choices.borrow();
+        let secs = |i: usize, row: &adw::ComboRow| choices[i].get(row.selected() as usize).copied();
+        Some(Chosen {
+            idle_timeout_secs: secs(0, &self.idle)?,
+            remember_secs: secs(1, &self.remember)?,
+            dialog_timeout_secs: secs(2, &self.dialog)?,
+            lock_on_suspend: self.suspend.is_active(),
+            lock_on_screen_lock: self.screen.is_active(),
+        })
+    }
 }
 
 /// What the history page has read of the audit log since it was last
@@ -686,14 +734,64 @@ impl Manager {
         );
         data.append(&later);
 
-        // Settings.
+        // Settings: the agent's (ADR 0007, section 3).
         let settings = column(24);
         let policy = group(
-            "Agent policy",
+            "Agent settings",
             Some(
-                "Auto-lock and remembered approvals are options of the agent service today (--idle-timeout, --remember); editing them here comes in a later version. The agent also locks the vault when the screen locks or the computer suspends (see Status). Closing this app does not lock the vault.",
+                "The agent applies a change at once, after you approve it in its own dialog, saves it in its settings file, and forgets remembered approvals. Settings are changed only while the vault is unlocked. Any program of yours can also edit that file and restart the agent: the dialog guards changes made here, not the file. Closing this app does not lock the vault.",
             ),
         );
+        let settings_note = styled("", &["dim-label"]);
+        policy.add(&settings_note);
+        let settings_file = styled("", &["caption", "dim-label"]);
+        settings_file.set_selectable(true);
+        policy.add(&settings_file);
+        let combo = |title: &str, name: &str| {
+            let row = adw::ComboRow::builder()
+                .title(title)
+                .use_markup(false)
+                .use_subtitle(false)
+                .build();
+            row.set_widget_name(name);
+            row
+        };
+        let switch = |title: &str, name: &str| {
+            let row = adw::SwitchRow::builder()
+                .title(title)
+                .use_markup(false)
+                .build();
+            row.set_widget_name(name);
+            row
+        };
+        let settings_rows = SettingsRows {
+            note: settings_note,
+            file: settings_file,
+            idle: combo(Key::IdleTimeout.label(), "setting-idle"),
+            remember: combo(Key::Remember.label(), "setting-remember"),
+            dialog: combo(Key::DialogTimeout.label(), "setting-dialog"),
+            suspend: switch(Key::LockOnSuspend.label(), "setting-suspend"),
+            screen: switch(Key::LockOnScreenLock.label(), "setting-screen"),
+            apply: button("Apply…", None),
+            revert: button("Revert", None),
+            choices: RefCell::new([vec![], vec![], vec![]]),
+        };
+        for (row, _) in settings_rows.durations() {
+            policy.add(row);
+        }
+        policy.add(&settings_rows.suspend);
+        policy.add(&settings_rows.screen);
+        settings_rows.apply.set_widget_name("settings-apply");
+        settings_rows.apply.add_css_class("suggested-action");
+        settings_rows.apply.set_tooltip_text(Some(
+            "Ask the agent to change the settings: it shows each old and new value in its own dialog.",
+        ));
+        settings_rows.revert.set_widget_name("settings-revert");
+        let settings_buttons = row_box(12);
+        settings_buttons.set_halign(gtk::Align::End);
+        settings_buttons.append(&settings_rows.revert);
+        settings_buttons.append(&settings_rows.apply);
+        policy.add(&settings_buttons);
         settings.append(&policy);
         let password_group = group(
             "Master password",
@@ -884,6 +982,9 @@ impl Manager {
             lock_sent: Cell::new(false),
             #[cfg(test)]
             history_gate: RefCell::new(None),
+            settings: settings_rows,
+            settings_shown: RefCell::new(None),
+            settings_filling: Cell::new(false),
         });
         manager.actions.replace(vec![
             refresh.clone(),
@@ -949,6 +1050,33 @@ impl Manager {
             }
         });
         manager.clear_history();
+        // The Settings page: a choice the human makes enables Apply and
+        // Revert; Apply asks the agent.
+        for (row, _) in manager.settings.durations() {
+            let weak = Rc::downgrade(&manager);
+            row.connect_selected_notify(move |_| {
+                if let Some(s) = weak.upgrade() {
+                    s.paint_settings_controls();
+                }
+            });
+        }
+        for row in [&manager.settings.suspend, &manager.settings.screen] {
+            let weak = Rc::downgrade(&manager);
+            row.connect_active_notify(move |_| {
+                if let Some(s) = weak.upgrade() {
+                    s.paint_settings_controls();
+                }
+            });
+        }
+        manager.connect_button(&manager.settings.apply, |s| s.apply_settings());
+        let weak = Rc::downgrade(&manager);
+        manager.settings.revert.connect_clicked(move |_| {
+            if let Some(s) = weak.upgrade() {
+                let shown = s.settings_shown.borrow().clone();
+                s.fill_settings(shown.as_ref());
+            }
+        });
+        manager.paint_settings(None);
         let weak = Rc::downgrade(&manager);
         manager.rows.set_header_func(move |row, before| {
             let Some(s) = weak.upgrade() else { return };
@@ -1439,6 +1567,127 @@ impl Manager {
         }
     }
 
+    /// Show the settings the agent reports — the rows set again only when
+    /// they differ from what was last shown, so that a status check does not
+    /// undo a choice under way — or that it reports none.
+    fn paint_settings(&self, info: Option<&SettingsInfo>) {
+        if self.settings_shown.borrow().as_ref() != info {
+            *self.settings_shown.borrow_mut() = info.cloned();
+            self.fill_settings(info);
+        }
+        self.paint_settings_controls();
+    }
+
+    /// Set the rows from `info`: each value, offered among the usual ones,
+    /// and where it comes from; a row a flag fixes cannot be changed here.
+    fn fill_settings(&self, info: Option<&SettingsInfo>) {
+        let rows = &self.settings;
+        let reported = info.is_some();
+        for (row, _) in rows.durations() {
+            row.set_visible(reported);
+        }
+        rows.suspend.set_visible(reported);
+        rows.screen.set_visible(reported);
+        rows.apply.set_visible(reported);
+        rows.revert.set_visible(reported);
+        let Some(info) = info else {
+            set_plain(&rows.file, "");
+            return;
+        };
+        self.settings_filling.set(true);
+        set_plain(&rows.file, &format!("Saved in {}", info.file));
+        let mut choices = rows.choices.borrow_mut();
+        for (i, ((row, key), setting)) in rows
+            .durations()
+            .into_iter()
+            .zip([
+                &info.idle_timeout_secs,
+                &info.remember_secs,
+                &info.dialog_timeout_secs,
+            ])
+            .enumerate()
+        {
+            let offered = model::duration_choices(key, setting.value);
+            let labels: Vec<&str> = offered.iter().map(|(_, l)| l.as_str()).collect();
+            row.set_model(Some(&gtk::StringList::new(&labels)));
+            choices[i] = offered.iter().map(|(s, _)| *s).collect();
+            let at = choices[i]
+                .iter()
+                .position(|s| *s == setting.value)
+                .unwrap_or(0);
+            row.set_selected(at as u32);
+            row.set_subtitle(&rusthorse::ui::dialog_text(&model::setting_source(
+                key,
+                setting.source,
+            )));
+            row.set_sensitive(setting.source != Source::Flag);
+        }
+        drop(choices);
+        for (row, key, setting) in [
+            (&rows.suspend, Key::LockOnSuspend, &info.lock_on_suspend),
+            (
+                &rows.screen,
+                Key::LockOnScreenLock,
+                &info.lock_on_screen_lock,
+            ),
+        ] {
+            row.set_active(setting.value);
+            row.set_subtitle(&rusthorse::ui::dialog_text(&model::setting_source(
+                key,
+                setting.source,
+            )));
+            row.set_sensitive(setting.source != Source::Flag);
+        }
+        self.settings_filling.set(false);
+        self.paint_settings_controls();
+    }
+
+    /// The change the rows hold, if any, against the settings shown.
+    fn settings_change(&self) -> Option<rusthorse::protocol::SettingsChange> {
+        let shown = self.settings_shown.borrow();
+        self.settings.chosen()?.change(shown.as_ref()?)
+    }
+
+    /// The note, and whether Apply and Revert can be used: Apply needs a
+    /// change, the vault unlocked, and no request under way.
+    fn paint_settings_controls(&self) {
+        if self.settings_filling.get() {
+            return;
+        }
+        let rows = &self.settings;
+        let reported = self.settings_shown.borrow().is_some();
+        let unlocked = self.vault_unlocked();
+        let changed = self.settings_change().is_some();
+        let idle = self.job.borrow().is_none();
+        rows.apply
+            .set_sensitive(reported && unlocked && changed && idle);
+        rows.revert.set_sensitive(reported && changed && idle);
+        let note = if self.status.borrow().is_none() {
+            "Not available while the agent cannot be reached."
+        } else if !reported {
+            "The agent does not report its settings: it predates them, or it was started without a settings file. Restart it after an upgrade."
+        } else if !unlocked {
+            "Unlock the vault to change settings. Until then they are shown as they are."
+        } else if changed {
+            "Apply asks the agent; nothing changes until you approve in its dialog."
+        } else {
+            "Choose new values, then Apply."
+        };
+        set_plain(&rows.note, note);
+    }
+
+    /// Ask the agent to change the settings the rows changed. The agent
+    /// shows the change in its own dialog; until the human approves there,
+    /// nothing changes.
+    fn apply_settings(self: &Rc<Self>) {
+        if !self.vault_unlocked() {
+            return;
+        }
+        if let Some(change) = self.settings_change() {
+            self.submit(Request::Configure { settings: change }, Pending::Change);
+        }
+    }
+
     /// Whether the history page is the one shown.
     fn showing_history(&self) -> bool {
         self.stack.visible_child_name().as_deref() == Some("history")
@@ -1701,6 +1950,7 @@ impl Manager {
         }
         self.detail.set_sensitive(!busy);
         self.waiting.set_visible(busy);
+        self.paint_settings_controls();
     }
 
     fn feedback(&self, text: &str, problem: bool) {
@@ -1883,6 +2133,7 @@ impl Manager {
     fn unreachable(self: &Rc<Self>, failure: &Failure) {
         self.status.borrow_mut().take();
         self.lock_sent.set(false);
+        self.paint_settings(None);
         // Whether the vault is locked is not known now.
         self.grants_locked.set_visible(false);
         self.agent_down.set(failure.not_running);
@@ -2007,7 +2258,9 @@ impl Manager {
                 (false, None) => "Auto-lock is off".to_string(),
             });
         self.paint_status(&info);
+        self.paint_settings(info.settings.as_ref());
         *self.status.borrow_mut() = Some(info);
+        self.paint_settings_controls();
         if locked {
             self.hide_revealed();
             self.clear_entries();

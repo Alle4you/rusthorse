@@ -21,7 +21,7 @@ use rusthorse::protocol::{
 use rusthorse::ui::{Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
-use rusthorse::{audit, paths};
+use rusthorse::{audit, paths, settings};
 
 /// `eprintln!` that never panics. The standard one panics when standard
 /// error cannot be written (`2>/dev/full`), which would turn an exit status
@@ -257,22 +257,57 @@ struct AgentArgs {
     /// Audit log file.
     #[arg(long, env = paths::ENV_AUDIT_LOG, value_name = "PATH")]
     audit_log: Option<PathBuf>,
-    /// Lock after this much inactivity (`0` = never).
-    #[arg(long, default_value = "15m", value_parser = parse_duration, value_name = "DURATION")]
-    idle_timeout: Duration,
+    /// Settings file (default `$XDG_CONFIG_HOME/rusthorse/agent.toml`). The
+    /// flags below win over it; the manager's Settings page changes it.
+    #[arg(long, env = paths::ENV_AGENT_CONFIG, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Lock after this much inactivity: `0` (never), or 1s to 24h. Default
+    /// 15m, or the settings file's.
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
+    idle_timeout: Option<Duration>,
     /// Offer "Allow for DURATION" in run dialogs, approving identical requests
-    /// for that long without asking. Off (`0`) by default; see docs/cli.md.
-    #[arg(long, default_value = "0", value_parser = parse_duration, value_name = "DURATION")]
-    remember: Duration,
-    /// How long dialogs wait for an answer before denying.
-    #[arg(long, default_value = "2m", value_parser = parse_duration, value_name = "DURATION")]
-    dialog_timeout: Duration,
+    /// for that long without asking: `0` (off), or 1s to 8h. Off by default;
+    /// see docs/cli.md.
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
+    remember: Option<Duration>,
+    /// How long dialogs wait for an answer before denying: 15s to 5m.
+    /// Default 2m, or the settings file's.
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
+    dialog_timeout: Option<Duration>,
     /// Do not lock when the computer is about to sleep (logind).
     #[arg(long)]
     no_lock_on_suspend: bool,
     /// Do not lock when the session is locked or its screensaver starts.
     #[arg(long)]
     no_lock_on_screen_lock: bool,
+}
+
+impl AgentArgs {
+    /// The settings that explicit flags set, each within its bounds.
+    fn settings(&self) -> anyhow::Result<settings::Layer> {
+        use settings::{Key, Value};
+        let mut flags = settings::Layer::default();
+        for (key, value) in [
+            (Key::IdleTimeout, self.idle_timeout.map(Value::Duration)),
+            (Key::Remember, self.remember.map(Value::Duration)),
+            (Key::DialogTimeout, self.dialog_timeout.map(Value::Duration)),
+            (
+                Key::LockOnSuspend,
+                self.no_lock_on_suspend.then_some(Value::Switch(false)),
+            ),
+            (
+                Key::LockOnScreenLock,
+                self.no_lock_on_screen_lock.then_some(Value::Switch(false)),
+            ),
+        ] {
+            if let Some(value) = value {
+                flags
+                    .set(key, value)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", key.flag()))?;
+            }
+        }
+        Ok(flags)
+    }
 }
 
 /// What an entry is for (see `EntryKind`); `other` is no particular kind.
@@ -915,10 +950,7 @@ fn new_master_password() -> anyhow::Result<SecretString> {
             SecretString::new(rpassword::prompt_password("Repeat it: ")?),
         )
     } else {
-        let ui = DesktopUi {
-            remember_for: Duration::ZERO,
-            timeout: Duration::from_secs(300),
-        };
+        let ui = DesktopUi::new(Duration::ZERO, Duration::from_secs(300));
         let ask =
             |headline: &str, explanation: &str, field: &str| -> anyhow::Result<SecretString> {
                 match ui.master_password(&Prompt {
@@ -983,6 +1015,16 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
              inside another program's process tree (see docs/threat-model.md)."
         );
     }
+    // The settings (ADR 0007, section 3): the defaults, then the file, then
+    // explicit flags. A file or a flag the agent cannot accept stops it:
+    // the defaults may protect less than what the human set.
+    let flags = args.settings()?;
+    let path = args.config.clone().unwrap_or_else(paths::agent_config);
+    let path = std::path::absolute(&path)
+        .with_context(|| format!("cannot resolve the settings path {}", path.display()))?;
+    let file = settings::load(&path).map_err(anyhow::Error::msg)?;
+    let sources = settings::Sources { path, file, flags };
+    let effective = sources.effective();
     // Absolute, so that `status` names the file wherever a client runs.
     let vault = args.vault.unwrap_or_else(paths::vault);
     let vault = std::path::absolute(&vault)
@@ -991,12 +1033,12 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         vault,
         socket,
         audit_log: args.audit_log.unwrap_or_else(paths::audit_log),
-        idle_timeout: args.idle_timeout,
+        idle_timeout: effective.idle_timeout,
         request_timeout: Duration::from_secs(10),
         send_buffer: None,
         session_lock: rusthorse::session_lock::Settings {
-            on_suspend: !args.no_lock_on_suspend,
-            on_screen_lock: !args.no_lock_on_screen_lock,
+            on_suspend: effective.lock_on_suspend,
+            on_screen_lock: effective.lock_on_screen_lock,
             system_bus: None,
             session_bus: None,
             refresh_every: None,
@@ -1008,18 +1050,21 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         broker_ready_timeout: None,
         // Each grant lasts as long as its profile says.
         broker_lifetime: None,
+        settings: Some(sources),
     };
-    let ui = DesktopUi {
-        remember_for: args.remember,
-        timeout: args.dialog_timeout,
-    };
+    let ui = DesktopUi::new(effective.remember, effective.dialog_timeout);
     let listener = Agent::bind(&config.socket)?;
     eprintln!(
-        "rusthorse agent {} listening on {} (vault {}, auto-lock {}, lock on suspend {}, \
-         lock on screen lock {})",
+        "rusthorse agent {} listening on {} (vault {}, settings {}, auto-lock {}, \
+         lock on suspend {}, lock on screen lock {})",
         env!("CARGO_PKG_VERSION"),
         config.socket.display(),
         config.vault.display(),
+        config
+            .settings
+            .as_ref()
+            .map(|s| s.path.display().to_string())
+            .unwrap_or_default(),
         if config.idle_timeout.is_zero() {
             "off".into()
         } else {
@@ -1071,6 +1116,12 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
         (false, None) => println!("state:      unlocked (auto-lock off)"),
     }
     println!("remembered: {} approval(s)", info.remembered_approvals);
+    if let Some(s) = &info.settings {
+        println!("settings:   {}", printable(&s.file));
+        for line in settings_lines(s) {
+            println!("            {line}");
+        }
+    }
     if let Some(dialogs) = &info.dialogs {
         println!("dialogs:    {}", printable(dialogs));
     }
@@ -2676,6 +2727,55 @@ fn doctor(client: &Client) -> anyhow::Result<u8> {
     })
 }
 
+/// The agent's settings as `rusthorse status` shows them, one per line:
+/// `Lock after inactivity: 15m (default)`, `Remembered approvals: off (set
+/// by --remember)`.
+fn settings_lines(info: &rusthorse::protocol::SettingsInfo) -> Vec<String> {
+    use settings::{Key, Source, Value};
+    let secs = |s: u64| Value::Duration(Duration::from_secs(s));
+    [
+        (
+            Key::IdleTimeout,
+            secs(info.idle_timeout_secs.value),
+            info.idle_timeout_secs.source,
+        ),
+        (
+            Key::Remember,
+            secs(info.remember_secs.value),
+            info.remember_secs.source,
+        ),
+        (
+            Key::DialogTimeout,
+            secs(info.dialog_timeout_secs.value),
+            info.dialog_timeout_secs.source,
+        ),
+        (
+            Key::LockOnSuspend,
+            Value::Switch(info.lock_on_suspend.value),
+            info.lock_on_suspend.source,
+        ),
+        (
+            Key::LockOnScreenLock,
+            Value::Switch(info.lock_on_screen_lock.value),
+            info.lock_on_screen_lock.source,
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value, source)| {
+        format!(
+            "{}: {} ({})",
+            key.label(),
+            value.describe(key),
+            match source {
+                Source::Default => "default".to_string(),
+                Source::File => "settings file".to_string(),
+                Source::Flag => format!("set by {}", key.flag()),
+            }
+        )
+    })
+    .collect()
+}
+
 /// A line of `rusthorse doctor`, its text escaped: it can quote what the
 /// agent reports (paths, its version, the sources of its locks).
 fn check_line(check: &Check) -> String {
@@ -3693,6 +3793,7 @@ mod tests {
             lock_triggers: vec![],
             broker: broker.map(Into::into),
             grants: None,
+            settings: None,
         }
     }
 

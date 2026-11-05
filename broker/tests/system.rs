@@ -269,6 +269,7 @@ impl System {
             broker_program: Some(dir.path().join("rusthorse-broker")),
             broker_ready_timeout: Some(Duration::from_secs(10)),
             broker_lifetime: settings.broker_lifetime,
+            settings: None,
         };
         let listener = Agent::bind(&socket).expect("bind the agent's socket");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));

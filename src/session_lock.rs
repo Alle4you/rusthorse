@@ -116,43 +116,94 @@ impl Triggers {
     }
 }
 
-/// The running watchers. Dropping it stops them: their connections are
-/// closed — which also lets go of the inhibitor — and their threads joined.
+/// The running watchers, those of each event apart. Dropping it stops them:
+/// their connections are closed — which also lets go of the inhibitor — and
+/// their threads joined.
 #[derive(Default)]
 pub struct Watchers {
-    /// Kept for its `Drop`.
+    /// The suspend watcher, while it runs.
     #[cfg(feature = "session-lock")]
-    _inner: Option<watch::Handle>,
+    suspend: Option<watch::Handle>,
+    /// The screen lock watchers (logind's sessions and the screensavers),
+    /// while they run.
+    #[cfg(feature = "session-lock")]
+    screen_lock: Option<watch::Handle>,
+}
+
+#[cfg(feature = "session-lock")]
+impl Drop for Watchers {
+    /// Stop the watchers of both events together, within one time limit.
+    fn drop(&mut self) {
+        watch::stop_all(&mut [&mut self.suspend, &mut self.screen_lock]);
+    }
 }
 
 /// Start the watchers that `settings` asks for; report each in `triggers`.
-#[cfg(feature = "session-lock")]
 pub fn start<L: Locker>(
     locker: std::sync::Weak<L>,
     settings: Settings,
     triggers: std::sync::Arc<Triggers>,
 ) -> Watchers {
-    Watchers {
-        _inner: Some(watch::start(locker, settings, triggers)),
-    }
+    let mut watchers = Watchers::default();
+    watchers.apply(locker, &settings, &triggers);
+    watchers
 }
 
-/// Without D-Bus support, only report that nothing is watched.
-#[cfg(not(feature = "session-lock"))]
-pub fn start<L: Locker>(
-    _locker: std::sync::Weak<L>,
-    settings: Settings,
-    triggers: std::sync::Arc<Triggers>,
-) -> Watchers {
-    let why = "this build has no D-Bus support (Cargo feature session-lock)";
-    for (event, on) in [
-        (SUSPEND, settings.on_suspend),
-        (SCREEN_LOCK, settings.on_screen_lock),
-    ] {
-        let note = if on { why } else { "turned off" };
-        triggers.set(event, "D-Bus", State::Inactive, Some(note.into()));
+impl Watchers {
+    /// Start or stop the watchers of each event as `settings` now asks
+    /// (`configure`), and report them in `triggers`. Those of an event whose
+    /// setting did not change are left as they are: turning the screen lock
+    /// off does not let go of the suspend inhibitor. Stopping waits for the
+    /// watchers' threads, which may lock the vault meanwhile: never call it
+    /// while holding the agent's state.
+    #[cfg(feature = "session-lock")]
+    pub fn apply<L: Locker>(
+        &mut self,
+        locker: std::sync::Weak<L>,
+        settings: &Settings,
+        triggers: &std::sync::Arc<Triggers>,
+    ) {
+        match (settings.on_suspend, self.suspend.is_some()) {
+            (true, false) => {
+                self.suspend = Some(watch::start_suspend(locker.clone(), settings, triggers));
+            }
+            (false, true) => {
+                self.suspend.take();
+                watch::suspend_off(triggers);
+            }
+            (false, false) => watch::suspend_off(triggers),
+            (true, true) => {}
+        }
+        match (settings.on_screen_lock, self.screen_lock.is_some()) {
+            (true, false) => {
+                self.screen_lock = Some(watch::start_screen_lock(locker, settings, triggers));
+            }
+            (false, true) => {
+                self.screen_lock.take();
+                watch::screen_lock_off(triggers);
+            }
+            (false, false) => watch::screen_lock_off(triggers),
+            (true, true) => {}
+        }
     }
-    Watchers::default()
+
+    /// Without D-Bus support, only report that nothing is watched.
+    #[cfg(not(feature = "session-lock"))]
+    pub fn apply<L: Locker>(
+        &mut self,
+        _locker: std::sync::Weak<L>,
+        settings: &Settings,
+        triggers: &std::sync::Arc<Triggers>,
+    ) {
+        let why = "this build has no D-Bus support (Cargo feature session-lock)";
+        for (event, on) in [
+            (SUSPEND, settings.on_suspend),
+            (SCREEN_LOCK, settings.on_screen_lock),
+        ] {
+            let note = if on { why } else { "turned off" };
+            triggers.set(event, "D-Bus", State::Inactive, Some(note.into()));
+        }
+    }
 }
 
 /// What else locks the vault, one line per event — `suspend: logind (locks
@@ -304,10 +355,16 @@ mod watch {
         threads: Vec<JoinHandle<()>>,
     }
 
-    impl Drop for Handle {
-        fn drop(&mut self) {
+    impl Handle {
+        /// Tell the watchers to stop, and close their connections.
+        pub(super) fn stop(&self) {
             self.shared.stopped.store(true, Ordering::SeqCst);
             self.shared.close_all();
+        }
+
+        /// Wait until `until` at most for the watchers' threads to end, and
+        /// join those that did; those still running are left behind.
+        pub(super) fn wait_until(&mut self, until: Instant) {
             // The last reference to the agent may go away in one of these
             // threads (it holds one while locking): never wait for oneself.
             let me = thread::current().id();
@@ -317,7 +374,6 @@ mod watch {
                 .chain(lock_of(&self.shared.helpers).drain(..))
                 .filter(|h| h.thread().id() != me)
                 .collect();
-            let until = Instant::now() + SHUTDOWN;
             while handles.iter().any(|h| !h.is_finished()) && Instant::now() < until {
                 // A connection made after `close_all` is closed by `keep`.
                 thread::sleep(STEP);
@@ -327,6 +383,25 @@ mod watch {
                     let _ = handle.join();
                 }
             }
+        }
+    }
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            self.stop();
+            self.wait_until(Instant::now() + SHUTDOWN);
+        }
+    }
+
+    /// Stop several handles together: all are told first, then waited for
+    /// within one time limit, not one each.
+    pub(super) fn stop_all(handles: &mut [&mut Option<Handle>]) {
+        for handle in handles.iter().filter_map(|h| h.as_ref()) {
+            handle.stop();
+        }
+        let until = Instant::now() + SHUTDOWN;
+        for handle in handles.iter_mut().filter_map(|h| h.as_mut()) {
+            handle.wait_until(until);
         }
     }
 
@@ -436,59 +511,80 @@ mod watch {
         }
     }
 
-    pub(super) fn start<L: Locker>(
+    /// Start the suspend watcher.
+    pub(super) fn start_suspend<L: Locker>(
         locker: Weak<L>,
-        settings: Settings,
-        triggers: Arc<Triggers>,
+        settings: &Settings,
+        triggers: &Arc<Triggers>,
+    ) -> Handle {
+        let shared = Arc::new(Shared::default());
+        triggers.set(SUSPEND, LOGIND, State::Inactive, Some("connecting".into()));
+        let watcher = Watcher {
+            name: "rusthorse-suspend",
+            system: true,
+            once: watch_suspend::<L>,
+            lost: |t: &Triggers, note| t.set(SUSPEND, LOGIND, State::Inactive, Some(note)),
+        };
+        let threads = watcher
+            .spawn(&locker, triggers, &shared, settings)
+            .into_iter()
+            .collect();
+        Handle { shared, threads }
+    }
+
+    /// Report the suspend watcher turned off.
+    pub(super) fn suspend_off(triggers: &Triggers) {
+        triggers.set(SUSPEND, LOGIND, State::Inactive, Some("turned off".into()));
+    }
+
+    /// Start the screen lock watchers: logind's sessions and the
+    /// screensavers.
+    pub(super) fn start_screen_lock<L: Locker>(
+        locker: Weak<L>,
+        settings: &Settings,
+        triggers: &Arc<Triggers>,
     ) -> Handle {
         let shared = Arc::new(Shared::default());
         let mut threads = Vec::new();
         let connecting = Some("connecting".to_string());
-        if settings.on_suspend {
-            triggers.set(SUSPEND, LOGIND, State::Inactive, connecting.clone());
-            let watcher = Watcher {
-                name: "rusthorse-suspend",
-                system: true,
-                once: watch_suspend::<L>,
-                lost: |t: &Triggers, note| t.set(SUSPEND, LOGIND, State::Inactive, Some(note)),
-            };
-            threads.extend(watcher.spawn(&locker, &triggers, &shared, &settings));
-        } else {
-            triggers.set(SUSPEND, LOGIND, State::Inactive, Some("turned off".into()));
-        }
-        if settings.on_screen_lock {
-            triggers.set(SCREEN_LOCK, LOGIND, State::Inactive, connecting.clone());
-            triggers.set(SCREEN_LOCK, ANY_SCREENSAVER, State::Inactive, connecting);
-            let sessions = Watcher {
-                name: "rusthorse-session",
-                system: true,
-                once: watch_sessions::<L>,
-                lost: |t: &Triggers, note| t.set(SCREEN_LOCK, LOGIND, State::Inactive, Some(note)),
-            };
-            threads.extend(sessions.spawn(&locker, &triggers, &shared, &settings));
-            let screensavers = Watcher {
-                name: "rusthorse-screensaver",
-                system: false,
-                once: watch_screensavers::<L>,
-                lost: |t: &Triggers, note| {
-                    for name in SCREENSAVERS {
-                        t.remove(SCREEN_LOCK, name);
-                    }
-                    t.set(SCREEN_LOCK, ANY_SCREENSAVER, State::Inactive, Some(note));
-                },
-            };
-            threads.extend(screensavers.spawn(&locker, &triggers, &shared, &settings));
-        } else {
-            for source in [LOGIND, ANY_SCREENSAVER] {
-                triggers.set(
-                    SCREEN_LOCK,
-                    source,
-                    State::Inactive,
-                    Some("turned off".into()),
-                );
-            }
-        }
+        triggers.set(SCREEN_LOCK, LOGIND, State::Inactive, connecting.clone());
+        triggers.set(SCREEN_LOCK, ANY_SCREENSAVER, State::Inactive, connecting);
+        let sessions = Watcher {
+            name: "rusthorse-session",
+            system: true,
+            once: watch_sessions::<L>,
+            lost: |t: &Triggers, note| t.set(SCREEN_LOCK, LOGIND, State::Inactive, Some(note)),
+        };
+        threads.extend(sessions.spawn(&locker, triggers, &shared, settings));
+        let screensavers = Watcher {
+            name: "rusthorse-screensaver",
+            system: false,
+            once: watch_screensavers::<L>,
+            lost: |t: &Triggers, note| {
+                for name in SCREENSAVERS {
+                    t.remove(SCREEN_LOCK, name);
+                }
+                t.set(SCREEN_LOCK, ANY_SCREENSAVER, State::Inactive, Some(note));
+            },
+        };
+        threads.extend(screensavers.spawn(&locker, triggers, &shared, settings));
         Handle { shared, threads }
+    }
+
+    /// Report the screen lock watchers turned off: none of the screensavers
+    /// they had found is watched any more.
+    pub(super) fn screen_lock_off(triggers: &Triggers) {
+        for name in SCREENSAVERS {
+            triggers.remove(SCREEN_LOCK, name);
+        }
+        for source in [LOGIND, ANY_SCREENSAVER] {
+            triggers.set(
+                SCREEN_LOCK,
+                source,
+                State::Inactive,
+                Some("turned off".into()),
+            );
+        }
     }
 
     fn signals(conn: &Connection, rule: MatchRule<'static>) -> zbus::Result<MessageIterator> {

@@ -6,7 +6,8 @@ document and the code, that is a bug; please report it
 ([SECURITY.md](../SECURITY.md)).
 
 - Applies to: Rusthorse 0.1.x
-- Last reviewed: 2026-11-04 (the feedback for a key the destination refused,
+- Last reviewed: 2026-11-05 (the manager's History page and the agent's
+  settings; before that, the feedback for a key the destination refused,
   escaped output, the scope amendment; see
   [review history](#11-review-history))
 
@@ -223,6 +224,9 @@ path there — need admission and an audit record, but no new human dialog.
 It can replace the `rusthorse` binary, the systemd unit or your shell startup
 files, wait for you to unlock, and capture the master password or the
 decrypted data. No program running with your privileges can prevent this.
+It can also edit the agent's settings file (`agent.toml`) — turning off the
+idle lock, turning on remembered approvals — and restart the agent: the
+agent's dialog guards a change made through it (`configure`), not the file.
 The Debian package's programs belong to root, but that does not change it: a
 service file of the user's in `~/.config/systemd/user/` takes precedence over
 the package's ([ADR 0010](adr/0010-debian-package.md)).
@@ -2889,3 +2893,133 @@ fake-keyring audit::tests` (10 passed). Builds used a fresh temporary
 The implementer ran the full `AGENTS.md` check matrix before the review
 and again after the fixes, before the commit; both runs passed. Codex did
 not rerun the full matrix.
+
+**2026-11-05 — The agent's settings and the manager's Settings page.**
+
+Manager item 2/6 (ADR 0007 section 3, rewritten on 2026-11-05): the human
+administers their own agent. The five existing settings now come from
+defaults, `agent.toml`, then explicit flags; status reports their values
+and sources. Protocol 10 adds `configure`: at the maintainer's choice it
+needs an unlocked vault, asking for the master password first if needed,
+then the agent's approval of old and new values, with warnings for weaker
+protection. It saves and applies the change at once and forgets remembered
+approvals. The manager's Settings page sends the request; there is no
+`reload_config` or new CLI command for changing settings.
+
+Design opinion (Codex, AI-assisted, 2026-11-05; recommendation: build with
+changes): apply immediately, with fixed operational bounds. Adopted: idle
+off or 1 s to 24 h, remembering off or 1 s to 8 h, and dialog timeout 15 s
+to 5 min. These are operational limits, not security guarantees.
+
+The other design recommendations were followed: serialize configuration
+requests through approval and application; audit the answer first and
+fail closed; recheck the vault generation under the state lock; preserve
+the failure contract across the atomic replacement. Before replacement, a
+definite error leaves the settings file and effective settings unchanged;
+after replacement, a directory-sync failure still applies the settings
+and reports `outcome_unknown`. The saved layer contains the file's values
+and approved changes, never values copied from overriding flags.
+
+An approval to configure does not touch the idle timer. A shorter timeout
+counts from the last use and is checked immediately; the timer keeps
+running while idle locking is off. Only a changed lock trigger's watchers
+are restarted, preserving the suspend inhibitor when suspend is unchanged.
+Dialogs already open keep their timing. Flag-fixed rows show their source
+and cannot be edited; the refusal and docs explain removing the flag from
+the service and restarting. An existing file that fails validation stops
+startup instead of silently selecting defaults.
+
+Before independent review, the implementer's own tests and checks exposed
+four implementation issues. Under umask `002`, a hand-made `0664` file
+would stop startup: an initial primary-group exception was added, then
+removed after R1 below. The harness gained an `Options` struct for clippy.
+A test could no longer use `Arc::get_mut` after the agent gained its weak
+self-reference and was adjusted. Dropping the watchers could wait twice;
+`stop_all` now signals both first and waits within one shared time limit.
+
+The code reviews and confirmations below were by Codex, AI-assisted, on
+2026-11-05. The successive findings are grouped as R1–R7; verdicts remained
+not ready until the final confirmation. Each disposition describes the
+fix and, where necessary, the later correction to an incomplete fix.
+
+| Finding | Disposition |
+|---|---|
+| **Medium — R1: the primary group need not be private.** Accepting a group-writable settings file let another member weaken it. | Fixed: `load` refuses any group/other write bit (`mode & 0o022`), including the primary group, and says `chmod 600`. Tests cover `0664`, `0620` and `0646`; fixtures use `write_private`. The docs explain umask `002`. |
+| **Medium — R1: duration labels dropped seconds.** A value such as 3659 s could appear as 1 h in the approval or manager. | Fixed: `exact_duration`, used by `Value::describe`, shows every part: `1h59s`. Unit and manager-model tests distinguish it from `1h`. |
+| **Medium — R1: saving changed existing directory permissions.** `ensure_private_dir` could chmod an existing configuration directory. | Fixed: `DirBuilder` creates missing directories privately and leaves existing modes alone. A test preserves `0755`; later checks refuse unsafe directories without chmod-ing them. |
+| **Medium — R1: the protocol wording overstated what an error guarantees.** It included `outcome_unknown` in the promise that nothing changed. | Fixed: only other errors guarantee no settings replacement or application; after `outcome_unknown` or no answer, the change may be in effect. Checked against the code; this wording fix has no executable mutation. |
+| **Low — R1: the docs promised a dialog within the manager's wait.** Unlocking first or waiting behind other dialogs can exceed ten minutes. | Fixed: one dialog lasts at most five minutes; the complete request can outlast the manager's wait and be reported as unknown. ADR 0007, architecture and `MAX_DIALOG` state the distinction. |
+| **Medium — R2: another user could remove a private file through its writable parent.** A later start could then use weaker defaults. | Fixed through the subsequent path checks: directories must belong to the user or root and not be group/other-writable unless sticky. Saving refuses an unsafe path before writing; reading an existing file refuses it too. Initially absent files still select defaults, as clarified in R7. |
+| **Medium — R3: checking the written and canonical paths missed an intermediate link.** `safe/chain -> open/bounce -> target`, with `open` writable by others, hid a replaceable component. | Fixed: walk each name and link as resolution proceeds, including relative targets, `..` and absolute targets restarting at `/`; refuse more than 40 links. Existing files reached through an unsafe component remain refused. |
+| **Medium — R4: a missing component ended validation too early.** Both `missing/../open/agent.toml` and a directory made by someone else before `mkdir` could lead to an unsafe write. | Fixed: walk again after making directories, before opening the temporary file. Tests preserve the existing file in `open` and leave the directory made meanwhile empty. R5 makes this second walk strict. An empty private directory created before refusal may remain. |
+| **R4 — Link-owner coverage initially seemed to require root.** Another user could replace their own link in a sticky directory. | Tested without privileges: a link owned by the test user is accepted as that user and refused with a simulated different uid. The final tests cover an existing target and the final link in all three walk modes; reading a nonexistent target follows the accepted missing-file rule. |
+| **Medium — R5: putting a parent aside during the second walk bypassed it.** An attacker could hide their `0777` directory while it was checked and restore it before the temporary file was opened. | Fixed: `BeforeWrite` requires every parent to exist. Hooks reproduce create, put aside and restore; the save is refused before anything is written. Removing this requirement fails the test. |
+| **R5 — The surviving non-strict `load` mutation was not harmless.** The implementer had claimed that an already-open file implied its parents were safe. | Corrected by the review: an unvalidated parent could belong to another user and disappear after opening. Codex's counterexample passed with the strict check and failed without it. It must not be recorded as a harmless survivor. R6 moves validation before opening and checks the opened file's identity. |
+| **Medium — R6: removing or replacing the final link after opening hid an unsafe read path.** The walk could accept the missing final name or validate an entry different from the open descriptor. | Fixed: walk before opening, retain device/inode and compare them with `fstat`; disappearance after a successful walk is an error. Link ownership is checked during the walk. Tests replace the file by rename with a distinct inode and put its parent aside between walk and open. |
+| **Low — R6: a dangling final link could not be replaced.** A missing directory in its target made a safe save fail, although rename replaces the link itself. | Fixed: both save walks check the final link's owner but do not follow it. The test replaces `config/dangling.toml -> absent/agent.toml` without creating `absent`; the saved settings read back correctly. |
+| **Medium — R7: walking first broke startup with no settings file under a `0775` configuration directory.** The directory error arrived before absence was discovered. | Fixed: `Read` keeps the first directory/link problem and rejects it if resolution reaches an existing file or directory; absence gives defaults. Save walks still refuse immediately. Unit cases and a real-agent startup test cover the absent file under writable directories without writing settings or using the real buses. |
+| **Low — R7: paths leading to directories were treated as missing files.** `/`, `child/..` and links to `.` or `/` silently selected defaults. | Fixed: a completed read walk returns the directory's identity, or its kept error, and `load` refuses a non-regular file. Save walks refuse directory destinations, including a trailing `.`; a final symlink itself remains replaceable. `a_directory_is_not_a_settings_file` covers these cases. |
+
+The implementer reported an initial batch of 15 mutation checks on a copy
+with its own target directory. Removing the effective guards made tests
+fail by their assertions: flag refusal, unlock required, a lock meanwhile,
+not touching the idle timer, clearing remembered approvals, checking idle
+at once, `set_timing`, save failure, switching a watcher, file permissions,
+bounds, Apply only while unlocked, keeping a choice across status, and
+not sending a flag's setting. The last was caught by the manager model
+test once the correct filter ran.
+
+One mutation survived because the assignment was dead:
+`config.idle_timeout = settings.idle_timeout` in `Agent::new`. The idle
+timer and status use `State.settings`; the assignment was removed.
+The overrides used to start the session-lock watchers remain necessary.
+
+The implementer's later mutations removed each fix in turn and failed by
+test assertions: the group rule, exact durations, leaving directories'
+modes alone, directory checks in load and save, resolved links, the sticky
+exception, checking each directory, following links, restarting at root
+for absolute targets, the second walk, link ownership, the strict final
+walk, file identity, not following the final link on save, refusing a
+missing parent before writing, reading deferral (also in the end-to-end
+startup test), and directory refusals. Intermediate canonical-path and
+strict-read checks were superseded by the final walk modes; their results
+do not replace tests of the final implementation.
+
+Accepted limits: absence cannot distinguish a file never written from one
+removed. It means defaults, while the agent saves only through paths that
+other users cannot replace; an existing unsafe file is refused. A program
+running as the user can still edit the file or systemd unit and restart
+the agent (L1). The dialog protects changes through `configure`, not the
+file against its owner. After a valid walk to a file that passes the
+descriptor checks, the device/inode comparison is defense in depth, not
+isolation from the user or root.
+
+The temporary file is synced before rename. That durability step has no
+deterministic failure or crash assertion in the current test harness; it
+was not proved by mutation. This is an accepted testing limit, not a
+reason to omit the sync.
+
+Final re-review (Codex, AI-assisted, 2026-11-05; verdict: READY): the two
+regressions fixed, no new finding, and the earlier protections checked
+still working. Codex ran `cargo fmt --all --check`, `git diff HEAD --check`
+and, under umask `002`, `cargo test --locked -p rusthorse --all-features
+--lib --test agent settings::`: 11 unit and 8 integration tests passed,
+again after restoring the temporary copy. Separate starts with missing
+files under configuration directories `0755` and `0775`, and a relative
+path, used defaults and wrote no settings; `--config /` was refused.
+
+Codex's final nine mutation runs failed by assertions: no reading deferral
+(unit and end-to-end), a directory treated as missing, removing early
+directory refusal on save, discarding the deferred error for a file or a
+directory, removing identity comparison, following the final link on
+save, and accepting a missing parent before writing. The save-directory
+mutation failed on the expected diagnostic; the operating system also
+refused that operation. Earlier re-reviews separately reproduced the
+unsafe-path races and checked the fixes in temporary copies. Builds used
+fresh target directories; the copies, targets and probes were removed,
+and the test agents were stopped. Repository files were not edited by
+these reviews.
+
+The implementer reports that the full `AGENTS.md` matrix passed after the
+last code fix. Codex did not rerun that full matrix or the GTK suites in
+the final re-review.

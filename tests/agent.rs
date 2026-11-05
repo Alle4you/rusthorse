@@ -37,6 +37,9 @@ struct ScriptedUi {
     /// Behave like a dialog whose content scrolls (rusthorse-dialog), so the
     /// agent applies no height limit.
     scrolls: std::sync::atomic::AtomicBool,
+    /// Every "Allow for …" duration and dialog timeout the agent set
+    /// (`set_timing`), in order.
+    timing: Mutex<Vec<(Duration, Duration)>>,
 }
 
 /// `Some(text)` is typed and confirmed; `None` cancels.
@@ -96,6 +99,9 @@ impl Ui for SharedUi {
     fn limits_height(&self) -> bool {
         !self.0.scrolls.load(Ordering::SeqCst)
     }
+    fn set_timing(&self, remember_for: Duration, timeout: Duration) {
+        self.0.timing.lock().unwrap().push((remember_for, timeout));
+    }
 }
 
 struct Harness {
@@ -106,6 +112,37 @@ struct Harness {
     /// The agent, for the events that do not come through its socket (a
     /// screen lock, a suspend).
     agent: Arc<Agent>,
+}
+
+/// How a test agent is set up: [`Options::default`] is the usual one.
+/// Never the real buses: tests of locking and of the keyring start private
+/// ones.
+struct Options<'a> {
+    idle_timeout: Duration,
+    request_timeout: Duration,
+    send_buffer: Option<usize>,
+    session_lock: rusthorse::session_lock::Settings,
+    keyring: rusthorse::keyring::Settings,
+    broker_ready_timeout: Duration,
+    broker_lifetime: Option<Duration>,
+    /// A settings file holding this text (none for `None`), and these
+    /// explicit flags.
+    settings: Option<(Option<&'a str>, rusthorse::settings::Layer)>,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Options {
+            idle_timeout: Duration::ZERO,
+            request_timeout: Duration::from_secs(10),
+            send_buffer: None,
+            session_lock: rusthorse::session_lock::Settings::default(),
+            keyring: no_keyring(),
+            broker_ready_timeout: BROKER_READY_TIMEOUT,
+            broker_lifetime: None,
+            settings: None,
+        }
+    }
 }
 
 impl Harness {
@@ -126,86 +163,108 @@ impl Harness {
         request_timeout: Duration,
         send_buffer: Option<usize>,
     ) -> Harness {
-        // Never the real buses: tests of locking and of the keyring start
-        // private ones.
-        Harness::build(
+        Harness::build(Options {
             idle_timeout,
             request_timeout,
             send_buffer,
-            rusthorse::session_lock::Settings::default(),
-            no_keyring(),
-            BROKER_READY_TIMEOUT,
-            None,
-        )
+            ..Options::default()
+        })
+    }
+
+    /// An agent with a settings file holding `file` (no file for `None`)
+    /// and these explicit flags, whose lock triggers watch nothing real.
+    fn with_settings(file: Option<&str>, flags: rusthorse::settings::Layer) -> Harness {
+        Harness::with_settings_on(file, flags, unreachable_buses())
+    }
+
+    /// [`Harness::with_settings`], with the lock triggers on these buses.
+    fn with_settings_on(
+        file: Option<&str>,
+        flags: rusthorse::settings::Layer,
+        buses: rusthorse::session_lock::Settings,
+    ) -> Harness {
+        Harness::build(Options {
+            session_lock: buses,
+            settings: Some((file, flags)),
+            ..Options::default()
+        })
     }
 
     /// An agent that waits at most `ready` for a broker to answer.
     fn with_broker_ready_timeout(ready: Duration) -> Harness {
-        Harness::build(
-            Duration::ZERO,
-            Duration::from_secs(10),
-            None,
-            rusthorse::session_lock::Settings::default(),
-            no_keyring(),
-            ready,
-            None,
-        )
+        Harness::build(Options {
+            broker_ready_timeout: ready,
+            ..Options::default()
+        })
     }
 
     /// An agent whose grants last at most `lifetime`.
     fn with_broker_lifetime(lifetime: Duration) -> Harness {
-        Harness::build(
-            Duration::ZERO,
-            Duration::from_secs(10),
-            None,
-            rusthorse::session_lock::Settings::default(),
-            no_keyring(),
-            BROKER_READY_TIMEOUT,
-            Some(lifetime),
-        )
+        Harness::build(Options {
+            broker_lifetime: Some(lifetime),
+            ..Options::default()
+        })
     }
 
     #[cfg(feature = "session-lock")]
     fn with_session_lock(settings: rusthorse::session_lock::Settings) -> Harness {
-        Harness::build(
-            Duration::ZERO,
-            Duration::from_secs(10),
-            None,
-            settings,
-            no_keyring(),
-            BROKER_READY_TIMEOUT,
-            None,
-        )
+        Harness::build(Options {
+            session_lock: settings,
+            ..Options::default()
+        })
     }
 
     /// An agent that finds the Secret Service on the bus at `address`.
     #[cfg(feature = "fake-keyring")]
     fn with_keyring(address: &str) -> Harness {
-        Harness::build(
-            Duration::ZERO,
-            Duration::from_secs(10),
-            None,
-            rusthorse::session_lock::Settings::default(),
-            rusthorse::keyring::Settings {
+        Harness::build(Options {
+            keyring: rusthorse::keyring::Settings {
                 address: Some(address.into()),
                 plain: true,
                 ..Default::default()
             },
-            BROKER_READY_TIMEOUT,
-            None,
-        )
+            ..Options::default()
+        })
     }
 
-    fn build(
-        idle_timeout: Duration,
-        request_timeout: Duration,
-        send_buffer: Option<usize>,
-        session_lock: rusthorse::session_lock::Settings,
-        keyring: rusthorse::keyring::Settings,
-        broker_ready_timeout: Duration,
-        broker_lifetime: Option<Duration>,
-    ) -> Harness {
+    fn build(options: Options<'_>) -> Harness {
+        let Options {
+            idle_timeout,
+            request_timeout,
+            send_buffer,
+            session_lock,
+            keyring,
+            broker_ready_timeout,
+            broker_lifetime,
+            settings,
+        } = options;
         let dir = tempfile::tempdir().expect("tempdir");
+        // A settings file in the test's directory, holding `text` (none
+        // without it), and these flags: the settings in effect then decide
+        // the lock triggers, which must never watch the real buses.
+        let settings = settings.map(|(text, flags)| {
+            // The settings file must not be where others could remove it,
+            // whatever the umask.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+            assert!(
+                session_lock.system_bus.is_some() && session_lock.session_bus.is_some(),
+                "an agent with settings watches buses: never the real ones"
+            );
+            let path = settings_file(dir.path());
+            if let Some(text) = text {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(path.parent().unwrap())
+                    .expect("mkdir");
+                write_private(&path, text);
+            }
+            let file = rusthorse::settings::load(&path).expect("settings file");
+            rusthorse::settings::Sources { path, file, flags }
+        });
         let vault = dir.path().join("vault.kdbx");
         Vault::create(
             &vault,
@@ -231,6 +290,7 @@ impl Harness {
             broker_program: Some(dir.path().join("rusthorse-broker")),
             broker_ready_timeout: Some(broker_ready_timeout),
             broker_lifetime,
+            settings,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -315,6 +375,31 @@ impl Harness {
 
     fn audit_text(&self) -> String {
         std::fs::read_to_string(&self.audit).unwrap_or_default()
+    }
+}
+
+/// Write `text` to a new file at `path` that only its owner can change, as
+/// the agent requires of its settings file (whatever the umask).
+fn write_private(path: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, text).expect("write");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// Where an agent with settings keeps them, in the test's directory `dir`.
+fn settings_file(dir: &Path) -> PathBuf {
+    dir.join("config").join("rusthorse").join("agent.toml")
+}
+
+/// Lock triggers on buses where nothing listens: an agent whose settings
+/// turn them on watches nothing real.
+fn unreachable_buses() -> rusthorse::session_lock::Settings {
+    rusthorse::session_lock::Settings {
+        on_suspend: false,
+        on_screen_lock: false,
+        system_bus: Some("unix:path=/nonexistent/rusthorse-test-bus".into()),
+        session_bus: Some("unix:path=/nonexistent/rusthorse-test-bus".into()),
+        refresh_every: Some(Duration::from_millis(300)),
     }
 }
 
@@ -2792,6 +2877,7 @@ fn scripted_raw_agent(
                     lock_triggers: vec![],
                     broker: None,
                     grants: None,
+                    settings: None,
                 });
                 let _ = send_frame(&stream, &status, &[]);
                 continue;
@@ -3106,6 +3192,7 @@ fn a_lost_connection_after_the_request_is_reported_as_unknown() {
                     lock_triggers: vec![],
                     broker: None,
                     grants: None,
+                    settings: None,
                 });
                 send_frame(&stream, &status, &[]).expect("status");
             } else {
@@ -3161,6 +3248,7 @@ fn fake_agent(
                     lock_triggers: vec![],
                     broker: None,
                     grants: None,
+                    settings: None,
                 });
                 let _ = send_frame(&stream, &status, &[]);
             } else if let Some(reply) = run_reply {
@@ -3371,6 +3459,7 @@ fn fake_import_agent(
                         lock_triggers: vec![],
                         broker: None,
                         grants: None,
+                        settings: None,
                     });
                     send_frame(&stream, &status, &[]).expect("status");
                 }
@@ -7349,6 +7438,482 @@ fn the_run_dialog_shows_destination_settings_without_credentials() {
     assert!(!audit.contains("FAKE"), "{audit}");
 }
 
+/// The agent's settings (ADR 0007, section 3): a `configure` needs the vault
+/// unlocked and the human's approval; it saves the settings file and applies
+/// the change at once; what it cannot do it refuses before anyone is asked.
+mod settings {
+    use super::*;
+    use rusthorse::protocol::{ErrorCode, Request, Response, SettingsChange, SettingsInfo};
+    use rusthorse::settings::{Key, Layer, Source, Value};
+
+    fn configure(h: &Harness, change: SettingsChange) -> Response {
+        h.call(&Request::Configure { settings: change })
+    }
+
+    fn settings(h: &Harness) -> SettingsInfo {
+        status(h).settings.expect("settings reported")
+    }
+
+    fn records(h: &Harness, action: &str) -> Vec<serde_json::Value> {
+        h.audit_text()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("record"))
+            .filter(|r| r["action"] == action)
+            .collect()
+    }
+
+    fn approval(h: &Harness) -> ApprovalRequest {
+        h.ui.last_approval.lock().unwrap().clone().expect("asked")
+    }
+
+    fn detail<'a>(request: &'a ApprovalRequest, key: &str) -> Option<&'a str> {
+        request
+            .details
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn file_text(h: &Harness) -> Option<String> {
+        std::fs::read_to_string(settings_file(h.dir.path())).ok()
+    }
+
+    fn unlock(h: &Harness) {
+        assert!(h.run(&["unlock"]).status.success());
+    }
+
+    #[test]
+    fn a_change_asks_for_the_master_password_then_approval_and_applies_at_once() {
+        let h = Harness::with_settings(
+            Some("idle_timeout = \"30m\"\nremember = \"1h\"\n"),
+            Layer::default(),
+        );
+        let file = settings_file(h.dir.path());
+        // In effect: the file's, else the defaults; the dialogs were told.
+        let s = settings(&h);
+        assert_eq!(s.file, file.display().to_string());
+        assert_eq!(
+            (s.idle_timeout_secs.value, s.idle_timeout_secs.source),
+            (1800, Source::File)
+        );
+        assert_eq!(
+            (s.remember_secs.value, s.remember_secs.source),
+            (3600, Source::File)
+        );
+        assert_eq!(
+            (s.dialog_timeout_secs.value, s.dialog_timeout_secs.source),
+            (120, Source::Default)
+        );
+        assert_eq!(
+            (s.lock_on_suspend.value, s.lock_on_suspend.source),
+            (true, Source::Default)
+        );
+        assert_eq!(status(&h).idle_timeout_secs, 1800);
+        assert_eq!(
+            h.ui.timing.lock().unwrap().as_slice(),
+            [(Duration::from_secs(3600), Duration::from_secs(120))]
+        );
+        let shown = text(&h.run(&["status"]).stdout);
+        assert!(
+            shown.contains(&format!("settings:   {}", file.display())),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Lock after inactivity: 30m (settings file)"),
+            "{shown}"
+        );
+        assert!(shown.contains("Dialog timeout: 2m (default)"), "{shown}");
+
+        // Locked: the master password first, then the approval.
+        assert!(status(&h).locked);
+        h.decide(&[Decision::AllowOnce]);
+        let answer = configure(
+            &h,
+            SettingsChange {
+                idle_timeout_secs: Some(300),
+                remember_secs: Some(0),
+                dialog_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+        );
+        assert!(
+            matches!(&answer, Response::Ok { message } if message == "settings changed"),
+            "{answer:?}"
+        );
+        assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 1);
+        assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+        let asked = approval(&h);
+        assert_eq!(asked.summary, "Change the agent's settings?");
+        assert_eq!(detail(&asked, "Lock after inactivity"), Some("30m → 5m"));
+        assert_eq!(detail(&asked, "Remembered approvals"), Some("1h → off"));
+        assert_eq!(detail(&asked, "Dialog timeout"), Some("2m → 1m"));
+        assert_eq!(
+            detail(&asked, "Settings file"),
+            Some(file.display().to_string().as_str())
+        );
+        assert!(detail(&asked, "Requested by (unverified)").is_some());
+        assert!(asked.warnings.is_empty(), "{:?}", asked.warnings);
+        assert!(!asked.can_remember);
+
+        // Saved, privately; in effect at once; the dialogs told.
+        let saved = rusthorse::settings::load(&file).expect("load");
+        assert_eq!(
+            saved.get(Key::IdleTimeout),
+            Some(Value::Duration(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            saved.get(Key::Remember),
+            Some(Value::Duration(Duration::ZERO))
+        );
+        assert_eq!(
+            saved.get(Key::DialogTimeout),
+            Some(Value::Duration(Duration::from_secs(60)))
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let s = settings(&h);
+        assert_eq!(
+            (s.idle_timeout_secs.value, s.idle_timeout_secs.source),
+            (300, Source::File)
+        );
+        assert_eq!(
+            (s.dialog_timeout_secs.value, s.dialog_timeout_secs.source),
+            (60, Source::File)
+        );
+        assert_eq!(status(&h).idle_timeout_secs, 300);
+        assert_eq!(
+            h.ui.timing.lock().unwrap().last(),
+            Some(&(Duration::ZERO, Duration::from_secs(60)))
+        );
+        // Recorded as approved, after the unlock.
+        let audit = h.audit_text();
+        let unlocked = audit.find(r#""action":"unlock""#).expect("unlock record");
+        let configured = audit.find(r#""action":"configure""#).expect("record");
+        assert!(unlocked < configured);
+        let record = &records(&h, "configure")[0];
+        assert_eq!(record["outcome"], "allowed_once");
+        assert_eq!(
+            record["detail"],
+            "idle_timeout 30m -> 5m; remember 1h -> 0; dialog_timeout 2m -> 1m"
+        );
+    }
+
+    #[test]
+    fn a_change_that_protects_less_is_warned_about_and_a_denial_changes_nothing() {
+        let h = Harness::with_settings(None, Layer::default());
+        unlock(&h);
+        let before = settings(&h);
+        let change = SettingsChange {
+            idle_timeout_secs: Some(0),
+            remember_secs: Some(3600),
+            lock_on_suspend: Some(false),
+            lock_on_screen_lock: Some(false),
+            dialog_timeout_secs: Some(300),
+        };
+        for decision in [Decision::Deny, Decision::TimedOut] {
+            h.decide(&[decision]);
+            let (code, message) = error_of(&configure(&h, change.clone()));
+            assert_eq!(code, ErrorCode::Denied, "{message}");
+            let asked = approval(&h);
+            for warning in [
+                "The vault will no longer lock by itself when it is not used.",
+                "Run dialogs will offer “Allow for …”",
+                "Dialogs will wait longer for an answer.",
+                "The vault will no longer lock when the computer suspends.",
+                "The vault will no longer lock when the screen locks.",
+            ] {
+                assert!(
+                    asked.warnings.iter().any(|w| w.starts_with(warning)),
+                    "{warning}: {:?}",
+                    asked.warnings
+                );
+            }
+            assert_eq!(detail(&asked, "Lock after inactivity"), Some("15m → never"));
+            assert_eq!(detail(&asked, "Lock on suspend"), Some("on → off"));
+        }
+        // Nothing written, nothing changed; both answers recorded.
+        assert_eq!(file_text(&h), None);
+        assert_eq!(settings(&h), before);
+        assert_eq!(h.ui.timing.lock().unwrap().len(), 1);
+        let outcomes: Vec<_> = records(&h, "configure")
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(outcomes, ["denied", "timed_out"]);
+    }
+
+    #[test]
+    fn what_cannot_be_changed_is_refused_before_anyone_is_asked() {
+        let mut flags = Layer::default();
+        flags
+            .set(Key::Remember, Value::Duration(Duration::ZERO))
+            .unwrap();
+        let h = Harness::with_settings(Some("dialog_timeout = \"1m\"\n"), flags);
+        let original = file_text(&h);
+        assert_eq!(settings(&h).remember_secs.source, Source::Flag);
+        let refused = |change: SettingsChange, says: &str| {
+            let (code, message) = error_of(&configure(&h, change));
+            assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+            assert!(message.contains(says), "{says}: {message}");
+        };
+        refused(
+            SettingsChange {
+                remember_secs: Some(3600),
+                idle_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+            "set by --remember on the agent's command line",
+        );
+        refused(
+            SettingsChange {
+                dialog_timeout_secs: Some(10),
+                ..SettingsChange::default()
+            },
+            "dialog_timeout cannot be 10s (allowed: 15s to 5m)",
+        );
+        refused(
+            SettingsChange {
+                idle_timeout_secs: Some(25 * 3600),
+                ..SettingsChange::default()
+            },
+            "idle_timeout cannot be 25h",
+        );
+        refused(
+            SettingsChange {
+                dialog_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+            "nothing to change: the settings already have these values",
+        );
+        refused(SettingsChange::default(), "nothing to change");
+        // A field this agent does not know: refused whole.
+        let answer = send_raw(
+            &h,
+            &serde_json::json!({
+                "type": "configure",
+                "settings": {"idle_timeout_secs": 60, "lock_forever": true}
+            }),
+        );
+        assert_eq!(error_of(&answer).0, ErrorCode::InvalidRequest);
+        // Nobody was asked anything; nothing changed or was recorded.
+        assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 0);
+        assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 0);
+        assert_eq!(file_text(&h), original);
+        assert!(records(&h, "configure").is_empty());
+
+        // An agent without a settings file cannot be configured.
+        let plain = Harness::new();
+        assert!(status(&plain).settings.is_none());
+        let (code, message) = error_of(&configure(
+            &plain,
+            SettingsChange {
+                idle_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+        ));
+        assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+        assert!(message.contains("without a settings file"), "{message}");
+    }
+
+    #[test]
+    fn a_shorter_idle_lock_counts_from_the_last_use() {
+        // Off at start: turning it on needs no restart of the timer.
+        let h = Harness::with_settings(Some("idle_timeout = \"0\"\n"), Layer::default());
+        unlock(&h);
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(!status(&h).locked);
+        // The approval is not a use: the vault has been idle for two
+        // seconds already, and locks at once.
+        h.decide(&[Decision::AllowOnce]);
+        let answer = configure(
+            &h,
+            SettingsChange {
+                idle_timeout_secs: Some(1),
+                ..SettingsChange::default()
+            },
+        );
+        assert!(matches!(answer, Response::Ok { .. }), "{answer:?}");
+        assert!(status(&h).locked);
+        let audit = h.audit_text();
+        let configured = audit.find(r#""action":"configure""#).expect("record");
+        let locked = audit.find(r#""outcome":"idle_timeout""#).expect("lock");
+        assert!(configured < locked);
+    }
+
+    #[test]
+    fn remembered_approvals_are_forgotten() {
+        let h = Harness::with_settings(Some("remember = \"1h\"\n"), Layer::default());
+        h.add_secret("T", "abcdefgh", &[]);
+        h.decide(&[Decision::AllowFor(Duration::from_secs(3600))]);
+        assert!(h.run(&["run", "T", "--", "true"]).status.success());
+        assert_eq!(status(&h).remembered_approvals, 1);
+        h.decide(&[Decision::AllowOnce]);
+        let answer = configure(
+            &h,
+            SettingsChange {
+                dialog_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+        );
+        assert!(matches!(answer, Response::Ok { .. }), "{answer:?}");
+        assert_eq!(status(&h).remembered_approvals, 0);
+        // The same run is asked again (and denied by default here).
+        let out = h.run(&["run", "T", "--", "true"]);
+        assert_eq!(out.status.code(), Some(125));
+    }
+
+    #[test]
+    fn a_change_that_cannot_be_recorded_or_saved_changes_nothing() {
+        let h = Harness::with_settings(Some("idle_timeout = \"30m\"\n"), Layer::default());
+        unlock(&h);
+        let before = settings(&h);
+        let original = file_text(&h);
+        let change = SettingsChange {
+            idle_timeout_secs: Some(60),
+            ..SettingsChange::default()
+        };
+        // The audit log cannot be written: refused after the approval,
+        // before the file is touched (fail closed).
+        std::fs::rename(&h.audit, h.dir.path().join("audit.moved")).unwrap();
+        std::fs::create_dir(&h.audit).unwrap();
+        h.decide(&[Decision::AllowOnce]);
+        let (code, message) = error_of(&configure(&h, change.clone()));
+        assert_eq!(code, ErrorCode::Internal, "{message}");
+        assert!(message.contains("cannot write the audit log"), "{message}");
+        assert_eq!(file_text(&h), original);
+        assert_eq!(settings(&h), before);
+        std::fs::remove_dir(&h.audit).unwrap();
+        std::fs::rename(h.dir.path().join("audit.moved"), &h.audit).unwrap();
+        // The file cannot be replaced: nothing changes, and it says so.
+        if !nix::unistd::getuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = settings_file(h.dir.path()).parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            h.decide(&[Decision::AllowOnce]);
+            let answer = configure(&h, change);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (code, message) = error_of(&answer);
+            assert_eq!(code, ErrorCode::Internal, "{message}");
+            assert!(
+                message.contains("cannot save the settings file")
+                    && message.contains("nothing changed"),
+                "{message}"
+            );
+            assert_eq!(file_text(&h), original);
+            assert_eq!(settings(&h), before);
+            assert_eq!(status(&h).idle_timeout_secs, 1800);
+        }
+    }
+
+    #[test]
+    fn a_lock_while_the_human_decides_cancels_the_change() {
+        let h = Harness::with_settings(None, Layer::default());
+        unlock(&h);
+        let socket = h.socket.clone();
+        *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+            let locked = rusthorse::client::Client::new(socket)
+                .call(&Request::Lock)
+                .expect("lock");
+            assert!(matches!(locked, Response::Ok { .. }));
+        }));
+        h.decide(&[Decision::AllowOnce]);
+        let (code, message) = error_of(&configure(
+            &h,
+            SettingsChange {
+                idle_timeout_secs: Some(60),
+                ..SettingsChange::default()
+            },
+        ));
+        assert_eq!(code, ErrorCode::Locked, "{message}");
+        assert_eq!(file_text(&h), None);
+        assert_eq!(settings(&h).idle_timeout_secs.value, 900);
+    }
+
+    #[test]
+    fn a_settings_file_the_agent_cannot_accept_stops_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = dir.path().join("agent.toml");
+        write_private(&file, "remember = \"9h\"\n");
+        let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args(["agent", "--config"])
+            .arg(&file)
+            .env("RUSTHORSE_SOCKET", dir.path().join("agent.sock"))
+            .env("RUSTHORSE_VAULT", dir.path().join("vault.kdbx"))
+            .env("RUSTHORSE_AUDIT_LOG", dir.path().join("audit.jsonl"))
+            .stdin(Stdio::null())
+            .finish();
+        assert!(!out.status.success());
+        let said = text(&out.stderr);
+        assert!(
+            said.contains(&file.display().to_string())
+                && said.contains("remember cannot be 9h (allowed: 0 (off), or 1s to 8h)"),
+            "{said}"
+        );
+        // So does a flag out of bounds.
+        let out = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args(["agent", "--dialog-timeout", "1h", "--config"])
+            .arg(dir.path().join("none.toml"))
+            .env("RUSTHORSE_SOCKET", dir.path().join("agent.sock"))
+            .env("RUSTHORSE_VAULT", dir.path().join("vault.kdbx"))
+            .env("RUSTHORSE_AUDIT_LOG", dir.path().join("audit.jsonl"))
+            .stdin(Stdio::null())
+            .finish();
+        assert!(!out.status.success());
+        let said = text(&out.stderr);
+        assert!(
+            said.contains("--dialog-timeout: dialog_timeout cannot be 1h"),
+            "{said}"
+        );
+        assert!(!dir.path().join("agent.sock").exists());
+        // No settings file, under a configuration directory its group can
+        // change (as a umask of 002 makes it): the defaults, and the agent
+        // starts. (Its lock triggers are turned off: never the real buses.)
+        let config = dir.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let socket = dir.path().join("run").join("agent.sock");
+        let mut agent = Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args([
+                "agent",
+                "--no-lock-on-suspend",
+                "--no-lock-on-screen-lock",
+                "--config",
+            ])
+            .arg(config.join("rusthorse").join("agent.toml"))
+            .env("RUSTHORSE_SOCKET", &socket)
+            .env("RUSTHORSE_VAULT", dir.path().join("vault.kdbx"))
+            .env("RUSTHORSE_AUDIT_LOG", dir.path().join("audit.jsonl"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + TEST_LIMIT;
+        let started = loop {
+            if let Ok(Some(status)) = agent.try_wait() {
+                break Err(status);
+            }
+            if socket.exists() {
+                break Ok(());
+            }
+            if Instant::now() > until {
+                break Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = agent.kill();
+        let _ = agent.wait();
+        assert_eq!(started, Ok(()), "the agent stopped");
+        assert!(socket.exists(), "the agent never listened");
+        assert!(!config.join("rusthorse").exists(), "nothing written");
+    }
+}
+
 /// Private D-Bus buses and a fake logind and screensaver, to see the agent
 /// lock on their signals (ADR 0009). Never the real buses.
 #[cfg(feature = "session-lock")]
@@ -8324,6 +8889,89 @@ mod session_lock {
         accepted.lock().unwrap().clear();
     }
 
+    /// `configure` turns a lock trigger off and on again: only that
+    /// trigger's watchers stop and start. Turning the screen lock off keeps
+    /// the suspend watcher and its inhibitor, and the screensaver no longer
+    /// locks; turning it on again does.
+    #[test]
+    fn a_changed_setting_switches_only_its_own_trigger() {
+        use rusthorse::protocol::{Request, Response, SettingsChange};
+        if !Bus::available() {
+            return;
+        }
+        let (system, session) = (Bus::started(), Bus::started());
+        let inhibitors = Arc::new(Mutex::new(Vec::new()));
+        let _logind = logind(&system, &inhibitors, &Arc::new(AtomicU64::new(0)));
+        let screensaver = screensaver(&session, false);
+        // The settings turn both triggers on (the defaults).
+        let h = Harness::with_settings_on(
+            None,
+            rusthorse::settings::Layer::default(),
+            settings(&system, &session),
+        );
+        let watched = |event: &str, source: &str| {
+            trigger(&h, event, source).is_some_and(|t| t["active"] == true)
+        };
+        wait_for("the watchers", || {
+            watched("suspend", "logind")
+                && watched("screen_lock", "logind")
+                && watched("screen_lock", "org.cinnamon.ScreenSaver")
+        });
+        assert_eq!(inhibitors.lock().unwrap().len(), 1);
+        let screen_lock = |on: bool| {
+            h.decide(&[Decision::AllowOnce]);
+            let answer = h.call(&Request::Configure {
+                settings: SettingsChange {
+                    lock_on_screen_lock: Some(on),
+                    ..SettingsChange::default()
+                },
+            });
+            assert!(matches!(answer, Response::Ok { .. }), "{answer:?}");
+        };
+        let screensaver_on = || {
+            emit(
+                &screensaver,
+                "/org/cinnamon/ScreenSaver",
+                "org.cinnamon.ScreenSaver",
+                "ActiveChanged",
+                &(true,),
+            );
+        };
+        unlock(&h);
+        screen_lock(false);
+        let off = trigger(&h, "screen_lock", "logind").unwrap();
+        assert_eq!(
+            (off["active"].clone(), off["note"].clone()),
+            (false.into(), "turned off".into())
+        );
+        assert!(trigger(&h, "screen_lock", "org.cinnamon.ScreenSaver").is_none());
+        // Suspend untouched: still watched, the same inhibitor held, no new
+        // one taken.
+        assert!(watched("suspend", "logind"));
+        assert_eq!(inhibitors.lock().unwrap().len(), 1);
+        assert!(!released(&inhibitors.lock().unwrap()[0]));
+        // The screensaver starting no longer locks.
+        screensaver_on();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!locked(&h));
+        emit(
+            &screensaver,
+            "/org/cinnamon/ScreenSaver",
+            "org.cinnamon.ScreenSaver",
+            "ActiveChanged",
+            &(false,),
+        );
+        // On again: watched, and it locks.
+        screen_lock(true);
+        wait_for("the screen lock watchers", || {
+            watched("screen_lock", "logind") && watched("screen_lock", "org.cinnamon.ScreenSaver")
+        });
+        assert_eq!(inhibitors.lock().unwrap().len(), 1);
+        screensaver_on();
+        wait_for("the screensaver lock", || locked(&h));
+        wait_for_records(&h, "screen_locked", 1);
+    }
+
     #[test]
     fn turned_off_watchers_say_so() {
         let h = Harness::with_session_lock(Settings::default());
@@ -9074,6 +9722,7 @@ mod broker_cli {
             lock_triggers: vec![],
             broker: broker.map(Into::into),
             grants: None,
+            settings: None,
         }
     }
 

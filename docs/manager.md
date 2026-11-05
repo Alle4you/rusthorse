@@ -18,7 +18,7 @@ awaiting an independent review: try it with fake entries first.
 | First start: start the agent, create the vault | |
 | Status of the agent, including what else locks it; unlock and lock | |
 | Browse, search and filter entries by group | Editing notes |
-| Create, edit, rename, move and delete entries; generate a random value | Settings for auto-lock and remembered approvals (M2) |
+| Create, edit, rename, move and delete entries; generate a random value | |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | |
 | Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
@@ -26,6 +26,7 @@ awaiting an independent review: try it with fake entries first.
 | Verified backup of the vault; change of the master password | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
 | The history: what the agent recorded in its audit log, newest first, while the vault is unlocked | |
+| The agent's settings — auto-lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — changed with the agent's approval while the vault is unlocked | |
 
 Pages for the later features are in the window already; they say what is
 missing and what to do meanwhile. An entry has no broker profile: the run
@@ -501,6 +502,37 @@ it. Keep backups somewhere else as well.
 To look at the vault in KeePassXC, open a **backup copy**: locking is not
 exclusive — another program can ask the agent to unlock the live vault while
 KeePassXC writes it ([threat model L15](threat-model.md)).
+
+### Agent settings
+
+**Settings → Agent settings** shows the agent's five settings, each with
+where it comes from (its default, the settings file, or an option on the
+agent's command line), and the settings file's path:
+
+- **Lock after inactivity**: never, or from a minute to 24 hours (default 15
+  minutes);
+- **Remembered approvals**: how long "Allow for …" lasts in the dialogs of
+  `rusthorse run`, off by default — read
+  [ADR 0005](adr/0005-remembered-approvals-opt-in.md) before turning it on;
+- **Dialog timeout**: how long the agent's dialogs wait for an answer (default
+  2 minutes);
+- **Lock on suspend** and **Lock on screen lock** (both on by default).
+
+Choose new values, then **Apply…**; **Revert** puts back what is in effect.
+Apply works only while the vault is unlocked. The agent shows each old and
+new value in its own dialog, with a warning for each change that protects
+less; if you approve, it saves the settings file, applies the change at once
+and forgets remembered approvals. A shorter auto-lock counts from the last
+time a secret was used, so it may lock the vault right away. A setting set by
+an option on the agent's command line (`--remember`, say) cannot be changed
+here: remove the option from the service (`systemctl --user edit
+rusthorse-agent`) and restart the agent. The page keeps your choice while
+you make it, until the agent reports other settings.
+
+The settings file is `~/.config/rusthorse/agent.toml`; you can also edit it
+while the agent is stopped ([cli.md](cli.md#settings)). Any program of yours
+can edit that file and restart the agent: the dialog guards the changes made
+through the agent, not the file.
 
 ### Change the master password
 

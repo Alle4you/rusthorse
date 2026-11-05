@@ -11,6 +11,9 @@
   `rusthorse audit` does, instead of through a new agent request. Any
   program of the user can read that file (L13), so a request would protect
   nothing, and would add code to the agent and the protocol.
+- Amended: 2026-11-05 — Agent settings (section 3), after a review of the
+  plan by Codex and the maintainer's choices: changes apply at once, need an
+  unlocked vault, and the bounds are fixed; `reload_config` is dropped.
 
 ## Context
 
@@ -156,22 +159,96 @@ X11 only, and it can type into the wrong window); the **primary selection**
 
 ### 3. Persistent agent configuration (M2)
 
-Add `$XDG_CONFIG_HOME/rusthorse/agent.toml` (default `~/.config/...`), owned by
-the user, mode 0600, parent 0700. Defaults stay remember=0, idle=15 minutes,
-dialog=120 seconds. CLI flags override the file and status identifies the
-source. M1 has no pretend settings switches.
+The human administers their own agent, and must be able to set it up
+without editing the systemd unit. (Amended on 2026-11-05: the first version
+of this section also planned an explicit `reload_config`; it is dropped.)
 
-The agent owns validation and atomic writes for a future `configure`
-request; the manager edits through that request, after an agent approval
-showing old and new values. Hand editing is permitted while stopped. No file
-watcher and no automatic reload: an explicit `reload_config` parses and
-validates the whole file, asks approval for changed security settings, then
-applies one snapshot. Invalid startup configuration stops startup with an
-actionable error; invalid reload keeps the old snapshot. Unknown fields are
-errors. Zero disables remembering; disabling idle lock requires an explicit
-warning. Bounds must be specified and tested before M2 implementation.
-Changing settings clears remembered approvals, bumps generation, and adjusts
-the idle deadline conservatively (it does not count as using a secret).
+**The settings.** Five, the agent's existing options, with the same
+defaults:
+
+| Setting | In the file | Flag | Default | Allowed |
+|---|---|---|---|---|
+| Lock after inactivity | `idle_timeout` | `--idle-timeout` | `15m` | `0` (never) or 1 s to 24 h |
+| Remembered approvals | `remember` | `--remember` | `0` (off) | `0` or 1 s to 8 h |
+| Dialog timeout | `dialog_timeout` | `--dialog-timeout` | `2m` | 15 s to 5 min |
+| Lock on suspend | `lock_on_suspend` | `--no-lock-on-suspend` | on | on or off |
+| Lock on screen lock | `lock_on_screen_lock` | `--no-lock-on-screen-lock` | on | on or off |
+
+The bounds are operational, not security guarantees, and apply alike to the
+file, the flags and the `configure` request. The dialog timeout stops at 5
+minutes, so that one dialog ends well before the manager's ten-minute wait
+for an answer; a request that waits behind other dialogs, or asks for the
+master password first, can still outlast it, and the manager then reports
+the outcome as unknown. A flag value accepted before outside these bounds
+now stops the agent's start.
+
+**The file.** `$XDG_CONFIG_HOME/rusthorse/agent.toml` (default
+`~/.config/rusthorse/agent.toml`; `RUSTHORSE_AGENT_CONFIG` or `--config`
+name another), TOML with those keys, each optional; durations are written
+as the flags take them (`"15m"`, `"0"`). A missing file means the defaults.
+The agent reads it when it starts; a file it cannot read, not a regular
+file, writable by its group or by others (the agent cannot tell whether a
+group is the user's alone; with a umask of `002` a file made by hand needs
+`chmod 600`, which the error says), under a directory that someone else
+could change (one that belongs to another user, or that its group or others
+can write without the sticky bit — they could remove or replace the file)
+or through another user's link (the path is followed link by link, and the
+file read must be the one checked),
+with an unknown key, a wrong type or a value out of bounds stops the start with an error that names the file, the key
+and what is allowed — failing closed, since the defaults may protect less
+than what the human set. Edits by hand take effect at the agent's next
+start: there is no file watcher and no reload request.
+
+**Precedence.** Default, then the file, then an explicit flag. `status`
+reports each setting's effective value and source (`default`, `file`,
+`flag`) and the file's absolute path; the manager shows them as reported and
+computes no path of its own.
+
+**Changing a setting: `configure`** (protocol 10). The request names only
+the settings to change. The agent:
+
+1. refuses, changing nothing, a request that changes nothing, a value out of
+   bounds, or a setting fixed by a flag (the flag wins until the human
+   removes it from the unit and restarts the agent);
+2. needs the vault unlocked, and asks for the master password first when it
+   is locked — settings are the administrator's, and an unlock is something
+   a program cannot do for the human;
+3. takes one `configure` at a time, from before its dialog to its end;
+4. shows its own dialog with each setting's old and new value, a warning for
+   each change that protects less (remembering turned on or longer, the idle
+   lock longer or off, a lock on suspend or screen lock turned off, a longer
+   dialog timeout), and no "Allow for…";
+5. records the human's answer in the audit log, refusing if it cannot (fail
+   closed); after Allow, acts only if the vault's generation did not change
+   while the human decided; then writes the file — a private temporary
+   file in the same directory, synced, renamed over the old one, the
+   directory synced — with the file's values and the changes, never the
+   values flags set; then applies the change and forgets remembered
+   approvals, bumping the generation;
+6. reports a failure before the rename as a definite error (nothing
+   changed); once the file is renamed it applies the change, and a failure
+   after that is `outcome_unknown`.
+
+Applying is immediate. A dialog already open keeps the timeout it was shown
+with. The idle lock counts from the last use of a secret, which `configure`
+is not: lowering it below the time already idle locks the vault at once;
+turning it on or off takes effect on the idle timer's next tick. A change of
+a lock trigger starts or stops that trigger's watchers only; the others,
+and the suspend inhibitor when suspend is unchanged, are left alone. Values
+apply to the next approvals; "Allow for…" never approves anything by
+itself.
+
+A missing file means the defaults: the agent cannot tell a file never
+written from one removed, so it writes the file only under directories
+nobody else can change (a refused save changes nothing), and creates
+missing ones private.
+
+**What the dialog protects.** A change made through the protocol needs the
+human's master password (when locked) and approval, and is recorded. Any
+program of the user can still edit `agent.toml` or the systemd unit and
+restart the agent (threat model L1); that is not prevented, and the docs say
+so. No tamper detection or extra authentication is added: the same user
+could alter it too.
 
 ### 4. Remembered approvals and history (M2)
 
@@ -295,7 +372,7 @@ No persistent settings, grants/history viewer, import UI, restoration,
 automatic screen/suspend lock or exclusive KeePassXC handoff is claimed yet.
 (Since then: the lock on screen lock and suspend, ADR 0009; the import
 windows, ADR 0012; the broker's Grants page, ADR 0013; the History page,
-section 4.)
+section 4; the agent's settings and the Settings page, section 3.)
 Copy puts a value where other programs and clipboard histories can keep it;
 the threat model (L14) records it.
 Before real credentials, the maintainer must review the reveal exposure,

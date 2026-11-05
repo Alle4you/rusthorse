@@ -351,6 +351,7 @@ updates it without revoking unrelated grants.
 | `run` | yes | approval | opt-in (`--remember`), exact match |
 | `broker_run_v2` | yes | approval of each grant's approved origin and the run's limits | no |
 | `grants`, `revoke_grant` | no | none | — |
+| `configure` | yes | approval showing each old and new value | no |
 
 "Metadata" is the entry name, group, kind, username, URL, host, port, tags,
 whether a value and notes exist, the *names* of other fields and the
@@ -385,8 +386,8 @@ display in full are refused outright.
 
 ### Locking
 
-The decrypted vault is dropped after `--idle-timeout` (default 15 minutes)
-without an *approved* use (`status`, `list`, `show` and denied requests do not
+The decrypted vault is dropped after the idle timeout (default 15 minutes; see
+[Agent settings](#agent-settings)) without an *approved* use (`status`, `list`, `show` and denied requests do not
 count), on `rusthorse lock`, when a save fails, when the agent stops, and when
 the session is locked or the computer is about to sleep. A command that is
 already running keeps values it was given by ordinary bindings. Broker grants
@@ -415,6 +416,33 @@ logind left or restarted (systemd keeps inhibitors across restarts); that only
 changes `status`. The agent's handle on the watchers closes their connections
 and waits up to 3 seconds for their threads when the agent is dropped. The
 watchers exist only with the `session-lock` Cargo feature (on by default).
+Those of suspend and those of the screen lock start and stop apart, so that
+`configure` can turn one off without letting go of the other's inhibitor.
+
+### Agent settings
+
+Five settings — the idle timeout, how long "Allow for…" lasts, the dialog
+timeout, and locking on suspend and on screen lock — come from their
+defaults, the settings file `$XDG_CONFIG_HOME/rusthorse/agent.toml` and the
+flags of `rusthorse agent`, in that order (`settings`,
+[ADR 0007, section 3](adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)).
+The agent reads the file when it starts and refuses to start with a file or
+a flag it cannot accept (a value out of bounds, an unknown key, a file other
+users can change). `status` reports each setting and its source.
+
+`configure` changes them while the agent runs. One at a time: before
+anyone is asked, it refuses a value out of bounds and a setting a flag
+fixes; it needs the vault unlocked (asking for the master password first),
+and the human's approval of each old and new value. The answer is recorded
+first, fail closed; after Allow, under the state's lock and only if the
+generation did not change, the agent replaces the file (a private temporary
+file, synced, renamed, the directory synced), sets the settings in effect,
+forgets remembered approvals and bumps the generation. Then it tells the
+dialogs their new timeout and "Allow for…" duration (a dialog already open
+keeps its own), starts or stops the watchers of a lock trigger that changed,
+and checks the idle lock at once: the approval is not a use of the vault, so
+a shorter timeout counts from the last use. The idle timer runs every second
+even while the timeout is off, so that turning it on needs nothing else.
 
 ## Storage format
 
@@ -736,6 +764,15 @@ its own dialog.
   until the next status. Filters choose among the records read. Every text is drawn
   as plain text through the dialogs' filter. It sends the agent no request
   of its own.
+- **Settings.** The page shows each setting `status` reports, with its
+  source; one a flag fixes cannot be changed. A choice is kept across status
+  checks until the agent reports other settings. Apply sends `configure`
+  with only the settings that differ, and only while the last status says
+  the vault is unlocked and Lock now was not sent since. Each dialog ends
+  within its timeout (5 minutes at most); a `configure` that waits behind
+  other dialogs, or that finds the vault locked meanwhile and asks for the
+  master password first, can outlast the manager's ten-minute wait, which
+  then reports its outcome as unknown.
 - **Command templates.** An entry offers two command templates, each
   labelled: one gives the value to the command (`run`), the other goes
   through the broker and leaves the destination, the token's variable and

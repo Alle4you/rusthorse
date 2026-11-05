@@ -413,6 +413,7 @@ fn desktop_flow() {
             broker_program: None,
             broker_ready_timeout: None,
             broker_lifetime: None,
+            settings: None,
             keyring: Default::default(),
         },
         Box::new(Scripted(
@@ -1257,6 +1258,7 @@ fn first_start() {
             broker_program: None,
             broker_ready_timeout: None,
             broker_lifetime: None,
+            settings: None,
             keyring: Default::default(),
         },
         Box::new(Scripted(
@@ -1368,6 +1370,7 @@ fn import_windows() {
             broker_program: None,
             broker_ready_timeout: None,
             broker_lifetime: None,
+            settings: None,
             keyring: rusthorse::keyring::Settings {
                 address: None,
                 plain: true,
@@ -1591,6 +1594,8 @@ struct FakeState {
     locked: bool,
     /// The audit log its status names.
     audit_log: String,
+    /// The settings its status reports; `configure` changes them.
+    settings: Option<rusthorse::protocol::SettingsInfo>,
     /// The protocol version its status reports.
     protocol: u32,
     /// Whether its status reports the broker's program and the number of
@@ -1621,6 +1626,7 @@ fn fake_state(locked: bool) -> Arc<Mutex<FakeState>> {
     Arc::new(Mutex::new(FakeState {
         locked,
         audit_log: "/fake/audit.jsonl".into(),
+        settings: None,
         protocol: PROTOCOL_VERSION,
         report_broker: true,
         entries: vec![],
@@ -1713,6 +1719,7 @@ fn fake_answer(state: &Mutex<FakeState>, request: &serde_json::Value) -> (Respon
             grants: s
                 .report_broker
                 .then(|| s.grants.iter().filter(|g| g.state != "revoked").count()),
+            settings: s.settings.clone(),
         }),
         "list" => Response::Entries {
             entries: s.entries.clone(),
@@ -1751,6 +1758,36 @@ fn fake_answer(state: &Mutex<FakeState>, request: &serde_json::Value) -> (Respon
             Response::Error {
                 code: ErrorCode::OutcomeUnknown,
                 message: "fake: the answer was lost".into(),
+            }
+        }
+        "configure" => {
+            // As the agent does once the human approves: the file holds the
+            // changes.
+            let change: rusthorse::protocol::SettingsChange =
+                serde_json::from_value(request["settings"].clone()).unwrap();
+            let file = rusthorse::settings::Source::File;
+            if let Some(info) = &mut s.settings {
+                if let Some(v) = change.idle_timeout_secs {
+                    info.idle_timeout_secs = rusthorse::protocol::SettingInfo {
+                        value: v,
+                        source: file,
+                    };
+                }
+                if let Some(v) = change.dialog_timeout_secs {
+                    info.dialog_timeout_secs = rusthorse::protocol::SettingInfo {
+                        value: v,
+                        source: file,
+                    };
+                }
+                if let Some(v) = change.lock_on_screen_lock {
+                    info.lock_on_screen_lock = rusthorse::protocol::SettingInfo {
+                        value: v,
+                        source: file,
+                    };
+                }
+            }
+            Response::Ok {
+                message: "settings changed".into(),
             }
         }
         "revoke_grant" if s.refuse_revoke.is_some() => Response::Error {
@@ -2143,6 +2180,159 @@ fn history_page() {
         s.toggle_lock();
         settle(&s);
     }
+    s.shutdown();
+}
+
+/// The label a combo row shows.
+fn combo_label(row: &adw::ComboRow) -> String {
+    row.selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|o| o.string().to_string())
+        .unwrap_or_default()
+}
+
+/// Choose `label` in a combo row, as the human would.
+fn choose(row: &adw::ComboRow, label: &str) {
+    let model = row.model().unwrap();
+    let at = (0..model.n_items())
+        .find(|i| {
+            model
+                .item(*i)
+                .and_downcast::<gtk::StringObject>()
+                .is_some_and(|o| o.string() == label)
+        })
+        .unwrap_or_else(|| panic!("no choice {label}"));
+    row.set_selected(at);
+}
+
+/// The Settings page, driven by a fake agent: it shows what the agent
+/// reports and where each value comes from, keeps a row a flag fixes out of
+/// reach, sends only what changed — and only while the vault is unlocked —
+/// and a status check does not undo a choice under way.
+#[test]
+fn settings_page() {
+    if !on_xvfb("settings_page") {
+        return;
+    }
+    adw::init().expect("GTK only on Xvfb");
+    crate::load_style();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("run/agent.sock");
+    let state = fake_state(true);
+    state.lock().unwrap().settings = Some(crate::model::tests::settings_info());
+    fake_agent(&socket, &state);
+    let configured = || -> Vec<serde_json::Value> {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["type"] == "configure")
+            .cloned()
+            .collect()
+    };
+    let app = adw::Application::builder()
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let s = Manager::new(&app, socket.clone());
+    s.window.present();
+    s.refresh();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Locked");
+    show_page(&s, "settings");
+    let rows = &s.settings;
+
+    // What the agent reports, and where it comes from.
+    assert_eq!(combo_label(&rows.idle), "15m");
+    assert_eq!(rows.idle.subtitle().as_deref(), Some("Default"));
+    assert_eq!(combo_label(&rows.dialog), "1m30s");
+    assert_eq!(
+        rows.dialog.subtitle().as_deref(),
+        Some("From the settings file")
+    );
+    assert_eq!(combo_label(&rows.remember), "off");
+    assert!(
+        rows.remember
+            .subtitle()
+            .unwrap()
+            .contains("Set by --remember")
+    );
+    assert!(!rows.remember.is_sensitive());
+    assert!(rows.idle.is_sensitive());
+    assert!(rows.suspend.is_active() && rows.screen.is_active());
+    assert_eq!(
+        rows.file.text(),
+        "Saved in /fake/config/rusthorse/agent.toml"
+    );
+
+    // Locked: a choice can be made, not applied.
+    choose(&rows.idle, "5m");
+    assert!(!rows.apply.is_sensitive());
+    assert!(rows.revert.is_sensitive());
+    assert!(
+        rows.note
+            .text()
+            .starts_with("Unlock the vault to change settings")
+    );
+    s.apply_settings();
+    settle(&s);
+    assert!(configured().is_empty());
+
+    // Unlocked: Apply sends what changed, nothing a flag fixes.
+    s.toggle_lock();
+    settle(&s);
+    assert_eq!(s.pill.text(), "Unlocked");
+    assert_eq!(combo_label(&rows.idle), "5m", "the choice was kept");
+    assert!(rows.apply.is_sensitive());
+    rows.screen.set_active(false);
+    rows.apply.emit_clicked();
+    settle(&s);
+    assert_eq!(
+        configured(),
+        [serde_json::json!({
+            "type": "configure",
+            "settings": {"idle_timeout_secs": 300, "lock_on_screen_lock": false}
+        })]
+    );
+    // The agent's report after it, shown: from the file now; nothing left
+    // to apply.
+    spin_until(|| rows.idle.subtitle().as_deref() == Some("From the settings file"));
+    assert_eq!(combo_label(&rows.idle), "5m");
+    assert!(!rows.screen.is_active());
+    assert!(!rows.apply.is_sensitive() && !rows.revert.is_sensitive());
+
+    // A status check does not undo a choice under way; Revert does.
+    choose(&rows.dialog, "5m");
+    let polls = state.lock().unwrap().requests.len();
+    spin_until(|| {
+        state.lock().unwrap().requests[polls..]
+            .iter()
+            .any(|r| r["type"] == "status")
+    });
+    let settle_frame = Instant::now() + Duration::from_millis(200);
+    spin_until(|| Instant::now() >= settle_frame);
+    assert_eq!(combo_label(&rows.dialog), "5m");
+    rows.revert.emit_clicked();
+    assert_eq!(combo_label(&rows.dialog), "1m30s");
+    assert!(!rows.revert.is_sensitive());
+
+    // Lock now: no Apply until a status says otherwise.
+    choose(&rows.dialog, "5m");
+    assert!(rows.apply.is_sensitive());
+    state.lock().unwrap().hold = Some("lock");
+    s.toggle_lock();
+    assert!(!rows.apply.is_sensitive());
+    state.lock().unwrap().hold = None;
+    settle(&s);
+    snapshot(&s, "settings");
+
+    // An agent that reports no settings: the page says so.
+    state.lock().unwrap().settings = None;
+    s.refresh();
+    settle(&s);
+    assert!(!rows.idle.is_visible() && !rows.apply.is_visible());
+    assert!(rows.note.text().contains("does not report its settings"));
     s.shutdown();
 }
 

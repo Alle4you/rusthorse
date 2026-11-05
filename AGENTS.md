@@ -158,12 +158,13 @@ Breaking one of these is a security bug, whatever the tests say.
    options that zenity 3 and 4 both have (no `--icon-name`), no colours or
    icons of our own. Verified on zenity 3.44 and GTK 4.14, dark and light.
 7. **Error contract** (since protocol 3): every error other than `outcome_unknown`
-   means the vault file was not changed and no command was started. Clients
-   treat an unknown error code as `outcome_unknown`. CLI exit statuses: `124`
-   outcome unknown (any request with effects); `125` `run` did not start
-   (including when its dialog was denied, cancelled or not answered); `4` a
-   dialog was denied, cancelled or not answered, outside `run`; `1` other
-   errors.
+   means the vault file was not changed and no command was started (and,
+   for `configure`, that the settings file was not replaced and no setting
+   changed). Clients treat an unknown error code as `outcome_unknown`. CLI
+   exit statuses: `124` outcome unknown (any request with effects); `125`
+   `run` did not start (including when its dialog was denied, cancelled or
+   not answered); `4` a dialog was denied, cancelled or not answered,
+   outside `run`; `1` other errors.
    A command started by `run` can exit with 124 or 125 itself; a `rusthorse:`
    message tells them apart — but a note that starts with `rusthorse: note:`
    comes only after a command that ran, whose status is its own (a grant's
@@ -307,6 +308,7 @@ present and capture only its window, in a dark and a light theme
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/session_lock.rs` | Locking on suspend and screen lock (D-Bus watchers, ADR 0009) |
+| `src/settings.rs` | The agent's settings, their bounds and their file (`agent.toml`, ADR 0007 §3) |
 | `src/keyring.rs`, `src/import.rs` | Imports the agent reads: GNOME Keyring (and a fake one for tests), `.env` parsing, batches (ADR 0012) |
 | `manager/src/import_window.rs` | The manager's import windows |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |

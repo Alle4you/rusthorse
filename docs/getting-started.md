@@ -8,7 +8,7 @@ using a credential it never sees. It assumes you have followed
 
 ```console
 $ rusthorse doctor
-  ok    rusthorse 0.1.0 (protocol 9)
+  ok    rusthorse 0.1.0 (protocol 10)
   ok    agent 0.1.0 is running (locked)
   ok    the agent runs the same program file as this rusthorse (/usr/bin/rusthorse)
   ok    dialogs: rusthorse-dialog 0.1.0 (/usr/bin/rusthorse-dialog)

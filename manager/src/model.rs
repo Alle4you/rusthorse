@@ -7,8 +7,9 @@ use rusthorse::broker_grant::AutomaticLocks;
 use rusthorse::generate::Spec;
 use rusthorse::protocol::{
     EntryChanges, EntryFields, EntryInfo, EntryKind, Field, GrantInfo, NewEntry, Request,
-    ValueChange,
+    SettingsChange, SettingsInfo, ValueChange,
 };
+use rusthorse::settings::{Key, Source, Value};
 
 #[derive(Clone, Default)]
 pub(crate) struct Form {
@@ -741,6 +742,82 @@ pub(crate) fn history_summary(c: HistoryCounts) -> String {
         text.push_str(" That is the whole log.");
     }
     text
+}
+
+/// What the Settings page says of where a setting in effect comes from.
+pub(crate) fn setting_source(key: Key, source: Source) -> String {
+    match source {
+        Source::Default => "Default".into(),
+        Source::File => "From the settings file".into(),
+        Source::Flag => format!(
+            "Set by {} on the agent's command line, which wins over the settings file. To change it here, remove that option from the agent's service and restart the agent.",
+            key.flag()
+        ),
+    }
+}
+
+/// The durations the Settings page offers for `key`, in seconds and as
+/// shown, `current` among them (a value set in the file or by hand need not
+/// be one of the usual ones).
+pub(crate) fn duration_choices(key: Key, current: u64) -> Vec<(u64, String)> {
+    let usual: &[u64] = match key {
+        Key::IdleTimeout => &[0, 60, 300, 900, 1800, 3600, 4 * 3600, 24 * 3600],
+        Key::Remember => &[0, 300, 900, 3600, 4 * 3600, 8 * 3600],
+        Key::DialogTimeout => &[30, 60, 120, 300],
+        Key::LockOnSuspend | Key::LockOnScreenLock => &[],
+    };
+    let mut secs = usual.to_vec();
+    if !secs.contains(&current) {
+        secs.push(current);
+        secs.sort_unstable();
+    }
+    secs.into_iter()
+        .map(|s| (s, Value::Duration(Duration::from_secs(s)).describe(key)))
+        .collect()
+}
+
+/// What the Settings page's rows hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Chosen {
+    pub idle_timeout_secs: u64,
+    pub remember_secs: u64,
+    pub dialog_timeout_secs: u64,
+    pub lock_on_suspend: bool,
+    pub lock_on_screen_lock: bool,
+}
+
+impl Chosen {
+    /// The settings in effect, as the agent reported them.
+    #[cfg(test)]
+    pub(crate) fn of(info: &SettingsInfo) -> Self {
+        Chosen {
+            idle_timeout_secs: info.idle_timeout_secs.value,
+            remember_secs: info.remember_secs.value,
+            dialog_timeout_secs: info.dialog_timeout_secs.value,
+            lock_on_suspend: info.lock_on_suspend.value,
+            lock_on_screen_lock: info.lock_on_screen_lock.value,
+        }
+    }
+
+    /// The `configure` that makes these the settings in effect: only those
+    /// that differ, never one a flag fixes (the agent would refuse it).
+    /// `None` when there is nothing to change.
+    pub(crate) fn change(&self, info: &SettingsInfo) -> Option<SettingsChange> {
+        fn differs<T: PartialEq + Copy>(
+            chosen: T,
+            now: &rusthorse::protocol::SettingInfo<T>,
+        ) -> Option<T> {
+            (chosen != now.value && now.source != Source::Flag).then_some(chosen)
+        }
+        let change = SettingsChange {
+            idle_timeout_secs: differs(self.idle_timeout_secs, &info.idle_timeout_secs),
+            remember_secs: differs(self.remember_secs, &info.remember_secs),
+            dialog_timeout_secs: differs(self.dialog_timeout_secs, &info.dialog_timeout_secs),
+            lock_on_suspend: differs(self.lock_on_suspend, &info.lock_on_suspend),
+            lock_on_screen_lock: differs(self.lock_on_screen_lock, &info.lock_on_screen_lock),
+        };
+        (change != SettingsChange::default()).then_some(change)
+    }
 }
 
 fn is_variable_name(name: &str) -> bool {
@@ -1792,5 +1869,94 @@ pub(crate) mod tests {
             }),
             "5 records read, newest first. 2 lines of the file are not audit records and are left out. The file changed since it was read: it was rotated, truncated or rewritten. Refresh to read it again from its end."
         );
+    }
+
+    pub fn settings_info() -> SettingsInfo {
+        use rusthorse::protocol::SettingInfo;
+        SettingsInfo {
+            file: "/fake/config/rusthorse/agent.toml".into(),
+            idle_timeout_secs: SettingInfo {
+                value: 900,
+                source: Source::Default,
+            },
+            remember_secs: SettingInfo {
+                value: 0,
+                source: Source::Flag,
+            },
+            dialog_timeout_secs: SettingInfo {
+                value: 90,
+                source: Source::File,
+            },
+            lock_on_suspend: SettingInfo {
+                value: true,
+                source: Source::Default,
+            },
+            lock_on_screen_lock: SettingInfo {
+                value: true,
+                source: Source::File,
+            },
+        }
+    }
+
+    #[test]
+    fn settings_offer_the_usual_durations_and_the_current_one() {
+        let shown = |key, current| -> Vec<String> {
+            duration_choices(key, current)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect()
+        };
+        assert_eq!(
+            shown(Key::IdleTimeout, 900),
+            ["never", "1m", "5m", "15m", "30m", "1h", "4h", "24h"]
+        );
+        assert_eq!(
+            shown(Key::Remember, 0),
+            ["off", "5m", "15m", "1h", "4h", "8h"]
+        );
+        // A value set by hand is offered where it falls.
+        assert_eq!(
+            shown(Key::DialogTimeout, 90),
+            ["30s", "1m", "1m30s", "2m", "5m"]
+        );
+        assert_eq!(duration_choices(Key::DialogTimeout, 90)[2].0, 90);
+        // Never rounded: an hour and 59 seconds is not shown as an hour.
+        assert_eq!(
+            shown(Key::Remember, 3659),
+            ["off", "5m", "15m", "1h", "1h59s", "4h", "8h"]
+        );
+        assert!(setting_source(Key::Remember, Source::Flag).contains("--remember"));
+        assert_eq!(
+            setting_source(Key::IdleTimeout, Source::File),
+            "From the settings file"
+        );
+    }
+
+    #[test]
+    fn a_change_holds_only_what_differs_and_no_flag() {
+        let info = settings_info();
+        let same = Chosen::of(&info);
+        assert_eq!(same.change(&info), None);
+        let chosen = Chosen {
+            idle_timeout_secs: 300,
+            // Fixed by --remember: never sent.
+            remember_secs: 3600,
+            lock_on_screen_lock: false,
+            ..same
+        };
+        assert_eq!(
+            chosen.change(&info),
+            Some(SettingsChange {
+                idle_timeout_secs: Some(300),
+                lock_on_screen_lock: Some(false),
+                ..SettingsChange::default()
+            })
+        );
+        // Only the flag's: nothing to send.
+        let flag_only = Chosen {
+            remember_secs: 3600,
+            ..same
+        };
+        assert_eq!(flag_only.change(&info), None);
     }
 }

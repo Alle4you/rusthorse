@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **9** (`PROTOCOL_VERSION` in
+Protocol version: **10** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -18,6 +18,7 @@ Protocol version: **9** (`PROTOCOL_VERSION` in
 | 7 | `EntryChanges.group` moves an entry to another group (see [EntryChanges](#entrychanges)). An agent of version 6 would silently drop it and report the edit done, so the version changed. |
 | 8 | `broker_run`, `broker_edit`, `grants`, `revoke_grant`; optional entry profile and broker status fields. Separate request tags make a protocol-7 agent refuse broker operations whole even if the agent changes between the version check and the request. Added later, optional: `GrantInfo.unauthorized`, `exited.unauthorized`. |
 | 9 | The broker without profiles or presets ([ADR 0013](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets)): `broker_run_v2`, whose broker bindings each name their `destination` and whose `limits` set the grants' limits, with unknown fields refused. `broker_run` and `broker_edit` are gone (refused), and so are `EntryInfo.broker`, `EntryChanges.broker`, `"broker"` in `EntryChanges.clear` and `GrantInfo.preset`; `EntryChanges` refuses fields it does not know. `GrantInfo.destination` and `exited.unauthorized[].destination` mean the approved origin, no longer the profile's origin and base path; `GrantInfo.base_path` (optional) is new. A run through the broker is a new request rather than `broker_run` with more fields: a protocol-8 agent would accept that and ignore the destinations and the limits. |
+| 10 | The agent's settings ([ADR 0007, section 3](adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)): `configure` (see [Configure](#configure)) and `status.settings` (optional). For `configure`, every error other than `outcome_unknown` also means that the settings file was not replaced and no setting changed. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -125,6 +126,7 @@ Every request is an object with a `type` field.
 | `keyring_items` | — | `keyring_items` |
 | `dotenv_names` | `path` (absolute) | `names` |
 | `import_from` | `source` (see [Imports read by the agent](#imports-read-by-the-agent)), `tags` (array, optional), `replace` (bool, optional) | `ok` |
+| `configure` | `settings` (see [Configure](#configure)) | `ok` |
 
 Any request can also be answered with an [`error`](#errors).
 
@@ -239,6 +241,40 @@ client's own statement: the agent cannot enforce it, the dialog labels it
 "Stated purpose (unverified)", and its warnings hold whatever the client
 does. An approval for one purpose is never remembered and never reused for
 another. Clients leave the field out when they have no purpose to state.
+
+### Configure
+
+`configure` changes the agent's settings
+([ADR 0007, section 3](adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)).
+`settings` names only the settings to change, each optional; unknown fields
+are refused:
+
+| Field | Value |
+|---|---|
+| `idle_timeout_secs` | Lock after this many seconds without use: `0` (never), or 1 to 86400 |
+| `remember_secs` | How long "Allow for …" lasts in `run` dialogs: `0` (off), or 1 to 28800 |
+| `dialog_timeout_secs` | How long a dialog waits for an answer: 15 to 300 |
+| `lock_on_suspend` | Lock when the computer is about to sleep (bool) |
+| `lock_on_screen_lock` | Lock when the session is locked or its screensaver starts (bool) |
+
+```json
+{"type": "configure", "settings": {"idle_timeout_secs": 300, "lock_on_screen_lock": false}}
+```
+
+Refused with `invalid_request`, before anyone is asked: no setting, a value
+out of bounds, settings that all already have those values, a setting a
+flag of `rusthorse agent` fixes (`status.settings` says which), or an agent
+started without a settings file. Otherwise the agent needs the vault
+unlocked — it asks for the master password first when it is locked — and
+asks the human in its own dialog, showing each old and new value and a
+warning for each change that protects less; there is no "Allow for…". It
+records the human's answer in the audit log (`internal`, and nothing
+changed, if it cannot). After Allow, it acts only if the vault was not
+locked or changed meanwhile (`locked` otherwise, and nothing changed), then
+replaces the settings file, applies the change at once and forgets
+remembered approvals. A failure before the file is replaced is `internal`,
+and nothing changed; once it is replaced, the change is applied, and a
+failure to sync its directory is `outcome_unknown`.
 
 ### NewEntry
 
@@ -484,9 +520,24 @@ a removed grant disappears; the manager may retain an ended row locally.
     {"event": "screen_lock", "source": "org.cinnamon.ScreenSaver", "active": true},
     {"event": "suspend", "source": "logind", "active": true,
      "note": "locks before the computer sleeps"}
-  ]
+  ],
+  "settings": {
+    "file": "/home/me/.config/rusthorse/agent.toml",
+    "idle_timeout_secs": {"value": 900, "source": "default"},
+    "remember_secs": {"value": 0, "source": "default"},
+    "dialog_timeout_secs": {"value": 60, "source": "file"},
+    "lock_on_suspend": {"value": true, "source": "default"},
+    "lock_on_screen_lock": {"value": false, "source": "flag"}
+  }
 }
 ```
+
+`settings` (optional; left out by agents that predate it and by an agent
+started without a settings file) holds the agent's settings in effect: for
+each, its `value` and its `source` — `default`, `file` (the settings file
+at `file`, an absolute path) or `flag` (an explicit flag of `rusthorse
+agent`, which wins over the file and which `configure` cannot change).
+`idle_timeout_secs` at the top level is the same idle timeout.
 
 `lock_triggers` (optional; left out by agents that predate it) lists what
 else locks the vault ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)):
@@ -574,8 +625,11 @@ changed and no command was started.** (The audit log may record the attempt,
 the vault may have been locked, and a `backup` whose copy does not verify
 leaves that copy, which the message names.) A client that sends a request with
 effects — `create_vault`, `add`, `import`, `import_from`, `edit`, `remove`,
-`change_password`, `backup`, `run`, `broker_run_v2` — and gets no answer, or
-one it cannot parse, must likewise treat the outcome as unknown.
+`change_password`, `backup`, `run`, `broker_run_v2`, `configure` — and gets
+no answer, or one it cannot parse, must likewise treat the outcome as
+unknown. For `configure`, an error other than `outcome_unknown` also means
+that the settings file was not replaced and no setting changed; after
+`outcome_unknown`, or no answer, the change may be in effect.
 
 `revoke_grant`, like `lock`, is safe to repeat and is not classified as a
 request with effects by `Request::has_effects`. A lost reply is a regular
@@ -600,6 +654,9 @@ grants may have been revoked even when a later audit write fails.
 - Removing or changing the meaning of a field or of an error code —
   including what an error guarantees about the request's effects — or
   changing framing, bumps `PROTOCOL_VERSION`.
+- Protocol 10 added `configure`. A client of protocol 10 refuses an agent of
+  protocol 9 at its version check, and an agent of protocol 9 refuses
+  `configure`, which it does not know.
 - Protocol 9 removed fields and changed what `destination` means in
   `grants` and `exited.unauthorized`. A client of protocol 9 refuses an agent
   of protocol 8 at its version check, and an agent of protocol 8 refuses
@@ -610,14 +667,16 @@ grants may have been revoked even when a later audit write fails.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-9 requests above, with the same approvals
+`rusthorse-manager` uses the version-10 requests above, with the same approvals
 as the CLI. It targets entries by UUID, sends `reveal` with purpose `show` or
 `copy` for its Show and Copy actions, sends `create_vault` when there is no
 vault yet, imports with `keyring_items`, `dotenv_names` and `import_from`, and
 never sends a master password or a value it read. See
-[ADR 0007](adr/0007-visual-manager.md); the configuration, history and restore
-requests it proposes for later milestones do not exist yet. Its Grants page
-uses `grants` and `revoke_grant`. It sends no broker run itself: its command
+[ADR 0007](adr/0007-visual-manager.md). Its Grants page uses `grants` and
+`revoke_grant`; its Settings page shows `status.settings` and sends
+`configure`, only while the vault is unlocked; its History page reads the
+audit log at `status.audit_log` and sends no request of its own. No restore
+request exists yet. It sends no broker run itself: its command
 templates for `rusthorse run --broker` are text for the human to fill in
 and run.
 

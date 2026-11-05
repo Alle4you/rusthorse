@@ -125,6 +125,11 @@ pub trait Ui: Send + Sync {
     fn limits_height(&self) -> bool {
         true
     }
+    /// The agent's settings changed (`configure`): from now on "Allow for …"
+    /// lasts `remember_for` (zero does not offer it) and dialogs wait
+    /// `timeout`. A dialog already shown keeps what it was shown with. Ways
+    /// of asking that have no such settings ignore it.
+    fn set_timing(&self, _remember_for: Duration, _timeout: Duration) {}
 }
 
 /// Dialogs implemented with `zenity`.

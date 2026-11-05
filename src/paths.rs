@@ -5,6 +5,7 @@
 //! | Vault       | `$XDG_DATA_HOME/rusthorse/vault.kdbx`     | `RUSTHORSE_VAULT`     |
 //! | Socket      | `$XDG_RUNTIME_DIR/rusthorse/agent.sock`   | `RUSTHORSE_SOCKET`    |
 //! | Audit log   | `$XDG_STATE_HOME/rusthorse/audit.jsonl`   | `RUSTHORSE_AUDIT_LOG` |
+//! | Agent settings | `$XDG_CONFIG_HOME/rusthorse/agent.toml` | `RUSTHORSE_AGENT_CONFIG` |
 
 use std::path::PathBuf;
 
@@ -16,6 +17,8 @@ pub const ENV_VAULT: &str = "RUSTHORSE_VAULT";
 pub const ENV_SOCKET: &str = "RUSTHORSE_SOCKET";
 /// Environment variable that overrides the audit log location.
 pub const ENV_AUDIT_LOG: &str = "RUSTHORSE_AUDIT_LOG";
+/// Environment variable that overrides the agent's settings file location.
+pub const ENV_AGENT_CONFIG: &str = "RUSTHORSE_AGENT_CONFIG";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -65,5 +68,15 @@ pub fn audit_log() -> PathBuf {
         xdg_dir("XDG_STATE_HOME", ".local/state")
             .join("rusthorse")
             .join("audit.jsonl")
+    })
+}
+
+/// The agent's settings file: `$RUSTHORSE_AGENT_CONFIG`, or
+/// `$XDG_CONFIG_HOME/rusthorse/agent.toml`.
+pub fn agent_config() -> PathBuf {
+    from_env(ENV_AGENT_CONFIG).unwrap_or_else(|| {
+        xdg_dir("XDG_CONFIG_HOME", ".config")
+            .join("rusthorse")
+            .join("agent.toml")
     })
 }

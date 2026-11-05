@@ -57,7 +57,8 @@ use crate::helper_program::{self, Located};
 use crate::peer::Peer;
 use crate::protocol::{
     self, BrokerBinding, EntryChanges, EntryFields, ErrorCode, ImportSource, ImportedEntry,
-    NewEntry, Request, Response, RevealPurpose, RunRequest, SecretString, StatusInfo, ValueChange,
+    NewEntry, Request, Response, RevealPurpose, RunRequest, SecretString, SettingsChange,
+    SettingsInfo, StatusInfo, ValueChange,
 };
 use crate::redact::Redactor;
 use crate::session_lock;
@@ -128,6 +129,14 @@ pub struct AgentConfig {
     /// lifetime (`max_lifetime_minutes`), a minute at least. Tests
     /// shorten it, to see grants expire; it never lengthens one.
     pub broker_lifetime: Option<Duration>,
+    /// The settings file, and what it and the flags hold (ADR 0007, section
+    /// 3). `Some` in production: the settings in effect come from it — in
+    /// place of `idle_timeout` and of `session_lock`'s `on_suspend` and
+    /// `on_screen_lock`, and the [`Ui`] is told the rest — `status` reports
+    /// them, and `configure` changes them. `None` (tests): `idle_timeout`
+    /// and `session_lock` are used as given, `status` reports no settings,
+    /// and `configure` is refused.
+    pub settings: Option<crate::settings::Sources>,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`].
@@ -202,6 +211,10 @@ struct State {
     /// an unlock that reads other bytes ends every grant that survived the
     /// lock.
     content: Option<ContentFingerprint>,
+    /// The settings in effect (ADR 0007, section 3).
+    settings: crate::settings::Settings,
+    /// Where they come from, when the agent has a settings file.
+    sources: Option<crate::settings::Sources>,
 }
 
 impl State {
@@ -264,6 +277,10 @@ pub struct Agent {
     /// The key of the vault file's fingerprints, chosen at start and kept
     /// in memory only (the unlock barrier).
     fingerprint_key: FingerprintKey,
+    /// One `configure` at a time, from before its dialog to its end.
+    configuring: Mutex<()>,
+    /// The agent itself, for the watchers that `configure` starts.
+    me: Weak<Agent>,
 }
 
 impl session_lock::Locker for Agent {
@@ -297,10 +314,28 @@ impl session_lock::Locker for Agent {
 
 impl Agent {
     /// Build an agent that asks its questions through `ui`.
-    pub fn new(config: AgentConfig, ui: Box<dyn Ui>) -> Arc<Agent> {
+    pub fn new(mut config: AgentConfig, ui: Box<dyn Ui>) -> Arc<Agent> {
         let audit = Arc::new(AuditLog::new(config.audit_log.clone()));
         let registry = Registry::new(Arc::clone(&audit) as Arc<dyn broker_host::Recorder>);
-        Arc::new(Agent {
+        let settings = match &config.settings {
+            Some(sources) => {
+                let settings = sources.effective();
+                // The watchers start from `session_lock`; the idle timer
+                // and `status` read the settings in the state.
+                config.session_lock.on_suspend = settings.lock_on_suspend;
+                config.session_lock.on_screen_lock = settings.lock_on_screen_lock;
+                ui.set_timing(settings.remember, settings.dialog_timeout);
+                settings
+            }
+            None => crate::settings::Settings {
+                idle_timeout: config.idle_timeout,
+                lock_on_suspend: config.session_lock.on_suspend,
+                lock_on_screen_lock: config.session_lock.on_screen_lock,
+                ..crate::settings::Settings::default()
+            },
+        };
+        let sources = config.settings.clone();
+        Arc::new_cyclic(|me| Agent {
             config,
             ui,
             state: Mutex::new(State {
@@ -311,6 +346,8 @@ impl Agent {
                 keyring_listing: None,
                 locks: 0,
                 content: None,
+                settings,
+                sources,
             }),
             dialog: Mutex::new(()),
             waiting_for_dialog: AtomicUsize::new(0),
@@ -320,6 +357,8 @@ impl Agent {
             session_watchers: Mutex::default(),
             registry,
             fingerprint_key: FingerprintKey::random(),
+            configuring: Mutex::new(()),
+            me: me.clone(),
         })
     }
 
@@ -391,10 +430,9 @@ impl Agent {
         Ok(())
     }
 
+    /// Check every second whether the vault has been idle too long — also
+    /// while the idle lock is off, since `configure` can turn it on.
     fn start_idle_timer(self: &Arc<Self>) {
-        if self.config.idle_timeout.is_zero() {
-            return;
-        }
         let weak: Weak<Agent> = Arc::downgrade(self);
         let _ = thread::Builder::new()
             .name("rusthorse-idle".into())
@@ -432,7 +470,8 @@ impl Agent {
 
     fn lock_if_idle(&self) {
         let mut state = self.state();
-        if state.vault.is_some() && state.last_used.elapsed() >= self.config.idle_timeout {
+        let idle = state.settings.idle_timeout;
+        if !idle.is_zero() && state.vault.is_some() && state.last_used.elapsed() >= idle {
             state.lock();
             let ending = self
                 .registry
@@ -569,6 +608,7 @@ impl Agent {
                 grants: self.registry.list(),
             }),
             Request::RevokeGrant { id } => self.revoke_grant(peer, id),
+            Request::Configure { settings } => self.configure(peer, settings),
         }
     }
 
@@ -614,6 +654,156 @@ impl Agent {
 
     /// The broker program, as `status` reports it and `broker_run_v2` needs
     /// it.
+    /// Change the agent's settings (ADR 0007, section 3). They are the
+    /// administrator's: the vault must be unlocked (the master password is
+    /// asked first when it is not), and the agent's dialog shows each old
+    /// and new value, with a warning for each change that protects less.
+    /// One at a time. A setting a flag fixes is refused, as is a value out
+    /// of bounds. The approval is recorded before the file is written (fail
+    /// closed); the file then holds the old settings or the new ones, never
+    /// the flags' values; the change applies at once and remembered
+    /// approvals are forgotten. A failure once the file was replaced is
+    /// `outcome_unknown`; any other error changed nothing.
+    fn configure(&self, peer: &Peer, change: SettingsChange) -> Result<Response, Failure> {
+        use crate::settings::{self, Key};
+        let wanted = change.layer().map_err(Failure::invalid)?;
+        if wanted.is_empty() {
+            return Err(Failure::invalid("nothing to change"));
+        }
+        let _one = self.configuring.lock().unwrap_or_else(|p| p.into_inner());
+        let sources = self.state().sources.clone().ok_or_else(|| {
+            Failure::invalid(
+                "this agent was started without a settings file, so its settings cannot be changed",
+            )
+        })?;
+        let fixed: Vec<Key> = wanted
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| sources.flags.get(*key).is_some())
+            .collect();
+        if !fixed.is_empty() {
+            let flags: Vec<&str> = fixed.iter().map(|key| key.flag()).collect();
+            return Err(Failure::invalid(format!(
+                "{} set by {} on the agent's command line, which wins over the settings file: \
+                 remove it from the agent's service and restart the agent to change {} here",
+                if fixed.len() == 1 {
+                    "this setting is"
+                } else {
+                    "these settings are"
+                },
+                flags.join(" and "),
+                if fixed.len() == 1 { "it" } else { "them" },
+            )));
+        }
+        let current = sources.effective();
+        let changes: Vec<(Key, settings::Value, settings::Value)> = wanted
+            .iter()
+            .filter(|(key, value)| current.get(*key) != *value)
+            .map(|(key, value)| (key, current.get(key), value))
+            .collect();
+        if changes.is_empty() {
+            return Err(Failure::invalid(
+                "nothing to change: the settings already have these values",
+            ));
+        }
+        let generation = self.generation(peer)?;
+        let mut details: Vec<(String, String)> = changes
+            .iter()
+            .map(|(key, old, new)| {
+                (
+                    key.label().into(),
+                    format!("{} → {}", old.describe(*key), new.describe(*key)),
+                )
+            })
+            .collect();
+        details.push(("Settings file".into(), sources.path.display().to_string()));
+        details.push(("Requested by (unverified)".into(), peer.describe()));
+        let request = ApprovalRequest {
+            title: "Rusthorse — change settings".into(),
+            summary: "Change the agent's settings?".into(),
+            explanation: "The change applies at once and is saved in the agent's settings file. \
+                          Remembered approvals are forgotten."
+                .into(),
+            command: None,
+            details,
+            facts: Vec::new(),
+            warnings: changes
+                .iter()
+                .filter_map(|(key, old, new)| settings::weakens(*key, *old, *new))
+                .map(String::from)
+                .collect(),
+            can_remember: false,
+        };
+        let event = AuditEvent::new("configure", peer).detail(
+            changes
+                .iter()
+                .map(|(key, old, new)| format!("{} {} -> {}", key.name(), old.text(), new.text()))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        // Not a use of a secret: the idle lock is not postponed.
+        self.ask_approval(request, None, event)?;
+
+        let mut changed = settings::Layer::default();
+        for (key, _, new) in &changes {
+            changed.set(*key, *new).map_err(Failure::invalid)?;
+        }
+        let updated = settings::Sources {
+            file: sources.file.with(&changed),
+            ..sources
+        };
+        let mut state = self.state();
+        if state.generation != generation || state.vault.is_none() {
+            return Err(locked_meanwhile());
+        }
+        let saved = settings::save(&updated.path, &updated.file);
+        if let Err(e) = &saved
+            && !e.replaced
+        {
+            return Err(Failure::new(
+                ErrorCode::Internal,
+                format!(
+                    "cannot save the settings file {} ({}); nothing changed",
+                    updated.path.display(),
+                    e.error
+                ),
+            ));
+        }
+        let before = state.settings;
+        let after = updated.effective();
+        let file = updated.path.display().to_string();
+        state.settings = after;
+        state.sources = Some(updated);
+        state.remembered.clear();
+        state.generation += 1;
+        self.ui.set_timing(after.remember, after.dialog_timeout);
+        drop(state);
+        if (before.lock_on_suspend, before.lock_on_screen_lock)
+            != (after.lock_on_suspend, after.lock_on_screen_lock)
+        {
+            let mut session = self.config.session_lock.clone();
+            session.on_suspend = after.lock_on_suspend;
+            session.on_screen_lock = after.lock_on_screen_lock;
+            self.session_watchers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .apply(self.me.clone(), &session, &self.lock_triggers);
+        }
+        // A shorter idle lock counts from the last use, not from now.
+        self.lock_if_idle();
+        match saved {
+            Ok(()) => Ok(ok("settings changed")),
+            Err(e) => Err(Failure::new(
+                ErrorCode::OutcomeUnknown,
+                format!(
+                    "the settings were changed and saved in {file}, but the file may not survive \
+                     a crash ({})",
+                    e.error
+                ),
+            )),
+        }
+    }
+
     fn broker_program(&self) -> Located {
         match &self.config.broker_program {
             None => helper_program::locate(broker_protocol::PROGRAM),
@@ -642,7 +832,7 @@ impl Agent {
         let now = Instant::now();
         state.remembered.retain(|r| r.until > now);
         let locked = state.vault.is_none();
-        let idle = self.config.idle_timeout;
+        let idle = state.settings.idle_timeout;
         let executable = std::fs::read_link("/proc/self/exe").ok();
         // `/proc/self/exe` itself always leads to the running file, even once
         // its name points elsewhere or nowhere.
@@ -676,6 +866,7 @@ impl Agent {
             // Those that can still be used: not the revoked ones whose
             // commands still run (`grants` lists those too).
             grants: Some(self.registry.count_live()),
+            settings: state.sources.as_ref().map(SettingsInfo::of),
         }
     }
 
@@ -947,8 +1138,22 @@ impl Agent {
     }
 
     /// Ask for approval (or use a remembered one). `event` is the audit
-    /// record to write with the outcome.
+    /// record to write with the outcome. An approval is a use of the vault:
+    /// it postpones the idle lock.
     fn approve(
+        &self,
+        request: ApprovalRequest,
+        remember_key: Option<String>,
+        event: AuditEvent,
+    ) -> Result<(), Failure> {
+        self.ask_approval(request, remember_key, event)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// [`Agent::approve`], without postponing the idle lock: for requests
+    /// that use no secret (`configure`).
+    fn ask_approval(
         &self,
         request: ApprovalRequest,
         remember_key: Option<String>,
@@ -961,7 +1166,6 @@ impl Agent {
             if state.remembered.iter().any(|r| &r.key == key) {
                 drop(state);
                 self.record(event.outcome("allowed_remembered"))?;
-                self.touch();
                 return Ok(());
             }
         }
@@ -1008,7 +1212,6 @@ impl Agent {
             }
             Decision::AllowOnce => {
                 self.record(event.outcome("allowed_once"))?;
-                self.touch();
                 Ok(())
             }
             Decision::AllowFor(duration) => match remember_key {
@@ -1020,12 +1223,10 @@ impl Agent {
                         key,
                         until: Instant::now() + duration,
                     });
-                    self.touch();
                     Ok(())
                 }
                 _ => {
                     self.record(event.outcome("allowed_once"))?;
-                    self.touch();
                     Ok(())
                 }
             },
@@ -3698,6 +3899,7 @@ mod tests {
                 broker_program: None,
                 broker_ready_timeout: None,
                 broker_lifetime: None,
+                settings: None,
             },
             Box::new(NoDialogs),
         );
@@ -3753,6 +3955,7 @@ mod tests {
                 broker_program: None,
                 broker_ready_timeout: None,
                 broker_lifetime: None,
+                settings: None,
             },
             Box::new(NoDialogs),
         );
@@ -3798,7 +4001,12 @@ mod tests {
     /// program at `broker` (which they never run, unless something is
     /// wrong).
     fn agent_in(dir: &Path, broker: &Path, ui: Box<dyn Ui>) -> Arc<Agent> {
-        Agent::new(
+        Agent::new(config_in(dir, broker), ui)
+    }
+
+    /// The configuration of [`agent_in`].
+    fn config_in(dir: &Path, broker: &Path) -> AgentConfig {
+        {
             AgentConfig {
                 vault: dir.join("vault.kdbx"),
                 socket: dir.join("agent.sock"),
@@ -3812,9 +4020,9 @@ mod tests {
                 broker_program: Some(broker.to_path_buf()),
                 broker_ready_timeout: Some(Duration::from_secs(2)),
                 broker_lifetime: None,
-            },
-            ui,
-        )
+                settings: None,
+            }
+        }
     }
 
     /// A stand-in broker program that leaves `marker` behind if it is ever
@@ -3842,16 +4050,19 @@ mod tests {
             ..GrantLimits::default()
         };
         let longest = Duration::from_secs(30 * 60);
-        let mut agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
         assert_eq!(agent.grant_lifetime(&limits), longest);
         for (asked, lasts) in [
             (Duration::from_secs(2), Duration::from_secs(2)),
             (Duration::from_secs(48 * 3600), longest),
         ] {
-            Arc::get_mut(&mut agent)
-                .expect("only handle")
-                .config
-                .broker_lifetime = Some(asked);
+            let agent = Agent::new(
+                AgentConfig {
+                    broker_lifetime: Some(asked),
+                    ..config_in(dir.path(), &broker)
+                },
+                Box::new(NoDialogs),
+            );
             assert_eq!(agent.grant_lifetime(&limits), lasts, "{asked:?}");
         }
     }
@@ -4193,6 +4404,7 @@ mod tests {
                 broker_program: None,
                 broker_ready_timeout: None,
                 broker_lifetime: None,
+                settings: None,
             },
             Box::new(TypesPassword(Mutex::new(Some(asked)))),
         );
@@ -4268,6 +4480,7 @@ mod tests {
                 broker_program: None,
                 broker_ready_timeout: None,
                 broker_lifetime: None,
+                settings: None,
             },
             Box::new(NoDialogs),
         );

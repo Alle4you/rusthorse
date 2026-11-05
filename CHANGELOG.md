@@ -61,6 +61,18 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   to the command (`run`), the other goes through the broker and leaves the
   destination and the variables for you to fill in. Edit and import notes
   explain grant revocation.
+- **Agent settings** ([ADR 0007](docs/adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)):
+  the idle timeout, remembered approvals, the dialog timeout and locking on
+  suspend and on screen lock can be kept in `~/.config/rusthorse/agent.toml`
+  (`--config` or `RUSTHORSE_AGENT_CONFIG` name another file), read when the
+  agent starts; the flags win over it, and `status` shows each setting and
+  where it comes from. The manager's **Settings** page changes them through
+  the new `configure` request: only while the vault is unlocked, after the
+  agent shows each old and new value in its own dialog — warning when a
+  change protects less — and then the agent saves the file, applies the
+  change at once and forgets remembered approvals. A setting a flag fixes
+  cannot be changed that way. The `toml` crate is now a dependency of
+  `rusthorse`, to read the file.
 - **History in the manager** ([ADR 0007](docs/adr/0007-visual-manager.md#4-remembered-approvals-and-history-m2)):
   the **History** page shows the agent's audit log, newest first, 200
   records at a time (**Load older** reads the ones before them), with a
@@ -220,6 +232,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- **Protocol 10**: `configure` and `status.settings` (the agent's settings).
+  Clients and agents of protocol 9 refuse each other at the version check.
+- **The agent's duration options have bounds**: `--idle-timeout` `0` or 1s
+  to 24h, `--remember` `0` or 1s to 8h, `--dialog-timeout` 15s to 5m. A value
+  outside them, or a settings file the agent cannot accept, stops its start
+  instead of being used.
 - **Protocol 9** (protocol 8, with broker profiles, existed only during
   development): a run through the broker is a request of its own,
   `broker_run_v2`, whose bindings each name their destination and whose

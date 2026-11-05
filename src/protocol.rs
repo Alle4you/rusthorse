@@ -59,7 +59,10 @@ use crate::broker_grant::{AutomaticLocks, GrantLimits};
 /// through the broker is a new request, not `broker_run` with more fields:
 /// a version-8 agent met after the version check refuses it whole, where it
 /// would ignore the destinations and the limits.
-pub const PROTOCOL_VERSION: u32 = 9;
+///
+/// 10: the agent's settings (ADR 0007, section 3): the `configure` request
+/// and `status.settings`.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
@@ -241,6 +244,119 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+    /// Change the agent's settings (ADR 0007, section 3). The vault must be
+    /// unlocked (the agent asks for the master password when it is not),
+    /// and the agent asks the human, showing each old and new value. It then
+    /// saves the settings file and applies the change at once.
+    Configure {
+        /// The settings to change; the others are left as they are.
+        settings: SettingsChange,
+    },
+}
+
+/// Settings to change ([`Request::Configure`]): only those given change.
+/// Durations are in whole seconds, as [`SettingsInfo`] reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsChange {
+    /// Lock after this much time without use; `0` never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    /// How long "Allow for …" lasts in `run` dialogs; `0` does not offer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_secs: Option<u64>,
+    /// How long a dialog waits for an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog_timeout_secs: Option<u64>,
+    /// Lock when the computer is about to sleep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_on_suspend: Option<bool>,
+    /// Lock when the session is locked or its screensaver starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_on_screen_lock: Option<bool>,
+}
+
+impl SettingsChange {
+    /// The change as a layer of settings, each value checked against its
+    /// bounds ([`crate::settings::check`]).
+    pub fn layer(&self) -> Result<crate::settings::Layer, String> {
+        use crate::settings::{Key, Value};
+        let mut layer = crate::settings::Layer::default();
+        let secs = |s: Option<u64>| s.map(|s| Value::Duration(std::time::Duration::from_secs(s)));
+        for (key, value) in [
+            (Key::IdleTimeout, secs(self.idle_timeout_secs)),
+            (Key::Remember, secs(self.remember_secs)),
+            (Key::DialogTimeout, secs(self.dialog_timeout_secs)),
+            (Key::LockOnSuspend, self.lock_on_suspend.map(Value::Switch)),
+            (
+                Key::LockOnScreenLock,
+                self.lock_on_screen_lock.map(Value::Switch),
+            ),
+        ] {
+            if let Some(value) = value {
+                layer.set(key, value)?;
+            }
+        }
+        Ok(layer)
+    }
+}
+
+/// One setting in effect, and where it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingInfo<T> {
+    /// Its value.
+    pub value: T,
+    /// Where it comes from: the default, the settings file, or a flag of
+    /// `rusthorse agent` (which a `configure` cannot change).
+    pub source: crate::settings::Source,
+}
+
+/// The agent's settings in effect ([`StatusInfo::settings`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsInfo {
+    /// The settings file's absolute path.
+    pub file: String,
+    /// Lock after this much time without use, in seconds; `0` never.
+    pub idle_timeout_secs: SettingInfo<u64>,
+    /// How long "Allow for …" lasts, in seconds; `0` is off.
+    pub remember_secs: SettingInfo<u64>,
+    /// How long a dialog waits for an answer, in seconds.
+    pub dialog_timeout_secs: SettingInfo<u64>,
+    /// Whether the vault locks when the computer suspends.
+    pub lock_on_suspend: SettingInfo<bool>,
+    /// Whether the vault locks when the screen locks.
+    pub lock_on_screen_lock: SettingInfo<bool>,
+}
+
+impl SettingsInfo {
+    /// What `status` reports of `sources`.
+    pub fn of(sources: &crate::settings::Sources) -> Self {
+        use crate::settings::Key;
+        let settings = sources.effective();
+        SettingsInfo {
+            file: sources.path.display().to_string(),
+            idle_timeout_secs: SettingInfo {
+                value: settings.idle_timeout.as_secs(),
+                source: sources.source(Key::IdleTimeout),
+            },
+            remember_secs: SettingInfo {
+                value: settings.remember.as_secs(),
+                source: sources.source(Key::Remember),
+            },
+            dialog_timeout_secs: SettingInfo {
+                value: settings.dialog_timeout.as_secs(),
+                source: sources.source(Key::DialogTimeout),
+            },
+            lock_on_suspend: SettingInfo {
+                value: settings.lock_on_suspend,
+                source: sources.source(Key::LockOnSuspend),
+            },
+            lock_on_screen_lock: SettingInfo {
+                value: settings.lock_on_screen_lock,
+                source: sources.source(Key::LockOnScreenLock),
+            },
+        }
+    }
 }
 
 /// Where [`Request::ImportFrom`] reads the values.
@@ -325,6 +441,7 @@ impl Request {
             Request::KeyringItems | Request::DotenvNames { .. } => false,
             // Like `lock`: ending a grant twice does no harm.
             Request::Grants | Request::RevokeGrant { .. } => false,
+            Request::Configure { .. } => true,
         }
     }
 }
@@ -963,6 +1080,11 @@ pub struct StatusInfo {
     /// until its command ends. Left out by agents that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<usize>,
+    /// The agent's settings in effect, where each comes from, and the
+    /// settings file (ADR 0007, section 3). Left out by agents that predate
+    /// it, and by an agent started without a settings file (tests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SettingsInfo>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1428,6 +1550,7 @@ mod tests {
             lock_triggers: vec![],
             broker: None,
             grants: None,
+            settings: None,
         };
         let json = serde_json::to_value(&status).expect("json");
         assert!(json.get("agent_executable_replaced").is_none(), "{json}");

@@ -34,6 +34,7 @@
 //! - [`exec`]: program resolution and environment preparation for `run`.
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`session_lock`]: locking when the screen locks or the computer suspends.
+//! - [`settings`]: the agent's settings, their bounds and their file.
 //! - `supervise`: deadlines and process groups for the helper processes of dialogs.
 //! - [`peer`]: identifying the process on the other end of the socket.
 //! - [`audit`]: the append-only audit log.
@@ -62,6 +63,7 @@ pub mod peer;
 pub mod protocol;
 pub mod redact;
 pub mod session_lock;
+pub mod settings;
 mod supervise;
 pub mod ui;
 pub mod util;

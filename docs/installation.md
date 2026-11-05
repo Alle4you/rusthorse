@@ -204,7 +204,14 @@ Logs go to the journal: `journalctl --user -u rusthorse-agent`.
 
 ### Changing agent options
 
-Use a drop-in so that upgrades keep your settings:
+The agent's settings — auto-lock, remembered approvals, the dialog timeout,
+locking on suspend and on screen lock — are changed in the manager's
+**Settings** page, or in `~/.config/rusthorse/agent.toml` while the agent is
+stopped ([cli.md](cli.md#settings)). An option on the service's command line
+wins over both, and the manager cannot change it.
+
+For other options — the vault's location, say — use a drop-in so that
+upgrades keep your settings:
 
 ```sh
 systemctl --user edit rusthorse-agent
@@ -214,10 +221,10 @@ systemctl --user edit rusthorse-agent
 [Service]
 # Different vault location
 Environment=RUSTHORSE_VAULT=%h/Sync/passwords.kdbx
-# Clear the original ExecStart, then set a new one
+# Or clear the original ExecStart, then set a new one
 # (with the package, the program is /usr/bin/rusthorse)
-ExecStart=
-ExecStart=%h/.cargo/bin/rusthorse agent --idle-timeout 30m
+#ExecStart=
+#ExecStart=%h/.cargo/bin/rusthorse agent --audit-log %h/rusthorse-audit.jsonl
 ```
 
 Then `systemctl --user restart rusthorse-agent`. All agent options are listed

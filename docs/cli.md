@@ -97,7 +97,7 @@ Run the agent in the foreground. Normally started by the systemd unit
 (see [installation.md](installation.md)).
 
 ```
-rusthorse agent [--vault PATH] [--audit-log PATH]
+rusthorse agent [--vault PATH] [--audit-log PATH] [--config PATH]
                 [--idle-timeout DURATION] [--remember DURATION]
                 [--dialog-timeout DURATION]
                 [--no-lock-on-suspend] [--no-lock-on-screen-lock]
@@ -105,13 +105,60 @@ rusthorse agent [--vault PATH] [--audit-log PATH]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--idle-timeout` | `15m` | Lock after this much inactivity; `0` never locks. |
-| `--remember` | `0` (off) | Offer "Allow for DURATION" in `run` dialogs. Off by default; read [ADR 0005](adr/0005-remembered-approvals-opt-in.md) before enabling it. |
-| `--dialog-timeout` | `2m` | Unanswered dialogs are denied (or cancelled) after this long. |
+| `--config` | `$XDG_CONFIG_HOME/rusthorse/agent.toml` | The settings file (also `RUSTHORSE_AGENT_CONFIG`); see [Settings](#settings). |
+| `--idle-timeout` | `15m` | Lock after this much inactivity: `0` (never), or 1s to 24h. |
+| `--remember` | `0` (off) | Offer "Allow for DURATION" in `run` dialogs: `0`, or 1s to 8h. Off by default; read [ADR 0005](adr/0005-remembered-approvals-opt-in.md) before enabling it. |
+| `--dialog-timeout` | `2m` | Unanswered dialogs are denied (or cancelled) after this long: 15s to 5m. |
 | `--no-lock-on-suspend` | off | Do not lock when the computer is about to sleep. |
 | `--no-lock-on-screen-lock` | off | Do not lock when the session is locked or its screensaver starts. |
 
-Durations are a number followed by `s`, `m` or `h`, or `0`.
+Durations are a number followed by `s`, `m` or `h`, or `0`. A value outside
+these bounds stops the agent's start (earlier builds accepted any).
+
+### Settings
+
+The last five options are the agent's settings
+([ADR 0007, section 3](adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)).
+Each comes from its default, from the settings file, or from an explicit
+flag, which wins over the file. The file is TOML with these keys, each
+optional; durations are written as the flags take them:
+
+```toml
+idle_timeout = "30m"
+remember = "0"
+dialog_timeout = "1m"
+lock_on_suspend = true
+lock_on_screen_lock = true
+```
+
+The agent reads it when it starts. A missing file means the defaults. A file
+it cannot accept stops its start, saying which file, key and values are
+allowed: not a regular file, not yours, writable by its group or by others
+(the agent cannot tell whether a group is yours alone; with a umask of `002`,
+make a file you wrote by hand private with `chmod 600`, as the error says),
+under a directory someone else could change (another user's, or one its
+group or others can write, without the sticky bit: they could remove or
+replace the file) or through another user's link — the path is followed
+link by link, and the file read must be the one checked — larger than
+64 KiB, an unknown key, a wrong type, or a
+value out of bounds. The agent does not fall back to the defaults, which may
+protect less than what you set. It cannot tell a missing file from a removed
+one, so it saves the file only under directories nobody else can change; if
+`~/.config` is writable by its group, the manager's Apply says so and asks
+you to `chmod go-w` it.
+
+The manager's **Settings** page changes them while the agent runs: the agent
+asks for the master password if the vault is locked, shows each old and new
+value in its own dialog, and then saves the file — rewriting it whole,
+without comments, mode `0600`; a link at its path is replaced by the file;
+missing directories are created private, existing ones are left as they
+are — applies the
+change at once and forgets remembered approvals. A setting a flag fixes
+cannot be changed there: remove the flag from the service and restart the
+agent. Edits by hand take effect at the agent's next start. Any program of
+yours can edit the file and restart the agent, so the dialog guards the
+changes made through the agent, not the file
+([threat model L1](threat-model.md#l1--malware-running-as-you-can-defeat-rusthorse)).
 
 Besides the idle timer, the agent locks the vault when the computer is about
 to suspend or hibernate — logind waits for it, thanks to a delay inhibitor
@@ -131,7 +178,9 @@ rusthorse status [--json]
 ```
 
 Shows the agent version, the vault path, whether it is locked, when it will
-lock itself, how many approvals are remembered, which program shows its
+lock itself, how many approvals are remembered, the agent's settings — the
+file, then each setting in effect and where it comes from (`default`,
+`settings file`, `set by --remember`) — which program shows its
 dialogs (the path of `rusthorse-dialog`, `zenity`, or `none:` and why), what
 else locks the vault, and the program file the agent runs (with a note if it
 was replaced since the agent started). From an agent that reports them, it
