@@ -18,7 +18,7 @@ use rusthorse::protocol::{
     ErrorCode, Field, GrantInfo, ImportSource, NewEntry, Request, Response, RunRequest,
     SecretString, StatusInfo, UnauthorizedGrant, ValueChange,
 };
-use rusthorse::ui::{Prompt, Typed, Ui};
+use rusthorse::ui::{Connection, Prompt, Typed, Ui};
 use rusthorse::util::{format_duration, is_valid_env_name, parse_duration};
 use rusthorse::vault::{KdfParams, Vault};
 use rusthorse::{audit, paths, settings};
@@ -956,7 +956,8 @@ fn new_master_password() -> anyhow::Result<SecretString> {
         let ui = DesktopUi::new(Duration::ZERO, Duration::from_secs(300));
         let ask =
             |headline: &str, explanation: &str, field: &str| -> anyhow::Result<SecretString> {
-                match ui.master_password(&Prompt {
+                // Asked by this process itself: no requester to watch.
+                let prompt = Prompt {
                     title: "Rusthorse — new vault".into(),
                     headline: headline.into(),
                     explanation: explanation.into(),
@@ -964,11 +965,12 @@ fn new_master_password() -> anyhow::Result<SecretString> {
                     details: Vec::new(),
                     field: field.into(),
                     confirm: "OK".into(),
-                })? {
+                };
+                match ui.master_password(&prompt, Connection::none())? {
                     Typed::Value(value) => Ok(value),
                     // A dialog cancelled or not answered: exit 4, as with the
-                    // agent's dialogs.
-                    Typed::Cancelled => {
+                    // agent's dialogs. (Nothing watched cannot go away.)
+                    Typed::Cancelled | Typed::RequesterGone => {
                         eprintln!("rusthorse: cancelled; no vault was created");
                         Err(Exit(EXIT_DENIED).into())
                     }

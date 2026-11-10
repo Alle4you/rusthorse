@@ -173,6 +173,9 @@ pub struct AuditLog {
     path: PathBuf,
     /// Held while a record is written.
     lock: Mutex<Unsynced>,
+    /// Records waiting for the log, for tests that hold it.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 /// Directories that hold the name of a directory made for the log and have
@@ -332,6 +335,8 @@ impl AuditLog {
         Self {
             path,
             lock: Mutex::default(),
+            #[cfg(test)]
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -345,6 +350,13 @@ impl AuditLog {
     #[cfg(test)]
     pub(crate) fn hold(&self) -> impl Sized + '_ {
         self.lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How many records wait for the log (held, see [`AuditLog::hold`]).
+    /// For tests.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Append one record, stamped with the current time. An event is often
@@ -361,7 +373,13 @@ impl AuditLog {
     /// written. If writing or syncing the record fails, the record fails
     /// too, but part or all of it may be in the file.
     pub fn record(&self, event: &AuditEvent) -> io::Result<()> {
+        #[cfg(test)]
+        self.waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut unsynced = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        self.waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         let event = AuditEvent {
             time: now(),
             ..event.clone()

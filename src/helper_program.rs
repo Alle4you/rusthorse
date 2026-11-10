@@ -135,10 +135,12 @@ pub fn check_program(program: &Path, limit: Duration) -> anyhow::Result<(String,
         .stdout(Stdio::from(OwnedFd::from(theirs)))
         .stderr(Stdio::null());
     let child = Supervised::spawn(cmd)?;
-    let output = read_to_end_by(&ours, 4096, deadline).map_err(|e| match e.kind() {
-        io::ErrorKind::TimedOut => anyhow!("no complete answer to --check within {limit:?}"),
-        _ => anyhow!("cannot read its answer to --check: {e}"),
-    })?;
+    let output = read_to_end_by(&ours, 4096, deadline, crate::ui::Connection::none()).map_err(
+        |e| match e.kind() {
+            io::ErrorKind::TimedOut => anyhow!("no complete answer to --check within {limit:?}"),
+            _ => anyhow!("cannot read its answer to --check: {e}"),
+        },
+    )?;
     match child.exit_by(deadline)? {
         Some(exit) if exit.success() => {}
         Some(exit) => bail!("--check failed ({exit})"),

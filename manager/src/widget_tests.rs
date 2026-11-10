@@ -6,7 +6,7 @@ use super::*;
 use rusthorse::agent::{Agent, AgentConfig};
 use rusthorse::broker_grant::AutomaticLocks;
 use rusthorse::protocol::{ErrorCode, PROTOCOL_VERSION};
-use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
+use rusthorse::ui::{ApprovalRequest, Connection, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
 use std::sync::{
     Arc, Mutex,
@@ -23,13 +23,13 @@ struct Scripted(
     Arc<std::sync::atomic::AtomicUsize>,
 );
 impl Ui for Scripted {
-    fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+    fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
         Ok(Typed::Value("fake master password".to_string().into()))
     }
-    fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+    fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
         Ok(Typed::Value("FAKE-desktop-value".to_string().into()))
     }
-    fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+    fn approve(&self, _: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
         self.3.fetch_add(1, Ordering::SeqCst);
         let until = Instant::now() + Duration::from_secs(30);
         while self.1.load(Ordering::SeqCst) && Instant::now() < until {

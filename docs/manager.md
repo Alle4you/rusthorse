@@ -407,7 +407,10 @@ approvals and denials (and dialogs nobody answered), unlocks and locks, the
 commands it started and how they ended, the credential broker's grants and
 requests — newest first. Each record shows its time, action and outcome, in
 green when you approved, in the warning colour when you denied, cancelled
-or did not answer; then what else it says: the entries, the grant, a broker
+or did not answer (also when a dialog was taken down because the program
+that asked went away, `requester_gone`, which the **Denied or not
+answered** list shows too); then what else it says: the entries, the
+grant, a broker
 request (its number, the method's label, the status and the bytes sent and
 received), the grants a run creates, the command line and directory, the
 reason a grant ended and its count of requests, the detail, and the requester

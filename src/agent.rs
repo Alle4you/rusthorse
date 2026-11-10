@@ -62,7 +62,8 @@ use crate::protocol::{
 };
 use crate::redact::Redactor;
 use crate::session_lock;
-use crate::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
+use crate::supervise::poll_raw;
+use crate::ui::{ApprovalRequest, Connection, Decision, Prompt, Typed, Ui};
 use crate::util::{self, shell_join};
 use crate::vault::{ContentFingerprint, FingerprintKey, KdfParams, Vault, VaultError};
 
@@ -139,13 +140,16 @@ pub struct AgentConfig {
     pub settings: Option<crate::settings::Sources>,
 }
 
-/// A failed request: what goes back to the client as [`Response::Error`].
+/// A failed request: what goes back to the client as [`Response::Error`] —
+/// unless its requester went away, which gets no answer.
 #[derive(Debug)]
 pub struct Failure {
     /// Machine-readable reason.
     pub code: ErrorCode,
     /// Human-readable explanation.
     pub message: String,
+    /// The requester went away: its connection is shut down unanswered.
+    unanswered: bool,
 }
 
 impl Failure {
@@ -153,11 +157,21 @@ impl Failure {
         Self {
             code,
             message: message.into(),
+            unanswered: false,
         }
     }
 
     fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidRequest, message)
+    }
+
+    /// The requester went away, so the request stops here, unanswered (as a
+    /// cancelled run is: its connection is shut down). Nothing is done.
+    fn requester_gone(message: impl Into<String>) -> Self {
+        Self {
+            unanswered: true,
+            ..Self::new(ErrorCode::Cancelled, message)
+        }
     }
 }
 
@@ -248,6 +262,12 @@ impl Drop for CountGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// The failure of a request whose requester went away `before` its effect:
+/// no answer is sent.
+fn departed(before: &str) -> Failure {
+    Failure::requester_gone(format!("the requester went away {before}"))
 }
 
 fn locked_meanwhile() -> Failure {
@@ -497,6 +517,111 @@ impl Agent {
         })
     }
 
+    /// The requester has gone — it closed its connection or, for a run,
+    /// half-closed it — so the request stops before an effect: nothing is
+    /// done, `record` is written as `aborted`, saying why (best effort:
+    /// nothing acts after it, and it can be missing), and the request is
+    /// left unanswered. `record` is called only now, so that a caller with
+    /// something to undo first (a run's grants) does it there.
+    ///
+    /// The rule: the last check before an effect comes after every wait the
+    /// agent makes on the way to it for a dialog's turn, for the lock of its
+    /// state (which a save or a backup holds for a while), for an audit
+    /// record, for brokers to end or to start, and for a read from outside
+    /// (the keyring, a file). The registry of grants has a lock of its own,
+    /// held only for short work in memory: a wait for it is not followed by
+    /// a check. What remains unguarded is a departure during the effect. A
+    /// record of what a request does that comes before it does it
+    /// (`unlocked`, `changed`, `created`, a grant's `created`) is checked
+    /// right before it and again right before the effect (for a grant, at
+    /// the next check): a requester that leaves between the two leaves that
+    /// record, then `aborted` (or, for a grant, `ended`). Between them the
+    /// record is written, and then the agent may wait for its state's lock
+    /// (an unlock, a password change) or for the registry's (a grant). Every
+    /// such check ends here — through [`Agent::stop_if_gone`] or
+    /// [`Agent::state_unless_gone`] for most — or, for a run whose grants
+    /// were entered, through [`departed`] and the run's own record, written
+    /// once its grants have ended.
+    fn requester_left(&self, before: &str, record: impl FnOnce() -> AuditEvent) -> Failure {
+        let failure = departed(before);
+        let _ = self
+            .audit
+            .record(&record().outcome("aborted").detail(failure.message.clone()));
+        failure
+    }
+
+    /// Stop before an effect that does not need the state lock if the
+    /// requester has gone ([`Agent::requester_left`]).
+    fn stop_if_gone(
+        &self,
+        peer: &Peer,
+        before: &str,
+        record: impl FnOnce() -> AuditEvent,
+    ) -> Result<(), Failure> {
+        if peer.gone() {
+            return Err(self.requester_left(before, record));
+        }
+        Ok(())
+    }
+
+    /// The state lock, taken for an effect of `peer`'s request, which it
+    /// then makes under it — unless the requester has gone, also while this
+    /// waited for the lock (another request may hold it through a save or a
+    /// backup): then the lock is let go and the request stops
+    /// ([`Agent::requester_left`]).
+    fn state_unless_gone(
+        &self,
+        peer: &Peer,
+        before: &str,
+        record: impl FnOnce() -> AuditEvent,
+    ) -> Result<MutexGuard<'_, State>, Failure> {
+        let state = self.state();
+        if peer.gone() {
+            drop(state);
+            return Err(self.requester_left(before, record));
+        }
+        Ok(state)
+    }
+
+    /// The requester went away while its dialog was open, which was taken
+    /// down, or before it was shown: `event` is recorded with that outcome
+    /// (as a denial would be), and the request stops, unanswered — refused
+    /// as well if that record cannot be written, but unanswered still.
+    fn dialog_abandoned(&self, event: AuditEvent) -> Failure {
+        let mut failure = match self.record(event.outcome("requester_gone")) {
+            Ok(()) => Failure::requester_gone("the requester went away; nobody was asked"),
+            Err(failure) => failure,
+        };
+        failure.unanswered = true;
+        failure
+    }
+
+    /// Show an approval dialog for `peer` — not if it has gone, then
+    /// [`Decision::RequesterGone`] (also for a request that waited for its
+    /// turn). The caller holds the dialog lock.
+    fn show_approval(&self, request: &ApprovalRequest, peer: &Peer) -> anyhow::Result<Decision> {
+        if peer.gone() {
+            return Ok(Decision::RequesterGone);
+        }
+        self.ui.approve(request, peer.connection())
+    }
+
+    /// [`Agent::show_approval`] for a master-password dialog.
+    fn show_password(&self, prompt: &Prompt, peer: &Peer) -> anyhow::Result<Typed> {
+        if peer.gone() {
+            return Ok(Typed::RequesterGone);
+        }
+        self.ui.master_password(prompt, peer.connection())
+    }
+
+    /// [`Agent::show_approval`] for a dialog asking for a secret value.
+    fn show_value(&self, prompt: &Prompt, peer: &Peer) -> anyhow::Result<Typed> {
+        if peer.gone() {
+            return Ok(Typed::RequesterGone);
+        }
+        self.ui.secret_value(prompt, peer.connection())
+    }
+
     fn handle_connection(&self, stream: UnixStream) {
         if let Err(e) = self.handle_connection_inner(&stream)
             && !matches!(e.downcast_ref::<io::Error>(), Some(io) if io.kind() == io::ErrorKind::UnexpectedEof || io.kind() == io::ErrorKind::BrokenPipe)
@@ -528,6 +653,11 @@ impl Agent {
             }
         };
         drop(body);
+        // From here on the connection is watched for the requester leaving
+        // — closing it, or half-closing a run's (which cancels a run) — while
+        // a dialog is open or waited for, and before the request's effects.
+        let half_close_ends = matches!(request, Request::Run(_) | Request::BrokerRunV2(_));
+        let peer = peer.connected(Connection::new(stream.as_fd(), half_close_ends));
 
         let result = match request {
             // (A `run` that carries broker bindings does not parse: see
@@ -545,10 +675,18 @@ impl Agent {
             )),
             other => self.dispatch(&peer, other),
         };
-        let response = result.unwrap_or_else(|f| Response::Error {
-            code: f.code,
-            message: f.message,
-        });
+        let response = match result {
+            Ok(response) => response,
+            // Nobody to answer: shut down, as a cancelled run's connection.
+            Err(f) if f.unanswered => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Ok(());
+            }
+            Err(f) => Response::Error {
+                code: f.code,
+                message: f.message,
+            },
+        };
         protocol::send_frame(stream, &response, &[])?;
         Ok(())
     }
@@ -742,7 +880,7 @@ impl Agent {
                 .join("; "),
         );
         // Not a use of a secret: the idle lock is not postponed.
-        self.ask_approval(request, None, event)?;
+        self.ask_approval(request, None, event, peer)?;
 
         let mut changed = settings::Layer::default();
         for (key, _, new) in &changes {
@@ -752,7 +890,11 @@ impl Agent {
             file: sources.file.with(&changed),
             ..sources
         };
-        let mut state = self.state();
+        let mut state = self.state_unless_gone(
+            peer,
+            "before the settings were saved; nothing changed",
+            || AuditEvent::new("configure", peer),
+        )?;
         if state.generation != generation || state.vault.is_none() {
             return Err(locked_meanwhile());
         }
@@ -904,8 +1046,27 @@ impl Agent {
         f(vault)
     }
 
+    /// [`Agent::with_vault_at`] for an effect of `peer`'s request, which
+    /// stops instead if the requester has gone ([`Agent::state_unless_gone`]).
+    fn with_vault_unless_gone<R>(
+        &self,
+        generation: u64,
+        peer: &Peer,
+        (before, record): (&str, impl FnOnce() -> AuditEvent),
+        f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
+    ) -> Result<R, Failure> {
+        let mut state = self.state_unless_gone(peer, before, record)?;
+        if state.generation != generation {
+            return Err(locked_meanwhile());
+        }
+        let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
+        f(vault)
+    }
+
     /// Apply an approved change and save it, but only if nothing happened to
-    /// the vault since `generation`. The change is a transaction: if `f`
+    /// the vault since `generation` — and if `peer`, the requester, has not
+    /// gone (`stop`: what to say and record then, see
+    /// [`Agent::state_unless_gone`]). The change is a transaction: if `f`
     /// fails, everything it did is rolled back. If saving fails, the vault is
     /// locked so that memory never holds changes that are not on disk — and
     /// if it failed after the file was replaced, the answer is
@@ -916,9 +1077,11 @@ impl Agent {
     fn commit_reporting<R>(
         &self,
         generation: u64,
+        peer: &Peer,
+        stop: (&str, impl FnOnce() -> AuditEvent),
         f: impl FnOnce(&mut Vault) -> Result<R, Failure>,
     ) -> Result<(R, Option<String>), Failure> {
-        self.commit_changing(generation, |v, _| f(v))
+        self.commit_changing(generation, peer, stop, |v, _| f(v))
     }
 
     /// [`Agent::commit_reporting`] for a change to entries: `f` names, by
@@ -929,10 +1092,12 @@ impl Agent {
     fn commit_changing<R>(
         &self,
         generation: u64,
+        peer: &Peer,
+        (before, record): (&str, impl FnOnce() -> AuditEvent),
         f: impl FnOnce(&mut Vault, &mut Vec<String>) -> Result<R, Failure>,
     ) -> Result<(R, Option<String>), Failure> {
         let mut changed = Vec::new();
-        let mut state = self.state();
+        let mut state = self.state_unless_gone(peer, before, record)?;
         if state.generation != generation {
             return Err(locked_meanwhile());
         }
@@ -1011,7 +1176,7 @@ impl Agent {
         let mut tried = false;
         for attempt in 1..=UNLOCK_ATTEMPTS {
             let prompt = prompt_with(notice.take());
-            let password = match self.ui.master_password(&prompt)? {
+            let password = match self.show_password(&prompt, peer)? {
                 Typed::Value(password) => password,
                 Typed::Cancelled => {
                     self.record(AuditEvent::new("unlock", peer).outcome("cancelled"))?;
@@ -1023,6 +1188,9 @@ impl Agent {
                         ErrorCode::Cancelled,
                         "nobody answered the unlock dialog in time",
                     ));
+                }
+                Typed::RequesterGone => {
+                    return Err(self.dialog_abandoned(AuditEvent::new("unlock", peer)));
                 }
             };
             // Clicking Unlock with an empty field is not a guess at the
@@ -1058,9 +1226,17 @@ impl Agent {
                     // concerned, before the unlock completes. Decided as
                     // soon as the change is found, under the lock that
                     // checks the generation.
+                    // A requester that went away — while the password was
+                    // typed, or since — leaves the vault locked before any of
+                    // this: no grant ends for it, nothing is recorded but
+                    // `aborted`, and the fingerprint stays the last one.
                     let fingerprint = vault.content_fingerprint();
                     let ending = {
-                        let state = self.state();
+                        let state = self.state_unless_gone(
+                            peer,
+                            "before the vault was unlocked; it stays locked",
+                            || AuditEvent::new("unlock", peer),
+                        )?;
                         if state.generation != started {
                             drop(state);
                             return Err(locked_meanwhile(
@@ -1088,6 +1264,14 @@ impl Agent {
                              locked: {ended} grant(s) of the credential broker end"
                         ));
                     }
+                    // A requester that went away while the grants ended
+                    // leaves no `unlocked` record: the vault stays locked
+                    // (the grants ended stay ended).
+                    self.stop_if_gone(
+                        peer,
+                        "before its unlock was recorded; the vault stays locked",
+                        || AuditEvent::new("unlock", peer),
+                    )?;
                     // Recorded before the vault is unlocked, and outside the
                     // state lock, so that no lock waits for this record: if
                     // the audit log cannot be written, the vault stays
@@ -1096,8 +1280,16 @@ impl Agent {
                     self.record(event)?;
                     // Only a lock can have come meanwhile: this request
                     // holds the dialog lock, without which nothing else
-                    // unlocks or creates the vault.
-                    let mut state = self.state();
+                    // unlocks or creates the vault. A requester that went
+                    // away while the unlock was recorded, or while this
+                    // waits for the state lock, leaves the vault locked:
+                    // the vault read is dropped unused, and `aborted`
+                    // follows `unlocked`.
+                    let mut state = self.state_unless_gone(
+                        peer,
+                        "after its unlock was recorded; the vault stays locked",
+                        || AuditEvent::new("unlock", peer),
+                    )?;
                     if state.generation != started {
                         drop(state);
                         return Err(locked_meanwhile(
@@ -1145,8 +1337,9 @@ impl Agent {
         request: ApprovalRequest,
         remember_key: Option<String>,
         event: AuditEvent,
+        peer: &Peer,
     ) -> Result<(), Failure> {
-        self.ask_approval(request, remember_key, event)?;
+        self.ask_approval(request, remember_key, event, peer)?;
         self.touch();
         Ok(())
     }
@@ -1158,6 +1351,7 @@ impl Agent {
         request: ApprovalRequest,
         remember_key: Option<String>,
         event: AuditEvent,
+        peer: &Peer,
     ) -> Result<(), Failure> {
         if let Some(key) = &remember_key {
             let mut state = self.state();
@@ -1196,9 +1390,10 @@ impl Agent {
         }
         let decision = {
             let _dialog = self.dialog()?;
-            self.ui.approve(&request)?
+            self.show_approval(&request, peer)?
         };
         match decision {
+            Decision::RequesterGone => Err(self.dialog_abandoned(event)),
             Decision::Deny => {
                 self.record(event.outcome("denied"))?;
                 Err(Failure::new(ErrorCode::Denied, "the request was denied"))
@@ -1258,7 +1453,7 @@ impl Agent {
         }
         let value = {
             let _dialog = self.dialog()?;
-            self.ui.secret_value(&prompt)?
+            self.show_value(&prompt, peer)?
         };
         match value {
             Typed::Value(v) if !v.is_empty() => {
@@ -1266,8 +1461,8 @@ impl Agent {
                 Ok(v)
             }
             Typed::Value(_) => Err(Failure::invalid("empty value; nothing stored")),
+            Typed::RequesterGone => Err(self.dialog_abandoned(event)),
             Typed::Cancelled => {
-                let _ = peer;
                 self.record(event.outcome("cancelled"))?;
                 Err(Failure::new(ErrorCode::Cancelled, "cancelled"))
             }
@@ -1343,7 +1538,7 @@ impl Agent {
                     warnings: overwritten(),
                     can_remember: false,
                 };
-                self.approve(request, None, event)?;
+                self.approve(request, None, event.clone(), peer)?;
                 crate::generate::generate(spec).map_err(|e| Failure::invalid(e.to_string()))?
             }
             (None, None) => {
@@ -1371,7 +1566,7 @@ impl Agent {
                     field: "Secret value".into(),
                     confirm: "Save".into(),
                 };
-                self.ask_value(peer, prompt, event)?
+                self.ask_value(peer, prompt, event.clone())?
             }
             (Some(value), _) => {
                 let request = ApprovalRequest {
@@ -1390,11 +1585,12 @@ impl Agent {
                     warnings: overwritten(),
                     can_remember: false,
                 };
-                self.approve(request, None, event)?;
+                self.approve(request, None, event.clone(), peer)?;
                 value
             }
         };
-        self.commit_changing(generation, |v, changed| {
+        let stop = ("before the entry was saved; nothing changed", || event);
+        self.commit_changing(generation, peer, stop, |v, changed| {
             let uuid = v.find(&entry.name).ok().map(|id| v.info(id).id);
             let replaced = v.add(&entry, &value, replace)?;
             if replaced {
@@ -1435,13 +1631,27 @@ impl Agent {
             warnings: Vec::new(),
             can_remember: false,
         };
-        self.approve(request, None, AuditEvent::new("keyring_items", peer))?;
-        let locks = self.state().locks;
+        self.approve(request, None, AuditEvent::new("keyring_items", peer), peer)?;
+        // Checked under the lock that reads the count of locks (another
+        // request may hold it through a save), which is let go before the
+        // keyring is asked.
+        let locks = self
+            .state_unless_gone(peer, "before the keyring was listed", || {
+                AuditEvent::new("keyring_items", peer)
+            })?
+            .locks;
         let items = crate::keyring::items(&self.config.keyring)
             .map_err(|e| Failure::new(ErrorCode::Internal, format!("{e:#}")))?;
         // What this program may now import from, and what its dialogs show —
-        // unless the vault was locked meanwhile, which forgets approvals.
-        let mut state = self.state();
+        // unless the vault was locked meanwhile, which forgets approvals, or
+        // the requester went away while the keyring answered. (Its start
+        // time is read first: nothing but the listing comes after the check.)
+        let requester = (peer.pid, crate::peer::start_time(peer.pid));
+        let mut state = self.state_unless_gone(
+            peer,
+            "after the keyring was listed; the listing is not kept",
+            || AuditEvent::new("keyring_items", peer),
+        )?;
         if state.locks != locks {
             return Err(Failure::new(
                 ErrorCode::Locked,
@@ -1449,7 +1659,7 @@ impl Agent {
             ));
         }
         state.keyring_listing = Some(KeyringListing {
-            requester: (peer.pid, crate::peer::start_time(peer.pid)),
+            requester,
             at: Instant::now(),
             items: items
                 .iter()
@@ -1490,7 +1700,11 @@ impl Agent {
             request,
             None,
             AuditEvent::new("dotenv_names", peer).detail(path),
+            peer,
         )?;
+        self.stop_if_gone(peer, "before the file was read", || {
+            AuditEvent::new("dotenv_names", peer)
+        })?;
         let parsed = read_dotenv(path, None)?;
         Ok(Response::Names {
             names: parsed.pairs.into_iter().map(|(name, _)| name).collect(),
@@ -1660,7 +1874,15 @@ impl Agent {
             Origin::Dotenv(path) => AuditEvent::new("import_from", peer).detail(*path),
         };
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-        self.approve(request, None, event.entries(names))?;
+        let event = event.entries(names);
+        self.approve(request, None, event.clone(), peer)?;
+        // Before the values are read (the agent reads some itself), and again
+        // before they are saved.
+        self.stop_if_gone(
+            peer,
+            "before the values were read; nothing was imported",
+            || event.clone(),
+        )?;
         let values = values()?;
         if values.len() != entries.len() {
             return Err(Failure::new(
@@ -1668,7 +1890,11 @@ impl Agent {
                 "the source gave a different number of values; nothing was imported",
             ));
         }
-        self.commit_changing(generation, |v, changed| {
+        let stop = (
+            "before the entries were saved; nothing was imported",
+            || event,
+        );
+        self.commit_changing(generation, peer, stop, |v, changed| {
             let (mut added, mut replaced, mut skipped) = (0, 0, 0);
             for (entry, value) in entries.iter().zip(&values) {
                 let uuid = v.find(&entry.name).ok().map(|id| v.info(id).id);
@@ -1751,7 +1977,7 @@ impl Agent {
                 warnings: ends_grants(ends).into_iter().collect(),
                 can_remember: false,
             };
-            self.approve(request, None, event.clone())?;
+            self.approve(request, None, event.clone(), peer)?;
         }
         let new_value = match changes.value.take() {
             Some(ValueChange::Provided(v)) => Some(v),
@@ -1771,11 +1997,12 @@ impl Agent {
                     field: "New value".into(),
                     confirm: "Save".into(),
                 };
-                Some(self.ask_value(peer, prompt, event)?)
+                Some(self.ask_value(peer, prompt, event.clone())?)
             }
             _ => None,
         };
-        self.commit_changing(generation, |v, changed| {
+        let stop = ("before the change was saved; nothing changed", || event);
+        self.commit_changing(generation, peer, stop, |v, changed| {
             let id = v.find(&current.id)?;
             v.edit(id, &changes, new_value.as_ref())?;
             changed.push(current.id.clone());
@@ -1808,12 +2035,10 @@ impl Agent {
                 .collect(),
             can_remember: false,
         };
-        self.approve(
-            request,
-            None,
-            AuditEvent::new("remove", peer).entries(vec![info.identity()]),
-        )?;
-        self.commit_changing(generation, |v, changed| {
+        let event = AuditEvent::new("remove", peer).entries(vec![info.identity()]);
+        self.approve(request, None, event.clone(), peer)?;
+        let stop = ("before the entry was deleted; nothing changed", || event);
+        self.commit_changing(generation, peer, stop, |v, changed| {
             let id = v.find(&info.id)?;
             v.remove(id);
             changed.push(info.id.clone());
@@ -1842,12 +2067,13 @@ impl Agent {
             };
             let answer = {
                 let _dialog = self.dialog()?;
-                self.ui.master_password(&prompt)?
+                self.show_password(&prompt, peer)?
             };
             // Any dialog of the three that is not answered ends the change,
             // and is recorded as such.
             let (outcome, failure) = match answer {
                 Typed::Value(value) => return Ok(value),
+                Typed::RequesterGone => return Err(self.dialog_abandoned(event.clone())),
                 Typed::Cancelled => ("cancelled", Failure::new(ErrorCode::Cancelled, "cancelled")),
                 Typed::TimedOut => (
                     "timed_out",
@@ -1892,8 +2118,19 @@ impl Agent {
                 "the new master password must have at least 8 characters",
             ));
         }
-        self.record(event.outcome("changed"))?;
-        let ((), cleanup) = self.commit_reporting(generation, |v| {
+        // Before the record that says it changed, and again under the lock
+        // that saves it (`aborted` then follows `changed`).
+        self.stop_if_gone(
+            peer,
+            "before the password was changed; nothing changed",
+            || event.clone(),
+        )?;
+        self.record(event.clone().outcome("changed"))?;
+        let stop = (
+            "after its change was recorded; the password was not changed",
+            || event,
+        );
+        let ((), cleanup) = self.commit_reporting(generation, peer, stop, |v| {
             v.change_password(first);
             Ok(())
         })?;
@@ -1975,8 +2212,9 @@ impl Agent {
             ));
         }
         let ask = |prompt: Prompt| -> Result<SecretString, Failure> {
-            let (outcome, failure) = match self.ui.master_password(&prompt)? {
+            let (outcome, failure) = match self.show_password(&prompt, peer)? {
                 Typed::Value(value) => return Ok(value),
+                Typed::RequesterGone => return Err(self.dialog_abandoned(event.clone())),
                 Typed::Cancelled => (
                     "cancelled",
                     Failure::new(ErrorCode::Cancelled, "cancelled; no vault was created"),
@@ -2011,8 +2249,20 @@ impl Agent {
                 "the master password must have at least 8 characters; no vault was created",
             ));
         }
+        self.stop_if_gone(
+            peer,
+            "before the vault was created; no vault was created",
+            || event.clone(),
+        )?;
         // Record first: if the audit log cannot be written, nothing is created.
+        // A requester that went away while the record waited for the log
+        // leaves `created` followed by `aborted`, and no vault.
         self.record(event.clone().outcome("created"))?;
+        self.stop_if_gone(
+            peer,
+            "after its creation was recorded; no vault was created",
+            || event.clone(),
+        )?;
         let vault = match Vault::create_fingerprinted(
             &path,
             first,
@@ -2029,7 +2279,10 @@ impl Agent {
                 return Err(failure);
             }
         };
-        let mut state = self.state();
+        // Created, it is put in use only for a requester still there: one
+        // that went away while it was created leaves it locked.
+        let created_locked = "after the vault was created; it was created, and stays locked";
+        let mut state = self.state_unless_gone(peer, created_locked, || event.clone())?;
         // No vault can have been opened meanwhile: unlocking waits for the
         // dialog lock, which this request holds.
         if state.generation != started {
@@ -2048,6 +2301,19 @@ impl Agent {
         let fingerprint = vault.content_fingerprint();
         let ending = (fingerprint.is_none() || state.content != fingerprint)
             .then(|| self.registry.decide(Which::All, EndReason::VaultChanged));
+        // That decision may have waited for the registry's lock: the
+        // requester is checked once more (a poll), right before the vault is
+        // put in use. One gone by then leaves it locked; the grants ended
+        // stay ended, as at an unlock, and `aborted` is written once they
+        // are, without the state lock.
+        if peer.gone() {
+            drop(state);
+            if let Some(ending) = ending {
+                ending.complete();
+            }
+            drop(vault);
+            return Err(self.requester_left(created_locked, || event.clone()));
+        }
         state.vault = Some(vault);
         state.content = fingerprint;
         state.last_used = Instant::now();
@@ -2141,8 +2407,9 @@ impl Agent {
         let event = AuditEvent::new("reveal", peer)
             .entries(vec![info.identity()])
             .detail(audited);
-        self.approve(request, None, event)?;
-        self.with_vault_at(generation, |v| {
+        self.approve(request, None, event.clone(), peer)?;
+        let before = format!("before the {what} was read; nothing was revealed");
+        self.with_vault_unless_gone(generation, peer, (&before, || event), |v| {
             let id = v.find(&info.id)?;
             let value = read(v, id).ok_or_else(|| {
                 Failure::new(ErrorCode::NotFound, format!("{name} has no {what}"))
@@ -2159,7 +2426,18 @@ impl Agent {
         if !dest.is_absolute() {
             return Err(Failure::invalid("the backup path must be absolute"));
         }
-        let count = self.with_vault(peer, |v| Ok(v.backup_to(&dest)?))?;
+        // No dialog of its own: it may have waited for the unlock of another
+        // request, its requester gone meanwhile.
+        self.ensure_unlocked(peer)?;
+        let count = {
+            let mut state = self.state_unless_gone(
+                peer,
+                "before the backup was written; nothing was written",
+                || AuditEvent::new("backup", peer),
+            )?;
+            let vault = state.vault.as_mut().ok_or_else(locked_meanwhile)?;
+            vault.backup_to(&dest)?
+        };
         self.record(
             AuditEvent::new("backup", peer)
                 .outcome("written")
@@ -2598,7 +2876,8 @@ impl Agent {
         if !audited_env.is_empty() {
             event = event.detail(audited_env.join("; "));
         }
-        self.approve(request, key, event)?;
+        self.approve(request, key, event, peer)?;
+        let not_run = "before the command started; nothing was run";
         // Every failure from here on, before the command starts, follows the
         // approval's record with one that says why nothing ran (best effort).
         let aborted = |failure: Failure| {
@@ -2635,11 +2914,12 @@ impl Agent {
             ));
         }
         // ...and read the values under the same lock that checks that the
-        // vault did not change (no edit, lock or reload since the dialog).
-        // The grants are entered under that lock too, as starting: a lock
-        // comes either before (nothing was read) or after (it ends them).
-        // From this point on the approval is consumed: a later `lock` does
-        // not stop the command (it ends its grants).
+        // vault did not change (no edit, lock or reload since the dialog) and
+        // that the requester is still there (also after a wait for the
+        // lock). The grants are entered under that lock too, as starting: a
+        // lock comes either before (nothing was read) or after (it ends
+        // them). From this point on the approval is consumed: a later `lock`
+        // does not stop the command (it ends its grants).
         let command_text = shell_join(&run.argv);
         type UnderLock = (
             Vec<(String, String, SecretString)>,
@@ -2647,7 +2927,7 @@ impl Agent {
             Option<RunGrants>,
         );
         let (secrets, credentials, mut run_grants): UnderLock = self
-            .with_vault_at(generation, |v| {
+            .with_vault_unless_gone(generation, peer, (not_run, run_record), |v| {
                 let secrets = run
                     .bindings
                     .iter()
@@ -2697,8 +2977,15 @@ impl Agent {
                 Ok((secrets, credentials, run_grants))
             })
             // Locked or changed meanwhile, an entry gone, or no room left
-            // for the grants (another run took it).
-            .map_err(aborted)?;
+            // for the grants (another run took it) — or the requester gone,
+            // which is on record already.
+            .map_err(|failure| {
+                if failure.unanswered {
+                    failure
+                } else {
+                    aborted(failure)
+                }
+            })?;
 
         // With grants, before the command starts: each grant's creation is
         // recorded, its broker started and ready, and all of them made
@@ -2716,6 +3003,16 @@ impl Agent {
             Ok(prepared) => prepared,
             Err((failure, reason)) => return Err(abandon(run_grants.take(), reason, failure)),
         };
+        // The last check, right before the command starts (with grants, once
+        // they are ready): a requester that went away meanwhile — while the
+        // brokers started, say — has its grants ended first, and nothing
+        // runs.
+        self.stop_if_gone(peer, not_run, || {
+            if let Some(run_grants) = run_grants.take() {
+                run_grants.finish(EndReason::CommandEnded);
+            }
+            run_record()
+        })?;
 
         let mut command = Command::new(&program.canonical);
         command
@@ -2986,7 +3283,17 @@ impl Agent {
                 )));
             }
         };
+        // The requester is checked before each grant's record of its
+        // creation (a requester already gone leaves none), and once more
+        // right before the brokers start, after what can wait on the way
+        // there (the tokens, the registry's lock): no broker gets its
+        // credential for a requester gone by then. Its run records why
+        // nothing ran once the grants have ended.
+        let gone = |before: &str| (departed(before), EndReason::CommandEnded);
         for (grant, id) in grants.iter().zip(ids) {
+            if peer.gone() {
+                return Err(gone("before its grants were created; nothing was run"));
+            }
             let mut event = AuditEvent::new("grant", peer)
                 .outcome("created")
                 .entries(vec![grant.identity.clone()]);
@@ -3020,6 +3327,11 @@ impl Agent {
             .config
             .broker_ready_timeout
             .unwrap_or(broker_protocol::READY_TIMEOUT);
+        if peer.gone() {
+            return Err(gone(
+                "after its grants' creation was recorded; no broker was started and nothing was run",
+            ));
+        }
         let ports = run_grants.start(&broker, installs, ready).map_err(|why| {
             failed(format!(
                 "the credential broker could not serve a grant: {why}"
@@ -3610,24 +3922,6 @@ fn pump(
     }
 }
 
-/// `poll(2)` on raw descriptors. `nix`'s `PollFd::revents()` returns `None`
-/// when the kernel reports a bit `nix` does not name (`POLLRDHUP`, needed to
-/// notice a half-closed connection), so the agent reads the events itself.
-#[allow(unsafe_code)]
-fn poll_raw(fds: &mut [nix::libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
-    loop {
-        // SAFETY: `fds` is a valid, exclusively borrowed slice of pollfd.
-        let n = unsafe { nix::libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
-        if n >= 0 {
-            return Ok(n as usize);
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
-}
-
 /// Stdin credit to send back to the client, written by its own thread so
 /// that the watcher never writes to the socket (a client that does not read
 /// would block that write, and the watcher must keep watching).
@@ -3760,6 +4054,8 @@ impl Watch {
             }
             match poll_raw(&mut fds, 200) {
                 Ok(_) => {}
+                // A signal: poll again (the loop waits 200 ms at a time).
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => return self.cancel(),
             }
             let socket = fds[0].revents;
@@ -3866,13 +4162,13 @@ mod tests {
     struct NoDialogs;
 
     impl Ui for NoDialogs {
-        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             unreachable!("no dialog expected")
         }
-        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             unreachable!("no dialog expected")
         }
-        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+        fn approve(&self, _: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
             unreachable!("no dialog expected")
         }
     }
@@ -3913,10 +4209,15 @@ mod tests {
             ..NewEntry::default()
         };
         let failure = agent
-            .commit_reporting(generation, |v| {
-                v.add(&entry, &SecretString::new("abcd".into()), false)?;
-                Ok(())
-            })
+            .commit_reporting(
+                generation,
+                &Peer::agent(),
+                ("", || AuditEvent::new("add", &Peer::agent())),
+                |v| {
+                    v.add(&entry, &SecretString::new("abcd".into()), false)?;
+                    Ok(())
+                },
+            )
             .expect_err("the save did not complete");
         assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
         assert!(
@@ -3985,10 +4286,15 @@ mod tests {
             ..NewEntry::default()
         };
         agent
-            .commit_reporting(generation, |v| {
-                v.add(&entry, &SecretString::new("abcd".into()), false)?;
-                Ok(())
-            })
+            .commit_reporting(
+                generation,
+                &Peer::agent(),
+                ("", || AuditEvent::new("add", &Peer::agent())),
+                |v| {
+                    v.add(&entry, &SecretString::new("abcd".into()), false)?;
+                    Ok(())
+                },
+            )
             .expect_err("the save did not complete");
         assert!(agent.state().vault.is_none());
         assert_eq!(agent.registry.list()[0].state, "revoked");
@@ -4227,13 +4533,13 @@ mod tests {
     struct TakesTheRoomUi(Arc<TakesTheRoom>);
 
     impl Ui for TakesTheRoomUi {
-        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             unreachable!("no password dialog expected")
         }
-        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             unreachable!("no value dialog expected")
         }
-        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+        fn approve(&self, _: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
             let agent = self.0.agent.lock().expect("lock").upgrade().expect("agent");
             let all: Vec<NewGrant> = (0..broker_protocol::MAX_GRANTS)
                 .map(|i| NewGrant {
@@ -4358,16 +4664,16 @@ mod tests {
     struct TypesPassword(Mutex<Option<std::sync::mpsc::Sender<()>>>);
 
     impl Ui for TypesPassword {
-        fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             if let Some(asked) = self.0.lock().expect("lock").take() {
                 let _ = asked.send(());
             }
             Ok(Typed::Value(SecretString::new("correct horse".into())))
         }
-        fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+        fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
             unreachable!("no value dialog expected")
         }
-        fn approve(&self, _: &ApprovalRequest) -> anyhow::Result<Decision> {
+        fn approve(&self, _: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
             unreachable!("no approval expected")
         }
     }
@@ -4562,6 +4868,810 @@ mod tests {
                 assert!(!request.can_remember);
             }
         }
+    }
+
+    /// Answers every dialog — the master password, a value, Allow once —
+    /// and holds the first one open: it says when that one is shown, and
+    /// answers it once told to.
+    struct HoldsTheFirst {
+        shown: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        answer: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        asked: AtomicUsize,
+    }
+
+    impl HoldsTheFirst {
+        /// The UI, how to know that its first dialog is shown, and how to
+        /// have it answered.
+        fn new() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (shown, is_shown) = std::sync::mpsc::channel();
+            let (answer, answered) = std::sync::mpsc::channel();
+            let ui = HoldsTheFirst {
+                shown: Mutex::new(Some(shown)),
+                answer: Mutex::new(Some(answered)),
+                asked: AtomicUsize::new(0),
+            };
+            (ui, is_shown, answer)
+        }
+
+        fn shown(&self) {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let shown = self.shown.lock().expect("lock").take();
+            if let Some(shown) = shown {
+                let _ = shown.send(());
+                let answer = self.answer.lock().expect("lock").take();
+                if let Some(answer) = answer {
+                    let _ = answer.recv_timeout(Duration::from_secs(30));
+                }
+            }
+        }
+    }
+
+    impl Ui for HoldsTheFirst {
+        fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
+            self.shown();
+            Ok(Typed::Value(SecretString::new("correct horse".into())))
+        }
+        fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
+            self.shown();
+            Ok(Typed::Value(SecretString::new("fake-typed-value".into())))
+        }
+        fn approve(&self, _: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
+            self.shown();
+            Ok(Decision::AllowOnce)
+        }
+    }
+
+    /// A vault in `dir` holding `entries` (fake values).
+    fn vault_with(dir: &Path, entries: &[&str]) -> Vault {
+        let mut vault = Vault::create(
+            &dir.join("vault.kdbx"),
+            SecretString::new("correct horse".into()),
+            KdfParams::INSECURE_FOR_TESTS,
+        )
+        .expect("create");
+        for name in entries {
+            let entry = NewEntry {
+                name: (*name).into(),
+                ..NewEntry::default()
+            };
+            vault
+                .add(&entry, &SecretString::new("fake-value".into()), false)
+                .expect("add");
+        }
+        vault.save().expect("save");
+        vault
+    }
+
+    /// The peer at the agent's end of `stream`, its connection watched.
+    fn requester(stream: &UnixStream) -> Peer<'_> {
+        Peer::of(stream)
+            .expect("peer")
+            .connected(Connection::new(stream.as_fd(), false))
+    }
+
+    /// Wait (at most 10 seconds) until `count` requests wait for the dialog.
+    fn waiting_for_the_dialog(agent: &Agent, count: usize) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while agent.waiting_for_dialog.load(Ordering::SeqCst) != count {
+            assert!(Instant::now() < until, "never waited for the dialog");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The outcomes the audit log holds for `action`, in order.
+    fn outcomes(dir: &Path, action: &str) -> Vec<String> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["action"] == action)
+            .map(|record| record["outcome"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// A backup has no dialog of its own. One that waited for the dialog
+    /// while another request unlocked the vault, and whose requester left
+    /// meanwhile, writes nothing (CON01).
+    #[test]
+    fn a_backup_whose_requester_left_while_it_waited_for_an_unlock_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(vault_with(dir.path(), &["T"]));
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        let dest = dir.path().join("backup.kdbx");
+        let (unlocking, _its_client) = UnixStream::pair().expect("pair");
+        let (backing_up, its_client) = UnixStream::pair().expect("pair");
+        let backup = std::thread::scope(|scope| {
+            let unlock = scope.spawn(|| agent.ensure_unlocked(&requester(&unlocking)));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the unlock's dialog is shown");
+            let backup =
+                scope.spawn(|| agent.backup(&requester(&backing_up), dest.to_str().expect("utf8")));
+            // The backup waits for the dialog the unlock holds; its
+            // requester leaves; then the unlock is answered.
+            waiting_for_the_dialog(&agent, 1);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            answer.send(()).expect("answer");
+            unlock.join().expect("unlock").expect("unlocked");
+            backup.join().expect("backup")
+        });
+        let failure = backup.expect_err("a backup for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(!dest.exists(), "the backup was written");
+        assert_eq!(outcomes(dir.path(), "backup"), ["aborted"]);
+    }
+
+    /// A request that waits for its turn while another's dialog is open,
+    /// and whose requester leaves meanwhile, gets no dialog, and does
+    /// nothing.
+    #[test]
+    fn a_request_whose_requester_left_while_it_waited_gets_no_dialog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = vault_with(dir.path(), &["A", "B"]);
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let ui = Arc::new(ui);
+        struct Shared(Arc<HoldsTheFirst>);
+        impl Ui for Shared {
+            fn master_password(&self, p: &Prompt, c: Connection<'_>) -> anyhow::Result<Typed> {
+                self.0.master_password(p, c)
+            }
+            fn secret_value(&self, p: &Prompt, c: Connection<'_>) -> anyhow::Result<Typed> {
+                self.0.secret_value(p, c)
+            }
+            fn approve(&self, r: &ApprovalRequest, c: Connection<'_>) -> anyhow::Result<Decision> {
+                self.0.approve(r, c)
+            }
+        }
+        let agent = agent_in(
+            dir.path(),
+            &dir.path().join("broker"),
+            Box::new(Shared(Arc::clone(&ui))),
+        );
+        agent.state().vault = Some(vault);
+        let (first, _its_client) = UnixStream::pair().expect("pair");
+        let (second, its_client) = UnixStream::pair().expect("pair");
+        let (removed, waited) = std::thread::scope(|scope| {
+            let removing = scope.spawn(|| agent.remove(&requester(&first), "A"));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the first dialog is shown");
+            let waiting = scope.spawn(|| agent.remove(&requester(&second), "B"));
+            waiting_for_the_dialog(&agent, 1);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            answer.send(()).expect("answer");
+            (
+                removing.join().expect("first"),
+                waiting.join().expect("second"),
+            )
+        });
+        assert!(removed.is_ok());
+        let failure = waited.expect_err("removed for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert_eq!(ui.asked.load(Ordering::SeqCst), 1, "a second dialog");
+        assert!(agent.state().vault.as_ref().expect("open").contains("B"));
+        // (In either order: the dialog is let go before its answer is
+        // recorded.)
+        let mut recorded = outcomes(dir.path(), "remove");
+        recorded.sort();
+        assert_eq!(recorded, ["allowed_once", "requester_gone"]);
+    }
+
+    /// A change whose requester leaves while it waits for the state lock —
+    /// which another request may hold through a save or a backup — is not
+    /// saved.
+    #[test]
+    fn a_change_whose_requester_left_while_it_waited_for_the_state_lock_is_not_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = vault_with(dir.path(), &["A"]);
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        agent.state().vault = Some(vault);
+        let saved = std::fs::read(dir.path().join("vault.kdbx")).expect("vault");
+        let (removing, its_client) = UnixStream::pair().expect("pair");
+        let removed = std::thread::scope(|scope| {
+            let remove = scope.spawn(|| agent.remove(&requester(&removing), "A"));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the dialog is shown");
+            // Allowed while the state lock is held elsewhere: the removal
+            // waits for it, and its requester leaves meanwhile.
+            let held = agent.state();
+            answer.send(()).expect("answer");
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            remove.join().expect("remove")
+        });
+        let failure = removed.expect_err("removed for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(agent.state().vault.as_ref().expect("open").contains("A"));
+        assert_eq!(
+            std::fs::read(dir.path().join("vault.kdbx")).expect("vault"),
+            saved
+        );
+        assert_eq!(outcomes(dir.path(), "remove"), ["allowed_once", "aborted"]);
+    }
+
+    /// An import whose requester leaves while the agent reads its values —
+    /// from the keyring or a `.env` file, as `values` stands for here — is
+    /// not saved: checked before the values are read, and again before the
+    /// entries are saved.
+    #[test]
+    fn an_import_whose_requester_left_while_its_values_were_read_is_not_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = vault_with(dir.path(), &[]);
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        agent.state().vault = Some(vault);
+        let (importing, its_client) = UnixStream::pair().expect("pair");
+        let entries = vec![NewEntry {
+            name: "IMPORTED".into(),
+            ..NewEntry::default()
+        }];
+        let imported = agent.import_entries(
+            &requester(&importing),
+            entries,
+            false,
+            Origin::Dotenv("/fake/app.env"),
+            || {
+                its_client
+                    .shutdown(std::net::Shutdown::Both)
+                    .expect("leave");
+                Ok(vec![SecretString::new("fake-imported-value".into())])
+            },
+        );
+        let failure = imported.expect_err("imported for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("before the entries were saved"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !agent
+                .state()
+                .vault
+                .as_ref()
+                .expect("open")
+                .contains("IMPORTED")
+        );
+        assert_eq!(
+            outcomes(dir.path(), "import_from"),
+            ["allowed_once", "aborted"]
+        );
+    }
+
+    /// Wait (at most 10 seconds) until a record waits for the held log.
+    fn a_record_waits(agent: &Agent) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while agent.audit.waiting() != 1 {
+            assert!(Instant::now() < until, "no record waited for the log");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// An unlock whose requester leaves while its `unlocked` record waits
+    /// for the log keeps the vault locked: `aborted` follows `unlocked`.
+    #[test]
+    fn an_unlock_whose_requester_left_after_its_record_keeps_the_vault_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(vault_with(dir.path(), &[]));
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        let generation = agent.state().generation;
+        let (unlocking, its_client) = UnixStream::pair().expect("pair");
+        let unlocked = std::thread::scope(|scope| {
+            let held = agent.audit.hold();
+            let unlock = scope.spawn(|| agent.ensure_unlocked(&requester(&unlocking)));
+            // The password opened the vault and the requester was there:
+            // the unlock waits to record itself. Then it leaves.
+            a_record_waits(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            unlock.join().expect("unlock")
+        });
+        let failure = unlocked.expect_err("unlocked for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(agent.state().vault.is_none(), "the vault was unlocked");
+        assert_eq!(agent.state().generation, generation);
+        assert_eq!(outcomes(dir.path(), "unlock"), ["unlocked", "aborted"]);
+    }
+
+    /// A password change whose requester leaves while its `changed` record
+    /// waits for the log is not saved: `aborted` follows `changed`.
+    #[test]
+    fn a_password_change_whose_requester_left_after_its_record_is_not_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = vault_with(dir.path(), &[]);
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        agent.state().vault = Some(vault);
+        let saved = std::fs::read(dir.path().join("vault.kdbx")).expect("vault");
+        let (changing, its_client) = UnixStream::pair().expect("pair");
+        let changed = std::thread::scope(|scope| {
+            let held = agent.audit.hold();
+            let change = scope.spawn(|| agent.change_password(&requester(&changing)));
+            a_record_waits(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            change.join().expect("change")
+        });
+        let failure = changed.expect_err("changed for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert_eq!(
+            std::fs::read(dir.path().join("vault.kdbx")).expect("vault"),
+            saved
+        );
+        assert_eq!(outcomes(dir.path(), "passwd"), ["changed", "aborted"]);
+    }
+
+    /// A vault creation whose requester leaves while its `created` record
+    /// waits for the log creates no vault: `aborted` follows `created`.
+    #[test]
+    fn a_vault_whose_requester_left_while_its_creation_was_recorded_is_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        let (creating, its_client) = UnixStream::pair().expect("pair");
+        let created = std::thread::scope(|scope| {
+            let held = agent.audit.hold();
+            let create = scope.spawn(|| agent.create_vault(&requester(&creating)));
+            a_record_waits(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            create.join().expect("create")
+        });
+        let failure = created.expect_err("created for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            !dir.path().join("vault.kdbx").exists(),
+            "a vault was created"
+        );
+        assert!(agent.state().vault.is_none());
+        assert_eq!(outcomes(dir.path(), "create_vault"), ["created", "aborted"]);
+    }
+
+    /// A vault whose requester leaves while it is created is created, but
+    /// not put in use: it stays locked.
+    #[test]
+    fn a_vault_created_for_a_requester_that_left_meanwhile_stays_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        // A grant that outlived the last lock, which the new vault's barrier
+        // would end: it is not reached for a requester gone.
+        let (survivor, _, _) = grants_entered(&agent, 1);
+        let path = dir.path().join("vault.kdbx");
+        let (creating, its_client) = UnixStream::pair().expect("pair");
+        let created = std::thread::scope(|scope| {
+            let create = scope.spawn(|| agent.create_vault(&requester(&creating)));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the first dialog is shown");
+            // Answered while the state lock is held elsewhere: the vault is
+            // created, then waits for the lock to be put in use; its
+            // requester leaves then.
+            let held = agent.state();
+            answer.send(()).expect("answer");
+            let until = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < until, "the vault was never created");
+                thread::sleep(Duration::from_millis(5));
+            }
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            create.join().expect("create")
+        });
+        let failure = created.expect_err("put in use for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("after the vault was created"),
+            "{}",
+            failure.message
+        );
+        assert!(path.exists());
+        assert!(agent.state().vault.is_none(), "the new vault was unlocked");
+        assert_eq!(outcomes(dir.path(), "create_vault"), ["created", "aborted"]);
+        let states: Vec<String> = agent.registry.list().into_iter().map(|g| g.state).collect();
+        assert_eq!(states, ["starting"], "the barrier ended a grant");
+        survivor.finish(EndReason::CommandEnded);
+    }
+
+    /// Wait (at most 10 seconds) until a taking of the registry's lock waits
+    /// for the hold ([`Registry::hold`]).
+    fn the_registry_is_waited_for(agent: &Agent) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while agent.registry.waiting() != 1 {
+            assert!(Instant::now() < until, "nothing waited for the registry");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A vault created for a requester that leaves while its barrier waits
+    /// for the registry's lock, after the check under the state lock, is not
+    /// put in use: the check right before stops it, and it stays locked.
+    #[test]
+    fn a_vault_whose_requester_left_while_the_registry_was_held_stays_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        let path = dir.path().join("vault.kdbx");
+        let (creating, its_client) = UnixStream::pair().expect("pair");
+        let created = std::thread::scope(|scope| {
+            // The barrier's decision is the creation's first taking of it.
+            let held = agent.registry.hold(0);
+            let create = scope.spawn(|| agent.create_vault(&requester(&creating)));
+            the_registry_is_waited_for(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            create.join().expect("create")
+        });
+        let failure = created.expect_err("put in use for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("after the vault was created"),
+            "{}",
+            failure.message
+        );
+        assert!(path.exists());
+        assert!(agent.state().vault.is_none(), "the new vault was unlocked");
+        assert_eq!(outcomes(dir.path(), "create_vault"), ["created", "aborted"]);
+    }
+
+    /// An unlock whose requester leaves while the grants its barrier ends
+    /// are being ended writes no `unlocked` record: the vault stays locked.
+    #[test]
+    fn an_unlock_whose_requester_left_while_its_grants_ended_records_no_unlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(vault_with(dir.path(), &[]));
+        let (ui, _shown, answer) = HoldsTheFirst::new();
+        answer.send(()).expect("answer at once");
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        let generation = agent.state().generation;
+        let (unlocking, its_client) = UnixStream::pair().expect("pair");
+        let unlocked = std::thread::scope(|scope| {
+            // A file the agent never read: the barrier decides (one taking
+            // let through), then waits to end the grants.
+            let held = agent.registry.hold(1);
+            let unlock = scope.spawn(|| agent.ensure_unlocked(&requester(&unlocking)));
+            the_registry_is_waited_for(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            unlock.join().expect("unlock")
+        });
+        let failure = unlocked.expect_err("unlocked for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("before its unlock was recorded"),
+            "{}",
+            failure.message
+        );
+        assert!(agent.state().vault.is_none(), "the vault was unlocked");
+        assert_eq!(agent.state().generation, generation);
+        assert_eq!(outcomes(dir.path(), "unlock"), ["aborted"]);
+    }
+
+    /// An unlock whose requester leaves while it waits for the state lock,
+    /// before its barrier, ends no grant, though the vault's file changed:
+    /// the check before the barrier stops it, and a grant that outlived the
+    /// last lock stays as it was.
+    #[test]
+    fn an_unlock_whose_requester_left_before_its_barrier_ends_no_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        drop(vault_with(dir.path(), &[]));
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let agent = agent_in(dir.path(), &dir.path().join("broker"), Box::new(ui));
+        // A file the agent never read: the barrier would end this grant.
+        let (survivor, _, _) = grants_entered(&agent, 1);
+        let generation = agent.state().generation;
+        let (unlocking, its_client) = UnixStream::pair().expect("pair");
+        let unlocked = std::thread::scope(|scope| {
+            let unlock = scope.spawn(|| agent.ensure_unlocked(&requester(&unlocking)));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the password is asked");
+            // Typed while the state lock is held elsewhere: the unlock opens
+            // the file, then waits for the lock; its requester leaves.
+            let held = agent.state();
+            answer.send(()).expect("answer");
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            unlock.join().expect("unlock")
+        });
+        let states: Vec<String> = agent.registry.list().into_iter().map(|g| g.state).collect();
+        survivor.finish(EndReason::CommandEnded);
+        assert_eq!(states, ["starting"], "the barrier ended a grant");
+        let failure = unlocked.expect_err("unlocked for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("before the vault was unlocked"),
+            "{}",
+            failure.message
+        );
+        assert!(agent.state().vault.is_none(), "the vault was unlocked");
+        assert_eq!(agent.state().generation, generation);
+        assert_eq!(outcomes(dir.path(), "unlock"), ["aborted"]);
+    }
+
+    /// A keyring listing whose requester leaves while it waits for the state
+    /// lock, before the keyring is asked, never asks it (CON06): here the
+    /// keyring's address is a socket that would see the connection.
+    #[cfg(feature = "secret-service")]
+    #[test]
+    fn the_keyring_is_not_asked_for_a_requester_that_left_while_it_waited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = dir.path().join("bus");
+        let listener = std::os::unix::net::UnixListener::bind(&bus).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let (ui, shown, answer) = HoldsTheFirst::new();
+        let mut config = config_in(dir.path(), &dir.path().join("broker"));
+        config.keyring = crate::keyring::Settings {
+            address: Some(format!("unix:path={}", bus.display())),
+            plain: true,
+            deadline: Duration::from_secs(1),
+        };
+        let agent = Agent::new(config, Box::new(ui));
+        let (listing, its_client) = UnixStream::pair().expect("pair");
+        let listed = std::thread::scope(|scope| {
+            let list = scope.spawn(|| agent.keyring_items(&requester(&listing)));
+            shown
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the dialog is shown");
+            // Allowed while the state lock is held elsewhere: the listing
+            // waits for it, and its requester leaves meanwhile.
+            let held = agent.state();
+            answer.send(()).expect("answer");
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            list.join().expect("list")
+        });
+        let failure = listed.expect_err("listed for a requester that left");
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the keyring was asked"
+        );
+        assert_eq!(
+            outcomes(dir.path(), "keyring_items"),
+            ["allowed_once", "aborted"]
+        );
+    }
+
+    /// `count` grants of a run, entered: the run, their IDs and what each
+    /// is.
+    fn grants_entered(agent: &Agent, count: usize) -> (RunGrants, Vec<String>, Vec<Brokered>) {
+        let ids: Vec<String> = (0..count)
+            .map(|_| broker_protocol::new_grant_id())
+            .collect();
+        let run = agent
+            .registry
+            .enter(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| NewGrant {
+                        id: id.clone(),
+                        entry_uuid: format!("uuid-of-key-{i}"),
+                        entry: format!("KEY{i} (uuid-of-)"),
+                        var: format!("K{i}"),
+                        destination: example_destination(),
+                        limits: GrantLimits::default(),
+                        command: "true".into(),
+                        requester: "test".into(),
+                        lifetime: Duration::from_secs(60),
+                    })
+                    .collect(),
+            )
+            .expect("enter");
+        let grants = (0..count)
+            .map(|i| Brokered {
+                uuid: format!("uuid-of-key-{i}"),
+                name: format!("KEY{i}"),
+                identity: format!("KEY{i} (uuid-of-)"),
+                var: format!("K{i}"),
+                url_var: None,
+                destination: example_destination(),
+            })
+            .collect();
+        (run, ids, grants)
+    }
+
+    /// Wait (at most 10 seconds) until the log has the end of every grant
+    /// whose creation it has: written by another thread, it must not come
+    /// after the test (it would make the test's directory again).
+    fn grants_ended(dir: &Path) {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let said = outcomes(dir, "grant");
+            let created = said.iter().filter(|o| *o == "created").count();
+            if said.iter().filter(|o| *o == "ended").count() == created {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "a grant's end was not recorded: {said:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A run whose requester leaves while its grant's creation is recorded
+    /// starts no broker: no credential leaves the agent.
+    #[test]
+    fn no_broker_is_started_for_a_requester_that_left_while_its_grants_were_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let marker = dir.path().join("broker-ran");
+        stand_in_broker(&broker, &marker);
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        let (mut run, ids, grants) = grants_entered(&agent, 1);
+        let program = std::fs::canonicalize(&broker).expect("canonical");
+        let (running, its_client) = UnixStream::pair().expect("pair");
+        let prepared = std::thread::scope(|scope| {
+            let held = agent.audit.hold();
+            let prepare = scope.spawn(|| {
+                agent.prepare_grants(
+                    &requester(&running),
+                    &mut run,
+                    &program,
+                    &grants,
+                    &ids,
+                    vec![SecretString::new("sk-ant-test-0000000000000000".into())],
+                )
+            });
+            a_record_waits(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            prepare.join().expect("prepare")
+        });
+        let Err((failure, reason)) = prepared else {
+            panic!("grants prepared for a requester that left");
+        };
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains("after its grants' creation was recorded"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(reason, EndReason::CommandEnded);
+        run.finish(reason);
+        grants_ended(dir.path());
+        assert!(!marker.exists(), "a broker was started");
+        assert_eq!(outcomes(dir.path(), "grant"), ["created", "ended"]);
+    }
+
+    /// A run whose requester leaves while its brokers' installs wait for
+    /// the registry's lock, after its grants' records, starts no broker:
+    /// the last check comes right before the brokers start.
+    #[test]
+    fn no_broker_is_started_for_a_requester_that_left_while_the_registry_was_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let marker = dir.path().join("broker-ran");
+        stand_in_broker(&broker, &marker);
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        let (mut run, ids, grants) = grants_entered(&agent, 1);
+        let program = std::fs::canonicalize(&broker).expect("canonical");
+        let (running, its_client) = UnixStream::pair().expect("pair");
+        let prepared = std::thread::scope(|scope| {
+            // The grant's creation is noted in the registry (one taking let
+            // through); then its install's lifetime waits for the lock.
+            let held = agent.registry.hold(1);
+            let prepare = scope.spawn(|| {
+                agent.prepare_grants(
+                    &requester(&running),
+                    &mut run,
+                    &program,
+                    &grants,
+                    &ids,
+                    vec![SecretString::new("sk-ant-test-0000000000000000".into())],
+                )
+            });
+            the_registry_is_waited_for(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            prepare.join().expect("prepare")
+        });
+        let Err((failure, reason)) = prepared else {
+            panic!("grants prepared for a requester that left");
+        };
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("no broker was started"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(reason, EndReason::CommandEnded);
+        run.finish(reason);
+        grants_ended(dir.path());
+        assert!(!marker.exists(), "a broker was started");
+        assert_eq!(outcomes(dir.path(), "grant"), ["created", "ended"]);
+    }
+
+    /// A run whose requester has gone records the creation of no further
+    /// grant: of two, the one whose record waited when it left is the only
+    /// one recorded.
+    #[test]
+    fn no_grant_is_recorded_as_created_for_a_requester_already_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broker = dir.path().join("rusthorse-broker");
+        let marker = dir.path().join("broker-ran");
+        stand_in_broker(&broker, &marker);
+        let agent = agent_in(dir.path(), &broker, Box::new(NoDialogs));
+        let (mut run, ids, grants) = grants_entered(&agent, 2);
+        let program = std::fs::canonicalize(&broker).expect("canonical");
+        let (running, its_client) = UnixStream::pair().expect("pair");
+        let prepared = std::thread::scope(|scope| {
+            let held = agent.audit.hold();
+            let prepare = scope.spawn(|| {
+                agent.prepare_grants(
+                    &requester(&running),
+                    &mut run,
+                    &program,
+                    &grants,
+                    &ids,
+                    vec![
+                        SecretString::new("sk-ant-test-0000000000000000".into()),
+                        SecretString::new("sk-ant-test-1111111111111111".into()),
+                    ],
+                )
+            });
+            a_record_waits(&agent);
+            its_client
+                .shutdown(std::net::Shutdown::Both)
+                .expect("leave");
+            drop(held);
+            prepare.join().expect("prepare")
+        });
+        let Err((failure, reason)) = prepared else {
+            panic!("grants prepared for a requester that left");
+        };
+        assert!(failure.unanswered, "{}", failure.message);
+        assert!(
+            failure.message.contains("before its grants were created"),
+            "{}",
+            failure.message
+        );
+        run.finish(reason);
+        grants_ended(dir.path());
+        assert!(!marker.exists(), "a broker was started");
+        assert_eq!(outcomes(dir.path(), "grant"), ["created", "ended"]);
     }
 
     #[test]

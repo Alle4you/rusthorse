@@ -34,7 +34,9 @@ are not negotiated beyond that.
 - **One request per connection.** The client connects, sends one request
   message and reads one response message, then closes the connection. During
   a `run` with redaction, data frames flow in both directions before the
-  response (see [Framing](#framing)).
+  response (see [Framing](#framing)). Closing the connection while a dialog
+  for the request is open, or waited for, cancels it (see
+  [Cancellation](#framing)).
 
 ## Framing
 
@@ -99,22 +101,84 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   (`shutdown(SHUT_WR)`), or sending anything not listed above (a message, an
   unknown channel, unrequested input, an oversized or truncated frame)
   cancels the request: the agent shuts the socket down and terminates the
-  command's process group. The agent watches the connection only once the
-  command has started. Before that — while a dialog is open — a close or a
-  violation is not noticed: the dialog stays until it is answered or times
-  out, and if the human allows the request, the approval is recorded and
-  the command is started with the secrets. Only then does the agent notice
-  and cancel: the command has started, and its process group gets `SIGTERM`,
-  then `SIGKILL` 3 seconds later. As for any cancelled run, the audit log
-  records the command's end (`exited`, for example `killed by signal 15`),
-  not that the client had gone. The other requests are not watched at all
-  while a dialog is open: one that the human allows after its client has
-  gone is carried out (an `edit`, a `remove`, an `add`), with nobody to
-  read the answer.
+  command's process group. Before the command starts, from the moment the
+  request is read, the agent watches for a close or a half-close (not for
+  the rest, which it notices only once the command has started): a dialog
+  open for the request is taken down, one it waits for is not shown, and
+  after the human answers the agent checks again as it reads the values —
+  under the lock it reads them under, so also after any wait for that
+  lock — and once more right before the command starts. Nothing is then
+  started, the audit log records `requester_gone` (a dialog taken down or
+  not shown) or `aborted` (after the answer), and the request gets no
+  answer: the agent shuts the socket down. A close or a half-close after
+  that last check is noticed once the command has started: its process
+  group gets `SIGTERM`, then `SIGKILL` 3 seconds later, and, as for any
+  cancelled run, the audit log records the command's end (`exited`, for
+  example `killed by signal 15`), not that the client had gone.
+- **The other requests** are cancelled by closing the connection (`close`,
+  or `shutdown(SHUT_RDWR)`), not by a half-close, after which the client
+  can still read the answer. The agent watches for that close while a
+  request waits for a dialog or has one open: the dialog is taken down, or
+  not shown, and no later dialog of the request is shown. After the
+  dialogs, for every request (a `run` too), the last check of the
+  requester before an effect comes after every wait the agent makes on the
+  way to it for a dialog's turn, for the lock of its state (which a save
+  or a backup holds for a while), for an audit record, for brokers to end
+  or to start, and for a read from outside (the keyring, a file). The
+  registry of grants has a lock of its own, held only for short work in
+  memory (on the grants and their counters, reading the clocks, writing a
+  new broker's install without waiting); a wait for it is not followed by
+  a check. What remains unguarded is a departure during the effect. The
+  effects so checked: the vault file or the settings file written, a
+  backup written, a value read for the answer, the vault an unlock opened
+  put in use, a vault created and then put in use, an import's values
+  read, a `.env` file or the keyring read, and a keyring listing kept for
+  the program that asked. A `backup`, which shows no dialog of its own
+  (only the unlock it may need), is checked too. A cancelled request does
+  nothing more, is recorded as `requester_gone` or `aborted`, and gets no
+  answer, also when that record cannot be written. An unlock, a password
+  change and the creation of a vault write their record — `unlocked`,
+  `changed`, `created` — before they act, and are checked right before
+  that record and again right before they act: only a requester that
+  leaves between those two checks leaves that record, followed by
+  `aborted`, and nothing is done: the vault stays locked, the password
+  unchanged, no vault is created. Between them the record waits for the
+  audit log and is written, and, for an unlock and a password change, the
+  agent then waits for the lock of its state, under which the second
+  check is made; for a vault's creation nothing else. When `aborted`
+  cannot be written, that earlier record stands alone. A requester that
+  leaves while a wait for the registry's lock follows its last check
+  leaves two things done: the
+  grants that an unlock or a new vault ends because the vault's file
+  changed stay ended (a protection, like `lock` and `revoke_grant`,
+  carried out once decided; the vault stays locked), and a run's grants
+  are entered in the registry, which the next check ends before any is
+  recorded or started. The human's answer stands too: an "Allow for N"
+  given as the requester left is remembered, and an approval postpones
+  the idle lock (`allowed_for_…`, then `aborted`). A close
+  during an effect comes too late: the save, the backup or the creation of
+  a vault is carried out, and names or a listing are put in an answer
+  nobody reads — but a vault whose requester left while it was created is
+  not put in use: it stays locked, its `created` followed by an `aborted`
+  that says so. A connection that another process still holds open is not
+  closed.
 
 The same run framing, descriptor rules, flow control and cancellation apply to
-`broker_run_v2`. Cancelling it also ends its grants; after a close while a
-dialog was open they too are created, recorded and served first.
+`broker_run_v2`. Cancelling it also ends its grants. The check after the
+answer comes before any grant is created; the run is checked again before each
+grant's `created` record, and once more right before its brokers start, once
+their tokens and installs are prepared. That start is one step: the
+credentials reach the agent's own brokers after that check, and the tokens
+leave only with the command, after the last check, which comes once the grants
+are ready: a close or a half-close while their brokers start ends them there,
+and nothing runs (their `created` records are followed by `ended`, the run's
+approval by `aborted`). A requester that leaves between the check before a
+grant's `created` record and the next check leaves that record, followed by
+`ended`; no further grant is recorded and no broker starts. Between those
+checks the record waits for the audit log and is written, and the agent waits
+for the registry's lock to note it; after the last grant's record, the tokens
+are drawn and the installs prepared, which waits for the registry's lock
+again.
 
 ## Requests
 
@@ -175,11 +239,16 @@ for the new master password twice, in its own dialogs, so that it never
 passes through a client; at least 8 characters, and both must match
 (`invalid_request` otherwise, `cancelled` when a dialog is cancelled or not
 answered). It records the attempt in the audit log (`create_vault`, outcome
-`created`, `cancelled`, `timed_out`, `mismatch`, `too_short` or `failed`)
+`created`, `cancelled`, `timed_out`, `requester_gone`, `aborted`,
+`mismatch`, `too_short` or `failed`)
 before the file is written, never replaces a file that appears meanwhile,
 and leaves the new vault unlocked — unless the vault was locked while the
 dialogs were open (by `lock`, a screen lock or a suspend),
-in which case it is created locked and the `ok` message says so. Requests
+in which case it is created locked and the `ok` message says so. A
+`created` record followed by `aborted` means that no vault was created —
+unless the `aborted` record says that it was: its requester left while it
+was being created or put in use, and it stays locked
+([Cancellation](#framing)). Requests
 are handled one at a time: of two, the second gets `already_exists`.
 
 ### Imports read by the agent

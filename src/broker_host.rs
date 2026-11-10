@@ -657,6 +657,14 @@ fn room(inner: &Inner, asked: usize) -> Result<(), String> {
 
 /// The registry of grants: the one authority for their states, counters and
 /// limits (see the module's documentation).
+///
+/// Its lock is held only for work in memory — on the grants and their
+/// counters, the messages to send, reading the monotonic and boot-time
+/// clocks — and, in [`Registry::register`], to write a new broker's install
+/// without waiting. It is not held while a broker is told, killed or waited
+/// for (a wait on its condition variable lets it go), nor while a record is
+/// written, a thread started or a file read. Taking it can still mean a
+/// short wait for another thread's work under it.
 pub(crate) struct Registry {
     inner: Mutex<Inner>,
     /// Notified when a grant confirms a revocation or ends, or its broker is
@@ -667,6 +675,53 @@ pub(crate) struct Registry {
     timer: AtomicBool,
     /// The timer could not start: no grant is entered.
     no_timer: AtomicBool,
+    /// For tests that hold the lock ([`Registry::hold`]).
+    #[cfg(test)]
+    test_hold: TestHold,
+}
+
+/// A hold on the registry's lock for tests ([`Registry::hold`]): a gate in
+/// front of it, which lets a given number of takings through first.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHold {
+    /// While held: how many more takings go through before the others wait.
+    held: Mutex<Option<usize>>,
+    released: Condvar,
+    /// Takings that wait for the hold to be released.
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl TestHold {
+    fn pass(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        match held.as_mut() {
+            None => return,
+            Some(after) if *after > 0 => {
+                *after -= 1;
+                return;
+            }
+            Some(_) => {}
+        }
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while held.is_some() {
+            held = self.released.wait(held).unwrap_or_else(|p| p.into_inner());
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Releases a [`TestHold`] when dropped.
+#[cfg(test)]
+struct Held<'a>(&'a TestHold);
+
+#[cfg(test)]
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        *self.0.held.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.0.released.notify_all();
+    }
 }
 
 /// Why a broker does not serve its grant once the grant ended while the
@@ -686,11 +741,35 @@ impl Registry {
             audit,
             timer: AtomicBool::new(false),
             no_timer: AtomicBool::new(false),
+            #[cfg(test)]
+            test_hold: TestHold::default(),
         })
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
+        #[cfg(test)]
+        self.test_hold.pass();
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Hold the registry's lock, as another thread's work under it would:
+    /// from the `after`-th next taking of it (0: the next one), each waits
+    /// until the guard is dropped, then goes on as usual. A condition
+    /// variable's wait that takes it back is not held. For tests.
+    #[cfg(test)]
+    pub(crate) fn hold(&self, after: usize) -> impl Sized + '_ {
+        *self
+            .test_hold
+            .held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(after);
+        Held(&self.test_hold)
+    }
+
+    /// How many takings of the lock wait for [`Registry::hold`]. For tests.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.test_hold.waiting.load(Ordering::SeqCst)
     }
 
     /// Refused when the timer that ends grants could not start: a grant
@@ -799,6 +878,8 @@ impl Registry {
     /// would then not have ended, and when the timer could not start.
     pub(crate) fn enter(self: &Arc<Self>, grants: Vec<NewGrant>) -> Result<RunGrants, String> {
         self.timer_running()?;
+        // Read before the lock: the local time may read the time zone's file.
+        let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         let mut inner = self.inner();
         room(&inner, grants.len())?;
         let mut ids: Vec<&str> = grants.iter().map(|g| g.id.as_str()).collect();
@@ -810,7 +891,6 @@ impl Registry {
         let run = inner.next_run;
         inner.next_run += 1;
         let now = BootInstant::now();
-        let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         let mut ids = Vec::with_capacity(grants.len());
         let mut reports = Vec::with_capacity(grants.len());
         for new in grants {

@@ -12,10 +12,13 @@ use std::time::{Duration, Instant};
 
 use rusthorse::agent::{Agent, AgentConfig};
 use rusthorse::protocol::SecretString;
-use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
+use rusthorse::ui::{ApprovalRequest, Connection, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
 
 const PASSWORD: &str = "correct horse battery";
+
+/// Something a test does while the "human" looks at a dialog.
+type Hook = Box<dyn FnOnce() + Send>;
 
 /// Answers dialogs from queues; records what it was asked.
 #[derive(Default)]
@@ -29,6 +32,16 @@ struct ScriptedUi {
     on_approve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs (once) while the "human" is typing the next master password.
     on_password: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// How many dialogs of any kind were shown.
+    dialogs: AtomicUsize,
+    /// Runs (once) while the "human" looks at the dialog with this index in
+    /// `dialogs` (0 for the first one this UI shows).
+    on_dialog: Mutex<Option<(usize, Hook)>>,
+    /// Like the real dialogs, a dialog whose requester has gone by the time
+    /// its hooks have run is taken down (`RequesterGone`) — unless this is
+    /// set: then the "human" answers as scripted anyway, as one clicking at
+    /// that very moment would.
+    answers_late: std::sync::atomic::AtomicBool,
     /// The text of every master-password dialog shown.
     password_prompts: Mutex<Vec<String>>,
     /// Which master-password dialogs nobody answers, by their index in
@@ -47,8 +60,31 @@ fn typed(answer: Option<String>) -> Typed {
     answer.map_or(Typed::Cancelled, |v| Typed::Value(SecretString::new(v)))
 }
 
+impl ScriptedUi {
+    /// A dialog is shown: count it, and run the hook for it if there is one.
+    /// Then whether it is taken down: its requester has gone, and the
+    /// "human" does not answer late.
+    fn shown(&self, requester: Connection<'_>) -> bool {
+        let index = self.dialogs.fetch_add(1, Ordering::SeqCst);
+        let hook = {
+            let mut on_dialog = self.on_dialog.lock().unwrap();
+            match on_dialog.take() {
+                Some((at, hook)) if at == index => Some(hook),
+                other => {
+                    *on_dialog = other;
+                    None
+                }
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+        requester.gone() && !self.answers_late.load(Ordering::SeqCst)
+    }
+}
+
 impl Ui for ScriptedUi {
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
+    fn master_password(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
         let index = {
             let mut prompts = self.password_prompts.lock().unwrap();
             prompts.push(rusthorse::ui::prompt_text(prompt));
@@ -57,6 +93,9 @@ impl Ui for ScriptedUi {
         if let Some(hook) = self.on_password.lock().unwrap().take() {
             hook();
         }
+        if self.shown(requester) {
+            return Ok(Typed::RequesterGone);
+        }
         if self.password_timeouts.lock().unwrap().contains(&index) {
             return Ok(Typed::TimedOut);
         }
@@ -64,15 +103,25 @@ impl Ui for ScriptedUi {
         Ok(typed(next.unwrap_or(Some(PASSWORD.to_string()))))
     }
 
-    fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+    fn secret_value(&self, _: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        if self.shown(requester) {
+            return Ok(Typed::RequesterGone);
+        }
         Ok(typed(self.values.lock().unwrap().pop_front().flatten()))
     }
 
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
+    fn approve(
+        &self,
+        request: &ApprovalRequest,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Decision> {
         self.approvals_asked.fetch_add(1, Ordering::SeqCst);
         *self.last_approval.lock().unwrap() = Some(request.clone());
         if let Some(hook) = self.on_approve.lock().unwrap().take() {
             hook();
+        }
+        if self.shown(requester) {
+            return Ok(Decision::RequesterGone);
         }
         Ok(self
             .decisions
@@ -87,14 +136,14 @@ impl Ui for ScriptedUi {
 struct SharedUi(Arc<ScriptedUi>);
 
 impl Ui for SharedUi {
-    fn master_password(&self, p: &Prompt) -> anyhow::Result<Typed> {
-        self.0.master_password(p)
+    fn master_password(&self, p: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.0.master_password(p, requester)
     }
-    fn secret_value(&self, p: &Prompt) -> anyhow::Result<Typed> {
-        self.0.secret_value(p)
+    fn secret_value(&self, p: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.0.secret_value(p, requester)
     }
-    fn approve(&self, r: &ApprovalRequest) -> anyhow::Result<Decision> {
-        self.0.approve(r)
+    fn approve(&self, r: &ApprovalRequest, requester: Connection<'_>) -> anyhow::Result<Decision> {
+        self.0.approve(r, requester)
     }
     fn limits_height(&self) -> bool {
         !self.0.scrolls.load(Ordering::SeqCst)
@@ -7605,6 +7654,655 @@ fn the_run_dialog_shows_destination_settings_without_credentials() {
     assert!(!audit.contains("FAKE"), "{audit}");
 }
 
+/// A requester that goes away — closes its connection, or shuts it down
+/// both ways as the manager cancels, or half-closes a run's — while a dialog
+/// for it is open, or waited for, gets nothing done: the dialog is taken
+/// down (or never shown) and recorded as `requester_gone`; and if the human
+/// answers at that very moment, the agent checks again before the effect and
+/// records `aborted`. Such a request gets no answer.
+mod requester_leaves {
+    use super::*;
+    use rusthorse::protocol::{
+        Binding, EntryChanges, ImportSource, ImportedEntry, NewEntry, Request, Response,
+        RunRequest, SettingsChange, ValueChange,
+    };
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    /// While the "human" looks at the `nth` dialog from now on (0: the
+    /// next one), the requester leaves: `stream` is shut down `how`.
+    pub(super) fn leave_at(h: &Harness, nth: usize, stream: &UnixStream, how: Shutdown) {
+        let leaving = stream.try_clone().expect("clone");
+        let at = h.ui.dialogs.load(Ordering::SeqCst) + nth;
+        *h.ui.on_dialog.lock().unwrap() = Some((
+            at,
+            Box::new(move || {
+                let _ = leaving.shutdown(how);
+            }),
+        ));
+    }
+
+    /// The first audit record of `action` with `outcome`, once it is there.
+    pub(super) fn record_of(h: &Harness, action: &str, outcome: &str) -> serde_json::Value {
+        eventually(&format!("a record of {action} {outcome}"), || {
+            audit_records(h)
+                .into_iter()
+                .find(|r| r["action"] == action && r["outcome"] == outcome)
+        })
+    }
+
+    /// How a requester behaves while its request's dialogs are open.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Departure {
+        /// It waits for the answer.
+        Stays,
+        /// It goes away while the first dialog is open, which is taken down.
+        WhileAsked,
+        /// It goes away while the last dialog is open, and the human answers
+        /// at that very moment.
+        AsTheHumanAnswers,
+    }
+
+    /// Whether a request's effect was done, when the test can tell.
+    pub(super) type Done = Option<Box<dyn Fn(&Harness) -> bool>>;
+
+    /// A request that shows dialogs: what its records are of, how many
+    /// dialogs it shows (each allowed or answered as scripted), what its
+    /// `aborted` record says it stopped before, and how to set up a harness
+    /// for it.
+    pub(super) struct Case {
+        pub(super) action: &'static str,
+        pub(super) dialogs: usize,
+        pub(super) aborted: &'static str,
+        pub(super) setup: fn() -> (Harness, Request, Done),
+    }
+
+    /// Send the case's request with its requester behaving as `departure`
+    /// does, and check what was done and recorded.
+    pub(super) fn check(case: &Case, departure: Departure) {
+        let (h, request, done) = (case.setup)();
+        let action = case.action;
+        let before = h.ui.dialogs.load(Ordering::SeqCst);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        match departure {
+            Departure::Stays => {}
+            Departure::WhileAsked => leave_at(&h, 0, &stream, Shutdown::Both),
+            Departure::AsTheHumanAnswers => {
+                h.ui.answers_late.store(true, Ordering::SeqCst);
+                leave_at(&h, case.dialogs - 1, &stream, Shutdown::Both);
+            }
+        }
+        rusthorse::protocol::send_frame(&stream, &request, &[]).expect("send");
+        let shown = || h.ui.dialogs.load(Ordering::SeqCst) - before;
+        match departure {
+            Departure::Stays => {
+                let response: Response =
+                    rusthorse::protocol::read_message(&stream).expect("an answer");
+                assert!(
+                    !matches!(response, Response::Error { .. }),
+                    "{action}: {}",
+                    response.kind()
+                );
+                assert_eq!(shown(), case.dialogs, "{action}");
+                if let Some(done) = &done {
+                    assert!(done(&h), "{action}: not done although allowed");
+                }
+            }
+            Departure::WhileAsked => {
+                record_of(&h, action, "requester_gone");
+                assert_eq!(shown(), 1, "{action}: asked more once it was gone");
+                if let Some(done) = &done {
+                    assert!(!done(&h), "{action}: done for a requester that left");
+                }
+            }
+            Departure::AsTheHumanAnswers => {
+                let aborted = record_of(&h, action, "aborted");
+                let said = format!("the requester went away {}", case.aborted);
+                assert!(
+                    aborted["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with(&said)),
+                    "{aborted}"
+                );
+                assert_eq!(shown(), case.dialogs, "{action}");
+                if let Some(done) = &done {
+                    assert!(!done(&h), "{action}: done for a requester that left");
+                }
+                // No record says it was done.
+                let said = audit_outcomes(&h, action);
+                assert!(
+                    !said.iter().any(
+                        |o| ["unlocked", "changed", "created", "written"].contains(&o.as_str())
+                    ),
+                    "{action}: {said:?}"
+                );
+            }
+        }
+        // Whatever it asked for was answered — the effect done, or the
+        // records above written — so the agent is done with it.
+        drop(stream);
+    }
+
+    /// A harness whose vault is unlocked, and holds `T`.
+    fn unlocked() -> Harness {
+        let h = Harness::new();
+        seed(&h, &[("T", "abcdefgh")]);
+        assert!(h.run(&["unlock"]).status.success());
+        h
+    }
+
+    /// Whether the vault file is no longer what it was when this is called.
+    fn vault_changes(h: &Harness) -> Done {
+        let path = h.vault_path();
+        let was = std::fs::read(&path).expect("the vault");
+        done(move |_: &Harness| std::fs::read(&path).ok().as_ref() != Some(&was))
+    }
+
+    fn entry(name: &str) -> NewEntry {
+        NewEntry {
+            name: name.into(),
+            ..NewEntry::default()
+        }
+    }
+
+    fn dotenv(h: &Harness) -> String {
+        let file = h.dir.path().join("app.env");
+        std::fs::write(&file, "FAKE_IMPORTED=fake-imported-value\n").expect("write");
+        file.to_str().expect("utf8").into()
+    }
+
+    /// `Some(f)`, boxed.
+    pub(super) fn done(f: impl Fn(&Harness) -> bool + 'static) -> Done {
+        Some(Box::new(f))
+    }
+
+    pub(super) fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                action: "unlock",
+                dialogs: 1,
+                aborted: "before the vault was unlocked",
+                setup: || {
+                    let h = Harness::new();
+                    (h, Request::Unlock, done(|h: &Harness| !status(h).locked))
+                },
+            },
+            Case {
+                action: "create_vault",
+                dialogs: 2,
+                aborted: "before the vault was created",
+                setup: || {
+                    let h = without_vault();
+                    (
+                        h,
+                        Request::CreateVault,
+                        done(|h: &Harness| h.vault_path().exists()),
+                    )
+                },
+            },
+            Case {
+                action: "passwd",
+                dialogs: 3,
+                aborted: "before the password was changed",
+                setup: || {
+                    let h = unlocked();
+                    h.ui.passwords.lock().unwrap().extend([
+                        Some(PASSWORD.to_string()),
+                        Some("a new master password".to_string()),
+                        Some("a new master password".to_string()),
+                    ]);
+                    let done = vault_changes(&h);
+                    (h, Request::ChangePassword, done)
+                },
+            },
+            Case {
+                action: "add",
+                dialogs: 1,
+                aborted: "before the entry was saved",
+                setup: || {
+                    let h = unlocked();
+                    h.ui.values
+                        .lock()
+                        .unwrap()
+                        .push_back(Some("fake-typed-value".into()));
+                    let request = Request::Add {
+                        entry: entry("NEW"),
+                        value: None,
+                        generate: None,
+                        replace: false,
+                    };
+                    let done = vault_changes(&h);
+                    (h, request, done)
+                },
+            },
+            Case {
+                action: "add",
+                dialogs: 1,
+                aborted: "before the entry was saved",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::Add {
+                        entry: entry("NEW"),
+                        value: Some(SecretString::new("fake-sent-value".into())),
+                        generate: None,
+                        replace: false,
+                    };
+                    let done = vault_changes(&h);
+                    (h, request, done)
+                },
+            },
+            Case {
+                action: "edit",
+                dialogs: 2,
+                aborted: "before the change was saved",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    h.ui.values
+                        .lock()
+                        .unwrap()
+                        .push_back(Some("fake-new-value".into()));
+                    let request = Request::Edit {
+                        name: "T".into(),
+                        changes: EntryChanges {
+                            url: Some("https://fake.example".into()),
+                            value: Some(ValueChange::Prompt),
+                            ..EntryChanges::default()
+                        },
+                    };
+                    let done = vault_changes(&h);
+                    (h, request, done)
+                },
+            },
+            Case {
+                action: "remove",
+                dialogs: 1,
+                aborted: "before the entry was deleted",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let done = vault_changes(&h);
+                    (h, Request::Remove { name: "T".into() }, done)
+                },
+            },
+            Case {
+                action: "import",
+                dialogs: 1,
+                aborted: "before the values were read",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::Import {
+                        entries: vec![ImportedEntry {
+                            entry: entry("IMPORTED"),
+                            value: SecretString::new("fake-imported-value".into()),
+                        }],
+                        replace: false,
+                    };
+                    let done = vault_changes(&h);
+                    (h, request, done)
+                },
+            },
+            Case {
+                action: "import_from",
+                dialogs: 1,
+                aborted: "before the values were read",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::ImportFrom {
+                        source: ImportSource::Dotenv {
+                            path: dotenv(&h),
+                            prefix: None,
+                            names: vec!["FAKE_IMPORTED".into()],
+                        },
+                        tags: vec![],
+                        replace: false,
+                    };
+                    let done = vault_changes(&h);
+                    (h, request, done)
+                },
+            },
+            Case {
+                action: "dotenv_names",
+                dialogs: 1,
+                aborted: "before the file was read",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::DotenvNames { path: dotenv(&h) };
+                    (h, request, None)
+                },
+            },
+            Case {
+                action: "reveal",
+                dialogs: 1,
+                aborted: "before the value was read",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::Reveal {
+                        name: "T".into(),
+                        notes: false,
+                        purpose: None,
+                    };
+                    (h, request, None)
+                },
+            },
+            Case {
+                action: "configure",
+                dialogs: 1,
+                aborted: "before the settings were saved",
+                setup: || {
+                    let h = Harness::with_settings(None, rusthorse::settings::Layer::default());
+                    assert!(h.run(&["unlock"]).status.success());
+                    h.decide(&[Decision::AllowOnce]);
+                    let request = Request::Configure {
+                        settings: SettingsChange {
+                            idle_timeout_secs: Some(30 * 60),
+                            ..SettingsChange::default()
+                        },
+                    };
+                    let file = settings_file(h.dir.path());
+                    (h, request, done(move |_: &Harness| file.exists()))
+                },
+            },
+            Case {
+                action: "run",
+                dialogs: 1,
+                aborted: "before the command started",
+                setup: || {
+                    let h = unlocked();
+                    h.decide(&[Decision::AllowOnce]);
+                    let marker = h.dir.path().join("ran");
+                    let request = Request::Run(RunRequest {
+                        bindings: vec![Binding {
+                            var: "T".into(),
+                            entry: "T".into(),
+                        }],
+                        argv: vec!["touch".into(), marker.to_str().expect("utf8").into()],
+                        cwd: h.dir.path().to_str().expect("utf8").into(),
+                        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+                        redact: true,
+                        forward_stdin: false,
+                    });
+                    (h, request, done(move |_: &Harness| marker.exists()))
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn a_requester_that_stays_gets_what_it_asked_for() {
+        for case in &cases() {
+            check(case, Departure::Stays);
+        }
+    }
+
+    #[test]
+    fn a_requester_that_leaves_while_asked_has_its_dialog_taken_down() {
+        for case in &cases() {
+            check(case, Departure::WhileAsked);
+        }
+    }
+
+    #[test]
+    fn a_requester_that_leaves_as_the_human_answers_gets_nothing_done() {
+        for case in &cases() {
+            check(case, Departure::AsTheHumanAnswers);
+        }
+    }
+
+    /// Once its requester has gone, a request shows no further dialog: the
+    /// human answered the first as it left, and the next — a password
+    /// dialog of three, a value dialog after an approval — is not shown.
+    #[test]
+    fn a_request_whose_requester_left_asks_nothing_more() {
+        let edit = Request::Edit {
+            name: "T".into(),
+            changes: EntryChanges {
+                url: Some("https://fake.example".into()),
+                value: Some(ValueChange::Prompt),
+                ..EntryChanges::default()
+            },
+        };
+        for (action, request) in [("passwd", Request::ChangePassword), ("edit", edit)] {
+            let h = unlocked();
+            h.decide(&[Decision::AllowOnce]);
+            let stream = UnixStream::connect(&h.socket).expect("connect");
+            h.ui.answers_late.store(true, Ordering::SeqCst);
+            leave_at(&h, 0, &stream, Shutdown::Both);
+            let before = h.ui.dialogs.load(Ordering::SeqCst);
+            let vault = std::fs::read(h.vault_path()).expect("vault");
+            rusthorse::protocol::send_frame(&stream, &request, &[]).expect("send");
+            record_of(&h, action, "requester_gone");
+            assert_eq!(h.ui.dialogs.load(Ordering::SeqCst) - before, 1, "{action}");
+            assert_eq!(std::fs::read(h.vault_path()).expect("vault"), vault);
+        }
+    }
+
+    /// A half-close (`shutdown(SHUT_WR)`) ends a run, so its dialog is
+    /// taken down and it gets no answer; any other request goes on, since
+    /// its requester can still read the answer.
+    #[test]
+    fn only_a_run_is_ended_by_a_half_close() {
+        let h = unlocked();
+        let marker = h.dir.path().join("ran");
+        let run = Request::Run(RunRequest {
+            bindings: vec![Binding {
+                var: "T".into(),
+                entry: "T".into(),
+            }],
+            argv: vec!["touch".into(), marker.to_str().expect("utf8").into()],
+            cwd: h.dir.path().to_str().expect("utf8").into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            redact: true,
+            forward_stdin: false,
+        });
+        h.decide(&[Decision::AllowOnce]);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        leave_at(&h, 0, &stream, Shutdown::Write);
+        rusthorse::protocol::send_frame(&stream, &run, &[]).expect("send");
+        // No answer: the agent shuts the connection down.
+        let answer = rusthorse::protocol::read_message::<Response>(&stream);
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{:?}",
+            answer.map(|r| r.kind())
+        );
+        record_of(&h, "run", "requester_gone");
+        assert!(!marker.exists(), "the command ran");
+        // A removal whose requester half-closes is carried out and answered.
+        h.ui.decisions.lock().unwrap().clear();
+        h.decide(&[Decision::AllowOnce]);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        leave_at(&h, 0, &stream, Shutdown::Write);
+        rusthorse::protocol::send_frame(&stream, &Request::Remove { name: "T".into() }, &[])
+            .expect("send");
+        let answer: Response = rusthorse::protocol::read_message(&stream).expect("an answer");
+        assert!(matches!(answer, Response::Ok { .. }), "{}", answer.kind());
+        assert_eq!(audit_outcomes(&h, "remove"), ["allowed_once"]);
+    }
+
+    /// A requester that leaves while its dialog is open gets no answer even
+    /// when its departure cannot be recorded (here a run that half-closes,
+    /// which could still read one): nothing runs.
+    #[test]
+    fn a_departure_that_cannot_be_recorded_gets_no_answer_either() {
+        let h = unlocked();
+        let marker = h.dir.path().join("ran");
+        let run = Request::Run(RunRequest {
+            bindings: vec![Binding {
+                var: "T".into(),
+                entry: "T".into(),
+            }],
+            argv: vec!["touch".into(), marker.to_str().expect("utf8").into()],
+            cwd: h.dir.path().to_str().expect("utf8").into(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            redact: true,
+            forward_stdin: false,
+        });
+        h.decide(&[Decision::AllowOnce]);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        // While the dialog is open the requester half-closes, and the audit
+        // log becomes a directory, which no record can be appended to.
+        let (leaving, audit) = (stream.try_clone().expect("clone"), h.audit.clone());
+        *h.ui.on_dialog.lock().unwrap() = Some((
+            h.ui.dialogs.load(Ordering::SeqCst),
+            Box::new(move || {
+                let _ = std::fs::remove_file(&audit);
+                let _ = std::fs::create_dir(&audit);
+                let _ = leaving.shutdown(Shutdown::Write);
+            }),
+        ));
+        rusthorse::protocol::send_frame(&stream, &run, &[]).expect("send");
+        let answer = rusthorse::protocol::read_message::<Response>(&stream);
+        assert!(
+            answer
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{:?}",
+            answer.map(|r| r.kind())
+        );
+        assert!(h.audit.is_dir(), "a record was written");
+        assert!(!marker.exists(), "the command ran");
+    }
+
+    /// A run through the broker whose requester leaves as the human allows
+    /// it creates no grant and starts no broker.
+    #[test]
+    fn a_broker_run_whose_requester_left_creates_no_grant() {
+        if !python3() {
+            return;
+        }
+        let h = Harness::new();
+        seed(&h, &[("KEY", FAKE_KEY)]);
+        assert!(h.run(&["unlock"]).status.success());
+        let log = fake_broker(&h, "ready");
+        let marker = h.dir.path().join("ran");
+        let request = broker_run_request(
+            &h,
+            vec![],
+            vec![brokered("K", "KEY", None)],
+            &format!("touch {}", marker.display()),
+        );
+        h.decide(&[Decision::AllowOnce]);
+        h.ui.answers_late.store(true, Ordering::SeqCst);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        leave_at(&h, 0, &stream, Shutdown::Both);
+        rusthorse::protocol::send_frame(&stream, &Request::BrokerRunV2(request), &[])
+            .expect("send");
+        // Stopped by the check under the lock that reads the values, before
+        // any grant is entered — not by one of the later checks.
+        let aborted = record_of(&h, "run", "aborted");
+        assert!(
+            aborted["detail"].as_str().is_some_and(
+                |d| d.starts_with("the requester went away before the command started")
+            ),
+            "{aborted}"
+        );
+        assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "aborted"]);
+        assert!(
+            audit_outcomes(&h, "grant").is_empty(),
+            "a grant was created"
+        );
+        assert!(broker_log(&log).is_empty(), "a broker was started");
+        assert!(!marker.exists(), "the command ran");
+    }
+
+    /// A requester that leaves while its run's brokers start: the agent
+    /// checks once more before the command starts, ends the grants first,
+    /// and runs nothing.
+    #[test]
+    fn a_requester_that_leaves_while_its_brokers_start_runs_nothing() {
+        if !python3() {
+            return;
+        }
+        let h = Harness::new();
+        seed(&h, &[("KEY", FAKE_KEY)]);
+        assert!(h.run(&["unlock"]).status.success());
+        let log = fake_broker(&h, "held_ready");
+        let ready = log.with_extension("jsonl.ready");
+        let marker = h.dir.path().join("ran");
+        let request = broker_run_request(
+            &h,
+            vec![],
+            vec![brokered("K", "KEY", None)],
+            &format!("touch {}", marker.display()),
+        );
+        h.decide(&[Decision::AllowOnce]);
+        let stream = UnixStream::connect(&h.socket).expect("connect");
+        rusthorse::protocol::send_frame(&stream, &Request::BrokerRunV2(request), &[])
+            .expect("send");
+        // The grant's creation is recorded and its broker has its install;
+        // the requester leaves, and only then does the broker answer.
+        let installed = logged(&log, "install");
+        let pid = installed["pid"].as_u64().expect("pid");
+        let port = installed["listen"][1].as_u64().expect("port") as u16;
+        let id = installed["install"]["grant"]
+            .as_str()
+            .expect("grant")
+            .to_string();
+        stream.shutdown(Shutdown::Both).expect("leave");
+        std::fs::write(&ready, "").expect("ready");
+        let aborted = record_of(&h, "run", "aborted");
+        assert!(
+            aborted["detail"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("the requester went away before")),
+            "{aborted}"
+        );
+        let ended = eventually("the grant's end", || {
+            audit_records(&h).into_iter().find(|r| {
+                r["action"] == "grant" && r["outcome"] == "ended" && r["grant"] == id.as_str()
+            })
+        });
+        assert_eq!(ended["reason"], "command_ended", "{ended}");
+        assert!(process_gone(pid), "the broker was left running");
+        assert!(port_released(port), "the broker's port was kept");
+        assert!(grants(&h).is_empty(), "a grant was left");
+        assert!(!marker.exists(), "the command ran");
+    }
+
+    /// `rusthorse run` interrupted while its dialog is open — here killed —
+    /// takes the dialog with it: nothing runs.
+    #[test]
+    fn interrupting_rusthorse_run_while_its_dialog_is_open_runs_nothing() {
+        let h = unlocked();
+        let marker = h.dir.path().join("ran");
+        let client: Arc<Mutex<Option<std::process::Child>>> = Arc::default();
+        let killing = Arc::clone(&client);
+        *h.ui.on_approve.lock().unwrap() = Some(Box::new(move || {
+            let until = Instant::now() + TEST_LIMIT;
+            loop {
+                if let Some(mut child) = killing.lock().unwrap().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                if Instant::now() >= until {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
+        h.decide(&[Decision::AllowOnce]);
+        let child = h
+            .cmd(&["run", "T", "--", "touch", marker.to_str().expect("utf8")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        *client.lock().unwrap() = Some(child);
+        record_of(&h, "run", "requester_gone");
+        assert_eq!(audit_outcomes(&h, "run"), ["requester_gone"]);
+        assert!(!marker.exists(), "the command ran");
+    }
+}
+
 /// The agent's settings (ADR 0007, section 3): a `configure` needs the vault
 /// unlocked and the human's approval; it saves the settings file and applies
 /// the change at once; what it cannot do it refuses before anyone is asked.
@@ -9435,6 +10133,91 @@ mod import_from {
             let stderr = text(&out.stderr);
             assert!(!raw(&stderr), "{stderr:?}");
             assert!(stderr.contains("TWICE\\u{1b}]0;x\\u{7}"), "{stderr}");
+        }
+
+        /// The keyring is listed for a requester that stays; for one that
+        /// leaves while asked, or as the human allows, it is not.
+        #[test]
+        fn the_keyring_is_not_listed_for_a_requester_that_left() {
+            use crate::requester_leaves::{Departure, leave_at, record_of};
+            use std::net::Shutdown;
+            let Some((bus, _service)) = keyring(vec![segredo("FAKE_A", "fake-a-value")]) else {
+                return;
+            };
+            for departure in [
+                Departure::Stays,
+                Departure::WhileAsked,
+                Departure::AsTheHumanAnswers,
+            ] {
+                let h = Harness::with_keyring(&bus.address);
+                h.decide(&[Decision::AllowOnce]);
+                let stream = std::os::unix::net::UnixStream::connect(&h.socket).expect("connect");
+                if departure != Departure::Stays {
+                    h.ui.answers_late
+                        .store(departure == Departure::AsTheHumanAnswers, Ordering::SeqCst);
+                    leave_at(&h, 0, &stream, Shutdown::Both);
+                }
+                rusthorse::protocol::send_frame(&stream, &Request::KeyringItems, &[])
+                    .expect("send");
+                match departure {
+                    Departure::Stays => {
+                        let answer: Response =
+                            rusthorse::protocol::read_message(&stream).expect("an answer");
+                        assert!(
+                            matches!(&answer, Response::KeyringItems { items } if !items.is_empty()),
+                            "{}",
+                            answer.kind()
+                        );
+                    }
+                    Departure::WhileAsked => {
+                        record_of(&h, "keyring_items", "requester_gone");
+                    }
+                    Departure::AsTheHumanAnswers => {
+                        record_of(&h, "keyring_items", "aborted");
+                    }
+                }
+            }
+        }
+
+        /// A requester that leaves while the keyring is listed for it gets
+        /// no listing, and none is kept for it: the check after the listing.
+        #[test]
+        fn a_listing_whose_requester_left_while_it_was_made_is_not_kept() {
+            use std::net::Shutdown;
+            use std::sync::{Arc, Mutex, mpsc};
+            let (asked, being_asked) = mpsc::sync_channel(1);
+            let (go_ahead, go) = mpsc::sync_channel(1);
+            let mut item = segredo("FAKE_A", "fake-a-value");
+            item.hold = Some(Arc::new(Mutex::new(Some((asked, go)))));
+            let Some((bus, _service)) = keyring(vec![item]) else {
+                return;
+            };
+            let h = Harness::with_keyring(&bus.address);
+            h.decide(&[Decision::AllowOnce]);
+            let stream = std::os::unix::net::UnixStream::connect(&h.socket).expect("connect");
+            rusthorse::protocol::send_frame(&stream, &Request::KeyringItems, &[]).expect("send");
+            being_asked
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the keyring is listed");
+            stream.shutdown(Shutdown::Both).expect("leave");
+            go_ahead.send(()).expect("go ahead");
+            let aborted = crate::requester_leaves::record_of(&h, "keyring_items", "aborted");
+            assert!(
+                aborted["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("after the keyring was listed")),
+                "{aborted}"
+            );
+            // No listing was kept for this process: an import of the item
+            // is refused as from a keyring not listed.
+            match h.call(&pick(FIRST, "FAKE_A")) {
+                Response::Error { code, message } => {
+                    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+                    assert!(message.contains("list the keyring first"), "{message}");
+                }
+                other => panic!("imported from a listing not kept: {}", other.kind()),
+            }
+            assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
         }
 
         #[test]

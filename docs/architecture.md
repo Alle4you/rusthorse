@@ -142,11 +142,14 @@ command gets the values unchanged.
 
 When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
-left of the command's process group and `SIGKILL` three seconds later. The
-agent watches the connection only once the command has started: a caller that
-disconnects while the dialog is open is not noticed until then, so a request
-the human still allows is recorded, its command started with the secrets, and
-then stopped in the same way ([protocol](protocol.md#framing)).
+left of the command's process group and `SIGKILL` three seconds later. A
+caller that disconnects (or half-closes) earlier, while the dialog is open,
+takes the dialog with it: the agent watches the connection from the moment
+the request is read, takes the dialog down, checks again after the human
+answers and once more right before the command starts, and starts nothing
+([protocol](protocol.md#framing)). One that disconnects after that last check
+is noticed once the command has started, which is then stopped in the same
+way.
 
 The leader is reaped only afterwards, so its process group id cannot be
 reused by an unrelated process while it is being signalled. A process whose
@@ -549,7 +552,11 @@ merging with an older copy does not bring them back. Vault files larger than
 The agent accepts connections on one thread and handles each connection on
 its own thread; a connection carries exactly one request, which must arrive
 within 10 seconds. At most 64 connections are handled at once and at most 8
-requests may wait for a dialog; more are refused. Shared state (the vault,
+requests may wait for a dialog; more are refused. A request whose requester
+goes away while it waits gets no dialog when its turn comes (the agent
+checks right before each dialog), and is not carried out: the agent checks
+again under the state mutex, right before it saves, backs up, reads a
+value or puts an unlocked vault in use. Shared state (the vault,
 the generation, the last-use time and remembered approvals) sits behind one
 mutex that is never held while a dialog is open or a command is running. A
 second mutex serializes dialogs, so you are asked one question at a time. A
@@ -596,7 +603,12 @@ answer sent a byte at a time cannot stretch it; after it the dialog counts as
 unanswered. The program runs in its own process group, which the agent kills
 — descendants that kept the socket open included — and then the program
 itself, in case it left the group, before it reaps it, so neither id can
-have been reused. Anything else — a crash, a partial, oversized or
+have been reused. The same happens, before the deadline, when the program
+that asked goes away: while it waits for the answer, the agent also polls
+the requester's connection, without reading it, and when that connection
+is closed (for a run, also half-closed) it takes the dialog down this way
+and records `requester_gone`; with zenity too.
+Anything else — a crash, a partial, oversized or
 contradictory answer, a failure after answering — is an error, never an
 approval. Its environment holds only the session's display, D-Bus and locale
 variables (and the X authority file, resolved before `HOME` changes), with

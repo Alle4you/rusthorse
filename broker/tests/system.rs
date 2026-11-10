@@ -68,7 +68,7 @@ use rusthorse::protocol::{
     Request, Response, RunRequest, SecretString, StatusInfo,
 };
 use rusthorse::session_lock::{Locker, SCREEN_LOCK, SUSPEND};
-use rusthorse::ui::{ApprovalRequest, Decision, Prompt, Typed, Ui};
+use rusthorse::ui::{ApprovalRequest, Connection, Decision, Prompt, Typed, Ui};
 use rusthorse::vault::{KdfParams, Vault};
 use serde_json::Value;
 use support::*;
@@ -106,7 +106,7 @@ struct ScriptedUi {
 }
 
 impl Ui for ScriptedUi {
-    fn master_password(&self, _: &Prompt) -> anyhow::Result<Typed> {
+    fn master_password(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
         self.unlocks.fetch_add(1, Ordering::SeqCst);
         let hook = self.on_password.lock().expect("lock").take();
         if let Some(hook) = hook {
@@ -118,11 +118,11 @@ impl Ui for ScriptedUi {
         )))
     }
 
-    fn secret_value(&self, _: &Prompt) -> anyhow::Result<Typed> {
+    fn secret_value(&self, _: &Prompt, _: Connection<'_>) -> anyhow::Result<Typed> {
         Ok(Typed::Cancelled)
     }
 
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
+    fn approve(&self, request: &ApprovalRequest, _: Connection<'_>) -> anyhow::Result<Decision> {
         self.approvals.lock().expect("lock").push(request.clone());
         let next = self.decisions.lock().expect("lock").pop_front();
         Ok(next.unwrap_or(Decision::Deny))
@@ -134,16 +134,20 @@ impl Ui for ScriptedUi {
 struct SharedUi(Arc<ScriptedUi>);
 
 impl Ui for SharedUi {
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.0.master_password(prompt)
+    fn master_password(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.0.master_password(prompt, requester)
     }
 
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.0.secret_value(prompt)
+    fn secret_value(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.0.secret_value(prompt, requester)
     }
 
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
-        self.0.approve(request)
+    fn approve(
+        &self,
+        request: &ApprovalRequest,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Decision> {
+        self.0.approve(request, requester)
     }
 
     fn limits_height(&self) -> bool {

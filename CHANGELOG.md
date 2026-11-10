@@ -353,6 +353,20 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   fails fails the record, and the action is refused, as when the log cannot
   be written; on a file system whose directories cannot be synced, or with a
   log directory the agent cannot read, the vault now stays locked.
+- A request whose requester goes away — `rusthorse` interrupted or killed,
+  the manager's window closed, an AI agent's tool call stopped — while a
+  dialog for it is open is cancelled, as the protocol had said: the dialog
+  is taken down, a request still waiting for its dialog never gets one, and
+  the agent checks again right before the effect, after the waits on the
+  way to it but the grant registry's own short lock (also for a `backup`,
+  which asks nothing itself). What it asked for is not done, the audit log
+  records `requester_gone` (or `aborted`, when the dialog had been answered)
+  and the request gets no answer. A half-close
+  cancels a `run` this way too, not the other requests. Before, the dialog
+  stayed, and what the human then allowed was done: a `run`'s command
+  started with the secrets (and its broker grants were served) before the
+  agent noticed and stopped it, and an `edit`, a `remove` or an `add` was
+  carried out with nobody to read the answer.
 - A vault that KeePassXC saved as KDBX 4.0 (as it does when nothing in the
   file needs 4.1) can be saved again: Rusthorse writes it back as KDBX 4.1,
   the version it writes. Before, every change to it failed with an

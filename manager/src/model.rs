@@ -544,10 +544,14 @@ pub(crate) enum Tone {
     Refused,
 }
 
-/// Outcomes of a request the human did not approve: denied, cancelled, or
-/// not answered before the dialog's time ran out.
+/// Outcomes of a request the human did not approve: denied, cancelled, not
+/// answered before the dialog's time ran out, or not answered because the
+/// program that asked went away and the dialog was taken down.
 fn refused(outcome: &str) -> bool {
-    matches!(outcome, "denied" | "cancelled" | "timed_out")
+    matches!(
+        outcome,
+        "denied" | "cancelled" | "timed_out" | "requester_gone"
+    )
 }
 
 /// How the history page shows one record of the audit log: plain text for
@@ -1778,6 +1782,7 @@ pub(crate) mod tests {
             of("grant", "created"),
             of("broker_request", "completed"),
             of("run", "exited"),
+            of("remove", "requester_gone"),
         ];
         let picked = |filter: HistoryFilter| -> Vec<usize> {
             records
@@ -1792,7 +1797,7 @@ pub(crate) mod tests {
             (0..records.len()).collect::<Vec<_>>()
         );
         assert_eq!(picked(HistoryFilter::Allowed), [0, 1]);
-        assert_eq!(picked(HistoryFilter::Refused), [2, 3, 4]);
+        assert_eq!(picked(HistoryFilter::Refused), [2, 3, 4, 10]);
         assert_eq!(picked(HistoryFilter::UnlockAndLock), [5, 6]);
         assert_eq!(picked(HistoryFilter::Broker), [7, 8]);
         // A run that creates grants is the broker's; one with an empty list
@@ -1822,6 +1827,7 @@ pub(crate) mod tests {
                 Tone::Plain,
                 Tone::Plain,
                 Tone::Plain,
+                Tone::Refused,
             ]
         );
         assert_eq!(HISTORY_FILTERS[0].0, HistoryFilter::All);

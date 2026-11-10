@@ -44,6 +44,14 @@ paths, messages — is shown with control and invisible characters escaped
 terminal; `--json` and `reveal` give the values as they are, and `open`
 hands the browser the URL as stored.
 
+A command interrupted while the agent's dialog for it is open — Ctrl-C, a
+kill, a closed terminal — cancels its request: the agent takes the dialog
+down (or never shows it, if the request was still waiting for another
+dialog), does nothing, and records `requester_gone` (or `aborted`, when the
+dialog had been answered at that moment). One interrupted after the agent's
+last check, just before the effect, is too late: the change is saved, or
+the command started (and is then stopped, as for [`run`](#rusthorse-run)).
+
 ## Entry names
 
 An entry name is the KeePass title. Names must be unique, at most 128
@@ -527,10 +535,11 @@ the command has started, so a denied request never consumes it.
 When the command exits, anything it left running in its process group (for
 example `sleep 30 &`) is terminated; if `rusthorse run` is interrupted before
 that, the whole group is terminated too — `SIGTERM`, then `SIGKILL` 3 seconds
-later. The agent notices an interruption only once the command has started:
-interrupted while its dialog is open, `rusthorse run` leaves the dialog there,
-and if you then allow it the command starts, with the secrets, and is
-terminated in the same way only then.
+later. Interrupted while its dialog is open, `rusthorse run` takes the
+dialog with it: the agent takes it down and starts nothing, also if you
+allowed it at that moment. Interrupted in the instant after the agent's last
+check, as the command starts, it is noticed once the command has started,
+which is then terminated in the same way.
 
 If remembered approvals are on (`--remember`, the `remember` setting in
 `agent.toml`, or the manager's Settings page), the dialog also offers "Allow

@@ -168,6 +168,7 @@ still holds the grant, including after revocation.
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
 | P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome. The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
+| P16 | A request is not carried out for a requester that has gone. | From the moment a request is read, the agent watches its connection for a close by the requester — also a shutdown both ways, as the manager cancels — and, for a `run` or `broker_run_v2`, a half-close, which cancels a run; it polls the connection, never reads it. A dialog open for the request is taken down, its program killed as at the dialog's deadline, and recorded as `requester_gone`; a dialog the request waits for, or a later one of the same request, is not shown. After the dialogs, the last check of the requester before an effect comes after every wait the agent makes on the way to it for a dialog's turn, for the lock of its state (which a save or a backup holds for a while), for an audit record, for brokers to end or to start, and for a read from outside (the keyring, a file). The registry of grants has a lock of its own, held only for short work in memory (on the grants and their counters, reading the clocks, writing a new broker's install without waiting); a wait for it is not followed by a check (L26). What remains unguarded is a departure during the effect (L26). The effects so checked: the vault file or the settings file written, a backup written, a value read for the answer, a run's values read, each grant's `created` record and then its brokers started, a command started (with grants, once they are ready, ending them first), the vault an unlock opened put in use (it stays locked), a vault created and then put in use, an import's values read, a `.env` file or the keyring read, a keyring listing kept for the program that asked. A `backup`, which has no dialog of its own, is checked the same way. It then records `aborted`, does nothing more, and sends no answer, even when it cannot record that. An unlock, a password change and the creation of a vault write their `unlocked`, `changed` or `created` record before they act, and are checked right before that record and again right before they act: only a requester that leaves between those two checks leaves that record, followed by `aborted` (the vault stays locked, the password unchanged, no vault created). Between them the record waits for the audit log and is written, and, for an unlock and a password change, the agent then waits for the lock of its state, under which the second check is made. So does a grant, followed by `ended`, whose requester leaves between the check before its `created` record and the next check: the record, then a wait for the registry's lock to note it, and, after the last grant's record, the tokens drawn and the installs prepared (the registry's lock again). Grants created for a run whose requester leaves while their brokers start are recorded `created`, then `ended`. A requester that leaves after the last check, or whose connection another process still holds, is served as before; what a wait for the registry's lock, the human's answer and a missing `aborted` leave behind is in L26. | Accidents (a requester interrupted, timed out or closed); not a control against A1 or A2, which can stay |
 
 Broker-specific bounds are in [ADR 0013](adr/0013-credential-broker.md): 16
 entries in the grant registry per agent (normally revoked brokers stay listed
@@ -670,6 +671,60 @@ spending limit at the provider; check the origin in the dialog as you would
 any destination (L4, L9); keep lifetimes and request limits short for keys
 that can do more than the task needs.
 
+### L26 — A requester that leaves late, or does not seem to leave, is served
+
+The agent stops a request whose requester went away only while a dialog for
+it is open or waited for, and at its checks before each effect, the last of
+them after the waits that P16 names. What remains unguarded is a departure
+during the effect. A requester that leaves after the last
+check is too late: a save, a backup or a vault's creation under way is
+completed (a vault created so is not put in use: it stays locked), or the
+value, names or listing put in an answer nobody reads (and a keyring listing
+kept for that program); a command has started — with the secrets in its
+environment — and is then stopped by the run's own watch (`SIGTERM`,
+`SIGKILL` 3 seconds later), its grants ended first. A record written before
+its effect — an unlock's `unlocked`, a password change's `changed`, a vault's
+`created`, a grant's `created` — has a check right before it and another
+right before its effect (for a grant, the next check): it stays when the
+requester leaves between the two, and the second then stops the request
+before it acts: `aborted` follows (for a grant, `ended`). Between them the
+record waits for the audit log and is written; then, for an unlock and a
+password change, the agent waits for the lock of its state, which a save or a
+backup can hold for a while; for a grant, it waits for the registry's lock to
+note the record and, after the last grant's, draws the tokens and prepares
+the installs, waiting for that lock again. The registry of grants has a lock
+of its own, held only for short work in memory (on the grants and their
+counters, reading the clocks, writing a new broker's install without
+waiting), and a wait for it is not followed by a check: a requester that
+leaves during such a wait after the last check is noticed only at the next
+one. That leaves two things done: the grants that an unlock or a new vault
+ends because the vault's file changed stay ended (a protection, like `lock`
+and `revoke_grant`, carried out once decided; the vault stays locked), and a
+run's grants are entered in the registry, which the next check ends before
+any is recorded or started. Three more things stand for a requester that
+left. The human's answer: an "Allow for N" given as the requester left is
+remembered, and an approval postpones the idle lock (`allowed_for_…`, then
+`aborted`). The start of a run's brokers, which is one step: the credentials
+reach the agent's own brokers after the check before it, and the tokens leave
+only with the command, after the last check. And, when the `aborted` record
+cannot be written — it is written best effort — the earlier record
+(`unlocked`, `changed`, `created`, a grant's `created`) alone. An import read
+by the agent is checked before its values are read and again before it is
+saved, so a requester that leaves while the keyring or the `.env` file is
+read is noticed only then. A connection is
+not closed while another process holds it — a descriptor inherited without
+close-on-exec, for example — and a half-close of a request other than a run,
+or a `shutdown(SHUT_RD)` alone, is not taken for a departure: such a client
+can still read, or chose not to. A requester that stays connected but no
+longer waits (stopped, hung) keeps its dialog until the dialog's timeout. A
+request waiting for its turn keeps its place among the 8 that may wait (P13)
+until its turn comes; it is then dropped without a dialog. A failure to poll
+the connection counts as not gone. Before a run's command starts, the agent
+watches only for a close or a half-close: a protocol violation is noticed
+once the command has started, as before. The dialog closes without telling
+the human why. None of this bypasses an approval: what runs or changes is
+what the human allowed.
+
 ## 8. Running AI agents in isolation
 
 To make Rusthorse resist a hostile requester (A2), deny the AI everything that
@@ -788,6 +843,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | The entry kind `ssh-key` and protocol 11, the maintainer's answer to SSH06 ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)). | A label, like the other kinds: no policy reads it and nothing checks it against the value. Reviewed the same day (Codex, AI-assisted): not ready with K01–K03 low, fixed; the confirmation found K04 and K05 low, in the record, fixed; then ready; see below. |
 | 2026-11-10 | Set the broker's limit of 100 request headers itself (Codex, AI-assisted). | Ready, no findings: the third behaviour left to the maintainer by the documentation audit of 2026-11-09 is closed; the explicit limit and its boundary tests are in place. Response limits and two older issues remain for the maintainer; see below. |
 | 2026-11-10 | Sync the audit log's directory entries before its records: three reviews (Codex, AI-assisted). | Not ready with AUD01–AUD04; those confirmed fixed, then not ready with AUD05; that confirmed fixed, then ready, with no new finding. The second behaviour left by the documentation audit is closed within P12's stated limits, whose acceptance remains the maintainer's. The twelve checks passed again on main with the broker's header-limit change; see below. |
+| 2026-11-10 | Stop a request whose requester goes away during its dialog: four reviews and a final confirmation (Codex, AI-assisted). | Not ready with CON01–CON04, then CON05–CON07, then CON08, then CON09 low; the final confirmation is ready within P16 and L26's limits, whose acceptance remains the maintainer's. The twelve checks passed on main with the staged change; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -3679,3 +3735,339 @@ Left to the maintainer, with no acceptance or further fix recorded here:
   `ensure_private_dir`) and `settings::save` make missing directories but
   sync only the file's own directory, not each newly made directory's
   parent. Nothing in these paths was changed to close that gap.
+
+**2026-11-10 — Stop a request whose requester goes away during its dialog.**
+
+The first behaviour that the documentation audit of 2026-11-09 left to the
+maintainer is closed, within P16 and L26's limits below. A connection was
+not watched while a dialog was open: the dialog stayed when the requester
+left, and what the human allowed was done. The agent now polls the borrowed
+connection, never reads it. A close or shutdown both ways counts as a
+departure for any request; a half-close counts only for `run` and
+`broker_run_v2`. Unread bytes, including a
+run's empty stdin frame, are left for the run's watch. While waiting for a
+dialog's answer, the agent watches both sockets under the same deadline;
+a departure wins over an answer noticed with it. The dialog's process group
+is killed and its leader reaped by the same path as at its deadline. A
+request that left while waiting for its turn gets no dialog when its turn
+comes, and no later dialog of that request is shown.
+
+After the dialogs, checks precede the effects according to P16's final
+rule: after waiting for a dialog's turn, the agent's state lock, an audit
+record, brokers to end or start, or a read from outside. The registry's own
+lock is a stated exception, not a claim that every wait is followed by a
+check. The dialog path records `requester_gone`; a check before an effect
+records `aborted`. A stopped request gets no answer even if that record
+fails. The connection is shut down; no new cancellation error is sent.
+There is no protocol bump: no wire message, field, framing or error-code
+guarantee changed; a half-close already cancelled a run. The outcomes are
+strings in the audit log. The existing `poll_raw` unsafe block and its
+`SAFETY` comment moved to `supervise`; the fix of CON02 made the wrapper a
+single system call, smaller than before. No unsafe block or dependency was
+added.
+
+The work began with the implementer's design proposal (Claude Opus 5.5,
+AI-assisted), which the maintainer's coordinating agent approved with
+conditions: no duplicated descriptor outliving the request; a narrow
+`Connection` parameter for the `Ui` methods rather than the requester's
+identity; a vault kept locked when the requester left after the right
+password; and a dated amendment to ADR 0006, not a new ADR. The five commit
+messages are all dated 2026-11-10; this entry records the four reviews and
+the final confirmation of that work.
+
+The first review (Codex, AI-assisted) found CON01 to CON04. Before the
+second review, the coordinating agent sent an intermediate fix back: the
+unlock still recorded `unlocked` for a requester it already knew was gone,
+and the message claimed mutations that had not run. The final fix, "Check
+for a departed requester after every wait, not only dialogs", put the
+checks under the state lock where needed, added checks before and after the
+unlock and password-change records, and reported the completed mutations
+below. The work was rebased onto main after the audit-log directory-sync
+change; the test-only count of records waiting for the audit log was
+adapted to that implementation. The second review confirmed CON01 to CON04
+fixed and found CON05 to CON07.
+
+The coordinating agent then asked for a rule and a table of every effect.
+Preparing the table found another defect: a run's grants' `created`
+records had no departure check. "Check the requester after every wait on
+the way to each effect" added those checks and fixed CON05 to CON07. The
+third review confirmed those fixes but found CON08: waits for the grant
+registry still followed the last check, contradicting the proposed rule.
+The coordinating agent chose to name the waits covered, leave the
+registry's lock as a stated limit and narrow that limit where cheap.
+"Bound the departure checks by what they cover (CON08)" moved the check
+before broker start past token and install preparation, checked again
+after a new vault's barrier before publishing it, and checked after an
+unlock's grants ended before writing `unlocked`.
+
+The reviewer considered that a defensible choice of scope, pending the
+maintainer's acceptance, but disagreed with its justification as a
+technical impossibility: a check could be made inside the registry, and
+"short work" does not bound the time waiting for its lock. The fourth
+review confirmed the functional fixes and the remaining limit, but found
+CON09 low in the wording of the audit window. "State the window of a
+record without its effect exactly (CON09)" corrected it and added the
+recommended behavioural test of the unlock's check before its barrier.
+The final confirmation found the whole change **ready**, within the
+limits whose acceptance remains the maintainer's below.
+
+Findings and their dispositions:
+
+| Finding | Disposition |
+|---|---|
+| Medium — CON01: a backup whose requester left while queued behind another request's unlock was still written; the early return from `ensure_unlocked` bypassed the dialog checks. | **Fixed:** backup checks after acquiring the state lock. The same rule was applied to vault writes, settings, reveals, run values and unlock publication through `state_unless_gone`, `with_vault_unless_gone` and the commit helpers. Confirmed in the second review. |
+| Medium — CON02: `poll_raw` retried an interrupted poll with its original timeout, allowing interruptions to extend the deadline without bound. | **Fixed:** one poll call returns `Interrupted`; `poll_by` recalculates the remaining time, and `read_by` stops at its deadline. `Watch` and the zero-time connection check retry interruptions themselves. Confirmed in the second review; the external checks and remaining test gap are below. |
+| Low — CON03: a failed `requester_gone` record turned a stopped request into an error reply. | **Fixed:** `dialog_abandoned` preserves the unanswered result when recording fails. Confirmed in the second review, including the fail-closed audit path. |
+| Low — CON04: zenity's two surviving mutations were called harmless, but mapping a taken-down dialog to a timeout also answered the stopped request with `cancelled` or `denied`. | **Fixed:** `typed_from` and `approval_from` preserve `RequesterGone` and have unit coverage. Confirmed in the second review; the original harmless-survivor claim is withdrawn. |
+| Medium — CON05: `create_vault` waited for its `created` record after its last check, then created and unlocked the vault for a requester that had left. | **Fixed:** check after the record before creating the file, and under the state lock before publication. A departure during creation leaves a file on disk, locked. Confirmed in the third review; CON08 subsequently covered the registry wait after that state check. |
+| Medium — CON06: `keyring_items` waited for the state lock after checking the connection, then asked the keyring; a completed listing could also be stored after its requester left. | **Fixed:** check under the state lock before asking, release it for the keyring call, and check again under the lock before keeping the listing. The requester's start time is read before that last lock. Confirmed in the third review. |
+| Low — CON07: the documents limited a record without its effect to a departure after the record had been written, omitting earlier waits and the possibility that best-effort `aborted` is missing. | **Fixed, with the final boundary corrected by CON09:** the window is between the checks, and the earlier record can stand alone. The third review confirmed the then-described wider window; the fourth found the later wording too narrow again. |
+| Medium — CON08: the registry's mutex could be waited for after the last check, allowing a new vault to be published or a broker to start after departure; an unlock's barrier could revoke a grant too. The rule promised more than the code guaranteed. | **Narrowed in code and bounded in the contract:** check immediately before broker start after preparation, after the new vault's barrier before publication, and after unlock containment before `unlocked`. The fourth review's probes confirmed no broker start, a created vault kept locked, and a grant still revoked by the unlock barrier. That protective revocation and provisional run-grant registration remain stated limits requiring acceptance. |
+| Low — CON09: the revised documents said a record without its effect remained only when departure occurred while waiting for the audit log. An unlock or password change could also wait for the state lock after the record was complete. | **Fixed and confirmed:** P16, L26, the protocol and comments bound the window by the check before the record and the check before the effect (for a grant, the next check), naming the intervening waits. No production logic changed in this final fix. |
+
+**First review: not ready.** The reviewer traced the approval and effect
+paths, borrowed descriptors, dialog supervision, audit failures and the
+error contract. A channel and the queue's counter placed the backup behind
+an unlock; it still wrote after its requester left (CON01). With
+`strace -f -e trace=poll -e inject=poll:error=EINTR:delay_enter=10ms:when=1..10`,
+ten interruptions made a 50 ms deadline take about 155 ms in three runs,
+against 50.15 ms without injection (CON02). A run half-closing while its
+audit path became invalid got `internal` instead of an unanswered close
+(CON03). The queue test's 200 ms sleep did not prove the position
+deterministically; the fix replaced it with a channel and the queue's
+counter.
+
+On a temporary copy the reviewer disabled `stop_if_gone` (the table's
+late-departure test failed), treated every half-close as a departure
+(`only_a_run_is_ended_by_a_half_close` failed), removed the second run
+check (the departure-during-broker-start test failed), and removed the
+watching in `read_by` (the dialog take-down test failed). M38 and M39,
+zenity's two `None` conversions changed from `RequesterGone` to a timeout,
+survived the 20 existing UI tests. Two additional tests with a stand-in
+executable and no display passed on the original and caught M38 and M39
+respectively, establishing CON04. Twelve runs of the end-to-end filters
+(`requester_leaves` and `the_keyring_is_not_listed_for_a_requester_that_left`,
+three runs at a time, `--test-threads=4`) passed 120 tests; six runs of the
+unit filters, three at a time, passed 42. No flake was found. The whole
+matrix passed.
+
+**Second review: not ready.** CON01 to CON04 were confirmed fixed.
+Interposing 20 poll interruptions made a 200 ms deadline finish at
+202.5 ms with decreasing timeouts. The failed-record test was repeated
+with the audit directory at mode `0300`. Probes held the audit log before
+`create_vault`, held the state mutex before a keyring query whose stand-in
+service socket observed the connection, and held the log and confirmed it
+empty before disconnecting an unlock or password change. These exposed
+CON05 to CON07. The reviewer also checked a zero deadline, an answer and a
+departure available together, and failure of the audit's sync.
+
+The reviewer reproduced R01, R14, R15, R17, R18, R20 and R21, each failing
+as expected: R01 restored the backup defect; R14 answered an error again;
+R15 made 101 calls all with 200 ms; R17 and R18 failed
+`zenity_answers_mean_what_they_say_and_a_dialog_taken_down_none`; R20
+removed the unlock's check after its record and R21 the password change's
+check before its record. R16 hung a read probe whose deadline had passed;
+the reviewer stopped and reaped it after three seconds. Counting that as
+a detection is valid with a bounded watchdog, not an unbounded test run.
+External interposition also confirmed the retries in `Connection::gone`
+and `Watch`; removing each made its probe fail.
+
+The range-diff of the original first version against its rebased version
+showed only a CHANGELOG context change; section 11 was identical to main,
+and the audit-log waiting count was wholly under `cfg(test)`. Ten rounds
+of 14 selected unit tests and nine `requester_leaves::` tests, with three
+CPU-load processes, passed 230 executions. The whole matrix passed,
+including 640 tests with all features and 532 without default features.
+
+**Third review: not ready.** CON05 to CON07 were confirmed fixed. The
+reviewer traced the effect table and held the actual registry mutex in
+independent probes, each repeated five times under load. `create_vault`
+answered successfully with the vault unlocked and only `created` on
+record. The unlock barrier changed a grant from `starting` to `revoked`
+after departure, leaving the vault locked and `unlocked`, then `aborted`.
+A broker started and its grant ended with `created`, then `ended`; no
+command ran. These were CON08. A private FIFO named by `TZ` showed that
+`chrono::Local::now()` held the registry lock while waiting to read the
+timezone. Another probe left `allowed_for_1m`, then `aborted`, one remembered
+approval and the idle lock postponed. A vault created and kept locked was
+recoverable: another creation returned `AlreadyExists`, and a later unlock
+worked.
+
+The reviewer reproduced five mutations, each killed with exit status 101:
+
+- M1, no check after `created`:
+  `a_vault_whose_requester_left_while_its_creation_was_recorded_is_not_created`.
+- M2, publication with a plain state lock:
+  `a_vault_created_for_a_requester_that_left_meanwhile_stays_locked`.
+- M3, the keyring's first check replaced with a plain lock:
+  `the_keyring_is_not_asked_for_a_requester_that_left_while_it_waited`.
+- M5, no check before each grant's record:
+  `no_grant_is_recorded_as_created_for_a_requester_already_gone`.
+- M6, no check after the grant records:
+  `no_broker_is_started_for_a_requester_that_left_while_its_grants_were_recorded`.
+
+M4 and M7 to M9 were not independently reproduced in that round. Fifteen
+rounds of 19 unit and 10 integration tests with three CPU-load processes
+passed 435 executions. The whole matrix passed, including 646 tests with
+all features and 536 without default features.
+
+**Fourth review: not ready only for CON09.** The reviewer read all 24 rows
+of the final table, the registry's critical sections and the test gate
+under `cfg(test)`. Probes again held the actual registry mutex: no broker
+started; the created vault stayed locked; the unlock's grant was revoked
+but only `aborted`, not `unlocked`, was written. The `TZ` FIFO probe
+confirmed that the registry lock was now available during that read.
+Another probe completed the `unlocked` record while the requester was
+still connected, held the state lock, then closed the connection:
+`unlocked`, `aborted`, and a locked vault proved CON09.
+
+The reviewer independently reproduced N1, N2 and N3: the selected
+regression tests failed with exit status 101. An independent behavioural
+probe also caught M13, the unlock's pre-barrier check changed to a plain
+lock: the original left the grant `starting`, the mutant made it
+`revoked`. Fifteen rounds of 22 unit and 10 integration tests passed under
+three CPU-load processes (480 executions); five rounds of five independent
+probes passed too (25 executions). All twelve checks passed: 649 tests
+with all features, 539 without default features, two existing ignored
+tests in each, 9 dialog tests and 45 manager tests.
+
+**Final confirmation: ready.** The reviewer compared every changed
+sentence and both comments against the unlock, password change, vault
+creation and grant preparation paths. The new
+`an_unlock_whose_requester_left_before_its_barrier_ends_no_grant`
+passed on a temporary copy. Replacing the check before the barrier with a
+plain state lock (M13) failed it with `["revoked"]` instead of
+`["starting"]`, not merely a different audit detail. The test also checks
+that the vault remains locked, the generation unchanged, the result
+unanswered and the unlock outcomes just `aborted`. This closes the fourth
+review's recommendation for a permanent behavioural test. The reviewer
+ran `cargo test -p rusthorse --all-features --lib <test>` for the original
+and mutant with a target directory and private `TMPDIR` of their own,
+then ran the whole matrix on main as recorded below. Copies and temporary
+targets were removed; no real vault, audit log or keyring was used.
+
+The implementer's mutation reports, read in the five commit messages,
+are separate from the reviewer's reproductions above:
+
+- **The first version:** 37 of 39 caught. They covered watching the
+  requester in the shared wait and both dialog drivers, close and
+  half-close handling, the pre-dialog and pre-effect checks, outcome
+  mappings, suppressing replies, carrying the connection in `Peer`, and
+  the manager's refused tone. The two zenity timeout conversions survived;
+  CON04 showed that they were not harmless and added direct coverage.
+- **The fix of CON01 to CON04:** R01 to R21 reported caught, covering the
+  checks after waits, the failed-audit unanswered path, deadline handling,
+  zenity conversions, and checks on both sides of the unlock and password
+  records. The implementer detected R16 by two dialog tests hanging until
+  an external 300-second limit; the reviewer's three-second probe above
+  was a separate run.
+- **The fix of CON05 to CON07:** M1 to M9 reported caught: checks after
+  `created`, before publishing the vault, before asking and keeping a
+  keyring listing, before each grant's record and before broker start;
+  the final run check, its values check and the early vault-creation
+  check were retested. M8 initially survived until the broker-run test
+  asserted the stopping point. Its removal on an ordinary run without
+  grants was harmless by design because the final check follows without
+  an intervening wait; that is not a claim about the broker-run path.
+- **The fix of CON08:** N1 to N3 reported caught, respectively moving the
+  broker-start check back before preparation, removing the new publication
+  check, and removing the check before `unlocked`. M2, M5, M6 and the
+  unlock's pre-barrier check, called M13 in this round, were rerun too.
+- **The fix of CON09:** no production logic changed. The new behavioural
+  test caught M13, replacing the unlock's pre-barrier check with a plain
+  state lock.
+
+The two `Interrupted` retries, in `Watch` and `Connection::gone`, still lack
+repository mutation coverage. The reviewer checked them by external
+interposition; they are not harmless omissions by design, nor impossible
+to test. Without the former retry a signal can cancel a live run; without
+the latter a departure can be missed by that check. A permanent equivalent
+check, by a test seam or an external harness, remains the reviewer's
+recommendation for the maintainer, not work claimed done here.
+
+Users can see a dialog disappear when they stop `rusthorse`, close the
+manager's window or abandon a tool call that closes its connection. A
+stopped request gets no reply; an existing client cannot infer from that
+alone that no effect happened, and retains its unknown-outcome handling.
+`rusthorse audit` shows the recorded outcome. In the manager's History,
+`requester_gone` has the refused tone and appears in **Denied or not
+answered**; `aborted` is plain text in **All records**, and in the
+applicable action filters, not in that refusal filter. A vault created
+while its requester left remains on disk, locked; a later request may
+unlock it, and another creation does not replace it.
+
+Wire compatibility does not mean library source compatibility: `Peer`
+now has a lifetime parameter, `Failure` has a private `unanswered` field
+(preventing external struct literals), the three dialog methods of `Ui`
+take `Connection`, and `Decision` and `Typed` gained `RequesterGone`.
+Implementations and exhaustive matches using those public items must adapt.
+The borrowed descriptor's lifetime is checked by a compile-fail doctest.
+
+**Checks on main before this record was added.** The staged tree was
+verified identical to the reviewed branch's tip. All twelve steps ran on
+that working tree, including the broker header-limit and audit-log changes
+already on main, with `CARGO_BUILD_JOBS=5`, `RUST_TEST_THREADS=5`, a private
+`TMPDIR` of mode `0700`, the feature sets in sequence and GTK tests on
+their virtual displays. All output was read; all steps passed:
+
+| Step | Command | Result |
+|---|---|---|
+| 1 | `cargo fmt --all --check` | Passed. |
+| 2 | `cargo clippy --all-targets --all-features -- -D warnings` | Passed. |
+| 3 | `cargo clippy --all-targets -- -D warnings` | Passed. |
+| 4 | `cargo test --all-features` | 650 passed, 2 ignored. |
+| 5 | `cargo test --no-default-features` | 540 passed, 2 ignored. |
+| 6 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Passed. |
+| 7 | `cargo +1.89 check --all-targets` | Passed. |
+| 8 | `cargo +1.89 check --all-targets --all-features` | Passed. |
+| 9 | `cargo clippy -p rusthorse-dialog --all-targets -- -D warnings` | Passed. |
+| 10 | `cargo test -p rusthorse-dialog` | 4 unit and 5 virtual-display tests passed. |
+| 11 | `cargo clippy -p rusthorse-manager --all-targets -- -D warnings` | Passed. |
+| 12 | `cargo test -p rusthorse-manager` | 45 passed. |
+
+With and without features respectively: 247/245 library tests, 20/20 CLI
+tests, 192/169 agent tests, 1/1 descriptor-alignment tests, 4/4 KeePass
+compatibility tests, 25/25 packaging tests, 45/45 broker unit tests, 80/30
+broker integration tests, 35/0 system tests and 1/1 compile-fail doctests
+passed. The descriptor-limit test's child rerun is not counted twice.
+The two existing ignored tests are the real KDF timing and the test
+requiring `keepassxc-cli`; neither was run. Tests ran as uid 1000, so
+permission checks did not skip as root. The temporary directory was empty
+afterwards. No package was installed or service changed. The confirmation
+and matrix preceded this documentation-only recording step; they were not
+rerun merely to add the history.
+
+Not checked: every possible interleaving, formal liveness or timing bounds,
+real secrets or the real keyring, or dialogs on the maintainer's screen.
+The GTK suites use virtual displays; stand-in dialog processes and unit
+mappings do not constitute a new manual zenity compatibility test. The
+final confirmation reran M13 and the complete matrix, not every earlier
+mutation, external interposition probe or load experiment. Its production
+code was unchanged from the fourth review; only documentation, comments
+and the new test differed. The older dated history, including the broker
+and audit-log entries, is left intact.
+
+Left to the maintainer's explicit acceptance; no acceptance is recorded
+by the ready verdict:
+
+- **The registry lock is outside the guarantee.** A barrier may end grants
+  after the requester left; those protective revocations stand. A run's
+  grants can be entered provisionally and then ended by the next check,
+  before being recorded or started. The reviewer considers this a
+  defensible scope choice, not a technical impossibility of checking more;
+  short critical sections do not bound lock acquisition time.
+- **The human's answer stands.** An "Allow for N" can be remembered, and
+  the idle lock postponed, for a requester that left as the human answered.
+  Its approval record can be followed by `aborted`.
+- **Broker start and activation are one step.** Credentials can reach the
+  agent's own brokers after departure during that step. The next check
+  ends them before starting the command; tokens leave only with the
+  command.
+- **An effect under way is not undone.** A save or backup can complete;
+  a vault created during departure stays on disk, locked. A departure
+  after the final command check is handled by the running command's watch.
+- **`aborted` is best effort.** A preceding `unlocked`, `changed` or
+  `created` record may stand alone without the corresponding effect.
+  The relevant departure window is between the checks, including the
+  intervening audit operation, subsequent state-lock wait or grant
+  preparation as CON09 now states; not only the wait for the audit log.

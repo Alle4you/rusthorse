@@ -22,9 +22,10 @@ use anyhow::{Context, anyhow, bail};
 
 use crate::dialog_protocol::{self as wire, Answer, Dialog, Remember, Reply, Request};
 use crate::helper_program;
-use crate::supervise::{Exit, GRACE, Supervised, read_by, read_frame_by, write_all_by};
+use crate::supervise::{Exit, GRACE, Supervised, is_gone, read_by, read_frame_by, write_all_by};
 use crate::ui::{
-    ApprovalRequest, Decision, Prompt, Typed, Ui, ZenityUi, dialog_env, dialog_text, remember_note,
+    ApprovalRequest, Connection, Decision, Prompt, Typed, Ui, ZenityUi, dialog_env, dialog_text,
+    remember_note,
 };
 use crate::util::format_duration;
 
@@ -138,13 +139,17 @@ fn random_hex(bytes: usize) -> io::Result<String> {
 enum Broken {
     /// The deadline passed.
     Deadline,
+    /// The requester went away before the answer.
+    RequesterGone,
     /// Anything else.
     Failed(anyhow::Error),
 }
 
-/// An I/O error, or the deadline if it is why.
+/// An I/O error, or the deadline or the requester's departure if it is why.
 fn io_broken(e: io::Error, what: &str, deadline: Instant) -> Broken {
-    if e.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline {
+    if is_gone(&e) {
+        Broken::RequesterGone
+    } else if e.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline {
         Broken::Deadline
     } else {
         Broken::Failed(anyhow!("{what}: {e}"))
@@ -154,15 +159,17 @@ fn io_broken(e: io::Error, what: &str, deadline: Instant) -> Broken {
 /// Show one dialog with `program` and return the human's reply. One deadline
 /// covers sending the request, reading the answer, the end of the stream and
 /// the program's exit; when it passes before the answer, the reply is
-/// [`Reply::TimedOut`]. Any other problem is an error. In every case the
-/// program's whole process group is killed and the program reaped before
-/// this returns.
+/// [`Reply::TimedOut`]. When `requester` goes away before the answer, the
+/// dialog is taken down and the result is `None`. Any other problem is an
+/// error. In every case the program's whole process group is killed and the
+/// program reaped before this returns.
 pub fn exchange(
     program: &Path,
     env: &[(String, String)],
     request: &Request,
     deadline: Instant,
-) -> anyhow::Result<Reply> {
+    requester: Connection<'_>,
+) -> anyhow::Result<Option<Reply>> {
     let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
     let mut cmd = Command::new(program);
     cmd.current_dir("/")
@@ -175,9 +182,10 @@ pub fn exchange(
         .stderr(Stdio::null());
     let child =
         Supervised::spawn(cmd).with_context(|| format!("cannot run {}", program.display()))?;
-    match talk(&ours, &child, request, deadline) {
-        Ok(reply) => Ok(reply),
-        Err(Broken::Deadline) => Ok(Reply::TimedOut),
+    match talk(&ours, &child, request, deadline, requester) {
+        Ok(reply) => Ok(Some(reply)),
+        Err(Broken::Deadline) => Ok(Some(Reply::TimedOut)),
+        Err(Broken::RequesterGone) => Ok(None),
         Err(Broken::Failed(e)) => Err(explain(&child, e, deadline)),
     }
 }
@@ -187,6 +195,7 @@ fn talk(
     child: &Supervised,
     request: &Request,
     deadline: Instant,
+    requester: Connection<'_>,
 ) -> Result<Reply, Broken> {
     let mut frame = Vec::new();
     wire::write_frame(&mut frame, request, wire::MAX_REQUEST)
@@ -197,7 +206,9 @@ fn talk(
     socket
         .shutdown(std::net::Shutdown::Write)
         .map_err(|e| Broken::Failed(anyhow!("cannot finish the request: {e}")))?;
-    let body = read_frame_by(socket, wire::MAX_ANSWER, deadline)
+    // While the human looks at it, the dialog is for a requester that may
+    // go away.
+    let body = read_frame_by(socket, wire::MAX_ANSWER, deadline, requester)
         .map_err(|e| io_broken(e, "no usable answer", deadline))?;
     let answer: Answer = wire::parse(&body).map_err(|e| Broken::Failed(anyhow!("{e}")))?;
     if answer.version != wire::VERSION || answer.id != request.id {
@@ -213,7 +224,7 @@ fn talk(
     };
     // Exactly one frame: then end of stream.
     let mut extra = [0u8; 1];
-    match read_by(socket, &mut extra, deadline) {
+    match read_by(socket, &mut extra, deadline, Connection::none()) {
         Ok(0) => {}
         Ok(_) => return Err(Broken::Failed(anyhow!("more than one answer"))),
         Err(e) => return Err(after(io_broken(e, "the answer did not end", deadline))),
@@ -244,9 +255,17 @@ fn explain(child: &Supervised, error: anyhow::Error, deadline: Instant) -> anyho
     anyhow!("the dialog program failed ({reason})")
 }
 
-/// The decision an approval reply stands for. `offered` tells whether
-/// "Allow for N" was offered.
-pub fn decision(reply: Reply, offered: bool, remember_for: Duration) -> anyhow::Result<Decision> {
+/// The decision an approval reply stands for — no reply: the requester went
+/// away and the dialog was taken down ([`exchange`]). `offered` tells
+/// whether "Allow for N" was offered.
+pub fn decision(
+    reply: Option<Reply>,
+    offered: bool,
+    remember_for: Duration,
+) -> anyhow::Result<Decision> {
+    let Some(reply) = reply else {
+        return Ok(Decision::RequesterGone);
+    };
     Ok(match reply {
         Reply::AllowOnce => Decision::AllowOnce,
         Reply::AllowFor if offered => Decision::AllowFor(remember_for),
@@ -256,8 +275,11 @@ pub fn decision(reply: Reply, offered: bool, remember_for: Duration) -> anyhow::
     })
 }
 
-/// What an entry reply stands for.
-pub fn typed(reply: Reply) -> anyhow::Result<Typed> {
+/// What an entry reply stands for — no reply, as for [`decision`].
+pub fn typed(reply: Option<Reply>) -> anyhow::Result<Typed> {
+    let Some(reply) = reply else {
+        return Ok(Typed::RequesterGone);
+    };
     Ok(match reply {
         Reply::Typed { text } if text.len() <= wire::MAX_TYPED => Typed::Value(text),
         Reply::Typed { .. } => bail!("the dialog program returned too much text"),
@@ -322,7 +344,8 @@ impl DesktopUi {
         title: &str,
         dialog: Dialog,
         timeout: Duration,
-    ) -> anyhow::Result<Reply> {
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Option<Reply>> {
         let session = dialog_env();
         let base = session
             .iter()
@@ -341,10 +364,16 @@ impl DesktopUi {
             title: dialog_text(title),
             dialog,
         };
-        exchange(program, &env, &request, Instant::now() + timeout + GRACE)
+        exchange(
+            program,
+            &env,
+            &request,
+            Instant::now() + timeout + GRACE,
+            requester,
+        )
     }
 
-    fn entry(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
+    fn entry(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
         let timing = self.timing();
         match locate() {
             Located::Absent(_) => {
@@ -353,7 +382,7 @@ impl DesktopUi {
                 if let Some(height) = crate::ui::prompt_too_tall(prompt) {
                     bail!("this dialog would be too tall to read at once ({height} pixels)");
                 }
-                Self::zenity(timing).master_password(prompt)
+                Self::zenity(timing).master_password(prompt, requester)
             }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
@@ -365,22 +394,26 @@ impl DesktopUi {
                     field: dialog_text(&prompt.field),
                     confirm: dialog_text(&prompt.confirm),
                 };
-                typed(self.show(&program, &prompt.title, dialog, timing.timeout)?)
+                typed(self.show(&program, &prompt.title, dialog, timing.timeout, requester)?)
             }
         }
     }
 }
 
 impl Ui for DesktopUi {
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.entry(prompt)
+    fn master_password(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.entry(prompt, requester)
     }
 
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.entry(prompt)
+    fn secret_value(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.entry(prompt, requester)
     }
 
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
+    fn approve(
+        &self,
+        request: &ApprovalRequest,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Decision> {
         let timing = self.timing();
         match locate() {
             Located::Absent(_) => {
@@ -389,7 +422,7 @@ impl Ui for DesktopUi {
                 if let Some(height) = crate::ui::approval_too_tall(request) {
                     bail!("this dialog would be too tall to read at once ({height} pixels)");
                 }
-                Self::zenity(timing).approve(request)
+                Self::zenity(timing).approve(request, requester)
             }
             Located::Unusable(why) => bail!("cannot show the dialog: {why}"),
             Located::Program(program) => {
@@ -408,7 +441,8 @@ impl Ui for DesktopUi {
                         note: dialog_text(note.trim()),
                     }),
                 };
-                let reply = self.show(&program, &request.title, dialog, timing.timeout)?;
+                let reply =
+                    self.show(&program, &request.title, dialog, timing.timeout, requester)?;
                 decision(reply, offered, timing.remember_for)
             }
         }
@@ -490,6 +524,17 @@ mod tests {
     /// still holds the writing descriptor (until its exec); only tests run
     /// programs they have just written, so only they retry.
     fn run(program: &Path, id: &str, deadline: Duration) -> anyhow::Result<Reply> {
+        run_for(program, id, deadline, Connection::none())
+            .map(|reply| reply.expect("nobody to go away"))
+    }
+
+    /// [`run`], for a dialog shown for `requester`.
+    fn run_for(
+        program: &Path,
+        id: &str,
+        deadline: Duration,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Option<Reply>> {
         let busy = |e: &anyhow::Error| {
             e.chain().any(|cause| {
                 cause
@@ -499,12 +544,24 @@ mod tests {
             })
         };
         for _ in 0..50 {
-            match exchange(program, &[], &request(id), Instant::now() + deadline) {
+            match exchange(
+                program,
+                &[],
+                &request(id),
+                Instant::now() + deadline,
+                requester,
+            ) {
                 Err(e) if busy(&e) => std::thread::sleep(Duration::from_millis(20)),
                 other => return other,
             }
         }
-        exchange(program, &[], &request(id), Instant::now() + deadline)
+        exchange(
+            program,
+            &[],
+            &request(id),
+            Instant::now() + deadline,
+            requester,
+        )
     }
 
     #[test]
@@ -576,6 +633,69 @@ mod tests {
         let reply = run(&program, "abc", Duration::from_secs(1)).expect("reply");
         assert_eq!(reply, Reply::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_dialog_whose_requester_goes_away_is_taken_down() {
+        use std::os::fd::AsFd;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("pid");
+        let program = fake(
+            dir.path(),
+            b"",
+            &format!(
+                "/bin/sleep 30 & echo $! > '{}'; exec /bin/sleep 30",
+                pidfile.display()
+            ),
+        );
+        let descendant = |pidfile: &Path| {
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pid) = fs::read_to_string(pidfile)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < until, "the dialog never ran");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // While nobody answers, the requester stays: the dialog lasts until
+        // its deadline, unread bytes from the requester notwithstanding.
+        let (watched, mut requester) = UnixStream::pair().expect("pair");
+        std::io::Write::write_all(&mut requester, b"\x80\x00\x00\x01\x00").expect("write");
+        let reply = run_for(
+            &program,
+            "abc",
+            Duration::from_millis(500),
+            Connection::new(watched.as_fd(), true),
+        )
+        .expect("reply");
+        assert_eq!(reply, Some(Reply::TimedOut));
+        let _ = fs::remove_file(&pidfile);
+        // Then it goes away while the dialog is open: taken down at once,
+        // with everything it started.
+        let leaving = pidfile.clone();
+        let leaves = std::thread::spawn(move || {
+            descendant(&leaving);
+            drop(requester);
+        });
+        let started = Instant::now();
+        let reply = run_for(
+            &program,
+            "abc",
+            Duration::from_secs(60),
+            Connection::new(watched.as_fd(), true),
+        )
+        .expect("reply");
+        assert_eq!(reply, None, "the requester's departure was missed");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        leaves.join().expect("join");
+        assert!(
+            crate::supervise::tests::gone(descendant(&pidfile)),
+            "the dialog's descendant survived"
+        );
     }
 
     #[test]
@@ -653,28 +773,34 @@ mod tests {
     fn only_offered_answers_count() {
         let ten = Duration::from_secs(600);
         assert_eq!(
-            decision(Reply::AllowOnce, false, ten).expect("once"),
+            decision(Some(Reply::AllowOnce), false, ten).expect("once"),
             Decision::AllowOnce
         );
         assert_eq!(
-            decision(Reply::AllowFor, true, ten).expect("for"),
+            decision(Some(Reply::AllowFor), true, ten).expect("for"),
             Decision::AllowFor(ten)
         );
-        assert!(decision(Reply::AllowFor, false, ten).is_err());
-        assert!(decision(Reply::Cancel, true, ten).is_err());
+        assert!(decision(Some(Reply::AllowFor), false, ten).is_err());
+        assert!(decision(Some(Reply::Cancel), true, ten).is_err());
         let text = || SecretString::new("t".into());
-        assert!(decision(Reply::Typed { text: text() }, true, ten).is_err());
+        assert!(decision(Some(Reply::Typed { text: text() }), true, ten).is_err());
         assert!(matches!(
-            typed(Reply::Typed { text: text() }).expect("typed"),
+            typed(Some(Reply::Typed { text: text() })).expect("typed"),
             Typed::Value(_)
         ));
         let long = SecretString::new("x".repeat(wire::MAX_TYPED + 1));
-        assert!(typed(Reply::Typed { text: long }).is_err());
-        assert!(typed(Reply::AllowOnce).is_err());
+        assert!(typed(Some(Reply::Typed { text: long })).is_err());
+        assert!(typed(Some(Reply::AllowOnce)).is_err());
         assert!(matches!(
-            typed(Reply::Cancel).expect("cancel"),
+            typed(Some(Reply::Cancel)).expect("cancel"),
             Typed::Cancelled
         ));
+        // No reply: the requester went away and the dialog was taken down.
+        assert_eq!(
+            decision(None, true, ten).expect("gone"),
+            Decision::RequesterGone
+        );
+        assert!(matches!(typed(None).expect("gone"), Typed::RequesterGone));
     }
 
     #[test]

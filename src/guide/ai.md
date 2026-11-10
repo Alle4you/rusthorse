@@ -33,6 +33,9 @@ version. Each command also has `--help`, for example `rusthorse run --help`.
   the human.
 - If a request is denied or times out, stop and ask the human. Do not retry
   a variation of it.
+- Let `rusthorse` wait for the human's answer. If you stop it, or your tool
+  call times out, while its dialog is open, the agent takes the dialog down
+  and does nothing.
 - Do not start, stop, restart or reconfigure the agent (`rusthorse agent`,
   `systemctl --user … rusthorse-agent`), and do not change the master
   password. Ask the human instead.

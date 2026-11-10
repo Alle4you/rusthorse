@@ -289,3 +289,12 @@ which the threat model already treats as out of scope.
   `timed_out`) and the request's two kinds (§3), the locale variables
   passed (§5), and which text is selectable (§6). Notes say where the
   answer frame's size and the follow-up changed.
+- 2026-11-10, a requester that goes away: the supervision of §4 also ends
+  when the program the dialog is for goes away. While it waits for the
+  answer, the agent polls that program's connection as well, without
+  reading it; when the connection is closed (for a `run`, also
+  half-closed), the agent kills and reaps the dialog program as at the
+  deadline, zenity too, and records `requester_gone` instead of `timed_out`.
+  The agent shows no dialog for a request whose requester has already gone.
+  The program and the protocol between it and the agent are unchanged: the
+  program is killed, so its window closes without an explanation.

@@ -6,7 +6,7 @@
 //! and no colours or icons of its own, so the dialogs follow the desktop's
 //! theme. Tests use their own [`Ui`] implementation.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -93,6 +93,9 @@ pub enum Decision {
     /// Nobody answered before the dialog's timeout: a denial, reported as
     /// such so that "nobody looked" is not mistaken for "the human said no".
     TimedOut,
+    /// The program that asked went away while the dialog was open, and the
+    /// dialog was taken down: nobody answered, and nothing is done.
+    RequesterGone,
     /// Allow this one request.
     AllowOnce,
     /// Allow this request and identical ones for the given duration.
@@ -108,16 +111,92 @@ pub enum Typed {
     Cancelled,
     /// Nobody answered before the dialog's timeout.
     TimedOut,
+    /// The program that asked went away while the dialog was open, and the
+    /// dialog was taken down.
+    RequesterGone,
 }
 
-/// Something that can ask the human questions.
+/// The connection of the program a dialog is shown for, watched so that the
+/// dialog is taken down when that program goes away. Nothing is read from
+/// it or written to it: it is only polled, for a close by the other end —
+/// with `half_close_ends`, also for a half-close (`shutdown(SHUT_WR)`), which
+/// ends a `run`. A connection that another process still holds open is not
+/// closed, so its requester is not gone.
+#[derive(Debug, Clone, Copy)]
+pub struct Connection<'a> {
+    watched: Option<(BorrowedFd<'a>, bool)>,
+}
+
+impl<'a> Connection<'a> {
+    /// The connection `socket`; a half-close ends it if `half_close_ends`.
+    pub fn new(socket: BorrowedFd<'a>, half_close_ends: bool) -> Self {
+        Connection {
+            watched: Some((socket, half_close_ends)),
+        }
+    }
+
+    /// No connection to watch (the agent's own requests, tests): never gone.
+    pub const fn none() -> Connection<'static> {
+        Connection { watched: None }
+    }
+
+    /// Whether the program at the other end has gone: it closed the
+    /// connection (or shut it down both ways), or, when a half-close ends
+    /// it, half-closed it. A failure to poll counts as not gone.
+    pub fn gone(&self) -> bool {
+        let Some(mut fd) = self.pollfd() else {
+            return false;
+        };
+        loop {
+            match crate::supervise::poll_raw(std::slice::from_mut(&mut fd), 0) {
+                // Interrupted by a signal: ask again (it waits for nothing).
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                polled => return polled.is_ok_and(|_| self.left(fd.revents)),
+            }
+        }
+    }
+
+    /// What to give `poll(2)` to watch it, if there is a connection.
+    pub(crate) fn pollfd(&self) -> Option<nix::libc::pollfd> {
+        self.watched
+            .map(|(socket, half_close_ends)| nix::libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: if half_close_ends {
+                    nix::libc::POLLRDHUP
+                } else {
+                    0
+                },
+                revents: 0,
+            })
+    }
+
+    /// Whether `revents`, as `poll(2)` reported them for [`Self::pollfd`],
+    /// say that the other end has gone.
+    pub(crate) fn left(&self, revents: i16) -> bool {
+        use nix::libc::{POLLERR, POLLHUP, POLLNVAL, POLLRDHUP};
+        let Some((_, half_close_ends)) = self.watched else {
+            return false;
+        };
+        let mask = POLLHUP | POLLERR | POLLNVAL | if half_close_ends { POLLRDHUP } else { 0 };
+        revents & mask != 0
+    }
+}
+
+/// Something that can ask the human questions. Each dialog is for the
+/// program at the other end of `requester`: when it goes away while the
+/// dialog is open, the dialog is taken down and the answer is
+/// [`Typed::RequesterGone`] or [`Decision::RequesterGone`].
 pub trait Ui: Send + Sync {
     /// Ask for the master password.
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed>;
+    fn master_password(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed>;
     /// Ask for a secret value to store.
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed>;
+    fn secret_value(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed>;
     /// Ask whether to allow a request.
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision>;
+    fn approve(
+        &self,
+        request: &ApprovalRequest,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Decision>;
     /// Whether approval dialogs must fit on the screen without scrolling, so
     /// that requests taller than [`metrics::MAX_HEIGHT`] are refused (zenity);
     /// `false` for dialogs whose content scrolls while the buttons stay in
@@ -210,32 +289,54 @@ impl ZenityUi {
         Ok(cmd)
     }
 
-    fn hidden_entry(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
+    fn hidden_entry(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
         let mut cmd = self.command(&prompt.title)?;
         cmd.arg("--entry")
             .arg("--hide-text")
             .arg(format!("--text={}", entry_label(&prompt_text(prompt))))
             .arg(format!("--ok-label={}", prompt.confirm));
-        let (status, output) = capture_through_socket(cmd, self.deadline())?;
-        match status {
-            Some(0) => {
-                let mut value = String::from_utf8(output.to_vec())
-                    .map(SecretString::new)
-                    .map_err(|_| anyhow::anyhow!("zenity returned invalid UTF-8"))?;
-                if value.ends_with('\n') {
-                    value.pop();
-                }
-                Ok(Typed::Value(value))
+        typed_from(capture_through_socket(cmd, self.deadline(), requester)?)
+    }
+}
+
+/// What zenity's entry dialog answered, from how it ended: `None`, the
+/// requester went away and the dialog was taken down.
+fn typed_from(captured: Option<DialogExit>) -> anyhow::Result<Typed> {
+    let Some((status, output)) = captured else {
+        return Ok(Typed::RequesterGone);
+    };
+    match status {
+        Some(0) => {
+            let mut value = String::from_utf8(output.to_vec())
+                .map(SecretString::new)
+                .map_err(|_| anyhow::anyhow!("zenity returned invalid UTF-8"))?;
+            if value.ends_with('\n') {
+                value.pop();
             }
-            Some(1) => Ok(Typed::Cancelled),
-            Some(ZENITY_TIMEOUT) => Ok(Typed::TimedOut),
-            other => bail!("zenity failed (exit status {other:?})"),
+            Ok(Typed::Value(value))
         }
+        Some(1) => Ok(Typed::Cancelled),
+        Some(ZENITY_TIMEOUT) => Ok(Typed::TimedOut),
+        other => bail!("zenity failed (exit status {other:?})"),
+    }
+}
+
+/// What zenity's question dialog answered, from how it ended
+/// ([`decision_from`]): `None`, the requester went away and the dialog was
+/// taken down.
+fn approval_from(captured: Option<DialogExit>, remember: Option<(&str, Duration)>) -> Decision {
+    match captured {
+        None => Decision::RequesterGone,
+        Some((status, output)) => decision_from(status, &output, remember),
     }
 }
 
 /// Most a dialog program may print.
 const MAX_DIALOG_OUTPUT: usize = 64 * 1024;
+
+/// How a dialog program ended — its exit status, if it exited — and what it
+/// printed.
+pub type DialogExit = (Option<i32>, Zeroizing<Vec<u8>>);
 
 /// Run a dialog program and collect what it prints, before `deadline`. Its
 /// stdout is one end of a socket pair, not a pipe: another process of the
@@ -243,18 +344,22 @@ const MAX_DIALOG_OUTPUT: usize = 64 * 1024;
 /// typed password, but opening a socket that way fails (`ENXIO`). It runs
 /// under the agent's supervision of helper processes: its own process group,
 /// killed when done. A program that has not finished by the deadline is
-/// reported as zenity reports a timeout.
+/// reported as zenity reports a timeout. If `requester` goes away before
+/// the program has printed its answer, the program is killed the same way
+/// and the result is `None`.
 pub fn capture_through_socket(
     mut cmd: Command,
     deadline: std::time::Instant,
-) -> anyhow::Result<(Option<i32>, Zeroizing<Vec<u8>>)> {
-    use crate::supervise::{Supervised, read_to_end_by};
-    let timed_out = || (Some(ZENITY_TIMEOUT), Zeroizing::new(Vec::new()));
+    requester: Connection<'_>,
+) -> anyhow::Result<Option<DialogExit>> {
+    use crate::supervise::{Supervised, is_gone, read_to_end_by};
+    let timed_out = || Some((Some(ZENITY_TIMEOUT), Zeroizing::new(Vec::new())));
     let (ours, theirs) = UnixStream::pair().context("cannot create a socket pair")?;
     cmd.stdout(Stdio::from(OwnedFd::from(theirs)));
     let child = Supervised::spawn(cmd).context("cannot run the dialog program")?;
-    let output = match read_to_end_by(&ours, MAX_DIALOG_OUTPUT, deadline) {
+    let output = match read_to_end_by(&ours, MAX_DIALOG_OUTPUT, deadline, requester) {
         Ok(output) => output,
+        Err(e) if is_gone(&e) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(timed_out()),
         Err(e) => return Err(e).context("cannot read the dialog's answer"),
     };
@@ -262,7 +367,7 @@ pub fn capture_through_socket(
         .exit_by(deadline)
         .context("cannot wait for the dialog program")?
     {
-        Some(exit) => Ok((exit.code(), output)),
+        Some(exit) => Ok(Some((exit.code(), output))),
         None => Ok(timed_out()),
     }
 }
@@ -297,15 +402,19 @@ fn entry_label(text: &str) -> String {
 }
 
 impl Ui for ZenityUi {
-    fn master_password(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.hidden_entry(prompt)
+    fn master_password(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.hidden_entry(prompt, requester)
     }
 
-    fn secret_value(&self, prompt: &Prompt) -> anyhow::Result<Typed> {
-        self.hidden_entry(prompt)
+    fn secret_value(&self, prompt: &Prompt, requester: Connection<'_>) -> anyhow::Result<Typed> {
+        self.hidden_entry(prompt, requester)
     }
 
-    fn approve(&self, request: &ApprovalRequest) -> anyhow::Result<Decision> {
+    fn approve(
+        &self,
+        request: &ApprovalRequest,
+        requester: Connection<'_>,
+    ) -> anyhow::Result<Decision> {
         let remember_label = format!("Allow for {}", format_duration(self.remember_for));
         let offer_remember = request.can_remember && !self.remember_for.is_zero();
 
@@ -322,9 +431,9 @@ impl Ui for ZenityUi {
         if offer_remember {
             cmd.arg(format!("--extra-button={remember_label}"));
         }
-        let (status, output) = capture_through_socket(cmd, self.deadline())?;
+        let captured = capture_through_socket(cmd, self.deadline(), requester)?;
         let remember = offer_remember.then_some((remember_label.as_str(), self.remember_for));
-        Ok(decision_from(status, &output, remember))
+        Ok(approval_from(captured, remember))
     }
 }
 
@@ -660,6 +769,7 @@ pub(crate) fn dialog_env() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
 
     #[test]
     fn dialog_output_arrives_through_a_socket() {
@@ -670,12 +780,16 @@ mod tests {
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "readlink /proc/self/fd/1"]);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            let _ = tx.send(capture_through_socket(cmd, deadline).map(|(s, o)| (s, o.to_vec())));
+            let _ = tx.send(
+                capture_through_socket(cmd, deadline, Connection::none())
+                    .map(|c| c.map(|(s, o)| (s, o.to_vec()))),
+            );
         });
         let (status, output) = rx
             .recv_timeout(Duration::from_secs(20))
             .expect("capture hung")
-            .expect("run");
+            .expect("run")
+            .expect("nobody to go away");
         assert_eq!(status, Some(0));
         let target = String::from_utf8_lossy(&output);
         assert!(target.starts_with("socket:"), "fd 1 was {target}");
@@ -685,7 +799,7 @@ mod tests {
     fn a_missing_dialog_program_is_an_error() {
         let cmd = Command::new("/nonexistent/zenity");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        assert!(capture_through_socket(cmd, deadline).is_err());
+        assert!(capture_through_socket(cmd, deadline, Connection::none()).is_err());
     }
 
     #[test]
@@ -698,8 +812,13 @@ mod tests {
             &format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display()),
         ]);
         let started = std::time::Instant::now();
-        let (status, output) =
-            capture_through_socket(cmd, started + Duration::from_millis(500)).expect("capture");
+        let (status, output) = capture_through_socket(
+            cmd,
+            started + Duration::from_millis(500),
+            Connection::none(),
+        )
+        .expect("capture")
+        .expect("nobody to go away");
         assert_eq!(status, Some(ZENITY_TIMEOUT));
         assert!(output.is_empty());
         assert!(started.elapsed() < Duration::from_secs(3));
@@ -712,6 +831,137 @@ mod tests {
             crate::supervise::tests::gone(descendant),
             "a descendant survived"
         );
+    }
+
+    /// A dialog program that never answers, with a descendant; returns the
+    /// file that names the descendant once it runs.
+    fn hanging_dialog(dir: &Path) -> (Command, std::path::PathBuf) {
+        let pidfile = dir.join("pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display()),
+        ]);
+        (cmd, pidfile)
+    }
+
+    /// Wait (at most 10 seconds) for a program to have written its
+    /// descendant's process id.
+    fn descendant_of(pidfile: &Path) -> u32 {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < until, "the program never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_dialog_whose_requester_goes_away_is_taken_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cmd, pidfile) = hanging_dialog(dir.path());
+        // The requester's connection: closed by its other end once the
+        // dialog runs.
+        let (watched, requester) = UnixStream::pair().expect("pair");
+        let leaving = pidfile.clone();
+        let leaves = std::thread::spawn(move || {
+            descendant_of(&leaving);
+            drop(requester);
+        });
+        let started = std::time::Instant::now();
+        let captured = capture_through_socket(
+            cmd,
+            started + Duration::from_secs(60),
+            Connection::new(watched.as_fd(), false),
+        )
+        .expect("capture");
+        assert!(captured.is_none(), "the requester's departure was missed");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        leaves.join().expect("join");
+        let descendant = descendant_of(&pidfile);
+        assert!(
+            crate::supervise::tests::gone(descendant),
+            "a descendant survived"
+        );
+    }
+
+    #[test]
+    fn a_requester_that_stays_or_only_half_closes_leaves_the_dialog_alone() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Bytes it sent and nobody read, and a half-close that does not end
+        // the request: still there, so the dialog runs to its deadline.
+        let (watched, mut requester) = UnixStream::pair().expect("pair");
+        requester.write_all(b"\x80\x00\x00\x01\x00").expect("write");
+        requester
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        let (cmd, _) = hanging_dialog(dir.path());
+        let captured = capture_through_socket(
+            cmd,
+            std::time::Instant::now() + Duration::from_millis(500),
+            Connection::new(watched.as_fd(), false),
+        )
+        .expect("capture");
+        assert_eq!(
+            captured.map(|(status, _)| status),
+            Some(Some(ZENITY_TIMEOUT))
+        );
+        // The same half-close ends a request that a half-close ends.
+        let (cmd, _) = hanging_dialog(dir.path());
+        let started = std::time::Instant::now();
+        let captured = capture_through_socket(
+            cmd,
+            started + Duration::from_secs(60),
+            Connection::new(watched.as_fd(), true),
+        )
+        .expect("capture");
+        assert!(captured.is_none());
+        assert!(started.elapsed() < Duration::from_secs(30));
+        drop(requester);
+    }
+
+    #[test]
+    fn a_connection_is_gone_only_once_its_other_end_closes() {
+        use std::io::Write;
+        assert!(!Connection::none().gone());
+        let (watched, mut other) = UnixStream::pair().expect("pair");
+        let run = Connection::new(watched.as_fd(), true);
+        let request = Connection::new(watched.as_fd(), false);
+        assert!(!run.gone() && !request.gone());
+        // Unread bytes are neither read nor taken for a departure.
+        other.write_all(b"\x80\x00\x00\x01\x00").expect("write");
+        assert!(!run.gone() && !request.gone());
+        other
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        assert!(run.gone(), "a half-close ends a run");
+        assert!(!request.gone(), "a half-closed client can still read");
+        let mut pending = [0u8; 5];
+        use std::io::Read;
+        (&watched).read_exact(&mut pending).expect("still there");
+        assert_eq!(&pending, b"\x80\x00\x00\x01\x00");
+        // Shut down both ways (as the manager cancels), or closed — seen
+        // once no other copy of it remains (a process forked by another
+        // test holds one until its exec).
+        other.shutdown(std::net::Shutdown::Both).expect("shutdown");
+        assert!(run.gone() && request.gone());
+        let (watched, other) = UnixStream::pair().expect("pair");
+        drop(other);
+        let closed = Connection::new(watched.as_fd(), false);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !closed.gone() {
+            assert!(
+                std::time::Instant::now() < until,
+                "a closed connection not seen"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -747,6 +997,35 @@ mod tests {
             Decision::Deny
         );
         assert_eq!(decision_from(Some(255), b"", remember), Decision::Deny);
+    }
+
+    #[test]
+    fn zenity_answers_mean_what_they_say_and_a_dialog_taken_down_none() {
+        let ended =
+            |status: i32, output: &[u8]| Some((Some(status), Zeroizing::new(output.to_vec())));
+        assert!(matches!(
+            typed_from(ended(0, b"fake typed\n")).expect("typed"),
+            Typed::Value(v) if v.as_str() == "fake typed"
+        ));
+        assert!(matches!(
+            typed_from(ended(1, b"")).expect("cancel"),
+            Typed::Cancelled
+        ));
+        assert!(matches!(
+            typed_from(ended(ZENITY_TIMEOUT, b"")).expect("timeout"),
+            Typed::TimedOut
+        ));
+        assert!(typed_from(ended(3, b"")).is_err());
+        assert!(typed_from(Some((None, Zeroizing::new(Vec::new())))).is_err());
+        assert_eq!(approval_from(ended(0, b""), None), Decision::AllowOnce);
+        assert_eq!(approval_from(ended(1, b""), None), Decision::Deny);
+        // Taken down because the requester went away: neither a timeout nor
+        // a denial, so that the agent records it as such and does not answer.
+        assert!(matches!(
+            typed_from(None).expect("gone"),
+            Typed::RequesterGone
+        ));
+        assert_eq!(approval_from(None, None), Decision::RequesterGone);
     }
 
     #[test]

@@ -305,7 +305,21 @@ pub mod fake {
         pub locked: bool,
         /// Answer its label only after this long (a slow keyring).
         pub delay: std::time::Duration,
+        /// Once, when its label is first asked for: say so, then wait to be
+        /// told to answer (a test acts while the keyring is being listed).
+        pub hold: Option<Hold>,
     }
+
+    /// See [`Item::hold`]: where to say that the label was asked for, and
+    /// where the go-ahead comes from.
+    pub type Hold = std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    >;
 
     impl Item {
         /// An unlocked item with these attributes.
@@ -319,6 +333,7 @@ pub mod fake {
                 secret: secret.as_bytes().to_vec(),
                 locked: false,
                 delay: std::time::Duration::ZERO,
+                hold: None,
             }
         }
     }
@@ -405,6 +420,15 @@ pub mod fake {
         #[zbus(property)]
         fn label(&self) -> String {
             std::thread::sleep(self.0.delay);
+            let held = self
+                .0
+                .hold
+                .as_ref()
+                .and_then(|hold| hold.lock().unwrap_or_else(|p| p.into_inner()).take());
+            if let Some((asked, answer)) = held {
+                let _ = asked.send(());
+                let _ = answer.recv_timeout(std::time::Duration::from_secs(30));
+            }
             self.0.label.clone()
         }
 

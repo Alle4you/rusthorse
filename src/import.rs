@@ -369,16 +369,15 @@ mod tests {
         // The room kept for the requester covers the longest chain the agent
         // can describe: eight processes with 15 bytes of invalid UTF-8 for a
         // name and the largest pid.
-        let worst = crate::peer::Peer {
-            uid: 1000,
-            pid: 4_194_304,
-            chain: (0..8)
-                .map(|_| crate::peer::ProcessInfo {
-                    pid: 4_194_304,
-                    name: String::from_utf8_lossy(&[0xff; 15]).into_owned(),
-                })
-                .collect(),
-        };
+        let mut worst = crate::peer::Peer::agent();
+        worst.uid = 1000;
+        worst.pid = 4_194_304;
+        worst.chain = (0..8)
+            .map(|_| crate::peer::ProcessInfo {
+                pid: 4_194_304,
+                name: String::from_utf8_lossy(&[0xff; 15]).into_owned(),
+            })
+            .collect();
         let keyring: Vec<Planned> = (0..80)
             .map(|i| planned(format!("FAKE_{i}"), Some("segredo: FAKE [nome=FAKE]")))
             .collect();
