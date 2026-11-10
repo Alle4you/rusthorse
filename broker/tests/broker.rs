@@ -961,6 +961,66 @@ fn oversized_heads_and_bodies_are_refused() {
     client.response().assert_local(403);
 }
 
+/// The broker's limit of 100 header lines, which it sets itself
+/// (`MAX_REQUEST_HEADERS`): one line more gets the HTTP library's empty
+/// `431` and the connection closed, before anything is asked, and counts as
+/// refused before admission; 100 go on to the admission (which the fake
+/// agent refuses).
+#[test]
+fn more_than_100_header_lines_get_431_before_anything_is_asked() {
+    let ca = TestCa::new();
+    let refuse = Admit::Refuse(AdmissionRefusal::Exhausted);
+    let broker = Broker::start(Options::nowhere(&ca).admit(refuse));
+    let mut client = broker.connect();
+    client.write(&broker.endpoint().request_with_header_lines(101));
+    let response = client.response();
+    assert_eq!(response.status, 431, "{response:?}");
+    assert!(response.body.is_empty(), "{response:?}");
+    assert!(client.closed_within(Duration::from_secs(5)), "left open");
+    assert_eq!(broker.admits(), 0, "admission was asked");
+    broker
+        .send(&broker.endpoint().request_with_header_lines(100))
+        .assert_local(403);
+    assert_eq!(broker.admits(), 1);
+    // Only the first is the broker's own refusal.
+    broker.revoke(EndReason::Revoked);
+    assert_eq!(broker.wait_revoked(), 1);
+}
+
+/// A head of 100 header lines reaches the destination whole, the key in
+/// the token's place; one of 101 reaches nothing.
+#[cfg(feature = "test-upstream")]
+#[test]
+fn a_head_of_100_header_lines_is_forwarded_and_one_of_101_is_not() {
+    let ca = TestCa::new();
+    let destination = Destination::new(&ca, answer(200, &[], b"ok"));
+    let broker = Broker::start(Options::new(&destination.origin(), &ca));
+    let response = broker.send(&broker.endpoint().request_with_header_lines(100));
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(response.body, b"ok");
+    let got = &destination.wait_for(1)[0];
+    let pads = got
+        .names()
+        .iter()
+        .filter(|n| n.starts_with("x-pad-"))
+        .count();
+    assert_eq!(pads, 98, "{got:?}");
+    assert_eq!(got.values("x-api-key"), vec![CREDENTIAL.to_string()]);
+    let mut client = broker.connect();
+    client.write(&broker.endpoint().request_with_header_lines(101));
+    let response = client.response();
+    assert_eq!(response.status, 431, "{response:?}");
+    assert!(response.body.is_empty(), "{response:?}");
+    assert!(client.closed_within(Duration::from_secs(5)), "left open");
+    // Confirmed once the first request has ended: one admission, one
+    // refusal, one connection to the destination.
+    broker.revoke(EndReason::Revoked);
+    assert_eq!(broker.wait_revoked(), 1);
+    assert_eq!(broker.admits(), 1);
+    assert_eq!(destination.connections(), 1);
+    assert_eq!(destination.received().len(), 1);
+}
+
 #[test]
 fn identical_duplicate_lengths_are_one_length() {
     let ca = TestCa::new();

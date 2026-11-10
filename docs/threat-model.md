@@ -786,6 +786,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-09 | The documentation correction, whole, and the SSH fixes (Codex, AI-assisted). | Not ready: SSH01–SSH05 confirmed fixed; DOC01–DOC06 low, fixed. Confirmation the same day: ready, no new finding; see below. |
 | 2026-11-10 | The SSH recipes tried against servers, by hand (the maintainer and the maintainer's agent; a test, not a review). | The probe, the key recipe and the password recipe worked for what was tried, on two routers; SSH06 low (nothing tells a password from a private key, and the agent first chose the wrong recipe), fixed in the guide, with a design decision left to the maintainer. The record and the fix reviewed the same day (Codex, AI-assisted): not ready with T01–T04 low, fixed, then ready; see below. |
 | 2026-11-10 | The entry kind `ssh-key` and protocol 11, the maintainer's answer to SSH06 ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)). | A label, like the other kinds: no policy reads it and nothing checks it against the value. Reviewed the same day (Codex, AI-assisted): not ready with K01–K03 low, fixed; the confirmation found K04 and K05 low, in the record, fixed; then ready; see below. |
+| 2026-11-10 | Set the broker's limit of 100 request headers itself (Codex, AI-assisted). | Ready, no findings: the third behaviour left to the maintainer by the documentation audit of 2026-11-09 is closed; the explicit limit and its boundary tests are in place. Response limits and two older issues remain for the maintainer; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -3385,3 +3386,85 @@ Second confirmation (Codex, AI-assisted, 2026-11-10): **ready.** K04 and K05
 confirmed fixed, with no new finding, and the whole record found accurate.
 The reviewer ran no test in that round. The maintainer's agent ran the
 matrix once more on the tree as committed: the twelve steps passed.
+
+**2026-11-10 — Set the broker's limit of 100 request headers itself.**
+
+The third behaviour that the documentation audit of 2026-11-09 left to the
+maintainer is closed. The limit of 100 request headers was hyper's default,
+neither set nor tested by the broker. The broker now passes its own
+`MAX_REQUEST_HEADERS` (100), in `src/broker_protocol.rs`, to
+`http1::Builder::max_headers`. The number, the empty `431`, the connection
+being closed and what is recorded did not change; no CHANGELOG line was
+needed. The dated note in ADR 0013 states the change.
+
+Tests in both builds send 100 header lines on to admission and refuse 101
+before asking the agent. With `test-upstream`, 100 reach the fake HTTPS
+destination whole, with the credential in the token's place, and 101 reach
+nothing. The system test checks that the refused request has no
+`broker_request` record and contributes to the grant's end count. That
+count reaches the end record when the agent receives the broker's
+`revoked`; without it, `broker_refused.unwrap_or(0)` contributes zero.
+End records are best effort. ADR 0013's note is made precise on those two
+conditions with this record.
+
+The implementer's mutations, on temporary copies with their own target
+directories:
+
+- `MAX_REQUEST_HEADERS = 99` fails
+  `more_than_100_header_lines_get_431_before_anything_is_asked` (both
+  builds), `a_head_of_100_header_lines_is_forwarded_and_one_of_101_is_not`
+  and `the_limits_are_those_of_phase_1`.
+- `MAX_REQUEST_HEADERS = 101` fails the same three tests and
+  `badly_framed_requests_are_refused_and_any_path_goes_as_sent`.
+- Removing the `max_headers` call survives every test in both builds,
+  harmless by design: hyper's default is the same 100 today. Keeping the
+  now-unused import makes clippy fail, but no behaviour test distinguishes
+  the default from the explicit setting. This surviving mutation is
+  recorded as such, as `AGENTS.md` requires.
+
+Review (Codex, AI-assisted, 2026-11-10; verdict: **ready**, no findings):
+
+| Finding | Disposition |
+|---|---|
+| None in this change. | **Ready.** The unchanged response limits, wording and test-helper issue below are left to the maintainer, not fixes claimed by this change. |
+
+The reviewer read hyper 1.12.0 and httparse 1.10.1 in Cargo's registry:
+the parser counts header lines, including `Host` and each occurrence of a
+repeated name, but not the request line; too many become a parse error,
+answered with an empty `431` and a closed connection. It traced that error
+to the broker's count of refusals before admission. It checked the helper's
+count: one `Host`, one `x-api-key` and the remaining padding lines, with
+exactly two more CRLFs than header lines (the request line and the empty
+line). It checked the forwarding and refusal assertions and the system
+test's end record.
+
+The reviewer ran the whole matrix of `AGENTS.md`'s checks: formatting,
+clippy with and without the test features, both test suites, documentation
+with warnings denied, both MSRV 1.89 checks, and clippy and tests for the
+dialog and the manager; all twelve steps passed. It reproduced the limit
+mutations and the harmless surviving removal on temporary copies. An
+extra probe sent 101 header lines without a token and got `431`, confirming
+that parsing precedes the token check. The library source and a separate
+probe confirmed that an explicit 100 keeps hyper's temporary header
+storage inline; it does not force those arrays onto the heap.
+
+Not checked: real destinations or credentials, fuzzing or a sustained load
+test, allocation or throughput benchmarks, or future library versions.
+The destination-response limits below were read in the code and the
+library's sources, not exercised with oversized responses.
+
+Left to the maintainer; nothing in these three areas changed:
+
+- **Destination responses.** `broker/src/exchange.rs` leaves the client's
+  `max_headers`, `max_header_size` and `max_buf_size` unset. It inherits
+  hyper's limit of 100 header lines and its default read buffer of 417792
+  bytes (about 418 kB), rather than a head-size limit set by the broker;
+  exceeding those inherited bounds makes the broker answer its own `502`.
+  The documents state no response limit. The reviewer's recommendation is
+  to set, test and document these limits in a change of their own.
+- **"A malformed request"** in `docs/cli.md` and `src/guide/ai.md` predates
+  this change. A request that only exceeds a size or count limit need not
+  be malformed; the wording should distinguish those cases.
+- **The fake agent's `wait_for`** in `broker/tests/support/mod.rs` asserts
+  while holding its lock. A failed assertion can make its reader thread
+  panic with `PoisonError`: noise after a test failure, not a broker defect.

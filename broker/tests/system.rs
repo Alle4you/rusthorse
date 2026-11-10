@@ -1968,9 +1968,11 @@ fn a_destinations_401_is_relayed_counted_and_reported_when_the_run_ends() {
 /// Badly framed requests are refused by the real broker before anything
 /// else (B's tests go through the whole list): a foreign `Host`, an
 /// `Origin`, `CONNECT`, an absolute target, a request `Transfer-Encoding`
-/// (alone and with a length) — nothing is asked of the agent, nothing
-/// reaches the destination, and the grant's end counts them. Any path and
-/// query, with a body on any method, goes to the approved origin as the
+/// (alone and with a length), and a head of 101 header lines, which the
+/// HTTP library answers itself — nothing is asked of the agent, nothing
+/// reaches the destination, no request is recorded, and the grant's end
+/// counts them. Any path and query, with a body on any method, goes to the
+/// approved origin as the
 /// command sent it: there is no route.
 #[test]
 fn badly_framed_requests_are_refused_and_any_path_goes_as_sent() {
@@ -2006,6 +2008,12 @@ fn badly_framed_requests_are_refused_and_any_path_goes_as_sent() {
         response.assert_local(400);
         assert_eq!(response.header("connection"), Some("close"));
     }
+    let mut client = ep.connect();
+    client.write(&ep.request_with_header_lines(101));
+    let response = client.response();
+    assert_eq!(response.status, 431, "{response:?}");
+    assert!(response.body.is_empty(), "{response:?}");
+    assert!(client.closed_within(Duration::from_secs(5)), "left open");
     settle();
     assert_eq!(destination.connections(), 0, "a request was forwarded");
     let grant = sys.grant(&a.id).expect("listed");
@@ -2033,7 +2041,7 @@ fn badly_framed_requests_are_refused_and_any_path_goes_as_sent() {
     }
     sys.go("a");
     assert_eq!(a.running.exit_code(), Some(0));
-    let (admitted, refused) = (targets.len() as u64, framing.len() as u64);
+    let (admitted, refused) = (targets.len() as u64, framing.len() as u64 + 1);
     assert_eq!(
         sys.end_of(&a.id)["requests"],
         serde_json::json!({

@@ -915,6 +915,19 @@ impl Endpoint {
         raw_request(method, target, self.port, &all, body)
     }
 
+    /// A `GET` whose head has `lines` header lines in all (at least two):
+    /// `Host`, the token in `x-api-key`, and `x-pad-N` lines for the rest.
+    pub fn request_with_header_lines(&self, lines: usize) -> Vec<u8> {
+        let mut headers = vec![("x-api-key".to_string(), self.token.clone())];
+        headers.extend((3..=lines).map(|n| (format!("x-pad-{n}"), n.to_string())));
+        let raw = raw_request("GET", "/v1/models", self.port, &headers, b"");
+        // The request line, each header line and the empty line that ends
+        // the head each end in CRLF.
+        let ends = raw.windows(2).filter(|pair| *pair == b"\r\n").count();
+        assert_eq!(ends, lines + 2, "not {lines} header lines");
+        raw
+    }
+
     /// Send `raw` on a new connection and read the response.
     pub fn send(&self, raw: &[u8]) -> Response {
         let mut client = Client::connect(self.port);

@@ -6,7 +6,8 @@
 //! Connections: at most the install's `max_connections` are open at once
 //! (one more is closed as soon as it is accepted); a request's head must
 //! arrive within the header deadline of the connection's opening or of the
-//! previous response, and of at most `MAX_REQUEST_HEADER_BYTES` (`431`); a
+//! previous response, and of at most `MAX_REQUEST_HEADER_BYTES` bytes and
+//! `MAX_REQUEST_HEADERS` header lines (`431`); a
 //! connection with no request in progress is closed after the idle
 //! deadline; every connection open when the grant closes — revoked, or past
 //! its lifetime, which a task of its own watches — is closed at once.
@@ -17,9 +18,10 @@
 //! admission (`403`, `429`, `503`, or the agent's answer), which names the
 //! request by its method's label alone. There is no route: the target goes
 //! to the approved origin as the client sent it. A request that hyper cannot
-//! parse it answers itself (`400`, or `431` for a head too large) and closes
-//! the connection. Every request refused before its admission was asked,
-//! those included, is counted, for `revoked`; once the grant is closed,
+//! parse it answers itself (`400`, or `431` for a head too large or with
+//! too many header lines) and closes the connection. Every request refused
+//! before its admission was asked, those included, is counted, for
+//! `revoked`; once the grant is closed,
 //! every request that passes the token gets `403`.
 
 use std::convert::Infallible;
@@ -34,8 +36,8 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rusthorse::broker_grant::{self, MethodLabel};
 use rusthorse::broker_protocol::{
-    FromBroker, MAX_REQUEST_BODY_BYTES, MAX_REQUEST_HEADER_BYTES, REQUEST_BODY_BUDGET_BYTES,
-    VERSION,
+    FromBroker, MAX_REQUEST_BODY_BYTES, MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_HEADERS,
+    REQUEST_BODY_BUDGET_BYTES, VERSION,
 };
 use rustls_pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};
@@ -185,10 +187,14 @@ async fn connection(stream: TcpStream, server: Arc<Server>, _slot: OwnedSemaphor
         let activity = Arc::clone(&activity);
         service_fn(move |request| handle(request, Arc::clone(&server), Arc::clone(&activity)))
     };
+    // The broker's own limit on the number of headers, not hyper's default
+    // (the same number today), which a new version could change: hyper
+    // counts header lines and answers one too many with `431`.
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(server.limits.request_header)
         .max_header_size(MAX_REQUEST_HEADER_BYTES)
+        .max_headers(MAX_REQUEST_HEADERS)
         .max_buf_size(MAX_BUFFER_BYTES)
         .keep_alive(true)
         .half_close(false);

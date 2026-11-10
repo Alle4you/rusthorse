@@ -52,6 +52,11 @@
   consecutive, and how a token-shaped string is compared. What the code
   does did not change.
 
+- Amended: 2026-11-10: the broker sets its limit of 100 request headers
+  itself instead of inheriting the HTTP library's default, and its tests
+  cover it ([Requests and responses](#requests-and-responses), step 1).
+  The limit and the answer did not change.
+
 ## Context
 
 ### The problem
@@ -532,7 +537,15 @@ request, in order:
    a parse error of the HTTP library, normally answered with an empty `400`,
    and an HTTP/2 connection preface closes the connection without a response;
    the limit of 100 headers is that library's default, which the broker does
-   not set itself and no test of the broker covers.)
+   not set itself and no test of the broker covers.) (Changed on 2026-11-10:
+   the broker sets the limit of 100 headers itself, and its tests send 100
+   and 101. The library counts header lines, `Host` and each line of a
+   repeated name included; it answers a request with more than 100 with an
+   empty `431` and closes the connection, before the token is checked or
+   anything is asked of the agent. Such a request has no number and no
+   `broker_request` record: it counts among the broker's refusals before
+   admission, which its `revoked` reports. The grant's end record includes
+   that count if the agent receives `revoked`; end records are best effort.)
 2. **Token**: missing or wrong → `401`.
 3. **Route** (superseded 2026-11-04: no route check; the path and query go
    as the program sent them): the path must be in the exact form above, without `%` escapes,

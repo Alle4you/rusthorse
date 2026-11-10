@@ -86,6 +86,10 @@ pub const RETRY_AFTER_SECS: u64 = 1;
 /// gets `431`.
 pub const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
 
+/// Most header lines in a request's head, `Host` and each line of a
+/// repeated name counted; one more gets `431`.
+pub const MAX_REQUEST_HEADERS: usize = 100;
+
 /// How long a request's whole head (request line and headers) may take to
 /// arrive, from the moment the connection was opened or the previous
 /// response on it was sent.
@@ -1349,6 +1353,7 @@ mod tests {
     fn the_limits_are_those_of_phase_1() {
         // Requests and responses.
         assert_eq!(MAX_REQUEST_HEADER_BYTES, 32 * 1024);
+        assert_eq!(MAX_REQUEST_HEADERS, 100);
         assert_eq!(REQUEST_HEADER_TIMEOUT, Duration::from_secs(30));
         assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
         assert_eq!(REQUEST_BODY_BUDGET_BYTES, 64 * 1024 * 1024);
