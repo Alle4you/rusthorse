@@ -13,12 +13,12 @@ supersedes the old one, which is marked as such.
 | [0004](0004-native-distribution.md) | Native binary and systemd user service, no Flatpak | Accepted |
 | [0005](0005-remembered-approvals-opt-in.md) | Remembered approvals are opt-in and bound to the vault generation | Accepted |
 | [0006](0006-own-dialog-program.md) | Rusthorse's own dialog program replaces zenity | Accepted |
-| [0007](0007-visual-manager.md) | A visual manager that remains a client of the agent | Proposed |
-| [0008](0008-entry-kinds.md) | Entry kinds, and an API key's endpoint for `run` | Proposed |
-| [0009](0009-lock-on-screen-lock-and-suspend.md) | The agent locks when the screen locks or the computer suspends | Proposed |
-| [0010](0010-debian-package.md) | A Debian package that installs and removes cleanly | Proposed |
-| [0011](0011-first-start-from-the-manager.md) | The first start happens in the manager; the agent creates the vault | Proposed |
-| [0012](0012-import-read-by-the-agent.md) | Imports are read by the agent, and the manager can start them | Proposed |
+| [0007](0007-visual-manager.md) | A visual manager that remains a client of the agent | Accepted |
+| [0008](0008-entry-kinds.md) | Entry kinds, and an API key's endpoint for `run` | Accepted |
+| [0009](0009-lock-on-screen-lock-and-suspend.md) | The agent locks when the screen locks or the computer suspends | Accepted |
+| [0010](0010-debian-package.md) | A Debian package that installs and removes cleanly | Accepted |
+| [0011](0011-first-start-from-the-manager.md) | The first start happens in the manager; the agent creates the vault | Accepted |
+| [0012](0012-import-read-by-the-agent.md) | Imports are read by the agent, and the manager can start them | Accepted |
 | [0013](0013-credential-broker.md) | A credential broker: approved programs get a grant, not the secret | Accepted |
 
 ## Writing a new ADR

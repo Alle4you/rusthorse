@@ -56,7 +56,8 @@ rusthorse show NAME --json        # one entry's metadata
 ```
 
 The JSON objects have `name`, `group`, `kind`, `username`, `url`, `host`,
-`port`, `tags`, `has_password` and `id`. The `id` is a UUID, which also
+`port`, `tags`, `has_password`, `has_notes`, `other_fields` (names only),
+`modified` and `id`. The `id` is a UUID, which also
 works as `NAME`. Fields without a value are left out. A field named in
 `protected_fields` is withheld like a secret.
 
@@ -104,7 +105,7 @@ not a secret and is not redacted.
   variables that make a program run other code (`NODE_OPTIONS`,
   `PYTHONPATH`, …). Set such variables only when the task needs them, and
   say why.
-- Output is redacted. Every occurrence of a secret value (4 characters or
+- Output is redacted. Every occurrence of a secret value (4 bytes or
   longer) in the command's standard output and error becomes
   `[REDACTED:NAME]`. Do not add `--no-redact` unless the human asks for it.
 - With redaction (the default), the command reads nothing (`/dev/null`)
@@ -128,35 +129,52 @@ not a secret and is not redacted.
 ### SSH
 
 ssh reads no password from the environment: `sshpass -e` passes it the one
-in `SSHPASS`. Take the username and the host from
-`rusthorse show NAME --json`.
+in `SSHPASS`. Take the username, the host and the port (`-p PORT`, when it is
+not 22) from `rusthorse show NAME --json`.
 
 ```sh
-rusthorse run SSHPASS=NAME -- sshpass -e ssh -o PubkeyAuthentication=no USER@HOST 'uptime'
+rusthorse run SSHPASS=NAME -- sshpass -e ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=yes USER@HOST 'uptime'
 ```
 
-- With redaction the command has no terminal, so ssh cannot ask whether to
-  trust an unknown host key, and the connection fails. Check first with
-  `ssh-keygen -F HOST`. If the host is unknown, ask the human to connect
-  once and check its fingerprint. Never turn host key checking off.
-- To see whether a host answers, without a secret:
-  `ssh -o BatchMode=yes -o ConnectTimeout=5 USER@HOST true`. A
-  `Permission denied` means that it answers. Do not wait for a banner on a
-  bare TCP connection: some SSH servers speak only after the client.
+- `StrictHostKeyChecking=yes` makes ssh refuse a host whose key it does not
+  know, whatever the ssh configuration says: the connection fails instead of
+  trusting a key that nobody checked. Check first with `ssh-keygen -F HOST`
+  (`ssh-keygen -F '[HOST]:PORT'` when the port is not 22). If the host is
+  unknown, ask the human to connect once and check its fingerprint. Never turn
+  host key checking off, and never use `accept-new`.
+- To see whether a host answers, without a secret, offer it nothing:
+
+  ```sh
+  ssh -F /dev/null -o BatchMode=yes -o PreferredAuthentications=none -o IdentityAgent=none -o StrictHostKeyChecking=yes -o ConnectTimeout=5 -p PORT USER@HOST true
+  ```
+
+  It reads no ssh configuration and offers no key and no password;
+  `BatchMode=yes` alone would still try the human's own keys, and could log
+  in with them. A `Permission denied` means that the host answers; a
+  `Host key verification failed`, that it answers with a key ssh does not
+  know. A host reached only through the human's ssh configuration (an
+  alias, a jump host) cannot be probed this way. Do not wait for a banner
+  on a bare TCP connection: some SSH servers speak only after the client.
 - If `sshpass` is not installed, tell the human; do not install it.
 - If the password is refused, stop and tell the human: a device's web and
   SSH passwords may differ, and repeated failures can lock the account.
 - An interactive session is the human's to start, with `--no-redact`.
 
 With a private key stored as an entry's value, a temporary ssh-agent holds
-it for the command only:
+it while the command runs. The key must have no passphrase: `ssh-add` would
+ask for it, and this recipe does not supply one. Tell the human instead,
+and never put a passphrase in a command line or a file.
 
 ```sh
-rusthorse run SSH_KEY=NAME -- ssh-agent sh -c 'printf "%s\n" "$SSH_KEY" | ssh-add -q - && ssh USER@HOST uptime; s=$?; ssh-agent -k >/dev/null; exit $s'
+rusthorse run SSH_KEY=NAME -- ssh-agent sh -c 'trap "ssh-agent -k >/dev/null" EXIT; trap "exit 143" HUP INT TERM; printf "%s\n" "$SSH_KEY" | ssh-add -q - && ssh -o StrictHostKeyChecking=yes USER@HOST uptime'
 ```
 
-`ssh-agent -k` ends the agent at once. Without it, the agent outlives the
-command by a few seconds, in a session of its own that `run` does not stop.
+The first `trap` ends the agent when the shell exits, with the command's
+status or `ssh-add`'s; the second makes the shell exit, and so end the
+agent, when `run` stops the command. The agent is in a session of its own,
+which `run` does not stop: if the shell is killed before it can do that
+(`SIGKILL`), the agent keeps the key until it notices that the shell is
+gone, and then ends: within about ten seconds with OpenSSH 9.6.
 
 ## Using an API key through the broker: `run --broker`
 
@@ -253,17 +271,14 @@ rusthorse run --broker DEEPSEEK_API_KEY=deepseek@https://api.deepseek.com --brok
 
 ### Claude Code through the broker
 
-This recipe follows what Claude Code's documentation says. Tried with Claude
-Code 2.1.317 and an earlier version of the broker (with profiles), its
-requests went through the broker, but no answer came back: the account used
-answered `400` ("credit balance is too low") to every request tried that
-carried Claude Code's beta `claude-code-20250219` — Claude Code's own,
-through the broker, and SDK requests, with the key by value as through the
-broker — while other requests with the same key worked. Claude Code
-2.1.318, run in print mode (`claude -p`) with a home directory of its own,
-and so no login, then answered through this version of the broker, in one
-request, and the maintainer then used it interactively through it with the
-recipe below; the earlier `400` did not recur. If Claude Code shows
+This recipe follows what Claude Code's documentation says. Tried on 2026-11-04
+with Claude Code 2.1.318: run in print mode (`claude -p`) with a home
+directory of its own, and so no login, it answered through the broker in one
+request, and the maintainer then used it interactively with the recipe below.
+No version is claimed supported. An account once answered `400` ("credit
+balance is too low") to every request tried that carried Claude Code's beta
+`claude-code-20250219`, with the key by value as through the broker, while
+other requests with the same key worked. If Claude Code shows
 `Credit balance is too low`, tell the human that the account refused the
 request, not the broker. If it does not work, tell the human: never fall
 back to the key, and do not try another key or other betas on your own.

@@ -77,14 +77,16 @@ extended-description = """\
 Rusthorse keeps secrets in a KeePass (KDBX4) file and runs an agent, a \
 systemd user service, through which programs — AI coding agents above all — \
 use a secret without seeing it: the agent asks you in a dialog before each \
-use, runs the approved command with the secret in its environment and hides \
-the value in its output. For an API key whose entry has a broker profile \
-(the Anthropic, OpenAI and OpenAI-compatible HTTP APIs), the approved \
-command can get a temporary token instead of the key: a credential broker, \
-which the agent starts for the run, adds the key to the requests the \
-profile allows. It locks the vault when the screen locks or the computer \
-suspends. The package contains the command-line program and the agent, the \
-agent's dialogs, the credential broker and the visual manager."""
+use (unless you turn on remembered approvals, which skip it for identical \
+requests), runs the approved command with the secret in its environment and \
+hides the value in its output. For a key that an HTTPS API takes in a \
+request header, the approved command can get a temporary token instead of \
+the key: the run names where the key may go, you approve that origin, and a \
+credential broker, which the agent starts for the run, puts the key in the \
+token's place in the requests it forwards there. By default it locks the \
+vault when the screen locks or the computer suspends, as far as the desktop \
+reports those events. The package contains the command-line program and the \
+agent, the agent's dialogs, the credential broker and the visual manager."""
 maintainer-scripts = "packaging/deb/"
 assets = [
     ["target/release/rusthorse", "usr/bin/", "755"],

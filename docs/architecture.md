@@ -95,12 +95,13 @@ sequenceDiagram
 
     C->>A: connect; Run{bindings, argv, cwd, env, redact} (fds 0,1,2 only with --no-redact)
     A->>A: SO_PEERCRED: same uid? read process chain
+    A->>A: resolve program, clean environment,<br/>refuse details too long to show
     alt vault locked
         A->>Z: master password dialog
         Z-->>A: password
         A->>A: decrypt vault.kdbx (Argon2id)
     end
-    A->>A: check entries exist (UUIDs), resolve program, clean environment,<br/>refuse details too long to show
+    A->>A: check entries exist (UUIDs)
     alt remembering enabled and an identical request was approved
         A->>A: use remembered approval
     else
@@ -124,7 +125,9 @@ sequenceDiagram
     C->>C: exit with the same status
 ```
 
-Cleaning the environment (`exec::prepare_env`) removes `LD_*` variables and
+Cleaning the environment (`exec::prepare_env`) removes `LD_*` variables,
+whatever the requester sent for the variables that receive values, tokens or
+the broker's address, and variables whose name is empty or contains `=`, and
 sorts the others the dialog must show: variables that can make the program
 run other code (`RISKY_VARS`), variables that name where it connects
 (`exec::destination`: `*_URL`, `*_HOST`, …, shown under "Destinations") and
@@ -139,7 +142,11 @@ command gets the values unchanged.
 
 When the command exits, and also if the caller disconnects (for example it is
 killed or interrupted) before that, the agent sends `SIGTERM` to whatever is
-left of the command's process group and `SIGKILL` three seconds later.
+left of the command's process group and `SIGKILL` three seconds later. The
+agent watches the connection only once the command has started: a caller that
+disconnects while the dialog is open is not noticed until then, so a request
+the human still allows is recorded, its command started with the secrets, and
+then stopped in the same way ([protocol](protocol.md#framing)).
 
 The leader is reaped only afterwards, so its process group id cannot be
 reused by an unrelated process while it is being signalled. A process whose
@@ -157,19 +164,20 @@ writes is its own socket. A full close, a half-close or a protocol violation
 by the caller cancels the request: the agent shuts the socket down — which
 fails any send in progress at once — and terminates the command. Input has
 its own window too, so input that the command has not read yet never stops
-the agent from reading the connection. If the caller's stdout is closed
-(`| head`), `rusthorse run` shuts the connection down (through a handle that
+the agent from reading the connection. If the caller's stdout or stderr is
+closed (`| head`), or a write to either fails otherwise, `rusthorse run` shuts
+the connection down (through a handle that
 needs no lock) and exits with status 141, like a process killed by
 `SIGPIPE` — within about half a second, even if its other output is stuck.
 
 ## Lifecycle of a `broker_run_v2`
 
-The CLI sends a distinct protocol-9 request with entry names, variable names,
-each binding's destination (`--broker VAR=ENTRY@URL`) and the run's limits
-(`--broker-requests`, `--broker-lifetime`, `--broker-locks`), never a token
-or source key. It checks the destinations and the limits before sending, and
-pairs a `--url` with the broker binding by the same entry spelling; an alias
-that would instead expose the entry's provider URL is refused. The agent
+The CLI sends a distinct request (since protocol 9) with entry names, variable
+names, each binding's destination (`--broker VAR=ENTRY@URL`) and the run's
+limits (`--broker-requests`, `--broker-lifetime`, `--broker-locks`), never a
+token or source key. It checks the destinations and the limits before sending,
+and pairs a `--url` with the broker binding by the same entry spelling; an
+alias that would instead expose the entry's provider URL is refused. The agent
 refuses unknown fields, parses each destination into an origin (`https://`,
 a lowercase host name that is not an IP address, an optional port) and a
 base path, checks the limits, resolves UUIDs, and rejects duplicate brokered
@@ -337,18 +345,20 @@ updates it without revoking unrelated grants.
 |---|---|---|---|
 | `status`, `lock` | no | none | — |
 | `unlock` | — | master password dialog | — |
+| `create_vault` | — (there is no vault yet) | new master password dialogs | — |
 | `list`, `show` | yes | none — metadata only | — |
 | `add` (value typed by you) | yes | value dialog | — |
 | `add --stdin` | yes | approval | no |
 | `add --generate` | yes | approval (the agent generates the value) | no |
 | `change_password` | yes | current and new password dialogs | no |
+| `backup` | yes | none — the copy is as protected as the vault; audited | — |
 | `import` (values from the client) | yes | one approval for the batch | no |
 | `keyring_items`, `dotenv_names` | no | approval (the requester learns labels, attributes or names) | no |
 | `import_from` (values read by the agent) | yes | one approval for the batch, naming the source | no |
 | `edit` | yes | approval (+ value dialog with `--value`) | no |
 | `remove` | yes | approval | no |
 | `reveal` | yes | approval with a warning; the dialog names the client's stated purpose (print, show, copy) | no |
-| `run` | yes | approval | opt-in (`--remember`), exact match |
+| `run` | yes | approval | opt-in (the `remember` setting), exact match |
 | `broker_run_v2` | yes | approval of each grant's approved origin and the run's limits | no |
 | `grants`, `revoke_grant` | no | none | — |
 | `configure` | yes | approval showing each old and new value | no |
@@ -413,7 +423,12 @@ seconds; on connecting — and when a screensaver appears — it locks if a
 session is locked or a screensaver on already, or if it gets no answer in
 time. The inhibitor is let go only once the lock is done — never because
 logind left or restarted (systemd keeps inhibitors across restarts); that only
-changes `status`. The agent's handle on the watchers closes their connections
+changes `status`. (Two caveats: while none is held, no suspend is under way
+and logind is on the bus, the watcher also asks for one again every 30
+seconds; and an inhibitor belongs to one connection of the watcher — when the
+watcher's own bus connection is lost, it is let go within about 30 seconds,
+and a new one is asked for once the watcher has connected again.) The agent's
+handle on the watchers closes their connections
 and waits up to 3 seconds for their threads when the agent is dropped. The
 watchers exist only with the `session-lock` Cargo feature (on by default).
 Those of suspend and those of the screen lock start and stop apart, so that
@@ -430,15 +445,17 @@ The agent reads the file when it starts and refuses to start with a file or
 a flag it cannot accept (a value out of bounds, an unknown key, a file other
 users can change). `status` reports each setting and its source.
 
-`configure` changes them while the agent runs. One at a time: before
-anyone is asked, it refuses a value out of bounds and a setting a flag
-fixes; it needs the vault unlocked (asking for the master password first),
-and the human's approval of each old and new value. The answer is recorded
-first, fail closed; after Allow, under the state's lock and only if the
-generation did not change, the agent replaces the file (a private temporary
-file, synced, renamed, the directory synced), sets the settings in effect,
-forgets remembered approvals and bumps the generation. Then it tells the
-dialogs their new timeout and "Allow for…" duration (a dialog already open
+`configure` changes them while the agent runs; only the manager's Settings
+page sends it (the CLI has no command for it). One at a time: before anyone is
+asked, it refuses a value out of bounds, a setting a flag fixes, and any
+change when the agent was started without a settings file (an agent embedded
+in a test); it needs the vault unlocked (asking for the master password
+first), and the human's approval of each old and new value. The answer is
+recorded first, fail closed; after Allow, under the state's lock and only if
+the generation did not change, the agent replaces the file (a private
+temporary file, synced, renamed, the directory synced), sets the settings in
+effect, forgets remembered approvals and bumps the generation. Then it tells
+the dialogs their new timeout and "Allow for…" duration (a dialog already open
 keeps its own), starts or stops the watchers of a lock trigger that changed,
 and checks the idle lock at once: the approval is not a use of the vault, so
 a shorter timeout counts from the last use. The idle timer runs every second
@@ -453,7 +470,9 @@ The vault is a standard KeePass **KDBX 4** file, written with the
   which KeePassXC writes when nothing in it needs 4.1, is written back as
   4.1; a newer KDBX 4, and KDBX3 or older, are read but not written.
 
-- Outer encryption AES-256, inner stream ChaCha20, GZip compression.
+- New vaults: outer encryption AES-256, inner stream ChaCha20, GZip
+  compression (the `keepass` crate's defaults); an existing file keeps its
+  own.
 - Key derivation for new vaults: Argon2id, 64 MiB, 20 passes, 2 lanes
   (about 0.7 s per unlock on a desktop CPU). Existing files keep their own
   parameters.
@@ -505,7 +524,7 @@ Every change is saved immediately:
    name removed): a link fails if `vault.kdbx` exists, so creating a vault
    never replaces one that another program created meanwhile.
 
-Before step 1, and again just before step 3, the agent compares the file's
+Before step 1, and again between steps 1 and 2, the agent compares the file's
 device, inode, size and modification time with what it loaded. If another
 program (KeePassXC, a sync client) changed the file, the save is refused with
 `vault_changed` instead of silently discarding those changes; locking and
@@ -569,7 +588,7 @@ the agent's own executable was replaced since it started, it shows no dialog
 until restarted. The program gets one end of a socket pair as standard input
 and output: the agent sends one length-framed JSON request (at most 64 KiB:
 version, a random identifier, the dialog's texts) and closes its sending
-side; the program answers with one frame (at most 8 KiB) carrying the same
+side; the program answers with one frame (at most 32 KiB) carrying the same
 version and identifier, and exits. An approval needs that one well-formed
 answer, end of stream and a clean exit, all within one deadline (the dialog
 timeout plus 5 seconds), recalculated before every read and write, so that an
@@ -582,7 +601,10 @@ contradictory answer, a failure after answering — is an error, never an
 approval. Its environment holds only the session's display, D-Bus and locale
 variables (and the X authority file, resolved before `HOME` changes), with
 `HOME` and the XDG directories pointing to a new `0700` directory removed
-after the dialog, and in-memory GSettings: no per-user GTK configuration,
+after the dialog (those of configuration, data and cache: `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_CACHE_HOME`; `XDG_RUNTIME_DIR` stays the session's and
+`XDG_DATA_DIRS` is set to the system's, `/usr/local/share:/usr/share`), and
+in-memory GSettings: no per-user GTK configuration,
 style sheet or setting can restyle the dialog or enable the GTK Inspector.
 The program refuses a request of another version, or with text that is not
 drawable as it is, before showing anything. It shows every string as plain
@@ -625,7 +647,9 @@ higher scale or a smaller screen make dialogs taller than estimated.
 With either program, a request whose dialog text would exceed 4000
 characters (counting the room reserved for the "Allow for" note) is refused,
 and imports — the CLI's and the manager's — are split into batches whose
-names take at most 24 lines (`import::batch_sizes`).
+dialogs fit (`import::batch_sizes`): at most 100 entries, the text within
+those 4000 characters and, where the dialog cannot scroll (zenity), within the
+estimated height.
 
 ## Audit log
 
@@ -675,31 +699,31 @@ where the next page would end).
 | [`src/session_lock.rs`](../src/session_lock.rs) | Locking on suspend and screen lock: the D-Bus watchers. |
 | [`src/protocol.rs`](../src/protocol.rs) | Request and response types, framing, fd passing. |
 | [`src/client.rs`](../src/client.rs) | Client side of the protocol; relays a `run`'s input and output. |
-| [`src/ui.rs`](../src/ui.rs) | The `Ui` trait, `dialog_text`, and the zenity implementation. |
+| [`src/ui.rs`](../src/ui.rs) | The `Ui` trait, `dialog_text`, the zenity implementation and its height estimate. |
 | [`src/dialog_program.rs`](../src/dialog_program.rs) | Starting and supervising `rusthorse-dialog`; falling back to zenity when it is not installed. |
-| [`src/helper_program.rs`](../src/helper_program.rs) | Finding and checking the helper programs the agent starts, such as `rusthorse-dialog`, next to its own executable; running their `--check` for `doctor`. |
+| [`src/helper_program.rs`](../src/helper_program.rs) | Finding and checking the helper programs the agent starts (`rusthorse-dialog`, `rusthorse-broker`) next to its own executable; running their `--check` for `doctor`. |
+| [`src/supervise.rs`](../src/supervise.rs) | Deadlines and process groups for the helper processes of dialogs. |
 | [`src/dialog_protocol.rs`](../src/dialog_protocol.rs) | The protocol between the agent and `rusthorse-dialog`. |
 | [`dialog/`](../dialog) | `rusthorse-dialog`, the GTK 4 dialog program, and its tests on a virtual display. |
 | [`manager/`](../manager) | `rusthorse-manager`, the GTK 4 window to manage entries: agent requests on a worker, the window, tests on a virtual display. |
 | [`src/exec.rs`](../src/exec.rs) | Program resolution and environment cleaning for `run`. |
 | [`src/redact.rs`](../src/redact.rs) | Streaming redaction of secret values. |
 | [`src/peer.rs`](../src/peer.rs) | Peer credentials and the requester process chain. |
-| [`src/audit.rs`](../src/audit.rs) | The audit log. |
-| [`src/import.rs`](../src/import.rs) | `.env` parsing and import batches. |
+| [`src/audit.rs`](../src/audit.rs) | The audit log: appending records, and reading it in pages for the manager's History page. |
+| [`src/settings.rs`](../src/settings.rs) | The agent's settings, their bounds and their file (`agent.toml`). |
+| [`src/generate.rs`](../src/generate.rs) | Generating random values. |
+| [`src/import.rs`](../src/import.rs) | `.env` parsing, the import approval and import batches. |
 | [`src/keyring.rs`](../src/keyring.rs) | GNOME Keyring (Secret Service) for imports the agent reads; a fake service for tests (`fake-keyring`). |
 | [`src/paths.rs`](../src/paths.rs), [`src/util.rs`](../src/util.rs) | Locations and helpers. |
 | [`tests/agent.rs`](../tests/agent.rs) | End-to-end tests against a real agent. |
+| [`packaging/`](../packaging), [`tests/packaging.rs`](../tests/packaging.rs) | The Debian package's scripts and files, and their tests. |
+| [`contrib/systemd/`](../contrib/systemd) | The service file for source installations. |
 
 ## Design decisions
 
 The reasoning behind the main choices is recorded as
-[architecture decision records](adr/README.md):
-
-- [ADR 0001](adr/0001-kdbx4-storage.md) — KeePass KDBX4 as the storage format
-- [ADR 0002](adr/0002-agent-mediated-execution.md) — the agent, not the client, runs approved commands
-- [ADR 0003](adr/0003-agent-side-dialogs.md) — approvals are dialogs shown by the agent
-- [ADR 0004](adr/0004-native-distribution.md) — native binary and systemd, no Flatpak
-- [ADR 0005](adr/0005-remembered-approvals-opt-in.md) — remembered approvals are opt-in
+[architecture decision records](adr/README.md); the index lists every record
+with its status.
 
 ## Visual manager
 
@@ -718,11 +742,11 @@ its own dialog.
   dialogs. With nothing listening on the socket, it offers **Start agent**,
   which runs `systemctl --user start rusthorse-agent.service` — systemd, not
   the manager, starts the agent ([ADR 0011](adr/0011-first-start-from-the-manager.md)).
-- **Requests.** It uses the protocol-9 requests and targets entries by UUID.
-  Before each request it checks the agent's protocol version. One request
-  started by the human runs at a time, on a worker thread, with bounded waits;
-  closing the window shuts the connection down. A lost answer to a request
-  with effects is reported as an unknown outcome, never retried.
+- **Requests.** It uses the current protocol's requests and targets entries by
+  UUID. Before each request it checks the agent's protocol version. One
+  request started by the human runs at a time, on a worker thread, with
+  bounded waits; closing the window shuts the connection down. A lost answer
+  to a request with effects is reported as an unknown outcome, never retried.
 - **Status.** A background `status` every five seconds, also while a
   request waits for the human; it never blocks the controls and does not
   postpone the idle lock. A result that predates a request of the human's is

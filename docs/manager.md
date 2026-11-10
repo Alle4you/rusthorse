@@ -7,9 +7,12 @@ values themselves. It is a client of the Rusthorse agent, exactly like the
 password, and every change and every value goes through the agent's own
 approval dialog.
 
-This is the first milestone of the manager
-([ADR 0007](adr/0007-visual-manager.md), Proposed). It is a pre-release
-awaiting an independent review: try it with fake entries first.
+The manager is designed in [ADR 0007](adr/0007-visual-manager.md), in three
+milestones. The first is done and reviewed, and so are the Settings and
+History pages of the second and the import windows of the third. Not built
+yet: the page that lists and revokes single remembered approvals, restoring
+a backup, and a safe hand-off to KeePassXC. No version of Rusthorse has been
+released: try the manager with fake entries first.
 
 ## What it does today
 
@@ -28,7 +31,7 @@ awaiting an independent review: try it with fake entries first.
 | The history: what the agent recorded in its audit log, newest first, while the vault is unlocked | |
 | The agent's settings — auto-lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — changed with the agent's approval while the vault is unlocked | |
 
-Pages for the later features are in the window already; they say what is
+The page for remembered approvals is in the window already; it says what is
 missing and what to do meanwhile. An entry has no broker profile: the run
 names where a key goes, and you approve it in the agent's dialog
 ([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
@@ -56,18 +59,25 @@ The window has three columns: a sidebar of fixed width, the entry list, and
 the details, which take any extra width. It fits a screen 1024 pixels wide
 (about 950 at its narrowest, measured with the default font).
 
-- **Sidebar.** The state of the vault (Locked, Unlocked, Unavailable), the
-  pages, and one button that unlocks or locks. Under it, when the vault is
-  open, the time left before the agent locks it by itself.
+- **Sidebar.** The state of the vault (Locked or Unlocked; Connecting… at
+  first; Not running, No vault or Unavailable when there is none to show, see
+  [First start](#first-start) and
+  [When something goes wrong](#when-something-goes-wrong)), the pages, and
+  one button that unlocks or locks. Above the button, a line says, when the
+  vault is open, in how many minutes the agent locks it by itself, or that
+  the auto-lock is off; when it is locked, that the values are encrypted on
+  disk.
 - **Entries.** The list, grouped by KeePass group, with a search field and a
   group filter. Search looks at names, UUIDs, groups, logins, URLs, hosts and
   tags — only metadata the manager already has.
-- **Details.** The selected entry: its actions (Edit, Delete), the
+- **Details.** The selected entry: its group, kind and when it was last
+  modified, its actions (**Edit…**, **Delete…**), the
   **Secret** rows (Value and Notes, each with **Show…** and **Copy…**, and
   the two ways to change the value: **Change the value…** and **Replace
   with a random value…**), the
-  **Details** (login, URL, host, port, tags, the names of other fields, the
-  UUID), and the two commands that use it (see
+  **Details** (login, URL, host, port, tags, the names of other fields and,
+  apart, of the fields the file marks protected, which the agent withholds,
+  the UUID), and the two commands that use it (see
   [Give a secret to a program](#give-a-secret-to-a-program)).
   Each row has its name on the left and
   its content on the right (screen readers name the row by it); the details
@@ -75,6 +85,20 @@ the details, which take any extra width. It fits a screen 1024 pixels wide
   added where a long value, URL or command wraps.
 - **Bottom line.** The result of the last action, and a spinner while the
   agent is waiting for you to answer one of its dialogs.
+
+The pages, in the sidebar's order:
+
+| Page | What it is for |
+|---|---|
+| **Entries** | The list and the details, above. |
+| **Grants** | The credential broker's grants: [list and revoke](#grants-of-the-credential-broker). |
+| **Remembered approvals** | Not built yet: the page says so. The Status page counts them, and **Lock now** forgets all of them. |
+| **History** | The agent's [audit log](#history). |
+| **Import & backup** | [Import](#import-from-gnome-keyring-or-a-env-file) and [back up](#back-up-the-vault). |
+| **Settings** | The [agent's settings](#agent-settings) and the [master password](#change-the-master-password). |
+| **Status** | What the agent reports, read every five seconds: its state, version and protocol, the vault file, the number of remembered approvals, the program that shows its dialogs, the credential broker and its active grants, the agent's program, what else locks the vault ("Also locks on"), and "Restart needed" after an upgrade. It is not `rusthorse doctor`: file permissions, the service and desktop isolation are not checked there. |
+| **Help** | A short version of this guide. |
+| **About** | The version and the license. |
 
 Selecting an entry fetches nothing secret. The manager checks the agent's
 status every five seconds in the background; that does not count as using
@@ -153,7 +177,7 @@ environments (`prod`, `test`) and for search.
 Under **Value**, choose how the value is made; every choice is in view,
 one row each:
 
-- **Type the value** (chosen at first) — after you click *Send to agent*,
+- **Type the value** (chosen at first) — after you click *Send to agent…*,
   the agent's own password-style dialog asks for it;
 - **Generate a random value** — 32 letters and digits, generated by the
   agent; the manager never receives it.
@@ -175,7 +199,7 @@ shown value is hidden.
 
 ### Edit, rename, move, delete
 
-**Edit** sends only the fields you changed, after the agent's approval.
+**Edit…** sends only the fields you changed, after the agent's approval.
 Emptying a field removes it. Renaming keeps the entry's UUID and its KeePass
 history. A field the file marks as *protected* is withheld from the manager
 and cannot be edited here. The form's **Value** rows keep the current value
@@ -186,8 +210,8 @@ agent's dialog for the value at once, like **Change the value…**. Choosing
 another **Group** moves the entry (see [Choose a group](#choose-a-group)).
 Any change to an entry — its value, name, group or fields — ends its grants
 of the credential broker, if it has any; the **Edit** form says so.
-**Delete** removes the entry and its history from the vault — it does not
-revoke the credential at its provider.
+**Delete…** removes the entry and its history from the vault, after the
+agent's approval — it does not revoke the credential at its provider.
 
 ### Choose a group
 
@@ -289,9 +313,10 @@ broker: give the program the value with the first command. Options of
 `run` set the grant's request limit, lifetime and automatic locks;
 `rusthorse guide ai` and the [CLI reference](cli.md) say more.
 
-An entry that phase 1 of the broker gave a profile keeps it, as a custom
-field named `Rusthorse.Broker`: the details list it by name among the other
-fields, like any other, and Rusthorse never interprets it.
+An entry that an earlier, unreleased version of the broker gave a profile
+keeps it, as a custom field named `Rusthorse.Broker`: the details list it by
+name among the other fields, like any other, and Rusthorse never interprets
+it.
 
 ### Grants of the credential broker
 
@@ -381,10 +406,12 @@ approvals and denials (and dialogs nobody answered), unlocks and locks, the
 commands it started and how they ended, the credential broker's grants and
 requests — newest first. Each record shows its time, action and outcome, in
 green when you approved, in the warning colour when you denied, cancelled
-or did not answer; then what else it says: the entries, the command line
-and directory, the grant, the detail, and the requester (process names,
-unverified). Values are never recorded; a command line holds whatever the
-requester put in it.
+or did not answer; then what else it says: the entries, the grant, a broker
+request (its number, the method's label, the status and the bytes sent and
+received), the grants a run creates, the command line and directory, the
+reason a grant ended and its count of requests, the detail, and the requester
+(process names, unverified). Values are never recorded; a command line holds
+whatever the requester put in it.
 
 The manager reads the file the agent names in its status ("Read from …"),
 as `rusthorse audit` reads it in a terminal; it asks the agent nothing for
@@ -427,7 +454,9 @@ appears in a small window:
 Its **Copy** button copies the value you are looking at — exactly, even
 where the window shows an escape — without asking again; the agent's dialog
 for Show told you that you could. What happens to a copied value is
-explained in the next section.
+explained in the next section. A value that contains a NUL character is not
+copied, here or with **Copy…**: the clipboard cannot carry it, and the window
+says so.
 
 Anyone who can see your screen, and other programs of your desktop session,
 can see a shown value. Never ask an AI agent to use Show.
@@ -473,14 +502,18 @@ names; the window then lists them, with what each would become:
 - **GNOME Keyring**: each item's label and attributes, never its secret.
   **Names from** chooses where the entry names come from — the label or an
   attribute (for items of a tool that names them by attribute, choose that
-  attribute). Type in **Filter** to show some items only, **Tick shown** to
-  tick them. A locked item cannot be ticked: unlock the keyring first.
-- **A .env file**: the variable names, and an optional **Prefix**.
-- For both: a **Tag** for the new entries (`imported` unless you change it),
-  and **Replace entries that already exist** (off: they are skipped).
-  Replacing an entry ends its grants of the credential broker, if it has
-  any; its other fields stay, as other KeePass clients keep them. Each
-  ticked name is marked new, existing, not allowed or repeated; **Import**
+  attribute; an item without it is marked "no such attribute"). A locked item
+  is marked locked and cannot be ticked: unlock the keyring first.
+- **A .env file**: the variable names, and an optional **Prefix**, put before
+  each name in capitals. A variable without a value cannot be imported, and is
+  marked so.
+- For both: type in **Filter** to show some rows only, **Tick shown** to tick
+  them, **Untick all** to start over; a **Tag** for the new entries
+  (`imported` unless you change it), and **Replace entries that already
+  exist** (off: they are skipped). Replacing an entry ends its grants of the
+  credential broker, if it has any; its other fields stay, as other KeePass
+  clients keep them. Each name is marked new, existing (replaced or skipped),
+  not allowed or, when ticked twice, repeated; **Import**
   stays off while a ticked one cannot be imported.
 
 **Import N** sends the names in batches, one dialog each: the agent reads
@@ -574,23 +607,23 @@ the new password in its own dialogs. The manager never receives them.
 
 ## For developers: tests
 
-`cargo test -p rusthorse-manager` runs logic tests, and runs its widget test
+`cargo test -p rusthorse-manager` runs logic tests, and runs its widget tests
 again under `xvfb-run` with a private D-Bus session, a UTF-8 locale and a
 private runtime directory — never on your display. Nothing can be activated
 on that session, and GVfs, the accessibility bus, the settings portal and
 Mesa's shader cache are turned off, so that no desktop service starts for
-the test, outlives it or writes into its directory. The widget test starts a
-real agent in the test process, on a fake vault, socket and audit log, with
-scripted dialogs; it drives the window, reads the clipboard with `xclip` as
-another program would, and focuses windows with `xdotool`. Missing tools
-(`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather than
-pass untested. The widget test also checks that the History page shows the
-unlock that agent recorded. The Grants page, the History page and an entry's
-two commands are tested against a fake agent in the test process instead —
-a test agent cannot start a broker, and the history needs a log written for
-the test: it answers from a script, records every request, and can hold an
-answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
+the tests, outlives them or writes into their directory. The main widget test
+starts a real agent in the test process, on a fake vault, socket and audit
+log, with scripted dialogs; it drives the window, reads the clipboard with
+`xclip` as another program would, and focuses windows with `xdotool`. Missing
+tools (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather
+than pass untested. It also checks that the History page shows the unlock that
+agent recorded. The Grants page, the History page, the Settings page and an
+entry's two commands are tested against a fake agent in the test process
+instead — a test agent cannot start a broker, and the history needs a log
+written for the test: it answers from a script, records every request, and can
+hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
 screenshots of the window in the light and dark styles, of the Show window,
 of the Grants page (also with a grant that ended while it was shown, and
-with a key the destination refused), of the History page and of an entry's
-two commands.
+with a key the destination refused), of the History page, of the Settings page
+and of an entry's two commands.

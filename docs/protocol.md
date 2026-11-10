@@ -65,7 +65,9 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   1 MiB on each output channel beyond what the client has acknowledged with
   credit frames, and the client grants credit as it writes data out. The
   client sends at most 1 MiB of input beyond what the agent has acknowledged;
-  sending more cancels the request. The client starts with no stdin credit:
+  sending more cancels the request only when the input the agent holds for the
+  command, not yet delivered, would pass 1 MiB (input delivered but not yet
+  acknowledged does not count). The client starts with no stdin credit:
   the agent grants the whole window when the command starts, so input given
   to a request that is denied or fails is never read. Input waiting for the
   command is buffered within the window, so the agent keeps reading the
@@ -82,7 +84,8 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   `invalid_request`.
 - The whole request must arrive within 10 seconds of connecting (a deadline,
   not a per-read timeout). The agent handles
-  at most 64 connections at a time and refuses (with `denied`) requests when
+  at most 64 connections at a time — it closes a further one without a
+  response — and refuses (with `denied`) requests when
   8 are already waiting for the human.
 - While a `run` request is in progress, the client must keep the connection
   open. With redaction the agent sends the command's output as data frames
@@ -95,10 +98,22 @@ data frame:     | 1 | length: 31 bits | channel: 1 byte | data: length-1 bytes |
   (`shutdown(SHUT_WR)`), or sending anything not listed above (a message, an
   unknown channel, unrequested input, an oversized or truncated frame)
   cancels the request: the agent shuts the socket down and terminates the
-  command's process group.
+  command's process group. The agent watches the connection only once the
+  command has started. Before that — while a dialog is open — a close or a
+  violation is not noticed: the dialog stays until it is answered or times
+  out, and if the human allows the request, the approval is recorded and
+  the command is started with the secrets. Only then does the agent notice
+  and cancel: the command has started, and its process group gets `SIGTERM`,
+  then `SIGKILL` 3 seconds later. As for any cancelled run, the audit log
+  records the command's end (`exited`, for example `killed by signal 15`),
+  not that the client had gone. The other requests are not watched at all
+  while a dialog is open: one that the human allows after its client has
+  gone is carried out (an `edit`, a `remove`, an `add`), with nobody to
+  read the answer.
 
 The same run framing, descriptor rules, flow control and cancellation apply to
-`broker_run_v2`. Cancelling it also ends its grants.
+`broker_run_v2`. Cancelling it also ends its grants; after a close while a
+dialog was open they too are created, recorded and served first.
 
 ## Requests
 
@@ -112,7 +127,7 @@ Every request is an object with a `type` field.
 | `lock` | — | `ok` |
 | `list` | — | `entries` |
 | `show` | `name` | `entry` |
-| `add` | `entry` ([NewEntry](#newentry)), `value` (string or `null`), `replace` (bool) | `ok` |
+| `add` | `entry` ([NewEntry](#newentry)), `value` (string or `null`), `generate` (optional, see below), `replace` (bool) | `ok` |
 | `import` | `entries` (array of `{entry, value}`), `replace` (bool) | `ok` |
 | `edit` | `name`, `changes` ([EntryChanges](#entrychanges)) | `ok` |
 | `remove` | `name` | `ok` |
@@ -146,8 +161,9 @@ With `"value": null`, `add` makes the agent ask the human for the value. A
 string value is accepted only after approval. Instead of a value, `add` may
 carry `"generate": {"length": 32, "alphabet": "alnum"}` (alphabets `alnum`,
 `symbols`, `hex`; length 8–1024): the agent generates the value after
-approval. `change_password` makes the agent ask for the current and the new
-master password in its own dialogs.
+approval; a request with both a string value and `generate` is refused
+(`invalid_request`). `change_password` makes the agent ask for the current and
+the new master password in its own dialogs.
 
 `create_vault` creates the vault file at the agent's vault path (the one
 `status` reports, absolute), which must not exist: if it does, the answer is
@@ -170,7 +186,11 @@ are handled one at a time: of two, the second gets `already_exists`.
 `import` carries the values: the client read them, and the dialog says that
 the requester supplied them. `import_from` carries only *where* the values
 are and the entry names; the agent reads the values itself, so no client
-holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-the-agent.md)).
+holds them, and its dialog names the source
+([ADR 0012](adr/0012-import-read-by-the-agent.md)). Both import at most 100
+entries per request, and both refuse, with `invalid_request` and before any
+dialog, a request with more, with none, with an invalid name or with a name
+given twice.
 
 ```json
 {"type": "keyring_items"}
@@ -184,24 +204,24 @@ holds them, and its dialog names the source ([ADR 0012](adr/0012-import-read-by-
   D-Bus object path), `label`, `attributes` (object of strings) and `locked`.
   No secret is read and nothing is unlocked. The agent asks the human first
   — the requester learns the labels and attributes — and refuses a keyring
-  of more than 10 000 items.
+  of more than 10 000 items (`internal`) and a listing that does not fit in
+  one message (`invalid_request`).
 - `dotenv_names` answers `{"type": "names", "names": [...], "empty": [...]}`:
   the names of the file's variables with a value, in its order, and, when
   there are any, those with an empty value, which cannot be imported (a
   file that sets a name twice is refused). The agent asks the human first, then reads the file
   and drops the values.
-- `import_from` imports at most 100 entries, after one approval. Keyring
+- `import_from` imports its entries after one approval. Keyring
   items can be imported only from the last `keyring_items` listing that
   the human allowed **this program** (the same process) to see, in the last
   10 minutes and since the vault was last locked (a lock while the listing
   is under way makes it fail with `locked` and keeps nothing of it); other
   items, or no such listing, are refused before any dialog, alike whatever
-  the keyring holds. At most 100 entries per request.
-  The dialog shows one row per entry — "Entry 1", "Entry 2", … — with the
-  entry's name and the item it comes from as that listing showed it (label
-  and attributes, or "locked"), so nothing in it, not even its size, is
-  news to the requester. For a `.env` file only what the request says (the
-  path, the names) is shown and checked before the dialog. After the
+  the keyring holds. The dialog shows one row per entry — "Entry 1", "Entry
+  2", … — with the entry's name and the item it comes from as that listing
+  showed it (label and attributes, or "locked"), so nothing in it, not even
+  its size, is news to the requester. For a `.env` file only what the request
+  says (the path, the names) is shown and checked before the dialog. After the
   approval, keyring items are read by `id` and imported under `name`; an
   item that is locked, gone, or no longer what the listing showed (label,
   attributes), or a secret that is not UTF-8 text, refuses the whole
@@ -347,7 +367,9 @@ through two groups of the same name side by side is refused with
 destination normalized and from the top, with the whole UUID of the deepest
 existing group and what would be created (`/Work/Servers (existing group
 8d2f6c1e-5b7a-4c3e-9f10-2a4b6c8d0e12)`, `/Work/Servers (creates Servers in
-/Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)`, `/ (the top level)`). A path that leads to the group the entry
+/Work, group 1a2b3c4d-6e7f-4a8b-9c0d-e1f2a3b4c5d6)`, `/ (the top level)`, and,
+without a UUID when no group of the path exists, `/New/Deeper (creates
+New/Deeper at the top level)`). A path that leads to the group the entry
 is already in — compared by identity, not by how its path reads — is
 dropped from the request before the dialog; if nothing else changes, the
 request fails with `invalid_request` ("nothing to change"). The audit
@@ -485,7 +507,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 |---|---|
 | `ok` | `message` (string) |
 | `status` | see [StatusInfo](#statusinfo) |
-| `grants` | `grants`: array of [GrantInfo](#grantinfo) |
+| `grants` | `grants`: array of [GrantInfo](#grantinfo), oldest first |
 | `entries` | `entries`: array of [EntryInfo](#entryinfo), sorted by group and name |
 | `entry` | `entry`: [EntryInfo](#entryinfo) |
 | `secret` | `value` (string) |
@@ -499,7 +521,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 ```json
 {
   "type": "status",
-  "protocol_version": 9,
+  "protocol_version": 10,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -541,13 +563,16 @@ agent`, which wins over the file and which `configure` cannot change).
 
 `lock_triggers` (optional; left out by agents that predate it) lists what
 else locks the vault ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)):
-`event` is `suspend` or `screen_lock`, `source` where the agent learns of it,
-`active` whether it is watched now (the service is there, not merely the
-subscription), `degraded` (optional, left out when false) whether it is
-watched less well than it should be — logind would not give a delay
-inhibitor, so the lock may come after the computer wakes — and `note` why
-not or a remark (`turned off`, `connecting`, the bus error). Clients that find it missing
-should say it is not reported, not that nothing locks.
+`event` is `suspend` or `screen_lock`, `source` where the agent learns of it
+(`logind`, a screensaver's D-Bus name, `screensaver` standing for all of them
+while none is watched, or `D-Bus` for either event in a build without the
+`session-lock` feature), `active` whether it is watched now (the service is
+there, not merely the subscription), `degraded` (optional, left out when
+false) whether it is watched less well than it should be — logind would not
+give a delay inhibitor, so the lock may come after the computer wakes — and
+`note` why not or a remark (`turned off`, `connecting`, the bus error).
+Clients that find it missing should say it is not reported, not that nothing
+locks.
 
 `locks_in_secs` is omitted when the vault is locked or auto-lock is off.
 `agent_executable` is the program file the agent runs, as the kernel reports
@@ -607,10 +632,10 @@ entry is replaced (`add` or `import` with `replace`).
 
 | `code` | Meaning |
 |---|---|
-| `denied` | The human denied the request, the dialog timed out, or too many requests were waiting. |
-| `cancelled` | The human cancelled a password or value dialog. |
+| `denied` | The human denied the request, an approval dialog was not answered in time, or too many requests were waiting. |
+| `cancelled` | The human cancelled a password or value dialog, or did not answer it in time. |
 | `locked` | The vault was locked or changed while the request was waiting; try again. |
-| `unlock_failed` | Wrong master password three times. |
+| `unlock_failed` | No answer gave the right master password. An unlock asks up to three times, and an empty answer uses one of them (when nothing was ever typed the error is `cancelled`); `change_password` asks for the current password once. |
 | `vault_missing` | There is no vault file yet. |
 | `vault_changed` | Another program changed the vault file since it was unlocked. |
 | `not_found` | No such entry, the entry has no value, or no such grant. |
@@ -637,8 +662,9 @@ client error (CLI exit 1), not proof that revocation completed.
 
 For `broker_run_v2`, definite errors before command start map to CLI exit 125;
 `outcome_unknown` or a lost/malformed reply maps to 124. An unknown field,
-an invalid destination or invalid limits, and a value the broker cannot send,
-use `invalid_request`; a missing/unusable broker, startup failure or failed
+an invalid destination or invalid limits, a value the broker cannot send, and
+no room for the run's grants (16 at a time) use `invalid_request`; a
+missing/unusable broker, startup failure or failed
 grant-creation record uses `internal`. There are no new error codes.
 Once the command starts, its exit status is reported normally: an HTTP failure
 or revocation does not retroactively make it a did-not-run result. These
@@ -695,7 +721,7 @@ owned and closed on refusal, and received descriptors are close-on-exec.
 |---|---|---|
 | Agent → broker | `install` | `version` (2), `grant`, secret `token` and `credential`, the approved `origin` (`https://`, a host name and an optional port; no base path, which only the command's base URL holds), `max_in_flight`, `max_connections`, `lifetime_secs`; listening fd. |
 | Broker → agent | `ready` | `version`, `grant`, matching the installation. |
-| Broker → agent | `admit` | Increasing `request` number from 1, and the label of its `method`: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method. Never the raw method, the path or the query. |
+| Broker → agent | `admit` | Consecutive `request` numbers from 1 (each one more than the last; a gap or a repeat is a violation), and the label of its `method`: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method. Never the raw method, the path or the query. |
 | Agent → broker | `admitted` / `refused` | Same `request`; refusal also carries `reason`. |
 | Broker → agent | `finished` | Same `request`, `outcome`, optional `status`, `bytes_sent`, `bytes_received`. |
 | Agent → broker | `revoke` | End `reason`. |

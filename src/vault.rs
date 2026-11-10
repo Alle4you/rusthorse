@@ -142,7 +142,7 @@ pub struct KdfParams {
 impl KdfParams {
     /// Defaults for new vaults: Argon2id with 64 MiB, 20 passes, 2 lanes.
     /// KeePassXC also uses 64 MiB and aims at about one second per unlock;
-    /// these settings take about 0.8 s on a 2020s desktop CPU (measure with
+    /// these settings take about 0.7 s on a 2020s desktop CPU (measure with
     /// the ignored `default_kdf_timing` test).
     pub const DEFAULT: Self = Self {
         memory_bytes: 64 * 1024 * 1024,

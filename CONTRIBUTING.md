@@ -4,7 +4,7 @@ Thank you for helping. Rusthorse handles secrets, so the bar for changes is
 higher than usual: every change must keep the security properties described
 in the [threat model](docs/threat-model.md) and must keep the documentation
 true. AI coding agents: read [AGENTS.md](AGENTS.md), which states the same
-rules in short form.
+rules, with the checks and the tests in full.
 
 ## Reporting bugs and proposing features
 
@@ -34,16 +34,24 @@ cargo test
 You need Rust 1.89 or newer (`rustup` is the easiest way) and, to try the
 agent by hand, `zenity` and a graphical session.
 
-To experiment without touching your real vault, use separate paths:
+To experiment without touching your real vault, use separate paths in a
+directory of their own, and remove it afterwards:
 
 ```sh
-export RUSTHORSE_VAULT=/tmp/rh-dev/vault.kdbx
-export RUSTHORSE_SOCKET=/tmp/rh-dev/agent.sock
-export RUSTHORSE_AUDIT_LOG=/tmp/rh-dev/audit.jsonl
+tmp=$(mktemp -d)
+export RUSTHORSE_VAULT=$tmp/vault.kdbx
+export RUSTHORSE_SOCKET=$tmp/agent.sock
+export RUSTHORSE_AUDIT_LOG=$tmp/audit.jsonl
 cargo run -- init
 cargo run -- agent &      # in another terminal is better
 cargo run -- add TEST
 ```
+
+The graphical programs (`dialog/`, `manager/`) need Rust 1.92, GTK 4.12+
+and libadwaita 1.4+, and their widget tests need `xvfb-run`,
+`dbus-run-session`, `xdotool` and `xclip`; the tests run on a virtual
+display, never on yours. Their checks are listed in
+[AGENTS.md](AGENTS.md#checks).
 
 ## Before opening a pull request
 
@@ -110,8 +118,8 @@ And check the following by hand:
   closed if they cannot.
 - `unsafe` code is denied crate-wide. If it is unavoidable, confine it to the
   smallest possible function with a `// SAFETY:` comment explaining why it is
-  sound, and call it out in the pull request.
-- New dependencies need a reason in the pull request. Prefer well-maintained
+  sound, and call it out in the commit message.
+- New dependencies need a reason in the commit message. Prefer well-maintained
   crates with a security track record.
 
 ## Style
@@ -129,8 +137,3 @@ And check the following by hand:
 By contributing, you agree that your contributions are licensed under the
 GNU General Public License, version 3 or (at your option) any later version,
 the same license as the project.
-
-The graphical programs (`dialog/`, `manager/`) need Rust 1.92, GTK 4.12+
-and libadwaita 1.4+, and their widget tests need `xvfb-run`,
-`dbus-run-session`, `xdotool` and `xclip`; the tests run on a virtual
-display, never on yours. Their checks are listed in AGENTS.md.

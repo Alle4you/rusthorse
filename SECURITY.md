@@ -5,12 +5,9 @@ privately first.
 
 ## Supported versions
 
-Rusthorse is in early development. Only the latest release (and the `main`
-branch) receive security fixes.
-
-| Version | Supported |
-|---|---|
-| 0.1.x | yes |
+Rusthorse is in early development (0.1.0), and no release has been published
+yet: security fixes go to the `main` branch. Once there are releases, only
+the latest one (and `main`) will receive them.
 
 ## Reporting a vulnerability
 

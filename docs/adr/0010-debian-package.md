@@ -1,6 +1,12 @@
 # 0010. A Debian package that installs and removes cleanly
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: implemented, unreleased; reviewed with the first start and
+  the import in the reviews of 2026-11-02, the eighth of which was ready
+  ([review history](../threat-model.md#11-review-history)), and its checks
+  of the packaged broker in those of 2026-11-03.
 - Date: 2026-11-02
 - Amended: 2026-11-02, after review — removal under `DPKG_ROOT`, warnings
   when an agent cannot be stopped, the crates' licenses, the documentation's
@@ -79,7 +85,10 @@ Build a Debian package with [cargo-deb](https://github.com/kornelski/cargo-deb)
    stops the build. The installed documentation is copied by
    `packaging/docs.py`, which points links to files the package does not
    install (the source code) to GitHub at the revision built, and fails on any
-   link that leads nowhere. A Debian changelog (`changelog.Debian.gz`) records
+   link that leads nowhere. (Stated exactly on 2026-11-09: it fails on a
+   relative Markdown link, outside code fences, whose file or directory is not
+   in the repository; it checks neither anchors nor links to other sites.) A
+   Debian changelog (`changelog.Debian.gz`) records
    the packaging. The broker adds ring's nested licence texts and source
    notices, including Portions Copyright lines. `copyright.py` checks nested
    files by crate/version and verifies exclusions against the enabled

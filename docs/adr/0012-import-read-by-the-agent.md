@@ -1,6 +1,11 @@
 # 0012. Imports are read by the agent, and the manager can start them
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: implemented, unreleased; reviewed ready on 2026-11-02 (the
+  eighth review of that day in the
+  [review history](../threat-model.md#11-review-history)).
 - Date: 2026-11-02
 - Amends: [ADR 0007](0007-visual-manager.md), section 5 (M3: the manager
   would read the sources itself and send the values).
@@ -90,8 +95,10 @@ not be another place that holds secrets.
    (the items, which can be filtered and ticked; names from the label or an
    attribute; each name marked new, existing, invalid or repeated) and
    **Import from a .env file…** (a file chooser, an optional prefix, the
-   names to tick). Importing sends one `import_from` per batch and
-   summarises what was imported, refused and uncertain, as the CLI does.
+   names to tick). (As built, the buttons read **From GNOME Keyring…** and
+   **From a .env file…**, under an "Import" heading.) Importing sends one
+   `import_from` per batch and summarises what was imported, refused and
+   uncertain, as the CLI does.
 
 ## Alternatives considered
 

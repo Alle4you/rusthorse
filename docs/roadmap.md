@@ -10,45 +10,46 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 
 ## Visual manager
 
-**M1 done, M2 and M3 in progress** ([ADR 0007](adr/0007-visual-manager.md),
-[guide](manager.md)). M1 (done, reviewed): metadata browsing, search and
-groups, agent-approved edits, generated values, Show and Copy, command
-snippets, status, locking and verified backup; since then, first start,
-changing the value and moving entries between groups. M2: persistent agent
-configuration (done: the settings file and the Settings page, which changes
-them through the agent's approval), bounded history (done: the History page,
-which reads the audit log in pages while the vault is unlocked),
-remembered-approval revocation, and screen/suspend locking (done in the
-agent, [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). M3: import UI (done,
-[ADR 0012](adr/0012-import-read-by-the-agent.md)), safe restoration and
-exclusive KeePassXC handoff. The
-[reference prototype](design/manager/index.html) uses fake data and simulates
-features not yet implemented.
+**M1 done and reviewed; M2 and M3 in progress**
+([ADR 0007](adr/0007-visual-manager.md), [guide](manager.md)).
+
+- **M1, done and reviewed:** metadata browsing, search and groups,
+  agent-approved edits, generated values, Show and Copy, command snippets,
+  status, locking and verified backup; since then, first start
+  ([ADR 0011](adr/0011-first-start-from-the-manager.md)), changing the value,
+  moving entries between groups and the broker's Grants page.
+- **M2:** done — the settings file and the Settings page, which changes the
+  agent's settings through its approval; the History page, which reads the
+  audit log in pages while the vault is unlocked; locking on screen lock
+  and suspend, in the agent
+  ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). Not built — a
+  page that lists and revokes remembered approvals (the manager shows a
+  placeholder for it).
+- **M3:** done — import from GNOME Keyring and `.env` files, read by the
+  agent ([ADR 0012](adr/0012-import-read-by-the-agent.md)). Not built — safe
+  restoration of a backup and the exclusive handoff to KeePassXC.
+
+The [reference prototype](design/manager/index.html) uses fake data and
+simulates features not yet implemented.
 
 ## Credential broker: secrets that never enter the client
 
-**Done, unreleased.** Phase 1 was reviewed READY on 2026-11-03, and the
-broker without profiles that replaced it on 2026-11-04.
-[ADR 0013](adr/0013-credential-broker.md) defines the HTTP broker; its later
-phases are dropped, and its
+**Done, unreleased.** [ADR 0013](adr/0013-credential-broker.md) defines the
+HTTP broker. Its
 [scope amendment](adr/0013-credential-broker.md#scope-amendment-2026-11-04)
-(2026-11-04) replaced phase 1's profiles and presets with a destination named
-in each run (below). The manual check with the maintainer's credentials began
-on 2026-11-04, with phase 1's broker: the Anthropic Python SDK worked through
-the broker for the requests tried; Claude Code's requests went through it,
-and the API answered them `400`, as it answered SDK requests with some of
-Claude Code's parameters sent with the key by value; the maintainer left its
-check for later. On 2026-11-04 the maintainer also tried the broker without
-profiles by hand, with a real key and `curl` through
-`https://api.anthropic.com`, the token in `x-api-key`: a `GET /v1/models` was
-answered `200`, as the audit recorded with the method's label only, and a
-`POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
-token in its URL was refused by the broker itself, and nothing was sent.
-The Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
-worked through it for a message and two streams, and Claude Code 2.1.318,
-run in print mode (`claude -p`) with a home directory of its own, answered
-through it, as it did interactively for the maintainer.
-No client version is claimed supported yet.
+of 2026-11-04 dropped the later phases and replaced phase 1's profiles and
+presets with a destination named in each run (below); phase 1 was reviewed
+READY on 2026-11-03, and the broker without profiles that replaced it on
+2026-11-04.
+
+Tried by hand on 2026-11-04, with a real key of the maintainer's, through
+`https://api.anthropic.com`: `curl` (a GET and a POST answered, a request
+with the token in its URL refused by the broker itself), the Anthropic
+Python SDK 2.4.0 (a message and two streams) and Claude Code 2.1.318, which
+answered in print mode (`claude -p`) and interactively. The threat model's
+[review history](threat-model.md#11-review-history) has the whole account,
+with the earlier test of phase 1's broker. No client version is claimed
+supported yet.
 
 ### Why
 
@@ -180,25 +181,22 @@ the approved command.
 ADR 0013 answers phase 1's original questions: revocation cuts open streams;
 the agent serializes counted admissions; the destination and DNS are
 constrained; and the local hop authenticates a token, not a process
-identity. Phase 1 was implemented and reviewed; in its manual check the
-Python SDK worked, and Claude Code's check was left for later. The broker
-without profiles or presets (above) replaced it; tried by hand with `curl`
-and the Anthropic Python SDK, it served a GET, POSTs and streams and refused
-a misplaced token, and Claude Code answered through it, in print mode and
-interactively. Nothing else is planned for the broker.
+identity. Phase 1 was implemented and reviewed; the broker without profiles or
+presets (above) replaced it, was reviewed and was tried by hand (above).
+Nothing else is planned for the broker.
 
 ## Desktop and usability
 
 | Item | Status | Notes |
 |---|---|---|
-| **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | Done — [ADR 0006](adr/0006-own-dialog-program.md) | `rusthorse-dialog`, a separate process started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until the end of a long request has been reached (no height limit), a distinct password dialog. The manager now has a broker Grants page; a page for remembered approvals remains planned. |
+| **Rusthorse's own dialog program instead of zenity** (GTK 4 + libadwaita) | Done — [ADR 0006](adr/0006-own-dialog-program.md) | `rusthorse-dialog`, a separate process started like zenity: two-column details, scrolling with the buttons always visible and Allow disabled until the end of a long request has been reached (no height limit), a distinct password dialog. |
 | **Lock on screen lock and suspend** | Done — [ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md) | The agent watches logind (with a delay inhibitor before a suspend) and the Cinnamon, GNOME, MATE and freedesktop screensavers over D-Bus. |
 | **"Waiting for your answer" hint** in the terminal | Later | Driven by an explicit event from the agent, not a client-side timer, and synchronised with the start of a command's output. |
 | **Entry kinds** | Done — [ADR 0008](adr/0008-entry-kinds.md) | `api-key`, `login`, `server`, `device`: labels and form fields, never policy. `run --url` passes an API key's endpoint. More kinds (database, SSH key) can follow. |
 | **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
-| **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Designed with the credential broker, whose tokens would point to a field. Needs an ADR. |
+| **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 done; M2, M3 in progress | ADR 0007 and milestones above; broker Grants page done (ADR 0013); History and Settings pages done; manager stays an agent client. |
+| **Visual manager** | M1 done and reviewed; M2, M3 in progress | [ADR 0007](adr/0007-visual-manager.md) and the milestones above. Done: the broker's Grants page (ADR 0013), the History and Settings pages, import. Not built: a page for remembered approvals, safe restoration, the KeePassXC handoff. The manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |
@@ -206,7 +204,8 @@ interactively. Nothing else is planned for the broker.
 
 ## Hardening
 
-From the [threat model](threat-model.md#10-planned-improvements):
+The same items as the threat model's
+[section 10](threat-model.md#10-planned-improvements), with their status:
 
 | Item | Status | Addresses |
 |---|---|---|
@@ -221,13 +220,14 @@ From the [threat model](threat-model.md#10-planned-improvements):
 
 | Item | Status | Notes |
 |---|---|---|
-| Publish on GitHub, CI on every pull request | Planned | After the clean reinstall and the owner's approval. |
+| CI on every push to `main` and every pull request | In progress | The workflow is written (`.github/workflows/ci.yml`) and has never run: it runs once the repository is published. |
+| Publish on GitHub | Planned | After the clean reinstall and the owner's approval. |
 | Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); four programs including the broker; built from a clone with `packaging/build-deb.sh` until releases are published. |
 | Published releases: the `.deb`, static binaries, signed checksums; `.rpm` | Planned | Static binaries with `install.sh` / `uninstall.sh` (or `rusthorse setup`) for other distributions. |
 | First start from the manager: start the agent, create the vault | Done (unreleased) | [ADR 0011](adr/0011-first-start-from-the-manager.md); the agent asks for the master password (`create_vault`). |
 | Import from the manager (GNOME Keyring, `.env`), read by the agent | Done (unreleased) | [ADR 0012](adr/0012-import-read-by-the-agent.md). |
 | Socket activation of the agent | Idea | Would start the agent on first use without a button; the agent must still run before anything connects, to lock on screen lock and suspend (ADR 0011). |
-| Guide for AI agents built into the binary (`rusthorse guide ai`) | Done (unreleased) | A test checks every command and option it names; the instructions file of an AI agent only points to it. |
+| Guide for AI agents built into the binary (`rusthorse guide ai`) | Done (unreleased) | A test checks that the CLI accepts every `rusthorse` command line it shows; the instructions file of an AI agent only points to it. |
 | Man page | Planned | Generated from the CLI definition; the Debian package has none yet. |
 | Examples and the exit statuses in `--help` | Idea | `rusthorse guide ai` has them for AI agents today. |
 | Build identifier in `status` and `doctor` | Later | Needs a build script to embed it. |

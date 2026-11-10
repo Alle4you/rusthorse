@@ -92,7 +92,8 @@ rusthorse open core-router        # opens https://192.168.1.1/ in your browser
 The first command that needs the vault asks for the master password, in a
 dialog with a text field (title "Rusthorse — unlock vault"): type it there and
 click **Unlock**. This is not an approval dialog — those show a command and
-**Allow once** / **Deny**. After 15 minutes without an approved use, the vault
+**Allow once** / **Deny**. After 15 minutes without an approved use (the
+default; a setting changes it), the vault
 locks itself again.
 
 ## 4. Use a secret
@@ -151,12 +152,13 @@ explains the rest.
 | Change the master password | `rusthorse passwd` |
 | Rotate a credential | `rusthorse edit NAME --generate` (then update it at the provider) |
 | Edit in KeePassXC | `rusthorse lock` first, then open the vault file in KeePassXC |
-| Back up | copy `~/.local/share/rusthorse/vault.kdbx` (it is encrypted) |
+| Back up | `rusthorse backup DEST` (copies the encrypted vault and checks that the copy opens) |
 
 ## Visual entry management
 
-The optional [manager](manager.md) shows the same vault in a window
-(`cargo run --locked -p rusthorse-manager` from the source tree). Try it with
+The [manager](manager.md) shows the same vault in a window: **Rusthorse** in
+the applications menu when installed from the package (from the source tree,
+`cargo run --locked -p rusthorse-manager`). Try it with
 a fake entry first: create it, edit it, copy its `rusthorse run` command, and
 try **Show** and **Copy**. A copied value stays on the clipboard until you
 copy something else, and a clipboard history may keep it even after that. Both are for you at the

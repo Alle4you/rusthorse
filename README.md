@@ -122,9 +122,11 @@ and keeps the value out of the agent's reach in the common case.
   the command's process group are stopped; detached descendants may survive,
   but its broker grants end. Exact-match limits are in threat model L5.
 - **The master password never touches the client.** The agent asks for it in
-  its own dialog (only `rusthorse init` reads the password of a new vault
-  itself) and locks itself after 15 minutes without an approved use, when the
-  screen locks, and before the computer sleeps. Locking before sleep depends
+  its own dialog (only `rusthorse init`, when no agent serves the vault, reads
+  the password of a new vault itself) and locks itself after 15 minutes
+  without an approved use, when the screen locks, and before the computer
+  sleeps. Those are the defaults: the agent's settings change the time or turn
+  each of the three off. Locking before sleep depends
   on the desktop's signals and inhibitor deadline; a slow save can delay it
   (threat model L20).
 - **Audit log.** Every unlock, approval, denial and command exit is recorded
@@ -172,13 +174,15 @@ rusthorse run GITHUB_TOKEN -- gh repo list
 rusthorse run GH_TOKEN=GITHUB_TOKEN -- gh pr create --fill
 ```
 
-## Visual manager (first milestone)
+## Visual manager
 
 `rusthorse-manager` is a window to see and organise your entries: search,
-groups, create, edit, delete, generate values, back up. When you approve it
-in the agent's dialog, it shows a value for 30 seconds or copies it to the
-clipboard. Like the CLI, it never opens the vault and never sees the master
-password.
+groups, create, edit, delete, generate values. Its other pages list and revoke
+the broker's grants, show the audit log (History), import from GNOME Keyring
+or a `.env` file and back up the vault, and change the agent's settings. When
+you approve it in the agent's dialog, it shows a value for 30 seconds or
+copies it to the clipboard. Like the CLI, it never opens the vault and never
+sees the master password.
 
 The package puts it in the applications menu as **Rusthorse**. From a
 clone, without installing anything:
@@ -187,10 +191,9 @@ clone, without installing anything:
 cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4+
 ```
 
-This first milestone ([ADR 0007](docs/adr/0007-visual-manager.md)) is
-implemented and reviewed, with the broker Grants page added in phase 1. The
-[manager guide](docs/manager.md) explains every action, where a shown or
-copied value can end up, and what comes later.
+The manager is described in [ADR 0007](docs/adr/0007-visual-manager.md); what
+is built has been reviewed. The [manager guide](docs/manager.md) explains
+every action, where a shown or copied value can end up, and what comes later.
 
 ## Using it with AI agents
 
@@ -305,13 +308,9 @@ presets: the agent names the destination in the `run`, you approve its
 origin in the dialog, and the broker puts the key in the request header
 where the program put the token, knowing nothing about the API. It relays
 streamed responses, and the CLI and the manager list and revoke its grants.
-Phase 1, with profiles and presets, was reviewed READY, and so was the
-broker without them (2026-11-04); in phase 1's manual test with a real key,
-the Python SDK worked through the broker, and Claude Code's check was left
-for later. The broker without profiles was then tried by hand with `curl` (a
-GET and a POST answered, a misplaced token refused) and the Python SDK (a
-message and two streams), and Claude Code answered through it in print mode
-(`claude -p`) and, run by the maintainer, interactively.
+It was reviewed READY on 2026-11-04 and tried by hand that day with `curl`,
+the Anthropic Python SDK 2.4.0 and Claude Code 2.1.318 (print mode and
+interactively); no client version is claimed supported.
 Screen-lock and suspend locking are implemented too. No other connector is
 planned: `rusthorse run` serves databases, devices and SSH. Published
 packages remain planned. See [docs/roadmap.md](docs/roadmap.md).

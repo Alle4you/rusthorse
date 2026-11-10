@@ -463,7 +463,9 @@ pub enum FromBroker {
         request: u64,
         /// How it ended.
         outcome: RequestOutcome,
-        /// The destination's status, when its answer began to arrive.
+        /// The destination's status, once its answer began to arrive;
+        /// before that, the status of the broker's own answer, if it gave
+        /// one (`408`, `502`, `504`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<u16>,
         /// Bytes of the request body sent to the destination.

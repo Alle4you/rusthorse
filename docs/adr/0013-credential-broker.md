@@ -27,6 +27,7 @@
   [implementation amendments](#implementation-amendments-2026-11-03) below
   explain each change; the review history records the findings, fixes and
   coverage gaps. Manual SDK validation with the maintainer is still pending.
+  (Done on 2026-11-04: see [answer 9](#answers-to-the-open-questions).)
 
 - Amended: 2026-11-04, after the maintainer's first manual test with a real
   key: `run` names the grants whose destination answered `401
@@ -41,6 +42,15 @@
   destination is named in the run and approved in the dialog, and the
   broker puts the key where the program put the token — and the other
   phases are dropped ([scope amendment](#scope-amendment-2026-11-04)).
+
+- Amended: 2026-11-09, after an audit of the documents against the code:
+  the passages of phase 1 that the scope amendment replaced are marked
+  where they stand, and six statements of the specification are made
+  exact — which `1xx` responses the broker refuses, when a connection
+  without a request is closed, what an HTTP version other than 1.1 gets,
+  where the limit of 100 headers comes from, that request numbers are
+  consecutive, and how a token-shaped string is compared. What the code
+  does did not change.
 
 ## Context
 
@@ -163,6 +173,13 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
 
 ## Decision
 
+(Read with the [scope amendment](#scope-amendment-2026-11-04) of 2026-11-04:
+the decisions below are kept as they were taken, for phase 1. Where they
+speak of a profile, a preset or a route, the amendment replaced it — the
+destination and the limits come with each run, and there is no route check.
+Each such passage is marked, and the amendment's closing paragraph lists
+them.)
+
 1. **What the broker guarantees.** In phase 1, for each entry a run binds
    with `--broker`, the approved command receives a **token**, never the
    source credential (entries bound by value in the same run are delivered
@@ -171,6 +188,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    destination, over TLS verified against the system's certificate
    authorities, and only for the profile's routes. Every request is
    recorded before it is forwarded. A grant ends as decision 8 says.
+   (Superseded 2026-11-04 where it names a profile: the destination is the
+   origin approved for the run, at any path there; the credential goes where
+   the program put the token, in the request headers the broker forwards.)
 
    Not guaranteed: what the program does with the operations it is allowed
    (it can spend credit, read data, change what the API lets it change, and
@@ -191,7 +211,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    profile's limits. The token is a secret like a value: never logged,
    audited, put in an error or in a `Debug` output, and redacted from the
    command's output when output redaction is on (the default; decision 6
-   says when it is off).
+   says when it is off). (Superseded 2026-11-04 where it names a profile: a
+   grant carries the destination and the limits its run named.)
 
 3. **Profiles fix the destination.** (Superseded 2026-11-04: there are no
    profiles; the destination is named in the run and approved in the
@@ -210,7 +231,8 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    `rusthorse-broker` for each grant and supervises it, as it does
    `rusthorse-dialog` ([ADR 0006](0006-own-dialog-program.md)), and gives it
    over a socket pair only what that grant needs — its credential, token,
-   profile snapshot, limits and listening socket — never the vault. A bug
+   profile snapshot (superseded 2026-11-04: its destination), limits and
+   listening socket — never the vault. A bug
    in the network code (HTTP parsing, TLS) that leaks memory then leaks at
    most the credential of that one grant; a bug that lets an attacker run
    code there gives the attacker the user's powers, which the separation
@@ -241,6 +263,10 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    (Amended 2026-11-04: after the command, `run` also names each grant
    whose destination answered `401 Unauthorized`, its status unchanged.)
    `run` without `--broker` stays as it is, with its documented limits.
+   (Superseded 2026-11-04 in its syntax: the binding is
+   `--broker VAR=ENTRY@URL`, which names the destination, and `--url` gives
+   the broker's address with that URL's base path; `--broker-requests`,
+   `--broker-lifetime` and `--broker-locks` set the limits.)
 
 7. **The dialog says what the grant allows**, from the profile and the
    request: the entry, the destination, every route (superseded 2026-11-04:
@@ -274,7 +300,10 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    explicit lock and the agent stopping end all of a run's grants together;
    the other events end the grants they concern (an entry's, one revoked by
    hand, those whose profile says `end`). Every automatic lock also ends
-   grants still being prepared (`starting`), even with `continue`.
+   grants still being prepared (`starting`), even with `continue`. (Superseded
+   2026-11-04 where it names a profile or a preset: the run sets the policy,
+   with `--broker-locks end|continue` and `--broker-lifetime`; `continue` and
+   12 hours unless it says otherwise.)
 
 9. **Audit.** The grant's creation is recorded before the command starts;
    every request is recorded under the grant ID — method and route, never the
@@ -283,7 +312,9 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
    recorded best effort with its reason (an abrupt agent SIGTERM does not
    write `agent_stopped` records). Never the token, a credential, a header
    value, a query or a body. The agent writes every record: the broker asks
-   it, and waits for the answer.
+   it, and waits for the answer. (Superseded 2026-11-04 in "method and route":
+   the record holds the method's label only — `GET`, `HEAD`, `POST`, `PUT`,
+   `PATCH`, `DELETE` or `OTHER` — and no route.)
 
 10. **Phases.** Each phase gets its own review and tests (superseded on
     2026-11-04: the next broker has no profiles or presets, and the other
@@ -321,12 +352,19 @@ Node SDK 7.47.0, Claude Code's gateway documentation) shaped phase 1:
 This section is normative for phase 1. Where a number is given, it is the
 phase 1 value; changing it changes this ADR.
 
+(Since 2026-11-04 the broker that is built is the one of the
+[scope amendment](#scope-amendment-2026-11-04), which keeps this section's
+processes, tokens, framing, admission, revocation, limits and audit, and
+replaces its profiles, presets, routes and header lists. Passages that the
+amendment replaced are marked where they stand.)
+
 ### Components and processes
 
 - **`rusthorse-broker`**, a new member of the workspace (`broker/`), built for
   Rust 1.89 like the main package. It depends on the `rusthorse` library
   (without default features) for the agent–broker protocol, the profile types
-  and the redactor, and on `hyper` 1 (HTTP/1.1 server and client), `tokio`
+  (superseded 2026-11-04: the grant's destination and limits) and the
+  redactor, and on `hyper` 1 (HTTP/1.1 server and client), `tokio`
   (current-thread runtime), `rustls` 0.23 with the `ring` provider,
   `tokio-rustls` and `rustls-pki-types` (to parse the fixed CA file; no
   `rustls-native-certs`). Their default features are off where those would add
@@ -349,7 +387,8 @@ phase 1 value; changing it changes this ADR.
   The agent keeps its own copy until the command ends, so the port cannot
   be taken by another program while the command may still use it, even if
   the broker fails. The command gets `http://127.0.0.1:PORT` plus the
-  profile's base path — never `localhost`, which can resolve to an IPv6
+  profile's base path (superseded 2026-11-04: the base path of the run's URL)
+  — never `localhost`, which can resolve to an IPv6
   address another program listens on.
 - **Trust.** The broker reads its certificate authorities from the first
   existing file of a fixed list (`/etc/ssl/certs/ca-certificates.crt`,
@@ -385,7 +424,13 @@ phase 1 value; changing it changes this ADR.
   bytes from the operating system's random generator). The agent creates
   it, puts it in the command's environment and in the redactor, and gives
   it to the broker. The broker compares it in constant time; anything not
-  of that exact form is refused before comparison.
+  of that exact form is refused before comparison. (Since the scope amendment:
+  a token-shaped string — `rh_` and 64 hexadecimal digits, in any case — in
+  the method, the target, a header's name or a header the broker drops or sets
+  itself is refused as it stands, the token itself included; in a header value
+  the broker forwards, each one is compared with the token byte for byte, in
+  constant time, and the first that differs, a copy of the token in another
+  case included, refuses the request.)
 - The **grant ID** is `g` followed by 16 lowercase hexadecimal digits,
   random. It is public: the audit log, `rusthorse grants` and the manager
   show it.
@@ -482,7 +527,12 @@ request, in order:
    `TRACE` or `OPTIONS`, or a body on a route without one; HTTP versions other
    than 1.1 get `505`; headers larger than 32 KiB or more than 100 headers get
    `431`. The whole header block must arrive within 30 seconds of the
-   connection being opened or of the previous response on it.
+   connection being opened or of the previous response on it. (Stated exactly
+   on 2026-11-09: HTTP/1.0 gets `505`; any other version in a request line is
+   a parse error of the HTTP library, normally answered with an empty `400`,
+   and an HTTP/2 connection preface closes the connection without a response;
+   the limit of 100 headers is that library's default, which the broker does
+   not set itself and no test of the broker covers.)
 2. **Token**: missing or wrong → `401`.
 3. **Route** (superseded 2026-11-04: no route check; the path and query go
    as the program sent them): the path must be in the exact form above, without `%` escapes,
@@ -502,7 +552,9 @@ request, in order:
    its body is received.
 6. **Body**: read whole into memory before anything is sent, within 60
    seconds; a body that does not arrive in full is not forwarded (outcome
-   `not_forwarded`; the use is spent). A body timeout returns `408`.
+   `not_forwarded`; the use is spent). A body timeout returns `408`. A client
+   that sent `Expect: 100-continue` gets its `100 Continue` only once the
+   request is admitted.
 7. **Forwarding**: the broker resolves the origin's host, keeps only public
    addresses (no loopback, private, link-local, unique-local, shared,
    multicast, unspecified or IPv4-mapped forms of them) and connects to one of
@@ -523,9 +575,17 @@ request, in order:
    `TE`, `Trailer`, `Upgrade`, `Proxy-*`) never do; a listed header whose name
    or value contains the token is dropped too, so the broker never sends the
    token in a header; trailers are dropped in both directions. One connection
-   per request; nothing is shared between grants.
+   per request; nothing is shared between grants. (Superseded 2026-11-04 for
+   the headers: there is no credential header of the broker's own and no list
+   per preset. Every request header is forwarded except the hop-by-hop ones
+   and `Host`, `Content-Length` and `Accept-Encoding`, and the key replaces
+   the token in the values forwarded.)
 8. **Response**: refused with a local `502`, before anything is passed to the
-   client, when it is a `3xx` (no `Location` reaches the client), has a
+   client, when it is a `101` (stated here on 2026-11-09, as the broker has
+   done since phase 1; the HTTP library discards a destination's other `1xx`
+   responses, such as `100 Continue` and `103 Early Hints`, with their
+   headers, and the broker checks and relays the final response), a `3xx` (no
+   `Location` reaches the client), has a
    `Content-Encoding` other than `identity` (in any of its occurrences), or a
    `Transfer-Encoding` other than exactly `chunked` (a compressed transfer
    coding would hide the credential from the redactor). Otherwise the status
@@ -553,13 +613,14 @@ response-head timeout returns `504`; a failure after sending can return `502`
 with outcome `unknown` and `x-should-retry: false`. Once response headers have
 gone to the client, a body failure cuts the stream. Hyper's own parse/framing
 errors precede this logic: they can have an empty body and no retry hint
-(including its `400`, `431` and possible `414`).
+(including its `400` and `431`).
 
 ### Admission, revocation and the agent's registry
 
 - The **agent** keeps a registry of grants and is the one authority for their
   state and limits. Every request the broker accepts goes through it over the
-  control channel: `admit` (request number, method and route) → the agent
+  control channel: `admit` (request number, method and route; superseded
+  2026-11-04: the method's label, no route) → the agent
   checks that the grant is active and within its limits, reserves a use and a
   slot, writes the admission record (durably), checks again that the grant is
   still active, and answers `admitted` or `refused` with the same request
@@ -569,8 +630,9 @@ errors precede this logic: they can have an empty body and no retry hint
   it reports `finished` with the number and the outcome, which frees the slot
   and is recorded. A `refused` admission releases its reservation; an admitted
   request spends its use whatever its outcome.
-- **Request numbers** are chosen by the broker, increasing from 1 within a
-  grant. The agent accepts each number once in `admit` and once in
+- **Request numbers** are chosen by the broker, consecutive from 1 within a
+  grant (each one more than the last: a gap is a violation, like a repeat).
+  The agent accepts each number once in `admit` and once in
   `finished`, after `admitted`; anything else — a number reused, a
   `finished` for a number not admitted or already finished, an unknown
   message — is a broken broker: the agent ends the grant (`broker_failed`)
@@ -643,7 +705,12 @@ errors precede this logic: they can have an empty body and no retry hint
   (L17) keeps only a token that no longer works.
 - **Limits** in phase 1: at most 16 grants at once per agent; per grant, 16
   requests in flight (more get `429` with `retry-after: 1`) and 64 open
-  connections; idle connections are closed after 60 seconds; the destination
+  connections; idle connections are closed after 60 seconds (stated exactly on
+  2026-11-09: a connection with no request in progress is closed, unanswered,
+  30 seconds after it was opened or after its last response — the deadline for
+  a request's head, which normally comes first; the broker's own idle limit of
+  60 seconds can still close a connection whose response is not being read,
+  once that response's body has been handed over); the destination
   must be resolved and connected within 10 seconds, complete TLS within 10
   seconds and answer with its headers within 10 minutes, and the response body
   may not pause for more than 5 minutes. The maximum lifetime is measured on
@@ -659,7 +726,8 @@ errors precede this logic: they can have an empty body and no retry hint
   second later.
 - **The idle timer**: requests through the broker are not approvals and do
   not postpone the idle lock (P9 unchanged). Whether that lock ends a
-  grant is the profile's `automatic_locks`.
+  grant is the profile's `automatic_locks` (superseded 2026-11-04: the run's
+  `--broker-locks`).
 
 ### The control channel
 
@@ -670,12 +738,13 @@ and the listening socket passed as file-descriptor data. Agent to broker:
 amended 2026-11-04: the destination instead of a profile, and an
 admission carries the method's label instead of the route),
 `admitted` and `refused` (request number), `revoke`. Broker to agent: `ready`,
-`admit` (request number, method, route), `finished` (request number, outcome,
-status, sizes), `revoked`, with a count of the requests it refused before
-admission (its own refusals, not the agent's). The normal broker sends
-`revoked` after every admission answer and every admitted request's
-`finished`. The agent tolerates an early acknowledgement and finishes
-outstanding admitted requests as unknown rather than hanging; see
+`admit` (request number, method, route; amended 2026-11-04 as above),
+`finished` (request number, outcome, status, sizes), `revoked`, with a count
+of the requests it refused before admission (its own refusals, not the
+agent's). The normal broker sends `revoked` after every admission answer and
+every admitted request's `finished`. The agent tolerates an early
+acknowledgement and finishes outstanding admitted requests as unknown rather
+than hanging; see
 [the control-channel contract](../protocol.md#agentbroker-control-channel-broker-protocol-2).
 The credential and the token are kept in zeroizing buffers and never printed.
 Nothing else crosses: no vault, no master password, no requester environment.
@@ -699,10 +768,12 @@ nothing more (it is revoked with reason `audit_failed`).
 destination and the limits come with the run, and the protocol becomes 9 —
 see the [scope amendment](#scope-amendment-2026-11-04).)
 
-- `rusthorse run --broker VAR=ENTRY` (repeatable) and `--url URLVAR=ENTRY` as
+- `rusthorse run --broker VAR=ENTRY` (repeatable; superseded 2026-11-04:
+  `VAR=ENTRY@URL`) and `--url URLVAR=ENTRY` as
   in decision 6. The agent checks that the variables are valid and distinct,
   that no entry is both brokered and given by value (by UUID), that each
-  brokered entry has a usable profile and a value the broker can carry (8 to
+  brokered entry has a usable profile (superseded 2026-11-04: that each
+  binding names a valid destination) and a value the broker can carry (8 to
   4096 visible ASCII characters), that no more than 16 grants would then be
   retained, and that the broker program is usable — all before the dialog —
   and adds `127.0.0.1` to `NO_PROXY` and `no_proxy` in the command's
@@ -722,7 +793,10 @@ see the [scope amendment](#scope-amendment-2026-11-04).)
 - `rusthorse status` reports the broker program and the number of active
   grants (starting and exhausted included, revoked excluded);
   `rusthorse doctor` checks the broker program and the certificate file.
-- **Protocol 8.** A run with broker bindings is a new request,
+- **Protocol 8.** (Superseded 2026-11-04: protocol 9 and `broker_run_v2`,
+  which an agent of protocol 8 refuses; `broker_run` and `broker_edit` are
+  refused. The protocol has since moved on for other work: see
+  [protocol.md](../protocol.md).) A run with broker bindings is a new request,
   `broker_run`: the run request's fields plus the list of broker bindings
   (variable, entry, URL variable). An agent of protocol 7 does not know
   that request and refuses it whole, so a client that checked the version
@@ -752,6 +826,13 @@ edit.)
 
 End-to-end, with a fake HTTPS destination in the test process and fake
 keys, showing the allowed and the refused path of each:
+
+(This is phase 1's list. Superseded 2026-11-04 where a row names routes,
+query parameters, a profile, protocol 7, `broker_edit` or the headers a
+preset lists, and its "Profiles" row whole: the broker without profiles
+has its own tests, in `broker/tests/` and `tests/agent.rs`, for the
+destination named in the run, the token's place in the request head and
+the method's label in the audit.)
 
 | Area | Must show |
 |---|---|
@@ -788,6 +869,8 @@ second review's corrections are folded in):
    broker enforces (destination, every route, the end of the grant, the
    request limit) and those it does not: the command can spend credit, a
    request count is not a spending limit, the bodies are not inspected.
+   (Superseded 2026-11-04 in "every route": the dialog shows the approved
+   origin and says that the key may be sent to any path there.)
 4. **Where does the client run?** The command is still started by the
    agent, outside the requester's sandbox (L16 unchanged in phase 1).
    Grants for a client that stays in its own sandbox come later
@@ -806,7 +889,9 @@ second review's corrections are folded in):
    channel; a changed certificate fails closed until a new approval.
 8. **Which endpoints are refused for every grant?** Everything that is not
    an exact route of the profile's preset; `CONNECT`, `TRACE`, `OPTIONS`
-   and upgrades always.
+   and upgrades always. (Superseded 2026-11-04 in its first half: there is no
+   route check, and any path at the approved origin is forwarded; `CONNECT`,
+   `TRACE`, `OPTIONS` and upgrades are still refused.)
 9. **Which SDKs are supported?** Phase 1 is tested with requests in the
    form the Anthropic and OpenAI SDKs and Claude Code send; Claude Code
    2.1.316 and the Python SDKs are tried by hand with the maintainer before
@@ -825,13 +910,19 @@ second review's corrections are folded in):
    through the broker has been seen yet, and no version is called
    supported yet; the maintainer left Claude Code's check for later, since
    the account, with or without the broker, refuses requests that carry
-   that beta.)
+   that beta. Amended 2026-11-09, to record what followed on 2026-11-04, with
+   the broker without profiles: the maintainer tried it with `curl` — a `GET`
+   and a `POST` answered, a token in the URL refused by the broker — the
+   Anthropic Python SDK 2.4.0 worked through it for a message and two streams,
+   and Claude Code 2.1.318 answered through it in print mode (`claude -p`) and
+   interactively. No client version is called supported yet.)
 10. **Can one grant cover several entries?** No: one grant, token, broker
     and port per entry; one run may hold several, approved in one dialog
     and prepared together before the command starts. They end together
     when the command ends, on the explicit lock and when the agent stops;
     each also ends on its own (its entry changed, revoked by hand, its
-    profile's policy, its lifetime).
+    profile's policy, its lifetime). (Superseded 2026-11-04 in "its profile's
+    policy": the policy its run set.)
 
 ## Alternatives considered
 
@@ -866,7 +957,8 @@ second review's corrections are folded in):
 - **Every lock ends every grant**, as this ADR first said. Simpler, but a
   long session of an AI agent would stop whenever the screen locks, which
   would push users back to `run` without the broker. The profile decides
-  instead, and the explicit lock still ends everything.
+  instead, and the explicit lock still ends everything. (Superseded
+  2026-11-04: the run decides, with `--broker-locks`.)
 - **The broker as the authority for limits**, with the agent only told the
   results. It would save a round trip per request, but the agent must
   record each request before it is forwarded anyway, and two counters
@@ -876,6 +968,11 @@ second review's corrections are folded in):
   not use the broker at all.
 
 ## Consequences
+
+(As written for phase 1. Superseded 2026-11-04 where they name a profile —
+as an asset, in an entry's details, in the guide's advice — and in
+"Protocol 8": the scope amendment made it 9. The guide's Claude Code recipe
+is the one `rusthorse guide ai` prints.)
 
 - **Invariant 1 changes**: a broker process handles the credential of its
   one grant, as the agent hands it over; the CLI and the manager still
@@ -929,7 +1026,7 @@ that only checked packages leave (R01–R04).
 | Registry and Install | P03/P04, `d8c8fe3`: register and send under one lock; confirmation or actual death before reporting containment. `broker_host.rs` counts all retained grants for capacity, including revoked ones, and every lock ends starting grants (`d0c4acb`). |
 | Unlock barrier | P01, `c1249d5`: contain before audit, audit outside the state lock, then generation recheck. Cancellation before comparison preserves the old fingerprint; cancellation after the decision never undoes revocation. Fingerprint implementation clarified in `e729ebd`. |
 | Lifetime and control contract | P02, `c14c4f9` and `24bea7e`: no serving without the agent timer, independent broker expiry. `6ed1ad7` documents early-Revoked tolerance; the broker sends no unsolicited acknowledgement on expiry. |
-| User-visible state, audit and approvals | `grants` includes retained revoked entries; status excludes them. End records are best effort and SIGTERM does not unwind `StopGrants`. The zenity height estimate can refuse multi-grant runs. Manual SDK support validation is pending, as answer 9 requires. |
+| User-visible state, audit and approvals | `grants` includes retained revoked entries; status excludes them. End records are best effort and SIGTERM does not unwind `StopGrants`. The zenity height estimate can refuse multi-grant runs. Manual SDK support validation is pending, as answer 9 requires (done on 2026-11-04: see answer 9). |
 
 The review history records remaining coverage gaps and accepted limitations; a
 passing fake-destination test is not evidence of live SDK compatibility.
@@ -977,8 +1074,9 @@ Rusthorse protects. No further controls are planned.
 
 ### The broker without profiles or presets
 
-This replaces phase 1's profiles and presets. It is reviewed before any
-code, and phase 1 stays as it is until it is built.
+This replaces phase 1's profiles and presets. It was reviewed before any code,
+and phase 1 stayed as it was until it was built: implemented in `2df51fd` and
+`d84f014`, and reviewed ready on 2026-11-04.
 
 - **No profile.** An entry carries no broker profile, and the code knows no
   preset, route or header of any API. `rusthorse edit --broker`,
@@ -1046,9 +1144,12 @@ code, and phase 1 stays as it is until it is built.
   `Accept-Encoding`, which the broker sets. Response headers are relayed
   except the hop-by-hop ones, `Content-Length` and `Transfer-Encoding` —
   the broker frames the body itself, chunked where HTTP allows a body,
-  since redaction changes its length — and any header whose name or value
+  since redaction changes its length — those a `Connection` header of the
+  response names, and any header whose name or value
   carries the key or a token; literal copies of the key in a response body
-  are redacted.
+  are redacted. A `101` response is refused with a local `502`, like a `3xx`;
+  the HTTP library discards a destination's other `1xx` responses, and the
+  final response is the one checked and relayed.
 - **Audit**: an admitted request is recorded, before it is forwarded, with
   the grant ID, its number and its method's label — `GET`, `HEAD`, `POST`,
   `PUT`, `PATCH`, `DELETE`, or `OTHER` for any other method — and its end
@@ -1097,10 +1198,18 @@ databases, devices, SSH and web logins, with its documented limits (threat
 model L3–L5). These are outside the product's scope and are not on the
 roadmap.
 
-Superseded where they say otherwise: decisions 3, 5 and 7 (profiles and
-routes), decision 8's device defaults, decision 10's table, answers 2 and
-7, the context's notes on private devices and administration APIs, the
-alternative "Specific operations instead of a generic proxy", and the phase
+Superseded where they say otherwise: decisions 1 and 2 where they name a
+profile, decisions 3, 5 and 7 (profiles and routes), decision 6's
+`--broker VAR=ENTRY`, decision 8's per-profile policy, preset defaults and
+device defaults, decision 9's "method and route", decision 10's table, answers
+2 and 7, answer 3's "every route", answer 8's exact routes and answer 10's
+"profile's policy", the context's notes on private devices and administration
+APIs, the alternatives "Specific operations instead of a generic proxy" and
+"Every lock ends every grant" where it says that the profile decides, the
+consequences that name a profile or protocol 8, and the phase
 1 specification's profiles, presets, route check, header lists, profile
-snapshot, route template, `edit --broker`, `broker_edit` and the manager's
-profile view.
+types and snapshot, the profile's base path and `automatic_locks`, the route
+in `admit`, the route template, `run --broker VAR=ENTRY`, protocol 8 with
+`broker_run`, `edit --broker`, `broker_edit`, the manager's profile view, and
+in its list of tests the rows and clauses about routes, profiles, protocol 7
+and `broker_edit`.

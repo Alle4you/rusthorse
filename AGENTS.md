@@ -1,8 +1,9 @@
 # AGENTS.md
 
 Instructions for AI coding agents (Claude Code, Codex, …) working on this
-repository. Human contributors: [CONTRIBUTING.md](CONTRIBUTING.md) has the same
-rules in longer form. If this file and the code disagree, stop and ask.
+repository. Human contributors: [CONTRIBUTING.md](CONTRIBUTING.md) states the
+same rules for people, and points here for the checks and the tests. If this
+file and the code disagree, stop and ask.
 
 ## The project
 
@@ -82,7 +83,8 @@ cargo +1.89 check --all-targets --all-features   # and with the code for tests
 cargo clippy -p rusthorse-dialog --all-targets -- -D warnings
 cargo test -p rusthorse-dialog
 
-# The manager uses the same GTK requirements and isolated widget tests.
+# The manager uses the same GTK requirements and isolated widget tests,
+# which also need xclip.
 cargo clippy -p rusthorse-manager --all-targets -- -D warnings
 cargo test -p rusthorse-manager
 ```
@@ -296,15 +298,20 @@ present and capture only its window, in a dark and a light theme
 | Path | What |
 |---|---|
 | `src/agent.rs` | The agent: policy, approvals, dialogs, `run` |
+| `src/exec.rs`, `src/redact.rs` | For `run`: resolving the program and preparing its environment; removing secret values from its output |
+| `src/peer.rs` | Identifying the process at the other end of the socket |
+| `src/audit.rs` | The audit log: appending records, and reading it in pages (`rusthorse audit`, the manager's History page) |
 | `src/ui.rs` | The `Ui` trait, `dialog_text`, zenity dialogs and their height estimate |
 | `src/dialog_program.rs`, `src/dialog_protocol.rs` | Driving `rusthorse-dialog`; the protocol between them |
 | `src/helper_program.rs` | Finding and checking the programs the agent starts next to its own (`rusthorse-dialog`, `rusthorse-broker`) |
+| `src/supervise.rs` | Deadlines and process groups for the dialogs' helper processes and for `doctor`'s checks of them |
 | `broker/` | `rusthorse-broker`, the credential broker (ADR 0013): one process per grant, serving it on a loopback port; its tests run it in front of a fake HTTPS destination |
 | `src/broker_grant.rs` | What a grant carries besides its token and key — the approved destination, the run's limits — and the rules shared with the broker (method labels, token-shaped strings, usable keys) |
-| `src/broker_protocol.rs` | The control channel between the agent and a broker, tokens and grant IDs, phase 1's limits, the file of certificate authorities |
+| `src/broker_protocol.rs` | The control channel between the agent and a broker, tokens and grant IDs, the broker's limits, the file of certificate authorities |
 | `src/broker_host.rs` | The agent's side of the broker: the registry of grants, starting and supervising brokers, admission, revocation, expiry |
 | `manager/` | The GTK metadata client; Show requires agent approval (ADR 0007). |
-| `manager/src/window.rs`, `manager/src/model.rs` | The manager's window and pages — the grants page among them, which lists the broker's grants and revokes them — and what the pages show |
+| `manager/src/window.rs`, `manager/src/model.rs` | The manager's window and pages — Entries, Grants (lists the broker's grants and revokes them), History (the audit log), Import & backup, Settings (`configure`), Status — and what the pages show |
+| `manager/src/connection.rs`, `manager/src/widget_tests.rs` | The manager's requests to the agent; its widget tests on a virtual display, with a real or a fake agent |
 | `dialog/` | `rusthorse-dialog` (GTK 4) and its tests on a virtual display |
 | `src/vault.rs` | KDBX4 storage, atomic saves |
 | `src/session_lock.rs` | Locking on suspend and screen lock (D-Bus watchers, ADR 0009) |
@@ -313,9 +320,11 @@ present and capture only its window, in a dark and a light theme
 | `manager/src/import_window.rs` | The manager's import windows |
 | `src/protocol.rs`, `src/client.rs` | Wire format, client side |
 | `src/main.rs` | The CLI |
-| `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; a test checks the commands and options it names |
+| `src/generate.rs`, `src/paths.rs`, `src/util.rs` | Random values; default file locations; small shared helpers |
+| `src/guide/ai.md` | `rusthorse guide ai`, the guide for AI agents; tests check that the CLI accepts every `rusthorse` command line it shows, and the kinds, statuses and JSON fields it names (not the other programs of its recipes) |
 | `tests/agent.rs` | End-to-end tests |
+| `tests/packaging.rs` | Tests of the package's scripts, service files and documentation |
 | `packaging/`, `[package.metadata.deb]` in `Cargo.toml` | The Debian package (ADR 0010): the four programs, service file, maintainer scripts, `build-deb.sh` (which refuses a broker built for tests, built or packaged: `check-broker.py`), the generated copyright file (`copyright.py`, with the crates checked by hand) and documentation (tested in `tests/packaging.rs`) |
 | `contrib/systemd/` | The service file for source installations (a test keeps it in step with the package's) |
-| `docs/roadmap.md` | Planned work, led by the credential broker |
+| `docs/roadmap.md` | What is done, planned and not planned |
 | `docs/threat-model.md` §11 | Every review finding and what was done about it |

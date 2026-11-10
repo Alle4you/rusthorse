@@ -17,6 +17,7 @@ terminal; `rusthorse --help` ends by pointing AI agents to
 | `--socket PATH` | `RUSTHORSE_SOCKET` | `$XDG_RUNTIME_DIR/rusthorse/agent.sock` | Agent socket |
 | `--vault PATH` (`init`, `agent`) | `RUSTHORSE_VAULT` | `$XDG_DATA_HOME/rusthorse/vault.kdbx` | Vault file |
 | `--audit-log PATH` (`agent`) | `RUSTHORSE_AUDIT_LOG` | `$XDG_STATE_HOME/rusthorse/audit.jsonl` | Audit log |
+| `--config PATH` (`agent`) | `RUSTHORSE_AGENT_CONFIG` | `$XDG_CONFIG_HOME/rusthorse/agent.toml` | The agent's [settings file](#settings) |
 
 `rusthorse audit` reads `RUSTHORSE_AUDIT_LOG` (or the default location).
 
@@ -28,7 +29,7 @@ terminal; `rusthorse --help` ends by pointing AI agents to
 | `1` | Error (agent not running, entry not found, invalid input, …). |
 | `2` | Invalid command line. |
 | `4` | You denied the request, cancelled a dialog, or a dialog timed out. |
-| `124` | The outcome is unknown: the request was sent but no usable answer came back, or the agent could not confirm that it took effect (it could not determine the result of a command it had started, or could not sync a change to disk). For `run`, the command may or may not have run; for a change (`add`, `edit`, `remove`, `import`, `passwd`, `backup`), check with `rusthorse list` or `show` before repeating it. Read-only commands exit with 1 instead. |
+| `124` | The outcome is unknown: the request was sent but no usable answer came back, or the agent could not confirm that it took effect (it could not determine the result of a command it had started, or could not sync a change to disk). For `run`, the command may or may not have run; for a change (`add`, `edit`, `remove`, `import`, `passwd`, `backup`), check with `rusthorse list` or `show` before repeating it. Commands that change no file and start no command (listings, `show`, `status`, `reveal`, `unlock`, `lock`, `grants`, `grants revoke`) exit with 1 instead. |
 | `125` | `run` only: Rusthorse failed or the request was denied; the command did not run. With `--broker`, also when a grant could not be served (an invalid destination or limit included): there is no fallback to the entry's value. |
 | other | `run` only: the command's own exit status (`128 + N` if killed by signal `N`; 141, without a message, when `rusthorse run` could not write the command's output — see [`run`](#rusthorse-run)). |
 
@@ -199,20 +200,23 @@ locks on:   suspend: logind (locks before the computer sleeps)
             screen lock: logind (session lock signals of this user), org.cinnamon.ScreenSaver
 ```
 
-`not watched` and the reason appear when a source is unavailable (no system
-bus, no session bus, logind or no screensaver on the bus, turned off, a
-build without the `session-lock` feature); a watcher whose bus goes away
-connects again every few seconds, and on connecting locks if the session is
-locked or a screensaver on already. When logind would not give an
-inhibitor, the suspend line says so: the lock may then come only after the
-computer wakes.
+`not watched` and the reason appear when no source of an event is watched,
+each one being unavailable (no system bus, no session bus, no logind or no
+screensaver on the bus, turned off, a build without the `session-lock`
+feature); a source that is unavailable beside one that is watched is not
+shown. A watcher whose bus goes away connects again every few seconds, and on
+connecting locks if the session is locked or a screensaver on already, or if
+logind or a screensaver does not answer that in time. When logind would not
+give an inhibitor, the suspend line says so: the lock may then come only after
+the computer wakes.
 
 ## `rusthorse unlock` / `rusthorse lock`
 
 `unlock` makes the agent ask for the master password now (it also asks
 whenever a request needs the vault). The dialog has a text field: type the
 password there and click **Unlock**. You get three attempts; clicking Unlock
-with the field empty asks again without counting as a wrong password, and if
+with the field empty uses one of them — it asks again, while one is left,
+without counting as a wrong password — and if
 nothing is ever typed the unlock counts as cancelled. Wrong passwords are
 recorded in the audit log; after three attempts the request fails. `lock`
 discards the decrypted vault and all remembered approvals immediately; so do
@@ -224,6 +228,8 @@ a suspend and a screen lock (see [`rusthorse agent`](#rusthorse-agent)).
 rusthorse list [--tag TAG] [--kind KIND] [--search TEXT] [--json]
 rusthorse ls …
 ```
+
+`-s` is short for `--search`.
 
 Lists entries with their username, endpoint (URL, or `host:port`) and tags.
 `--kind` keeps entries of one [kind](#entry-kinds) (`other`: entries of no
@@ -240,16 +246,16 @@ as protected. JSON output is an array of objects with the fields described in
 rusthorse show NAME [--json]
 ```
 
-Shows one entry's metadata: name, group, kind, username, URL, host, port,
-tags, whether it has a value and notes, the names of protected and other
-fields, and the last modification time.
+Shows one entry's metadata: name, UUID (`id:`), group, kind, username, URL,
+host, port, tags, whether it has a value and notes, the names of protected and
+other fields, and the last modification time.
 
 An entry carries nothing for the credential broker: where a grant may send
 the key is named in each [`run --broker`](#through-the-credential-broker---broker).
-A `Rusthorse.Broker` field, where phase 1 of the broker stored a profile, is
-an ordinary custom field: listed by name under `fields:` (`other_fields` in
-`--json`) like any other, its value never shown, read or interpreted, and
-kept as it is.
+A `Rusthorse.Broker` field, where an earlier, unreleased version of the broker
+stored a profile, is an ordinary custom field: listed by name under `fields:`
+(`other_fields` in `--json`) like any other, its value never shown, read or
+interpreted, and kept as it is.
 
 ## Entry kinds
 
@@ -291,8 +297,12 @@ example a database password it will only ever use through `rusthorse run`.
 `--length` (8–1024, default 32) and `--alphabet` (`alnum`, the default;
 `symbols`, which adds `-_.:@+=~%^`; or `hex`) shape the value.
 
+Short forms: `-u` for `--username` and `-t` for `--tag` (`edit` has `-u`
+too).
+
 `--replace` overwrites an existing entry with the same name (the old version
-stays in the entry's history). `--group` places a new entry in a group,
+stays in the entry's history) and, like any change to an entry, ends its
+grants of the credential broker. `--group` places a new entry in a group,
 creating it if needed (`Work/Servers`). A path into the recycle bin that
 another KeePass client keeps is refused, before the value is asked for: an
 entry there would be hidden from every listing, as if deleted.
@@ -406,8 +416,10 @@ Requires approval; the dialog shows:
 - **Destinations (environment)**: the variables that name where the program
   connects — names ending in `_URL`, `_URI`, `_API_BASE`, `_ENDPOINT`,
   `_HOST`, `_ADDR` or `_REGISTRY` (`OPENAI_BASE_URL`, `DATABASE_URL`,
-  `DOCKER_HOST`, `VAULT_ADDR`, …), `AWS_ENDPOINT_URL_<SERVICE>` and
-  `PGHOST`-style names. If a name appears twice, the last value — the one
+  `DOCKER_HOST`, `VAULT_ADDR`, …), `AWS_ENDPOINT_URL_<SERVICE>`,
+  `CARGO_REGISTRIES_<NAME>_INDEX`, `UV_INDEX`, `UV_DEFAULT_INDEX` and libpq's
+  `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGSERVICE` and `PGSERVICEFILE`. If a name
+  appears twice, the last value — the one
   the command gets — is shown;
 - a warning for the variables that route its connections or change which
   servers it trusts: proxies (`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
@@ -430,7 +442,7 @@ is judged item by item, at the separators its program uses — `GOPROXY` at
 `UV_EXTRA_INDEX_URL`, `UV_INDEX`, `UV_INSECURE_HOST`, and the resolver's
 `LOCALDOMAIN` and `RES_OPTIONS` at spaces — and uv's `name=URL` items keep
 their name. Any other value is one item, never split, and is not shown if it
-contains a space. Shown:
+contains a space (a certificate variable's paths may). Shown:
 
 - a URL by its scheme, host and port (`https://…@proxy:3128/…`): user
   names, passwords, paths and queries — where credentials and webhook
@@ -444,7 +456,8 @@ contains a space. Shown:
   when it is one word or number;
 - a local socket, file or database (`unix:///run/docker.sock`,
   `sqlite:///./app.db`, `sqlite:///:memory:`), the paths of certificate
-  variables, and absolute paths, as they are.
+  variables, and absolute paths, as they are; outside certificate variables,
+  not a path with `..`.
 
 Anything else appears as `(not shown)`, and a warning names the variable:
 a backslash anywhere; two `@`; a `?` and an `@` both before the first `/`
@@ -457,12 +470,14 @@ digits, `.`, `-` and `_`; a numeric host other than `a.b.c.d` (`127.1`,
 own way); an empty host outside `unix:`, `file:` and `sqlite:` (`https:///host/…`,
 `https:/host`); a path that starts with `//`; and a URL whose query names
 another destination (`host`, `hostaddr`, `port`, `service` — libpq connects
-to those, not to the URL's host) or has a parameter name with characters
-other than letters, digits, `_`, `-` and `.`. Programs read such values differently (a parser
-that takes `\` for `/` connects to the host before the `@`, while the text
-after it names another), so a host drawn from them could be the wrong one,
-and copying them could disclose a credential. The audit log gets the same
-shortened text; the variables reach the command unchanged.
+to those, not to the URL's host — and also `servicefile`, `socket`,
+`unix_socket`, `server`, `addr`, `address` and `proxy`) or has a parameter
+name with characters other than letters, digits, `_`, `-` and `.`. Programs
+read such values differently (a parser that takes `\` for `/` connects to the
+host before the `@`, while the text after it names another), so a host drawn
+from them could be the wrong one, and copying them could disclose a
+credential. The audit log gets the same shortened text; the variables reach
+the command unchanged.
 
 These rules were checked, case by case, against the readings of common URL
 parsers (WHATWG as in Node, Python's, curl's) and of libpq that reviews
@@ -482,7 +497,7 @@ directory were not replaced; otherwise nothing runs. The agent then starts the
 command itself, in the requested directory, with your environment minus
 `LD_*` variables plus the secrets. Unless `--no-redact` is given, the command's
 standard output and error are pipes owned by the agent, and every occurrence
-of a secret value (4 characters or longer) in them is replaced with
+of a secret value (4 bytes or longer) in them is replaced with
 `[REDACTED:<entry>]` before the agent sends the output back to
 `rusthorse run`, which prints it. The command's standard input is
 `/dev/null`, unless `--stdin` makes `rusthorse run` forward yours. Programs
@@ -503,12 +518,17 @@ the command has started, so a denied request never consumes it.
 When the command exits, anything it left running in its process group (for
 example `sleep 30 &`) is terminated; if `rusthorse run` is interrupted before
 that, the whole group is terminated too — `SIGTERM`, then `SIGKILL` 3 seconds
-later.
+later. The agent notices an interruption only once the command has started:
+interrupted while its dialog is open, `rusthorse run` leaves the dialog there,
+and if you then allow it the command starts, with the secrets, and is
+terminated in the same way only then.
 
-If the agent runs with `--remember`, the dialog also offers "Allow for …",
-which lets **identical** requests (same vault state, entries, command line,
-program, directory, input and output handling, and the complete environment)
-run without asking for that long. It does not cover what the command reads, so use it only for commands
+If remembered approvals are on (`--remember`, the `remember` setting in
+`agent.toml`, or the manager's Settings page), the dialog also offers "Allow
+for …", which lets **identical** requests (same vault state, entries, command
+line, program, directory, input and output handling, and the complete
+environment) run without asking for that long. It does not cover what the
+command reads, so use it only for commands
 whose input you control. It never applies to a run with `--broker`.
 
 Examples:
@@ -627,7 +647,8 @@ token; one with the token in the method, the request target, a header's
 name or a header the broker drops or sets itself (`Host`, …); one with any
 other token-shaped string (`rh_` and 64 hexadecimal digits, in any case,
 anywhere in the request's head), which includes a copy of the token whose
-case was changed; and one with the key itself. A program that encodes the
+case was changed; one with the key itself; and one whose head, with the key in
+the token's place, would exceed 32 KiB. A program that encodes the
 token or derives its credential from it, and an API that signs its requests
 with the key or takes it in the URL or the body, cannot be used through the
 broker: `run` serves them, with the value.
@@ -694,7 +715,8 @@ broker's message after its own `Please run /login · API Error: 403`, and its
 `/login` does not apply here.
 
 With redaction (the default), the tokens are redacted from the output like
-the values. `--no-redact` is allowed, and the dialog warns about it: the
+the values, labelled with their variable (`[REDACTED:<VAR>]`). `--no-redact`
+is allowed, and the dialog warns about it: the
 output is then not filtered, and whoever reads a token can use its grant
 until it ends. It is what an interactive program such as Claude Code needs,
 since only without redaction does the command get the terminal.
@@ -711,23 +733,16 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
 ```
 
 The last one runs Claude Code through the broker, as Claude Code's
-documentation describes it. Tried on 2026-11-04 with phase 1's broker (its
-`anthropic` preset) and Claude Code 2.1.317, its requests went through the
-broker to the API, which answered `400` ("credit balance is too low"); SDK
-requests with some of Claude Code's parameters drew the same answer with the
-key by value as through the broker. Claude Code 2.1.318, run in print mode
-(`claude -p`) with a home directory of its own, and so no login, then
-answered through the broker without profiles, in one request, and the
-maintainer then used it interactively through it with the recipe above. The
-Anthropic Python SDK 2.4.0 worked through phase 1's broker, for the requests
-and streams tried; the broker without profiles was tried by hand with `curl`
-(a GET and a POST answered, a token in the URL refused) and with that SDK (a
-message and two streams). `ANTHROPIC_AUTH_TOKEN` makes Claude Code send the
-token as `Authorization: Bearer`; `env -u ANTHROPIC_API_KEY` keeps a key
-your environment may hold out of the command (Claude Code may send it
-instead of the token, which the broker refuses, or beside it, in
-`x-api-key`, which the broker forwards to the approved origin as it came
-unless it is the entry's own key); and
+documentation describes it. The broker was tried by hand on 2026-11-04 with
+`curl`, the Anthropic Python SDK 2.4.0 and Claude Code 2.1.318, in print mode
+(`claude -p`) and interactively with this recipe; no client version is claimed
+supported, and the record of those trials is in the
+[review history](threat-model.md#11-review-history). `ANTHROPIC_AUTH_TOKEN`
+makes Claude Code send the token as `Authorization: Bearer`;
+`env -u ANTHROPIC_API_KEY` keeps a key your environment may hold out of the
+command (Claude Code may send it instead of the token, which the broker
+refuses, or beside it, in `x-api-key`, which the broker forwards to the
+approved origin as it came unless it is the entry's own key); and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, set in the environment that
 `rusthorse run` passes on, turns off its non-essential requests, some of
 which would go straight to `api.anthropic.com`. An `env` block in Claude
@@ -842,6 +857,8 @@ you made elsewhere keep the old password.
 rusthorse generate [--length N] [--alphabet alnum|symbols|hex]
 ```
 
+`-l` and `-a` are short for `--length` and `--alphabet`.
+
 Prints a random value; nothing is stored and the agent is not involved. To
 store a generated value without seeing it, use `rusthorse add NAME --generate`.
 
@@ -851,6 +868,8 @@ store a generated value without seeing it, use `rusthorse add NAME --generate`.
 rusthorse import dotenv FILE [--prefix PREFIX] [--tag TAG]... [--replace] [--dry-run]
 ```
 
+`-t` is short for `--tag`.
+
 Imports `NAME=value` lines in a small `.env` dialect, chosen so that
 python-dotenv and Node's dotenv read every file Rusthorse accepts as it does
 (Docker's `--env-file` keeps quotes in the value, and shells take no spaces
@@ -858,12 +877,15 @@ around `=`): lines end with LF or CRLF; the only blanks are spaces and
 tabs; a line is blank, a `#` comment, or `NAME=value` with an optional
 `export` and blanks around `=`, `NAME` made of ASCII letters, digits, `_`,
 `.` and `-`; a value is on one line, either in single or double quotes with
-neither that quote nor a backslash inside, or unquoted — not starting with a
-back quote — where a `#` after a blank starts a comment; no value holds
-`${…}` (python-dotenv replaces it by another variable's value, Node's
-dotenv does not), no name is set twice, and none is `__proto__` (Node's
-dotenv drops it). Any other file is refused as a whole, naming the line
-only: nothing in it is skipped, and the whole file is checked before any
+neither that quote nor a backslash inside and nothing after them but blanks
+and a `#` comment, or unquoted — not starting with a back quote or a `#` —
+where a `#` after a blank starts a comment and the value itself holds no `#`;
+no value holds `${…}` (python-dotenv replaces it by another variable's value,
+Node's dotenv does not), no name is set twice, and none is `__proto__` (Node's
+dotenv drops it). Any other file is refused as a whole, naming the line, never
+a value (a name set twice is named, with the line that set it first, and a
+character that readers do not read alike by its code or what it is): nothing
+in it is skipped, and the whole file is checked before any
 name is listed, so a file with an error starts no import. (The import itself
 saves batch by batch, as said below.) Add values the dialect cannot hold
 (over several lines, with backslashes) with `rusthorse add`. Variables with
@@ -892,6 +914,8 @@ rusthorse import secret-service --attribute KEY=VALUE... [--name-from ATTR]
                                 [--tag TAG]... [--replace] [--dry-run]
 ```
 
+`-a` is short for `--attribute` and `-t` for `--tag`.
+
 Imports items from the freedesktop Secret Service (GNOME Keyring, KWallet)
 whose attributes match all `--attribute` filters. The agent lists the
 keyring's items — after asking you, since this command then sees their
@@ -914,6 +938,8 @@ Not available in builds without the default `secret-service` feature.
 ```
 rusthorse audit [-n LINES] [--json]
 ```
+
+`--lines` is the long form of `-n`.
 
 Prints the last records of the audit log (default 20). `--json` prints the
 raw JSON Lines. Records contain the time, action, outcome, entry names,
@@ -982,7 +1008,14 @@ suspends and when the screen locks (a warning when nothing watches either:
 the idle timer still locks it), the systemd service is enabled, zenity is
 installed (only a warning when `rusthorse-dialog` is), the session type (X11
 is reported as a warning — see the threat model), Yama `ptrace_scope`, the
-vault's format and permissions, and the socket directory's permissions. Exits
+vault's format and permissions, whether the audit log is readable by others (a
+warning), and the socket directory's permissions. Of the rest, these are
+warnings: a lock that is watched but degraded, an agent that does not report
+its locks, a service that is not enabled, an unknown session type, a system
+without Yama, a vault that is not KDBX 4. These are errors: an agent that
+cannot be reached, speaks another protocol version or reports no vault file,
+`ptrace_scope` 0, a vault file that its group or others can access or that
+cannot be read, a socket directory that its group or others can access. Exits
 with status 1 if anything failed.
 
 Two checks concern the credential broker
@@ -997,9 +1030,12 @@ they check, no grant can be served, and they say so:
   all is next to the agent's program file: the program is then not
   installed. From an agent that does not report it, the program next to the
   agent's program file is checked as the agent checks it, and run (next to
-  this `rusthorse` when no agent answers). Not installed is a warning, since
+  this `rusthorse` when no agent answers); from one that does not report its
+  own program file either, the check can only warn that it cannot tell which
+  broker program the agent uses. Not installed is a warning, since
   everything else works without it; unusable, of another version or not
-  running is an error;
+  running is an error, and so is a broker built for tests (its `--check`
+  reports `test_upstream`), whatever its version;
 - the file of certificate authorities the broker trusts: the first of
   `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`
   and `/etc/ssl/ca-bundle.pem` that exists, which must be a regular file
@@ -1052,9 +1088,9 @@ with an explanation instead of failing in confusing ways. A run with
 `--broker` is a request that an agent of an older protocol refuses whole,
 should one be met after that check (restarted in between): it never runs
 the command without its grants, or with grants that ignore the destinations
-and limits you approved. A profile that phase 1 stored in an entry
-(`Rusthorse.Broker`) stays there as an ordinary field and is never used;
-nothing needs to be done about it.
+and limits you approved. A profile that an earlier, unreleased version of the
+broker stored in an entry (`Rusthorse.Broker`) stays there as an ordinary
+field and is never used; nothing needs to be done about it.
 
 ## Separate visual manager
 

@@ -68,8 +68,9 @@ from the vault straight into the approved program.
    (`VAR=NAME`, `--broker`, `--url`, quoting, input, redaction), what each
    exit status means and what to do about it, and how to store secrets without
    seeing them (`add`, `--generate`, `import dotenv`). A test checks that
-   every command and option it names exists, so it changes with the CLI and
-   the instructions file does not have to. Its source is
+   the CLI accepts every `rusthorse` command line it shows, so it changes with
+   the CLI and the instructions file does not have to; the test does not run
+   the other programs of its recipes (`ssh`, `sshpass`, `curl`). Its source is
    [src/guide/ai.md](../src/guide/ai.md). The snippet repeats the most
    important rules, so that they apply even before the agent has read the
    guide.
@@ -131,32 +132,16 @@ env -u ANTHROPIC_API_KEY CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 rusthorse ru
   --broker ANTHROPIC_AUTH_TOKEN=anthropic@https://api.anthropic.com --url ANTHROPIC_BASE_URL=anthropic -- claude
 ```
 
-The manual check with a real key (ADR 0013, answer 9) began on 2026-11-04,
-with phase 1's broker: the Anthropic Python SDK 2.4.0 worked through the
-broker for the requests tried; Claude Code's requests went through it, and
-the API answered them `400`, as it answered SDK requests with some of Claude
-Code's parameters sent with the key by value, so no Claude Code answer came
-through phase 1's broker. The maintainer then tried the broker without
-profiles by hand, with a real key and `curl` through
-`https://api.anthropic.com`, the token in `x-api-key`: a `GET /v1/models`
-was answered `200`, as the audit recorded with the method's label only, and
-a `POST /v1/messages`, which Claude Haiku 5.5 answered; a request with the
-token in its URL was refused by the broker itself, and nothing was sent. The
-Anthropic Python SDK 2.4.0, given the token in `ANTHROPIC_API_KEY`, then
-worked through it for a message and two streams. Claude Code 2.1.318, run in
-print mode (`claude -p`) with a home directory of its own, and so no login,
-answered through it, in one request, and the maintainer then used Claude
-Code interactively through it with the recipe of the built-in guide; the
-`Credit balance is too low` answer of the earlier test did not recur. If
-Claude Code shows
+The broker was tried by hand on 2026-11-04 with `curl`, the Anthropic Python
+SDK 2.4.0 and Claude Code 2.1.318 (print mode and interactively); no client
+version is claimed supported. If Claude Code shows
 `Credit balance is too low` while other requests with the same key work, the
 account refuses Claude Code's requests (with the key used in that test, its
 beta `claude-code-20250219` alone drew that answer, with or without the
-broker): check the account, not Rusthorse. No client version is called
-supported yet. You approve each use; the automated tests use fake
-destinations and keys only.
+broker): check the account, not Rusthorse. You approve each use; the
+automated tests use fake destinations and keys only.
 
-A grant is approved once, with no `--remember`. Each admitted request,
+A grant is approved once and never remembered. Each admitted request,
 including a retry, consumes one use; a stream holds a slot until it ends.
 Disable SDK retries where practical, and impose spending limits at the
 provider: a request count cannot bound the cost of one request.
@@ -194,7 +179,7 @@ these lines:
 | **Command** | Is this what I expected the agent to do right now? Does it send data anywhere (`curl`, `nc`, `ssh`, `git push`)? |
 | **Program** | Is this the real tool (`/usr/bin/gh`), or something in a project or temporary directory? |
 | **Directory** | Is the agent working where I think it is? |
-| **Broker grants** | Is the **approved origin** the API you expect (the agent named it), and may the key do anything it allows there? The key may go to any path at that origin: the **base path**, shown apart, is not a limit. Are the end (lifetime, automatic locks) and the requests (limit, concurrency) acceptable? The dialog warns that bodies are not inspected and calls can spend credit. Mixed runs still deliver real values for ordinary bindings. |
+| **Grant** (one for each broker binding) | Is the **approved origin** the API you expect (the agent named it), and may the key do anything it allows there? The key may go to any path at that origin: the **base path**, shown apart, is not a limit. Are the end (lifetime, automatic locks) and the requests (limit, concurrency) acceptable? The dialog warns that bodies are not inspected and calls can spend credit. Mixed runs still deliver real values for ordinary bindings. |
 | **Secrets** | Does this command need *these* secrets? An API key for a model has no business in `git push`. |
 | **Requested by (unverified)** | Is it the AI's shell, or something unexpected? These are process names, which any program can choose, so they inform but do not prove who asked. |
 | **Destinations (environment)** | Is every host one you expect — the provider's real API, your own database? An AI agent can set `OPENAI_BASE_URL` or `DATABASE_URL` to a server of its own, and the approved program would send the secret there. |
@@ -220,7 +205,8 @@ Be especially careful with:
   it (a token for a broker binding).
 
 **Remembered approvals** ("Allow for N") are off by default. If you enable
-them (`rusthorse agent --remember 5m`), they skip the dialog for *identical*
+them (`rusthorse agent --remember 5m`, the `remember` setting in `agent.toml`,
+or the manager's **Settings** page), they skip the dialog for *identical*
 requests — same command line, program, directory, secrets, environment and
 vault state — but not for what the command reads: an agent can change a
 script, a config file or the command's input between runs. Enable them only
@@ -230,7 +216,7 @@ away. Remembering never applies to a run with `--broker`.
 **Sandboxed agents.** If the AI agent runs in a sandbox (restricted network,
 read-only file system, container), remember that the command you approve is
 started by Rusthorse *outside* that sandbox, with your full access. The
-dialog says so on the "Runs" line.
+dialog says so in its opening text.
 
 When something looks wrong, click **Deny**. The command does not run, the AI
 gets exit status 125, and the denial is in `rusthorse audit`.
@@ -284,7 +270,10 @@ broker-specific limits.
   them on the command line: command lines are visible to other processes.
   ssh reads no password from the environment: with `sshpass -e`, it takes
   the one `run` puts in `SSHPASS` (`rusthorse run SSHPASS=NAME -- sshpass -e
-  ssh USER@HOST …`). A private key stored as an entry's value goes into a
-  temporary `ssh-agent` instead. The built-in guide has both recipes, and
-  covers unknown host keys and refused passwords.
+  ssh USER@HOST …`). A private key stored as an entry's value — one without a
+  passphrase — goes into a temporary `ssh-agent` instead, which the recipe
+  ends with the command. The built-in guide has both recipes, and covers
+  unknown host keys (ssh is told to refuse them), refused passwords, and how
+  to see whether a host answers without offering it any key. The automated
+  tests do not run these recipes.
 - Review `rusthorse audit` now and then.

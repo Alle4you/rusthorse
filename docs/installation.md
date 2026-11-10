@@ -37,7 +37,8 @@ authorities from it.
 
 No release has been published yet, so build the package from a clone. That
 needs what building from source needs (Rust, and the GTK 4 and libadwaita
-development packages, below) and cargo-deb:
+development packages, below), cargo-deb, and `python3` and `dpkg-deb`, which
+Debian, Ubuntu and Linux Mint normally have:
 
 ```sh
 sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config
@@ -176,11 +177,14 @@ distributions read neither `~/.bashrc` nor `~/.profile` — where rustup adds
 - Otherwise, give the AI the absolute path, `~/.cargo/bin/rusthorse`, in its
   instructions file.
 
-To build without the Secret Service importer (and its D-Bus dependencies):
+To build without the Secret Service importer:
 
 ```sh
-cargo install --locked --path . --no-default-features
+cargo install --locked --path . --no-default-features --features session-lock
 ```
+
+Without `--features session-lock` too, the agent has no D-Bus dependencies,
+and does not lock the vault when the screen locks or the computer suspends.
 
 ## 2. Run the agent as a systemd user service
 
@@ -252,9 +256,10 @@ rusthorse init
 ```
 
 Either way, when the agent is running, the agent asks for the new master
-password twice in its own dialog. (Without an agent, `init` asks in the
-terminal, without echoing it.) The vault is created at
-`~/.local/share/rusthorse/vault.kdbx` with mode `0600`, and left unlocked.
+password twice in its own dialog, and leaves the new vault unlocked. (Without
+an agent, `init` asks in the terminal, without echoing it, and only creates
+the file.) The vault is created at `~/.local/share/rusthorse/vault.kdbx` with
+mode `0600`.
 
 Choose a long master password — a passphrase of five or more random words is a
 good choice. Rusthorse refuses passwords shorter than 8 characters and warns
@@ -286,7 +291,7 @@ Any KDBX4 file protected by a password works. Point the agent at it with
 
 ```sh
 rusthorse status
-rusthorse add TEST_SECRET          # type any value in the dialog
+rusthorse add TEST_SECRET          # type a value of four characters or more
 rusthorse run TEST_SECRET -- sh -c 'echo "value: $TEST_SECRET"'
 # → value: [REDACTED:TEST_SECRET]
 rusthorse remove TEST_SECRET
@@ -412,7 +417,8 @@ With the package, install the newer package as in
 --user daemon-reload` and restart the agent (or log in again). From source,
 install a specific release of the programs the agent uses — `cargo install
 --git` needs their names, since the repository holds several — then restart
-the agent so that all of them run the same version:
+the agent so that all of them run the same version. No release has been
+published yet: `v0.1.0` below stands for the tag of a future one.
 
 ```sh
 cargo install --locked --git https://github.com/Alle4you/rusthorse --tag v0.1.0 --force \
@@ -436,6 +442,7 @@ and a broker of another version than `rusthorse`. Read
 | Previous vault | `vault.kdbx.bak`, next to the vault | — |
 | Agent socket | `$XDG_RUNTIME_DIR/rusthorse/agent.sock` (`/run/user/<uid>/…`) | `RUSTHORSE_SOCKET`, `--socket` |
 | Audit log | `$XDG_STATE_HOME/rusthorse/audit.jsonl` (`~/.local/state/…`) | `RUSTHORSE_AUDIT_LOG`, `--audit-log` |
+| Agent settings | `$XDG_CONFIG_HOME/rusthorse/agent.toml` (`~/.config/…`); it exists only once you write it or change a setting in the manager | `RUSTHORSE_AGENT_CONFIG`, `agent --config` |
 | Programs | `/usr/bin` (package) or `~/.cargo/bin` (source) | — |
 | Service file | `/usr/lib/systemd/user/` (package) or `~/.config/systemd/user/` (source) | A drop-in: `systemctl --user edit rusthorse-agent` |
 | Certificate authorities the broker trusts | The first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt` and `/etc/ssl/ca-bundle.pem` that exists | — (no variable changes it) |
@@ -447,7 +454,8 @@ agent started otherwise creates the directory itself and leaves it.
 
 ## Uninstalling
 
-Uninstalling never deletes your vault or your audit log.
+Uninstalling never deletes your vault, your audit log or the agent's settings
+file.
 
 ### The package
 
@@ -481,12 +489,14 @@ section](#optional-visual-manager).
 
 ### Your data
 
-The vault, its previous version and the audit log stay in place. Delete them
+The vault, its previous version, the audit log and the agent's settings file
+(if there is one) stay in place. Delete them
 only once you are sure you no longer need the secrets — the vault is an
 ordinary KeePass file, which KeePassXC opens, so keep a copy if in doubt:
 
 ```sh
 rm -r ~/.local/share/rusthorse ~/.local/state/rusthorse
+rm -rf ~/.config/rusthorse         # the settings file
 ```
 
 ## Optional visual manager
@@ -525,8 +535,10 @@ example `Exec=/home/you/.cargo/bin/rusthorse-manager`). `chmod go-w` keeps
 other users of your group from replacing the program; the agent does not run
 the manager, so it does not check it as it checks `rusthorse-dialog`.
 
-The manager starts nothing and writes no settings. Installing or upgrading it
-needs no restart of the agent.
+The manager starts no agent of its own — its **Start agent** button asks
+systemd to start the service — and it changes the agent's settings only
+through the agent, after your approval. Installing or upgrading it needs no
+restart of the agent.
 
 To uninstall it:
 

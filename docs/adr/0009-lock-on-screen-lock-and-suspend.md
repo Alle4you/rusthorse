@@ -1,6 +1,11 @@
 # 0009. The agent locks when the screen locks or the computer suspends
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: implemented, unreleased; reviewed ready on 2026-11-02 (the
+  third verification in the
+  [review history](../threat-model.md#11-review-history)).
 - Date: 2026-11-01
 - Amended: 2026-11-02, after review — how signals are trusted, a second
   connection per watcher for questions, the inhibitor taken on a thread of
@@ -56,7 +61,11 @@ When it starts, the agent watches, each in a thread of its own:
 remembered approval are forgotten and the vault's generation changes, so an
 unlock whose password is being typed, or an approval being answered, does
 nothing when it completes. Commands already running keep the secrets they
-were given. The audit log records a `lock` with outcome `suspend` or
+were given. (Since [ADR 0013](0013-credential-broker.md): for the vault it is
+still what `rusthorse lock` does; the credential broker's grants differ.
+`rusthorse lock` ends every grant; these locks end only those still starting
+and those whose run asked for it, with `--broker-locks end`.) The audit log
+records a `lock` with outcome `suspend` or
 `screen_locked` (and the source) when the vault was unlocked.
 
 The delay inhibitor is taken at start and again after each resume
@@ -66,12 +75,17 @@ arrives while the lock is under way is kept until the lock is done, one
 that arrives after it is let go at once. Nothing else lets it go: not
 logind leaving the bus, not its name changing hands — systemd keeps
 inhibitors when logind restarts — which only change what `status` says.
-While it is held, logind waits for the agent to lock — but
-only up to its `InhibitDelayMaxSec` (5 seconds by default), not forever.
-Locking drops the decrypted vault from memory; it waits for the agent's
-state lock, so a vault save in progress, or a slow disk under the audit
-record written before the inhibitor is let go, can make it take longer than
-logind waits.
+(Stated exactly on 2026-11-09: while none is held, no suspend is under way and
+logind is on the bus, the watcher also asks for one again every 30 seconds.
+And an inhibitor belongs to one connection of the watcher: when the watcher's
+own bus connection is lost, it is let go within about 30 seconds, and a new
+one is asked for once the watcher has connected again. Stopping the watchers
+lets it go too, as section 4 says.) While it is held, logind waits for the
+agent to lock — but only up to its `InhibitDelayMaxSec` (5 seconds by
+default), not forever. Locking drops the decrypted vault from memory; it waits
+for the agent's state lock, so a vault save in progress, or a slow disk under
+the audit record written before the inhibitor is let go, can make it take
+longer than logind waits.
 
 Each watcher reads signals on one connection and asks its questions — who
 owns logind's name, whose a session is, the inhibitor — on a second one,
@@ -113,7 +127,12 @@ the person is likely away.
 
 Both behaviours are on by default. `rusthorse agent --no-lock-on-suspend`
 and `--no-lock-on-screen-lock` turn them off (for example on a machine that
-nobody else can touch). There is no option to unlock automatically.
+nobody else can touch). There is no option to unlock automatically. (Since
+2026-11-05, when section 3 of [ADR 0007](0007-visual-manager.md) was built:
+the settings file's `lock_on_suspend` and `lock_on_screen_lock` also turn each
+on or off when the agent starts, and `configure`, sent by the manager's
+Settings page, while it runs. A flag still wins: what it turns off stays off
+until the agent is restarted without it.)
 
 ### 4. Reporting
 

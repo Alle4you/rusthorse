@@ -1,6 +1,16 @@
 # 0007. A visual manager that remains a client of the agent
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: unreleased. M1 implemented and reviewed (2026-11-01, the
+  rounds in the [review history](../threat-model.md#11-review-history)).
+  Of M2, the agent's settings and the History page (both reviewed ready on
+  2026-11-05) and the lock on screen lock and suspend
+  ([ADR 0009](0009-lock-on-screen-lock-and-suspend.md)); listing and
+  revoking remembered approvals is not built. Of M3, the import windows
+  ([ADR 0012](0012-import-read-by-the-agent.md)); restoration and the
+  KeePassXC handoff are not built.
 - Date: 2026-11-01
 - Amended: 2026-11-01 — Copy of a value (section 2), at the maintainer's
   request: without it, long random keys had to be retyped. A first design
@@ -34,6 +44,9 @@ unlock and value-entry dialogs remain agent-owned. The manager's metadata
 forms are not approval dialogs. It cannot turn a click on Save into an
 approval. It connects to `RUSTHORSE_SOCKET` or the usual XDG socket and checks
 protocol compatibility before operations. No service is started or restarted.
+(Since [ADR 0011](0011-first-start-from-the-manager.md): when no agent
+answers, **Start agent** asks systemd to start the agent's service; the
+manager still restarts nothing and starts no agent of its own.)
 
 M1 implements status, explicit unlock/lock, metadata list/search/group
 filter, details, create (including group), edit/rename/delete, generated
@@ -51,6 +64,10 @@ The manager does not embed a command runner in M1: the snippet uses
 `rusthorse run SECRET=<uuid> -- your-command` in the terminal/AI shell, keeping
 secrets in the approved child and redacting its output as today. No subprocess
 shell evaluates entry names. Search is local, over metadata already obtained.
+(Since then: the variable is the entry's name when that is a valid variable
+name, `SECRET` otherwise, and a second, labelled template goes through the
+credential broker and leaves the destination and the variables to fill in —
+[ADR 0013](0013-credential-broker.md#scope-amendment-2026-11-04).)
 
 One user operation runs at a time on a worker, never on the GTK thread. A
 bounded wait and connection shutdown on window close prevent indefinite
@@ -58,7 +75,10 @@ client workers. Closing a window or losing a reply does not prove a pending
 change was cancelled: report unknown outcomes, never automatically retry.
 Status polling is read-only and does not extend the agent's idle timeout.
 Metadata and shown secrets are cleared on observed lock/disconnection; there
-is no synchronous push notification of external locks in the protocol.
+is no synchronous push notification of external locks in the protocol. (Since
+then: status checks, the listing and revocation of the broker's grants and the
+reading of the History page run beside the human's request, each one at a
+time; none of them waits for a dialog the agent shows.)
 
 ### 2. Show, Copy and memory
 
@@ -294,7 +314,10 @@ for a preview, whereas Secret Service discovery can avoid reading values.
 Require explicit attributes, begin with one item, retain originals. Values
 then pass through zeroizing client buffers only for the chosen import. Each
 batch needs agent approval; summarize confirmed, refused and uncertain
-batches separately. Never silently retry or replace duplicates.
+batches separately. Never silently retry or replace duplicates. (Superseded by
+[ADR 0012](0012-import-read-by-the-agent.md) where it has the manager read the
+sources and hold values: the agent reads them, and the manager sends names
+only.)
 
 Restoration needs a new agent-owned `restore` operation and CLI command:
 approve source/destination and loss of newer entries, ask for the source
@@ -377,4 +400,9 @@ Copy puts a value where other programs and clipboard histories can keep it;
 the threat model (L14) records it.
 Before real credentials, the maintainer must review the reveal exposure,
 the Copy design, milestones and manual-lock limitations. ADR and M1 remain
-**awaiting independent review**, not Accepted by their implementer.
+**awaiting independent review**, not Accepted by their implementer. (Since
+then: M1 was reviewed on 2026-11-01, in the rounds the
+[review history](../threat-model.md#11-review-history) records under "ADR 0007
+and manager milestone 1", and the settings and the History page on 2026-11-05;
+this ADR was accepted on 2026-11-09. Listing and revoking remembered
+approvals, restoration and the KeePassXC handoff are still not built.)

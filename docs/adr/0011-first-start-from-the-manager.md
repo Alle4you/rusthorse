@@ -1,6 +1,11 @@
 # 0011. The first start happens in the manager; the agent creates the vault
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: implemented, unreleased; reviewed ready on 2026-11-02 (the
+  eighth review of that day in the
+  [review history](../threat-model.md#11-review-history)).
 - Date: 2026-11-02
 - Amends: [ADR 0007](0007-visual-manager.md) ("The manager does not
   install, start or restart anything"; the vault must exist).

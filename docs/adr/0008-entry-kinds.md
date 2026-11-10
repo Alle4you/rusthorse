@@ -1,6 +1,11 @@
 # 0008. Entry kinds, and an API key's endpoint for `run`
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-09, when the maintainer asked that the ADRs' statuses be
+  brought in step with what is built and reviewed
+- Implementation: implemented, unreleased; reviewed on 2026-11-01, the last
+  verification ready to keep trying with fake entries
+  ([review history](../threat-model.md#11-review-history)).
 - Date: 2026-11-01
 - Amended: 2026-11-04, by [ADR 0013's scope amendment](0013-credential-broker.md#scope-amendment-2026-11-04):
   the manager's commands for an entry infer nothing from its kind or its

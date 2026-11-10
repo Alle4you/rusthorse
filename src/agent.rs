@@ -286,8 +286,8 @@ pub struct Agent {
 impl session_lock::Locker for Agent {
     /// Lock as `rusthorse lock` does. The generation changes even when the
     /// vault is already locked, so that an unlock whose password is being
-    /// typed now does nothing when it completes. The grants whose profile
-    /// says that the automatic locks end them end too, and so does every
+    /// typed now does nothing when it completes. The grants whose run said
+    /// that the automatic locks end them end too, and so does every
     /// grant still starting; the lock is done once their brokers have
     /// confirmed (or were killed).
     fn lock_for(&self, event: &str, source: &str) {

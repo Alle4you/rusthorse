@@ -1048,7 +1048,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         // `rusthorse-broker` next to this program, with no fallback.
         broker_program: None,
         broker_ready_timeout: None,
-        // Each grant lasts as long as its profile says.
+        // Each grant lasts as long as its run says (`--broker-lifetime`).
         broker_lifetime: None,
         settings: Some(sources),
     };
@@ -1126,9 +1126,10 @@ fn status(client: &Client, json: bool) -> anyhow::Result<u8> {
         println!("dialogs:    {}", printable(dialogs));
     }
     // The credential broker (ADR 0013), from agents that report it. The
-    // count is the agent's, which may include grants that are no longer
-    // active (a revoked grant whose command still runs): it is not called
-    // "active" here, and `rusthorse grants` says what each one is.
+    // count is the agent's: the grants that are starting, active or
+    // exhausted, without the revoked ones whose commands still run. It is
+    // not called "active" here, and `rusthorse grants`, which lists the
+    // revoked ones too, says what each one is.
     if let Some(broker) = &info.broker {
         println!("broker:     {}", printable(broker));
     }
@@ -4322,7 +4323,7 @@ mod tests {
         };
         let json = serde_json::to_value(&bare).expect("json");
         for field in named {
-            let always = ["id", "name", "has_password"].contains(&field);
+            let always = ["id", "name", "has_password", "has_notes"].contains(&field);
             assert_eq!(json.get(field).is_some(), always, "{field}");
         }
     }

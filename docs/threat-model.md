@@ -6,10 +6,9 @@ document and the code, that is a bug; please report it
 ([SECURITY.md](../SECURITY.md)).
 
 - Applies to: Rusthorse 0.1.x
-- Last reviewed: 2026-11-05 (the manager's History page and the agent's
-  settings; before that, the feedback for a key the destination refused,
-  escaped output, the scope amendment; see
-  [review history](#11-review-history))
+- Last reviewed: 2026-11-09 (an audit of every document against the code;
+  before that, on 2026-11-05, the manager's History page and the agent's
+  settings; see [review history](#11-review-history))
 
 ## 1. Scope and the exact guarantee
 
@@ -59,6 +58,7 @@ this setup. It is outside what Rusthorse can enforce on its own.
 | Notes and other protected fields | Often contain recovery codes or secondary secrets. |
 | The master password | Unlocks everything, including copies of the vault elsewhere. |
 | Approval decisions | The human's control over *what* a secret is used for. |
+| The agent's settings (`agent.toml`) | They decide how long the vault stays unlocked without use, whether approvals can be remembered and for how long, how long a dialog waits, and whether the vault locks on suspend and on screen lock. |
 | Metadata (names, usernames, URLs, hosts, ports, tags) | Reveals what you have access to; useful for targeting. Treated as low sensitivity unless the file marks a field protected. |
 | The vault file and its backups | Encrypted at rest; exposed to offline guessing if copied. |
 | Broker tokens | Bearer capabilities usable through the local listener until the grant ends, for any path at its approved origin, within its limits. |
@@ -154,19 +154,20 @@ still holds the grant, including after revocation.
 | # | Property | Mechanism | Holds against |
 |---|---|---|---|
 | P1 | A requester never receives a secret value, notes or a protected field without an approval for that specific request. | Only `reveal` returns a value, after a non-rememberable approval. `list`/`show` return metadata only, and withhold any field the KDBX file marks as protected — including a protected title, which is shown as `[protected title]` and matched only by UUID — reporting only the field's name. | A1, A2 |
-| P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows them, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap in the instant between that check and the start of the program, and changes to file *contents*, are not prevented (L4). | A1, A2 |
-| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock and every saved change. The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. For ordinary `run`, reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. For `broker_run_v2`, the same state lock also registers grants as `starting`; any lock ends starting grants, and all grants must still be starting before the command starts. Automatic locks can preserve already active grants when the run says so (L22). | A1, A2 |
+| P2 | The approved command line, program, directory and environment are the ones used. | The agent resolves the program to a canonical path, fixes arguments, directory and environment, shows the command line, the program and the directory — and of the environment only the variables on its lists (L4) —, checks the program's and directory's identity (device and inode) again after you answer, and spawns the command itself ([ADR 0002](adr/0002-agent-mediated-execution.md)). A custom client cannot substitute another command. A swap between that check and the start of the program (an instant; for a run with `--broker`, the time its brokers take to start), and changes to file *contents*, are not prevented (L4). | A1, A2 |
+| P3 | An approval is acted on only if the vault did not change while you decided. | A vault *generation* counter is bumped on unlock, lock, every saved change and every approved change of the agent's settings (P15). The generation is checked under the same lock that reads the values, so an edit, lock or reload while the dialog was open cancels the request. For ordinary `run`, reading the values *consumes* the approval: a `lock` after that point does not stop the command. A `lock` while the master password is being typed cancels the unlock. For `broker_run_v2`, the same state lock also registers grants as `starting`; any lock ends starting grants, and all grants must still be starting before the command starts. Automatic locks can preserve already active grants when the run says so (L22). | A1, A2 |
 | P4 | Secrets used by `run` are not placed in a process the requester can inspect with a debugger. | The command is a child of the agent, not of the requester; Yama blocks `ptrace` from outside its ancestry. See L3 for `/proc/<pid>/environ`. | A1, A2 (partially) |
 | P5 | Secret values printed by an approved command do not reach the requester verbatim. | With redaction (the default), the command's stdout and stderr are pipes owned by the agent; the filtered output travels to the requester as data frames over the socket, and the requester writes it itself. The command's stdin is `/dev/null`, or an agent-owned pipe fed from the requester's data frames with `run --stdin`. The requester's own descriptors never reach the command or the agent, so there is no unfiltered way back. Exact-match only (L5). Broker tokens are filtered from command output too. Independently, the broker redacts literal copies of its credential from response bodies and drops relayed response headers whose name or value carries it or a token. With `--no-redact`, the command instead gets the requester's input/output descriptors directly and its output is unfiltered; HTTP response redaction stays on. | A1 |
-| P6 | The master password and new secret values never pass through a requester. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
-| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and the start of their UUID, so two entries with the same title in different groups do not look alike (unless a file written by another program gave them UUIDs that start alike, L9); requests whose dialog text would exceed 4000 characters (or 1000 for the command line, program path or directory of a `run`) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
-| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token in a header value it forwards; every token-shaped string in the request's head (`rh_` and 64 hexadecimal digits, in any case) must be that token byte for byte, compared in constant time; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
-| P9 | The decrypted vault is not held longer than needed. | Auto-lock after 15 minutes without an *approved* use — `status`, `list`, `show` and denied requests do not postpone it; `rusthorse lock`; lock on any save failure. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
+| P6 | The master password never passes through a requester, nor does a new secret value, unless the requester itself supplies it. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so, as do those of `add --stdin` and `edit --stdin`, whose value the requester supplies and already knows. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
+| P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and the start of their UUID in the dialogs of `run`, `reveal`, `edit` and `remove`, so two entries with the same title in different groups do not look alike (unless a file written by another program gave them UUIDs that start alike, L9), while those of `add` and of an import show the name the requester gave, without group or UUID; requests whose dialog text would exceed 4000 characters (or 1000 for the command line, program path or directory of a `run`, and for each detail of a run with `--broker`) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
+| P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token in a header value it forwards: every token-shaped string there (`rh_` and 64 hexadecimal digits, in any case) must be that token byte for byte, compared in constant time, and one anywhere else in the request's head is refused, the token itself included; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
+| P9 | The decrypted vault is not held longer than needed. | Auto-lock after a time without an *approved* use — 15 minutes by default; the `idle_timeout` setting changes it, up to 24 hours, and `0` turns it off (P15) — which `status`, `list`, `show` and denied requests do not postpone; `rusthorse lock`; lock on any save failure; lock when the computer is about to sleep and when the screen locks, unless those two settings are switched off, and within the limits of L20. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
-| P12 | Every decision leaves a record. | JSON Lines audit log, `fsync`ed per record. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
+| P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`; the directory entry of a log just created is not synced). Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
+| P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome. The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
 
 Broker-specific bounds are in [ADR 0013](adr/0013-credential-broker.md): 16
 entries in the grant registry per agent (normally revoked brokers stay listed
@@ -209,10 +210,11 @@ on.
 | Answer | What it authorizes |
 |---|---|
 | **Allow once** | This one request, exactly as shown. |
-| **Allow for N** (opt-in, `--remember`, off by default) | A reusable capability: for N minutes, any request with the same entries (by UUID), the same vault generation, command line, program, directory, redaction setting and environment runs **without asking**. It does not cover what the command reads — its standard input, files, network responses — which can differ on each run (L8). |
+| **Allow for N** (opt-in: the `remember` setting, off by default, set by the `--remember` flag, in `agent.toml` or on the manager's Settings page) | A reusable capability: for N minutes, any request with the same variables and entries (by UUID), the same vault generation, command line, program, directory, redaction and `--stdin` settings and environment runs **without asking**. Program and directory are compared as paths, so it covers whatever file is at that path at each use; and it does not cover what the command reads — its standard input, files, network responses — which can differ on each run (L8). |
 | **Deny**, closing the dialog, timeout | Nothing. The command does not run. |
 
-Locking, unlocking and any saved change invalidate remembered approvals.
+Locking, unlocking, any saved change and an approved change of the agent's
+settings invalidate remembered approvals.
 A run with `--broker` (`broker_run_v2`) never uses them. Its approval
 creates a grant for the approved origin whose individual requests — to any
 path there — need admission and an audit record, but no new human dialog.
@@ -247,8 +249,9 @@ Cinnamon and MATE.
 Wayland does not close every path: dialogs expose their buttons through the
 accessibility API (AT-SPI) so that screen readers work, and a program of the
 same user that can reach the accessibility bus can activate them on X11 and
-Wayland alike. zenity's GTK 3 dialogs do so today, and so will the dialog
-program of [ADR 0006](adr/0006-own-dialog-program.md).
+Wayland alike. zenity's GTK 3 dialogs do so, and so do those of
+`rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)), a GTK 4
+program in which nothing turns accessibility off.
 
 ### L3 — The environment of a running approved command is readable
 
@@ -268,8 +271,9 @@ contains when it runs — and an AI agent can edit that file, even between your
 answer and the start of the command. Rusthorse checks the identity (device and
 inode) of the program and of the working directory again after you answer,
 which catches a file swapped for another while the dialog was open. It does
-not pin them — a swap in the instant between that check and the start is
-still possible — and it does not notice a file rewritten in place, nor the scripts,
+not pin them — a swap between that check and the start is still possible (an
+instant; for a run with `--broker`, the time its brokers take to start) — and
+it does not notice a file rewritten in place, nor the scripts,
 modules, configuration files (`~/.gitconfig`, `.curlrc`, `.npmrc`) and
 plugins the program loads. The same applies to `sh -c '…'` and interpreters
 with inline code. The agent removes `LD_*` variables and warns about a list
@@ -319,7 +323,7 @@ reach loopback; it is not enforcement.
 ### L5 — Redaction only catches exact copies in the command's output
 
 A command that prints the secret encoded (base64, hex, URL-encoded), split,
-reversed or partially is not redacted, and secrets shorter than 4 characters
+reversed or partially is not redacted, and secrets shorter than 4 bytes
 never are. A command can also send the secret over the network, write it to a
 file, or put it in its own logs — none of which pass through the redactor.
 Redaction prevents *accidental* disclosure on stdout/stderr; it is not a
@@ -359,7 +363,10 @@ When enabled, "Allow for N" approves identical requests without asking, even
 when they read different input. For example, `curl --config -` with a
 remembered approval sends the token wherever the next request's standard input
 says. This is why remembering is **off by default** and should only be enabled
-for commands whose inputs you control. See
+for commands whose inputs you control. A remembered approval names the program
+and the directory by their paths, not by the files that were there: a program
+replaced at the same path between two uses runs without asking, as one whose
+contents changed does (L4). See
 [ADR 0005](adr/0005-remembered-approvals-opt-in.md). Broker grants are a
 separate capability: no `--remember`, but each grant permits multiple API
 calls, to any path at its approved origin, until its limit or end (L25). A
@@ -384,11 +391,12 @@ by an estimate made for an 11-point font, and larger fonts or a smaller screen
 can still make a dialog taller than the screen. ASCII itself has characters
 some fonts draw alike (`l`, `I`, `1`). A name drawn as an escape and a name
 that holds those characters literally (`東京` and `\u{6771}\u{4eac}`) look
-the same; dialogs add the entry's UUID (its first 8 characters) and a
-destination group's whole UUID, but a file written by another program can
-give two entries UUIDs that start alike. The requester chain is made of
-process names any program can choose — the dialog labels it "unverified".
-*Mitigation:* treat unexpected dialogs as a warning sign; deny when in doubt.
+the same; the dialogs of `run`, `reveal`, `edit` and `remove` add the entry's
+UUID (its first 8 characters) and a destination group's whole UUID, but a file
+written by another program can give two entries UUIDs that start alike. The
+requester chain is made of process names any program can choose — the dialog
+labels it "unverified". *Mitigation:* treat unexpected dialogs as a warning
+sign; deny when in doubt.
 
 ### L10 — The vault can be attacked offline
 
@@ -462,10 +470,12 @@ visual manager uses both:
 Status polling is not an immediate signal of a lock made elsewhere: the
 manager checks every five seconds, also while a request waits for the
 human, and drops what a waiting request returns after it saw a lock — a
-value, a list, an "unlocked" status read before the lock. `import` reads values in the client
-before sending them to the agent; `add --stdin` sends a value the client
-already has. None of these should be run by an AI agent. Importing also does
-not remove the original copies (for example in GNOME Keyring).
+value, a list, an "unlocked" status read before the lock. `add --stdin` and
+`edit --stdin` send a value the client already has, as would the older
+`import` request, which the CLI and the manager no longer send: their imports
+name the source, and the agent reads the values (P6). None of these should be
+run by an AI agent. Importing also does not remove the original copies (for
+example in GNOME Keyring).
 
 ### L15 — Concurrent edits by other programs
 
@@ -500,19 +510,6 @@ and before draining output. After confirmation or broker death, escaped
 descendants hold dead tokens. Requests already sent may still take effect at
 the destination. *Planned:* one cgroup per command.
 
-### L19 — A connected client that does not read holds the request open
-
-Output is delivered like in a pipeline: while the requester stays connected,
-the agent waits for it to read, however long that takes, and keeps the copy
-of the secret values that the redactor needs. Meanwhile the command may
-itself be blocked writing its output, exactly as it would be in a pipeline
-whose reader stopped. Stdout and stderr have separate 1 MiB flow-control
-windows, so one stuck channel does not stop the other. The request ends as
-soon as the requester reads its output, or closes, half-closes or breaks the
-connection (each of which cancels it: the agent shuts the socket down, which
-fails a pending send at once). A requester that does neither ties up one of
-the agent's 64 connections.
-
 ### L18 — Forwarded input races the end of the command
 
 With `run --stdin`, the `rusthorse run` process reads its own stdin and sends
@@ -525,9 +522,23 @@ after the call returns. If another process reads the same input at the same
 moment — between that `poll` and the `read` — the reader stays blocked in
 `read` and may later consume input meant for someone else; interrupting it
 would require changing file flags shared with the caller. Without `--stdin`
-(the default), the requester's input is never read. With `--stdin`,
-nothing is read before the command has started: a denied request leaves the
-input untouched.
+(the default) and with redaction, the requester's input is never read; with
+`--no-redact` the command holds the requester's standard input itself. With
+`--stdin`, nothing is read before the command has started: a denied request
+leaves the input untouched.
+
+### L19 — A connected client that does not read holds the request open
+
+Output is delivered like in a pipeline: while the requester stays connected,
+the agent waits for it to read, however long that takes, and keeps the copy
+of the secret values that the redactor needs. Meanwhile the command may
+itself be blocked writing its output, exactly as it would be in a pipeline
+whose reader stopped. Stdout and stderr have separate 1 MiB flow-control
+windows, so one stuck channel does not stop the other. The request ends as
+soon as the requester reads its output, or closes, half-closes or breaks the
+connection (each of which cancels it: the agent shuts the socket down, which
+fails a pending send at once). A requester that does neither ties up one of
+the agent's 64 connections.
 
 ### L20 — Locking with the screen depends on the desktop's signals
 
@@ -552,7 +563,8 @@ that held it is not guaranteed to have been overwritten (L7). Forged signals —
 screensaver's — can only lock: nothing unlocks but the master password.
 *Mitigation:* keep both behaviours on; check `rusthorse doctor`; with a
 locker that emits no signal, run `rusthorse lock` from its hook, and keep
-`--idle-timeout` short.
+the idle lock short (the `idle_timeout` setting: the `--idle-timeout` flag,
+`agent.toml` or the manager's Settings page).
 
 ### L21 — A loopback token is a bearer capability
 
@@ -620,18 +632,15 @@ Hyper-generated malformed/framing errors can also precede the broker's JSON
 errors and retry hints.
 
 The fake HTTPS tests cover the protocol, not every SDK's behaviour. By hand,
-with a real key (2026-11-04) and phase 1's broker, the Anthropic Python SDK
-2.4.0 worked through the broker for the requests tried; Claude Code's
-requests went through it, and the API answered them `400`, as it answered
-SDK requests with some of Claude Code's parameters sent with the key by
-value, so no Claude Code answer came through it. The broker without
-profiles was then tried by hand with `curl` (a GET and a POST answered, a
-token in the URL refused by the broker), with the Anthropic Python SDK
-2.4.0 (a message and two streams) and with Claude Code 2.1.318, which
-answered in print mode (`claude -p`) and interactively. A program works
-through it only if it presents the token literally in a header: one that
-encodes the token or derives its credential from it, and an API that signs
-requests with the key or takes it in the URL or the body, cannot use it.
+with a real key (2026-11-04), the broker was tried with `curl` (a GET and a
+POST answered, a token in the URL refused by the broker), with the Anthropic
+Python SDK 2.4.0 (a message and two streams) and with Claude Code 2.1.318,
+which answered in print mode (`claude -p`) and interactively; the
+[review history](#11-review-history) has the whole account, including the
+earlier test of phase 1's broker. No client version is claimed supported. A
+program works through it only if it presents the token literally in a header:
+one that encodes the token or derives its credential from it, and an API that
+signs requests with the key or takes it in the URL or the body, cannot use it.
 SDK configuration can override environment variables, or send a key of its
 own beside the token in another header, which the broker forwards to the
 approved origin as it came unless it is the entry's own key or
@@ -683,8 +692,10 @@ a small extension (an allow-list of uids) that is on the roadmap.
 - Prefer a Wayland session; use full-disk encryption.
 - Give AI agents narrowly scoped, revocable credentials (per-repository
   tokens, API keys with spending limits), stored as separate entries.
-- Keep `--idle-timeout` short; lock the screen when you step away (the agent
-  locks with it, L20); leave `--remember` off unless you need it.
+- Keep the idle lock short (`idle_timeout`); lock the screen when you step
+  away (the agent locks with it, L20); leave remembered approvals (`remember`)
+  off unless you need them. Both are settings of the agent: a flag of
+  `rusthorse agent`, `agent.toml` or the manager's Settings page (P15).
 - Read every dialog; be suspicious of `sh -c`, scripts the agent just edited,
   unexpected programs or directories, and risky-variable warnings.
 - Edit the vault in other programs only while the agent is locked.
@@ -700,15 +711,24 @@ a small extension (an allow-list of uids) that is on the roadmap.
 
 ## 10. Planned improvements
 
+The roadmap's [Hardening](roadmap.md#hardening) table lists the same items
+and carries their status:
+
 - **Isolation support** (§8): uid allow-list on the socket and documentation
-  for running agents as a separate user.
-- **One cgroup per approved command** (L17), with resource limits.
-- **Bounded KDF parameters** before unlocking (L12).
-- **Remembered-approval management**: the manager already lists and revokes
-  broker grants; remembered approvals remain separate.
-- **A "waiting for your answer" hint** in the terminal while a dialog is
-  open, driven by an explicit event from the agent.
-- Signed release artifacts.
+  for running agents as a separate user. Planned.
+- **One cgroup per approved command** (L17), with resource limits. Planned.
+- **Bounded KDF parameters** before unlocking (L12). Planned.
+- **Key files and hardware keys** (YubiKey challenge-response), which
+  KeePassXC vaults can use. Later.
+- Done: the run dialog lists the variables that redirect a program's
+  requests (L4).
+
+Other planned work in the [roadmap](roadmap.md) touches this model without
+being hardening: a manager page that lists and revokes remembered approvals
+(the manager already lists and revokes broker grants; remembered approvals
+remain separate, L8), a "waiting for your answer" hint in the terminal while
+a dialog is open, driven by an explicit event from the agent, and signed
+checksums for published releases.
 
 Per-entry policies that restrict an entry to listed programs or hosts are
 outside the product's scope and not planned; L3 and L4 remain limits.
@@ -739,7 +759,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-03 | Whole phase 1 at `0d71da0` (Codex, AI-assisted). | Not ready: P01–P06; fixes below. |
 | 2026-11-03 | Pieces F and G: system tests and packaging, independent verification and fixes (AI-assisted). | Coverage and packaging fixes, accepted test gaps and incident below. |
 | 2026-11-03 | Re-review at `9f7599b` (Codex, AI-assisted). | Ready: no medium or higher finding left; Q01/Q02 low, dispositions below. |
-| 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remains pending. |
+| 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remained pending then (since done on 2026-11-04; see the manual tests below). |
 | 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
 | 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
 | 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
@@ -757,6 +777,12 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `2df51fd` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `d84f014`. |
 | 2026-11-04 | Confirmation of G01 and G02 and their record, `2df51fd..4f8c00b` (Codex, AI-assisted). | Ready: G01 and G02 confirmed resolved, no new finding; `2df51fd`'s tree is the one reviewed as `9c069d4`, and the record is accurate. |
 | 2026-11-04 | Saving a vault that KeePassXC wrote as KDBX 4.0, `6a8d394` (Codex, AI-assisted). | Ready: no finding. |
+| 2026-11-04 | Manual test of the broker without profiles, with a real key (the maintainer and the maintainer's agent; a test, not a review). | `curl`, the Anthropic Python SDK 2.4.0 and Claude Code 2.1.318 worked through it for what was tried; see below. No client version is claimed supported. |
+| 2026-11-05 | The manager's History page (Codex, AI-assisted). | Not ready, then ready: the first review's findings fixed; see below. |
+| 2026-11-05 | The agent's settings and the manager's Settings page: design opinion, reviews and confirmations (Codex, AI-assisted). | Not ready until the last confirmation, then ready: R1–R7 fixed; see below. |
+| 2026-11-09 | Documentation audit: every document against the code at `3521f90`, in two rounds (eleven read-only audits by the maintainer's agent, AI-assisted). | Corrected in the same change; three behaviours of the code stated as they are and left to the maintainer; see below. |
+| 2026-11-09 | The SSH recipes of the guide for AI agents, `d88f7a5` and `eb75d19` (Codex, AI-assisted). | Not ready: SSH01 medium (the probe "without a secret" offered the human's own keys), SSH02–SSH05 low; fixed in the same change; see below. |
+| 2026-11-09 | The documentation correction, whole, and the SSH fixes (Codex, AI-assisted). | Not ready: SSH01–SSH05 confirmed fixed; DOC01–DOC06 low, fixed. Confirmation the same day: ready, no new finding; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -879,7 +905,7 @@ a first real test):
 | N26 — the protocol version stayed 1 across incompatible changes, so an older agent passed the check and then deadlocked | **Fixed:** protocol version 2; a check that gets anything but a status answer fails. |
 | N27 — `doctor` checked the vault named in the client's environment, not the one the agent uses | **Fixed:** it checks the vault and audit log the agent reports (new `status.audit_log`). |
 | Partial imports were not summarised; duplicates were not shown in the preview | **Fixed.** |
-| KeePassXC round trip is checked with the same parser, not by opening the result in KeePassXC | **Open:** part of the owner's first test (open the vault in KeePassXC after using Rusthorse). |
+| KeePassXC round trip is checked with the same parser, not by opening the result in KeePassXC | **Open** then (since closed: an ignored round-trip test was run with KeePassXC 2.7.6, `beaf9af`, S2 below; and KeePassXC 2.7.6 reopened the results of the KDBX 4.0 fix, `6a8d394`). |
 | Coverage | A mutation run reverted each of 46 fixes in turn: 44 make the suite fail. The test for the N23 shutdown order only became effective after its command stopped producing output (output workers blocked by the unread output had masked the order) and with a small agent-side send buffer, a test-only setting. The two not caught are those described in the sixth table. |
 
 Findings of the ninth review (N23, N26 and N27 confirmed fixed; verdict: not
@@ -2260,7 +2286,8 @@ restriction as excluding product ancestry reads. The maintainer's agent
 separately reported all AGENTS.md checks passing at `9f7599b`; that report is
 attributed, not presented as Codex's execution. The current documentation task
 explicitly permits the normal test suites. The phase remains unreleased; live
-Claude Code/SDK validation is pending.
+Claude Code/SDK validation is pending (since done on 2026-11-04; see the
+manual tests below).
 
 
 **2026-11-03 — Documentation checkpoint at `4ff834a` (uncommitted).**
@@ -2336,7 +2363,8 @@ are not commit references. Changed prose fits 78 columns except indivisible
 links, tables and examples; `git diff --check` passed. No runtime code,
 dependency, installed package or service was changed, and nothing was
 committed. Live SDK validation and the final implementation review remain
-separate pending work.
+separate pending work (both since done: the reviews and the manual tests of
+2026-11-04, below).
 
 **2026-11-03 — Final phase 1 review at `4b0186d`.**
 
@@ -2824,6 +2852,40 @@ unchanged. Codex's checks, offline in an isolated copy: `cargo test
 `cargo fmt --all --check`, `git diff --check`, a temporary probe, and the
 two mutations, which failed by their assertions.
 
+**2026-11-04 — Manual tests of the broker without profiles.**
+
+Not a review: what was tried by hand, with a real key of the maintainer's,
+through the broker without profiles (`2df51fd`, `d84f014`) at
+`https://api.anthropic.com`, after the test of phase 1's broker recorded
+above ("A key the destination refused, and the manual test so far"). From
+2026-11-09 this history is the one place that holds the whole account; the
+other documents state only what was tried last.
+
+- **`curl`, by the maintainer** (recorded in `cc42442`), the token in
+  `x-api-key`: a `GET /v1/models` was answered `200`, and the audit recorded
+  it with the method's label only; a `POST /v1/messages` was answered by
+  Claude Haiku 5.5; a request with the token in its URL was refused by the
+  broker itself, and nothing was sent.
+- **The Anthropic Python SDK 2.4.0, by the maintainer's agent at the
+  maintainer's request** (`0c34c65`), the token in `ANTHROPIC_API_KEY` and
+  the broker's address in `ANTHROPIC_BASE_URL`: a message and two streams
+  were answered `200`, and the audit recorded three `POST` admissions by
+  label only.
+- **Claude Code 2.1.318 in print mode** (`claude -p`), by the maintainer's
+  agent at the maintainer's request (`e943667`), with a home directory of
+  its own and so no login, the token in `ANTHROPIC_AUTH_TOKEN` and the
+  broker's address in `ANTHROPIC_BASE_URL`: it answered, in one `POST` that
+  the destination answered `200`.
+- **Claude Code interactively, by the maintainer** (`65a901d`), with the
+  guide's recipe: it worked. The `400` "credit balance is too low" that
+  phase 1's test met, which the API gave to requests with Claude Code's
+  beta whether or not they went through the broker, did not recur.
+
+These are the requests that were tried, on one account and one day. No
+client version is claimed supported, and the limits of L24 stand: a program
+works through the broker only if it presents the token literally in a
+request header.
+
 **2026-11-05 — The manager's History page.**
 
 Manager milestone item History (ADR 0007 section 4, amended on 2026-11-05
@@ -3023,3 +3085,166 @@ these reviews.
 The implementer reports that the full `AGENTS.md` matrix passed after the
 last code fix. Codex did not rerun that full matrix or the GTK suites in
 the final re-review.
+
+**2026-11-09 — Documentation audit against the code at `3521f90`.**
+
+At the maintainer's request, the maintainer's agent ran seven read-only
+audits (AI-assisted; nothing was built, run or changed by them), each
+comparing a set of documents with the code: the command line (`docs/cli.md`,
+the guide for AI agents, the README), the protocol, the architecture and
+the contributor instructions, the manager and the dialog program,
+installation and packaging, this threat model, and the credential broker
+with the CHANGELOG and the roadmap. No audit built or ran the programs;
+each reported what it did not check. What they found, by class:
+
+| Class of finding | Disposition |
+|---|---|
+| Statements the code contradicts: a protocol version in an example, the error an unanswered password dialog gives, the size of the dialog program's answer, how imports are split into batches, what the manager starts and changes, what a build without default features lacks, a line the run dialog does not have, the package's description. | **Corrected** in the documents concerned (and in the package's description and in comments in the code). |
+| The agent's settings of 2026-11-05 not carried through: remembered approvals and the idle lock named as flags only, the idle lock's 15 minutes stated without saying it is a default that can be turned off, the settings file absent from the assets and from the file locations. | **Corrected:** here, the settings file is an asset, P15 states what guards a change, P9 states the default and what can be switched off, and P3 and "What an approval means" say that an approved settings change forgets remembered approvals; the other documents name the settings. |
+| ADR 0013's text outside its scope amendment still described phase 1's profiles, routes and audit records as what is built. | **Corrected** by marking those passages superseded; the ADR remains the record of both decisions. |
+| Status that had not followed the work: ADRs still "Proposed", the manager's first milestone "awaiting review", the CI workflow "planned", two findings of this history still "Open". | **Corrected:** the statuses, and the two entries above, which now say when they were closed. The summary table of this history gained the rows of 2026-11-05. |
+| The manual tests of the broker told in five documents, mixed with phase 1's. | **Corrected:** the whole account is in this history ("A key the destination refused, and the manual test so far" and "Manual tests of the broker without profiles"); L24 and the other documents state the last result. |
+| Omissions: options, fields, refusals and pages the documents did not mention; code maps without the newer modules; §10 and the roadmap's Hardening table listing different items. | **Corrected.** §10 and the Hardening table now list the same items, and the roadmap carries their status. |
+| L18 and L19 out of order; L2 spoke of `rusthorse-dialog` in the future. | **Corrected.** |
+| No review recorded for the SSH recipes of the guide (`d88f7a5`, `eb75d19`). | **Reviewed on 2026-11-09:** see the next entry. |
+
+No finding of this first round changed what the code does or what this
+model's sections 1 to 9 guarantee; P9 was stated more strongly than the code
+(an unqualified 15 minutes), and is now exact. Each audit said what it had
+not traced, and a second round, the same day, traced those parts line by
+line (four more read-only audits; for the broker, also the HTTP library's
+source where the broker inherits its behaviour). Each finding was then
+checked in the code before a sentence changed:
+
+| What the second round traced | Found and corrected |
+|---|---|
+| The broker's internals (ADR 0013, the protocol, the CLI reference). | Nine statements. Only a `101` from the destination is refused with `502`: the HTTP library discards other `1xx` responses — the first round had this wrong, and its correction of that day was corrected. A connection waiting for a request is normally closed after 30 seconds, by the deadline for a request's head, before the idle limit of 60. Only HTTP/1.0 gets `505`. The limit of 100 headers is the library's default, not set by the broker and not covered by a test of its own. Request numbers are consecutive, not merely increasing. A token-shaped string in a forwarded header value is compared with the token, a copy in another case included; one anywhere else is refused as it stands. A `414` cannot occur. `100 Continue` is sent only after admission. A head that the key would make longer than 32 KiB gets `401`. |
+| This model's properties and limits (P1, P2, P4–P7, P12, P14, P15, L3–L20). | Eleven statements, none of them an invariant broken. L14 said that `import` reads values in the client: the CLI and the manager send names, and the agent reads the values. A remembered approval names the program and the directory by path, so a program replaced at that path between two uses runs without asking (L8). The run dialog shows of the environment only the variables on its lists, and for a run with `--broker` the time between the re-check and the start is the time its brokers take to start (P2, L4). `add --stdin` and `edit --stdin` pass a value through the requester (P6). The dialogs of `add` and of an import show the name as given, without group or UUID (P7, L9). With `--no-redact` the command holds the requester's standard input (L18). Redaction's minimum is 4 bytes (L5). Which directories the settings file may be under (P15); what is synced when a record is written (P12). |
+| The CLI reference and the protocol where the first round had not looked. | Fifteen statements, among them: the agent watches a connection only once the command has started (below); an empty click on Unlock uses one of the three attempts; `not watched` appears only when no source of an event is watched; which of `doctor`'s checks warn and which fail, a broker built for tests among the failures; the full lists of destination variables and of connection-string parameters; two rules of the `.env` dialect about `#`. |
+| The lifecycle of a `run`, the dialog programs, storage, the package, the manager, ADR 0009. | Eleven statements: the `run` diagram unlocked before it resolved the program (the code resolves first); for the broker's grants a lock on suspend or screen lock is not what `rusthorse lock` is; the settings also turn those locks on and off; when the suspend inhibitor is let go and asked for again; the cipher and compression are those of new vaults, and an existing file keeps its own; what the package's link check covers; the two statements of the KDF's cost now agree on about 0.7 s (the ignored timing test, built for release, opened a new vault in 0.67 s on the maintainer's machine). |
+
+What the documents now state as it is, and the maintainer may want to
+change in the code — none was changed here:
+
+- **A connection is not watched while a dialog is open.** A requester that
+  goes away then is not noticed: the dialog stays, and what the human
+  allows is done — a `run`'s command is started with the secrets, and its
+  broker grants served, before the agent notices and stops them; an `edit`,
+  a `remove` or an `add` is carried out with nobody to read the answer. The
+  human approved what the dialog showed, so no approval is bypassed; the
+  protocol had said that closing the connection cancels the request.
+- **The first records of a new audit log** are synced as data, but the
+  directory entry of the file just created is not: a crash right after may
+  lose them (P12 says so now).
+- **The limit of 100 request headers** is the HTTP library's default, which
+  a new version of the library could change unnoticed.
+
+One test changed with the documents: the guide's list of JSON fields gained
+`has_notes`, which `list --json` always carries, so the test that reads that
+list counts it among the fields that are always there. Still not confirmed
+by these audits: the unlock barrier and the first step of a broker run's
+preparation, the HTTP library's handling of a `#` fragment (L24), how other
+programs read a `.env` file or a connection string, the measured heights of
+dialogs, the dependencies the package computes when it is built, and the
+entries of this history before 2026-11-04.
+
+**2026-11-09 — The SSH recipes of the guide for AI agents (`d88f7a5`,
+`eb75d19`).**
+
+The two commits of 2026-11-04 added to `rusthorse guide ai` a recipe for
+SSH with a password (`sshpass -e`) and one with a private key from the vault
+(a temporary `ssh-agent`), and mentioned them in `docs/ai-agents.md` and the
+CHANGELOG. They changed no code and had no review on record; the
+documentation audit above found that. Review of the text at `3521f90`
+(Codex, AI-assisted, 2026-11-09; verdict: **not ready**, one medium and four
+low findings), and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Medium — SSH01: the probe "without a secret" (`ssh -o BatchMode=yes … true`) was not without one. `BatchMode` only turns the questions off: ssh still offered the human's own keys, from their files and from the session's ssh-agent, and where the host accepts one it ran `true` logged in, outside any approval or record of Rusthorse. | **Fixed:** the probe reads no ssh configuration (`-F /dev/null`) and offers no key, agent or password (`PreferredAuthentications=none`, `IdentityAgent=none`), with `StrictHostKeyChecking=yes` and the port given; the guide says why, what its two answers mean, and that a host reached only through the human's ssh configuration cannot be probed this way. |
+| Low — SSH02: "for the command only" promised a cleanup that an interruption skipped: `ssh-agent -k` ran only when the shell reached the end of its line, and the agent, in a session of its own, is not in the group that `run` stops (L17). | **Fixed:** the recipe sets its traps before it loads the key — one ends the agent whenever the shell exits, one makes the shell exit on `HUP`, `INT` and `TERM` — and the guide says what is left: a shell killed with `SIGKILL` cannot clean up, and the agent then keeps the key until it notices that the shell is gone. |
+| Low — SSH03: the guide gave the wrong reason for an unknown host key failing (no terminal; `sshpass` gives ssh one, and itself refuses to confirm a key), and its examples left `StrictHostKeyChecking` to the human's configuration, where `accept-new` trusts a new key unseen. | **Fixed:** both recipes and the probe pass `-o StrictHostKeyChecking=yes`, which wins over the configuration; the guide says that ssh then refuses a host it does not know, forbids `accept-new` beside turning the check off, and gives `ssh-keygen -F '[HOST]:PORT'` for a port other than 22. |
+| Low — SSH04: nothing said that the key recipe needs a key without a passphrase; with one, `ssh-add` asks for it, in the terminal or through an askpass program. | **Fixed:** the guide and `docs/ai-agents.md` say so, and that a passphrase never goes in a command line or a file. |
+| Low — SSH05: "a test checks every command and option it names" read as covering the recipes' other programs; the test gives the CLI's parser the `rusthorse` command lines, and what follows `--` is the command's own words, unchecked. | **Fixed** in `docs/ai-agents.md`, the CHANGELOG, the roadmap and AGENTS.md: the test checks that the CLI accepts every `rusthorse` command line the guide shows, not the other programs of its recipes. |
+
+Also checked by the review and found correct: the commits add no feature;
+`sshpass -e` keeps the password out of the arguments; the single quotes
+keep `$SSH_KEY` for the approved shell, whose `printf` is a builtin, so the
+key goes to `ssh-add` through a pipe and into no file; the dialog and the
+audit hold the command line as written, not its expansion; output redaction
+is literal (L3–L5).
+
+How the corrected recipe was checked, on the maintainer's machine, with
+OpenSSH 9.6, a key made for the test and a stand-in for the `ssh` command —
+no host was contacted, and neither recipe has been tried against a server
+since it was changed: the agent is gone when the shell ends after a
+success, after a command that failed (its status, 7, was the shell's) and
+after `ssh-add` refused what was not a key (status 1); half a second after a
+`SIGTERM` sent to the command's process group, the shell and the agent were
+both gone; after a `SIGKILL` sent to that group, the agent, which is in
+another group, ended by itself 9 seconds later. `ssh -G`, which connects to
+nothing, showed that `BatchMode=yes` leaves public-key authentication on,
+that the probe's options are accepted as written, and that
+`StrictHostKeyChecking=yes` on the command line wins over a configuration
+that says `accept-new`; `ssh-keygen -F` found a host stored with a port only
+as `[HOST]:PORT`. Not checked: that a server answers the probe `Permission
+denied` without being offered a key, which rests on OpenSSH's documentation
+of `PreferredAuthentications`; `sshpass` with a real server; an interactive
+session.
+
+Confirmation (Codex, AI-assisted, 2026-11-09): SSH01 to SSH05 confirmed
+fixed, with no new finding in the recipes, and this record found accurate.
+The reviewer repeated the local checks with dash and with bash — the shell's
+status 0 after a success, 7 after a command that failed, 1 after a key that
+was none, 143 after `HUP`, `INT` or `TERM`, the agent's socket gone each
+time, and about 9.8 seconds after a `SIGKILL` — and noted that this repeats
+the checks, not who first ran them. No server was contacted.
+
+**2026-11-09 — Review of the documentation correction.**
+
+Review of the whole uncommitted change — the corrections of the audit above,
+both rounds, with the SSH fixes — by Codex (AI-assisted, 2026-11-09; verdict:
+**not ready**, six low findings; no high or medium finding, and none in the
+SSH recipes or in what the programs do). The reviewer read the whole diff and,
+for this model, the README, `docs/ai-agents.md` and ADR 0013, the removed
+lines alone: no true reviewed guarantee was found dropped. What it found, and
+what was done:
+
+| Finding | Disposition |
+|---|---|
+| Low — DOC01: the audit's second round had said that the broker's idle limit of 60 seconds "never comes first", and ADR 0013 that the 30-second deadline for a request's head "always comes before" it. It can come first: the broker counts a request as over when its response's body is handed over, and the HTTP library waits for the next request only once that response is written, so a connection whose client does not read stays open past 30 seconds and is closed by the idle limit (reproduced by the reviewer with the library and the broker's counter over an in-memory pipe). | **Fixed:** ADR 0013 says that the head's deadline normally comes first and when the idle limit still does; the audit's record no longer lists the limit among the behaviours left to the maintainer — it is not redundant, and is kept. |
+| Low — DOC02: "any other version … answered with an empty `400`" (ADR 0013, a note of this day): an HTTP/2 connection preface closes the connection with no response at all. | **Fixed:** the note says both. |
+| Low — DOC03: "every token-shaped string … is compared … in constant time" (ADR 0013, a note of this day; P8 said the same of "the request's head"). One in the method, the target, a header's name or a header that is not forwarded is refused without being compared; in a forwarded value each is compared, and the first that differs refuses the request. | **Fixed** in ADR 0013, in P8 and in the audit's record. The refusals themselves were right. |
+| Low — DOC04: the protocol's error table still gave `unlock_failed` as "Wrong master password three times", after the CLI reference had been corrected: an empty answer uses an attempt, and `change_password` answers it after one wrong current password. | **Fixed** in the table. |
+| Low — DOC05: the guide for AI agents and the CLI reference still said that values of "4 characters or longer" are redacted, after L5 was corrected to bytes. | **Fixed** in both: 4 bytes or longer. |
+| Low — DOC06: the package's description said that the agent asks "before each use" and locks the vault when the screen locks or the computer suspends, without saying that remembered approvals skip the dialog and that those locks are defaults which depend on the desktop. | **Fixed** in `Cargo.toml`. |
+
+The reviewer's opinion on the behaviours that the audit left to the
+maintainer, each verified in the code — the decisions remain the
+maintainer's, and nothing was changed: the connection that is not watched
+while a dialog is open, **fix later** (no approval is bypassed, and the
+documents now say it; watch for a disconnection while waiting, and check
+again before the effects); the directory entry of a new audit log that is
+not synced, **fix now, in a change of its own** (a crash could keep the
+approved effect and lose the log's name; sync the directory, and any parent
+just created, before the effect is released, and fail closed); the limit of
+100 headers inherited from the HTTP library, **fix later** (set it
+explicitly and test 101 headers; the 32 KiB limit stands by itself).
+
+After the fixes of the first audit round, the maintainer's agent had run
+the whole matrix of `AGENTS.md`'s checks, and one test failed: the guide's
+list of JSON fields now named `has_notes`, which the test did not count
+among the fields always present. With that line corrected, the twelve steps
+passed on the tree the reviewer read — `cargo fmt`, both `clippy` runs, the
+tests with and without features, `cargo doc`, both MSRV checks, and the
+`clippy` and tests of the dialog program and of the manager. The reviewer
+did not run that matrix.
+
+Confirmation (Codex, AI-assisted, 2026-11-09): **ready.** DOC01 to DOC06
+confirmed fixed, each against the code, with no new finding and nothing made
+stronger or weaker by the fixes; this record and the SSH one found accurate.
+The reviewer did not repeat its experiments or run the checks. The
+maintainer's agent ran the whole matrix once more after these fixes: the
+twelve steps passed. Left as they were, as said above: no recipe was tried
+against a server after it changed, and the three behaviours of the code
+await the maintainer's decision.

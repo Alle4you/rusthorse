@@ -66,18 +66,20 @@ program, and `ZenityUi` remains.
   standard input and output; no pipe is used in either direction, so neither
   the request nor the answer can be read or injected through `/proc/<pid>/fd`.
 - Both directions carry one frame each: a 4-byte big-endian length and a
-  UTF-8 JSON object. The request is at most 64 KiB; the answer at most 8 KiB.
+  UTF-8 JSON object. The request is at most 64 KiB; the answer at most 8 KiB
+  (32 KiB since review round 24: see [Amendments](#amendments)).
 - The request carries the protocol version, a random request identifier, the
-  kind of dialog (approval, master password, secret value), the title,
+  kind of dialog (approval, master password, secret value — on the wire two
+  kinds, `approval` and `entry`, the second for both things typed), the title,
   headline, explanation, warnings, command, details, facts, whether "Allow
   for N" is offered and its label, and the timeout. The agent passes every
   requester-controlled string through `ui::dialog_text` first.
 - The answer carries the protocol version, the same identifier and either a
-  decision (`allow-once`, `allow-for`, `deny`) or, for password and value
-  dialogs, the typed text (at most 4 KiB) or `cancel`. `timed-out` reports a
-  timeout.
+  decision (`allow_once`, `allow_for`, `deny`) or, for password and value
+  dialogs, the typed text (`typed`, at most 4 KiB) or `cancel`. `timed_out`
+  reports a timeout.
 - **An approval requires all of**: one well-formed answer frame with the
-  expected version and identifier, a decision that was offered (`allow-for`
+  expected version and identifier, a decision that was offered (`allow_for`
   only when "Allow for" was), end of stream after the frame, and exit status
   0 — all within the deadline. Anything else is a denial: a crash, a partial
   or oversized frame, extra bytes, an unknown field value, a status that does
@@ -97,7 +99,7 @@ The program receives only these variables, taken from the agent's own
 environment (the desktop session's, through systemd), never from a request:
 `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` (the real one:
 Wayland and the session's services live there), `DBUS_SESSION_BUS_ADDRESS`,
-`LANG`, `LC_*` and `LANGUAGE`. The agent adds:
+`LANG`, `LC_ALL`, `LC_MESSAGES` and `LANGUAGE`. The agent adds:
 
 - `XAUTHORITY`, when it is not set and `DISPLAY` is: the X authority file is
   resolved **before** `HOME` is replaced (`$HOME/.Xauthority` of the real
@@ -129,7 +131,9 @@ below.
   the explanation, warnings in a card with the theme's standard warning icon,
   the command in a monospaced card, the details in a two-column card (label |
   value), the facts, the "Allow for" note.
-- All text is **plain text** — no markup — selectable, and wraps within the
+- All text is **plain text** — no markup — selectable where it is a value (the
+  warnings, the command, the details' and the facts' values; not the headline,
+  the explanation or the labels), and wraps within the
   available width, long words included: one vertical scroll for the whole
   content, no scrolling inside the command card, no ellipsis, nothing reachable
   only by scrolling sideways. The content never changes after the window is
@@ -242,9 +246,13 @@ which the threat model already treats as out of scope.
   decision logic are tested without a display; its widgets — focus, the
   approval gate, resizing, scaling, long strings, accessibility — are tested
   on an isolated virtual display, never on the maintainer's screen. The look
-  is checked by hand, in light and dark themes.
+  is checked by hand, in light and dark themes. (Resizing, scaling and
+  accessibility actions are not tested: see the amendment of review round 24.)
 - **Follow-up**: the same program can later show the grants panel and the
-  credential broker's approvals ([roadmap](../roadmap.md)).
+  credential broker's approvals ([roadmap](../roadmap.md)). (Since then: the
+  broker's approvals are shown by this program, as dialogs of the agent; the
+  list of grants went to the manager's Grants page,
+  [ADR 0013](0013-credential-broker.md).)
 
 ## Amendments
 
@@ -263,7 +271,9 @@ which the threat model already treats as out of scope.
   said. `doctor` relies on the agent's own report of the program it uses.
   The widget tests cover focus, keyboard approval, the approval gate with a
   long request, timeouts and the password field; resizing, scaling and
-  accessibility actions are not tested yet ([roadmap](../roadmap.md)).
+  accessibility actions are not tested yet ([roadmap](../roadmap.md)). The
+  same round raised the largest answer frame of §3 from 8 KiB to 32 KiB: 4 KiB
+  of typed text must fit even when JSON escapes every byte of it.
 - 2026-11-01, review round 25: the private-group exception of the first
   amendment is withdrawn. Users who share a group as their primary group are
   not listed among its members, so a group named after the user with no
@@ -273,3 +283,9 @@ which the threat model already treats as out of scope.
   `doctor`'s messages give the command. The supervisor also kills the program
   itself, not only its group, before waiting for it: a program that moved to
   another group would otherwise have kept the agent waiting.
+- 2026-11-09, documentation review: three descriptions corrected in place
+  to what the program has done since it was built — the answer's kinds as
+  the protocol spells them (`allow_once`, `allow_for`, `typed`,
+  `timed_out`) and the request's two kinds (§3), the locale variables
+  passed (§5), and which text is selectable (§6). Notes say where the
+  answer frame's size and the follow-up changed.

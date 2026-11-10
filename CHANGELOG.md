@@ -23,7 +23,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   one broker per grant puts the key in its place and forwards the request to
   the approved origin only, over verified TLS, streams server-sent events,
   redacts literal copies of the key in response bodies, drops response
-  headers carrying it or a token, refuses a request with the token misplaced, another
+  headers carrying it or a token and those the response's `Connection` names,
+  refuses a request with the token misplaced, another
   token or the key itself, and records each admission durably before
   forwarding, with the method's label, never the path. The broker knows
   nothing about any API: there are no profiles, presets or routes (phase
@@ -38,13 +39,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   in columns of their own, and `grants revoke ID|--all`. `status` reports
   the broker and live grant count; `doctor` checks the broker and the CA
   file; `audit` shows grant and request records. `rusthorse guide ai`
-  includes SDK recipes and a Claude Code recipe; in the manual test with a
-  real key and phase 1's broker, the Python SDK worked through the broker
-  for the requests tried, and Claude Code did not answer through it; the
-  broker without profiles was then tried with `curl` (a GET and a POST
-  answered, a token in the URL refused), with the Python SDK (a message and
-  two streams) and with Claude Code 2.1.318, which answered in print mode
-  (`claude -p`) and interactively.
+  includes SDK recipes and a Claude Code recipe. The broker was tried by hand
+  on 2026-11-04 with `curl`, the Anthropic Python SDK 2.4.0 and Claude Code
+  2.1.318 (print mode and interactively); no client version is claimed
+  supported.
 - **A key the destination refused is named**: when a grant's approved origin
   answers `401 Unauthorized`, `rusthorse run` says so after the command
   (`rusthorse: note:`, naming the entry and `rusthorse edit NAME --value`),
@@ -117,8 +115,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   **Edit**, behind a drop-down that kept the current value.
 - **`rusthorse guide ai`** prints a guide for AI agents, built into the
   binary: the rules, how to find entries and use `run` (SSH included, with
-  `sshpass` or a key in a temporary `ssh-agent`), what each exit status
-  means and what to do, and how to store secrets without seeing them. A test checks every command and option it names. The instructions
+  `sshpass` or a key in a temporary `ssh-agent` that the recipe ends with the
+  command; both refuse a host whose key ssh does not know, and a probe shows
+  whether a host answers without offering it any key), what each exit status
+  means and what to do, and how to store secrets without seeing them. A test
+  checks that the CLI accepts every `rusthorse` command line it shows (not the
+  other programs of its recipes, such as `ssh`). The instructions
   for `CLAUDE.md` or `AGENTS.md` in the README and
   [ai-agents.md](docs/ai-agents.md) now point to it, and `rusthorse --help`
   ends with a pointer for AI agents.
@@ -187,7 +189,6 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   keep it even after that — the window says so); copy the `rusthorse run`
   command for an entry; lock and unlock; back up; change the master password.
   Every change and every value still goes through the agent's approval.
-  Awaiting independent review.
 - `reveal` takes an optional `purpose` (`show` or `copy`): the approval
   dialog asks the matching question, labels it as stated by the requester,
   warns accordingly, and the audit record names it. Requests without it — the
@@ -243,8 +244,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   `broker_run_v2`, whose bindings each name their destination and whose
   `limits` set the grants' limits, with unknown fields refused, so that an
   older agent refuses it whole instead of ignoring them; a refused request
-  is never sent again as another type. Added `grants`, `revoke_grant`,
-  optional broker status fields, `GrantInfo.unauthorized` and
+  is never sent again as another type. A binding by value refuses unknown
+  fields too, in a plain `run` as well, before any dialog. Added `grants`,
+  `revoke_grant`, optional broker status fields, `GrantInfo.unauthorized` and
   `exited.unauthorized`; `GrantInfo.destination` is the approved origin, and
   `GrantInfo.base_path` the base path apart. The control channel between
   the agent and a broker is at version 2.

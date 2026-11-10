@@ -1,4 +1,5 @@
-//! The visual Rusthorse client. It never opens a vault or starts the agent.
+//! The visual Rusthorse client. It never opens a vault, and the agent is
+//! never its child: Start agent asks systemd to start the service.
 
 mod connection;
 mod model;
@@ -69,7 +70,8 @@ pub(crate) fn wipe_at_shutdown(
 }
 
 fn main() -> std::process::ExitCode {
-    // Apply before GTK can hold a revealed value. No child program is started.
+    // Apply before GTK can hold a revealed value. The one child program is
+    // `systemctl`, when the human asks to start the agent.
     if let Err(e) = rusthorse::agent::harden_process() {
         eprintln!("rusthorse-manager: cannot protect process memory: {e}");
         return std::process::ExitCode::FAILURE;

@@ -16,7 +16,8 @@
 //! - [`agent`]: the server side; policy, approvals, spawning approved commands.
 //! - [`client`]: the client side of the socket protocol.
 //! - [`protocol`]: request/response types and framing (including fd passing).
-//! - [`ui`]: approval and password dialogs (zenity).
+//! - [`ui`]: the `Ui` trait, the text dialogs may show (`dialog_text`), the
+//!   zenity dialogs and the estimate of their height.
 //! - [`dialog_program`]: showing dialogs with `rusthorse-dialog`, or zenity.
 //! - [`dialog_protocol`]: the protocol between the agent and `rusthorse-dialog`.
 //! - [`helper_program`]: finding and checking the helper programs the agent
@@ -35,11 +36,13 @@
 //! - [`redact`]: streaming removal of secret values from command output.
 //! - [`session_lock`]: locking when the screen locks or the computer suspends.
 //! - [`settings`]: the agent's settings, their bounds and their file.
-//! - `supervise`: deadlines and process groups for the helper processes of dialogs.
+//! - `supervise`: deadlines and process groups for the helper processes of
+//!   dialogs, and for the checks `doctor` runs of them.
 //! - [`peer`]: identifying the process on the other end of the socket.
-//! - [`audit`]: the append-only audit log.
+//! - [`audit`]: the append-only audit log, and reading it in pages.
 //! - [`generate`]: generating random secret values.
-//! - [`import`]: parsing `.env` files for imports.
+//! - [`import`]: parsing `.env` files, and the approval and the batches of
+//!   an import.
 //! - [`keyring`]: the items of GNOME Keyring (any Secret Service), for imports
 //!   the agent reads itself.
 //! - [`paths`]: default file locations.
