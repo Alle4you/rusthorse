@@ -783,6 +783,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-09 | Documentation audit: every document against the code at `3521f90`, in two rounds (eleven read-only audits by the maintainer's agent, AI-assisted). | Corrected in the same change; three behaviours of the code stated as they are and left to the maintainer; see below. |
 | 2026-11-09 | The SSH recipes of the guide for AI agents, `d88f7a5` and `eb75d19` (Codex, AI-assisted). | Not ready: SSH01 medium (the probe "without a secret" offered the human's own keys), SSH02–SSH05 low; fixed in the same change; see below. |
 | 2026-11-09 | The documentation correction, whole, and the SSH fixes (Codex, AI-assisted). | Not ready: SSH01–SSH05 confirmed fixed; DOC01–DOC06 low, fixed. Confirmation the same day: ready, no new finding; see below. |
+| 2026-11-10 | The SSH recipes tried against servers, by hand (the maintainer and the maintainer's agent; a test, not a review). | The probe, the key recipe and the password recipe worked for what was tried, on two routers; SSH06 low (nothing tells a password from a private key, and the agent first chose the wrong recipe), fixed in the guide, with a design decision left to the maintainer. The record and the fix reviewed the same day (Codex, AI-assisted): not ready with T01–T04 low, fixed, then ready; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -3248,3 +3249,74 @@ maintainer's agent ran the whole matrix once more after these fixes: the
 twelve steps passed. Left as they were, as said above: no recipe was tried
 against a server after it changed, and the three behaviours of the code
 await the maintainer's decision.
+
+**2026-11-10 — The SSH recipes tried against servers.**
+
+A test by hand, not a review. With the package built from `194c7f5`
+installed, the maintainer's agent followed the built-in guide on the
+maintainer's machine (OpenSSH 9.6, sshpass 1.09), and the maintainer
+answered each dialog. The servers were three devices of the maintainer's
+network: two routers whose SSH server is Dropbear, and a firewall, used for
+the probe only. What worked, for what was tried:
+
+- **The probe.** Each of the three devices answered `Permission denied
+  (publickey,password)`, with status 255. With `-v` added, on each router,
+  ssh offered and tried no key and stopped at "No more authentication
+  methods to try". On one router, with empty files of known hosts for that
+  call, the answer was `Host key verification failed`, status 255. That a
+  server answers the probe so without being offered a key is what the entry
+  of 2026-11-09 listed as not checked.
+- **The key recipe**, on each router, with an entry that holds a private
+  key without a passphrase: `uptime` answered, with status 0.
+  `pgrep -c -x ssh-agent` reported 0 before and right after the first
+  router's run, and 0 right after the second's. On the second router `-v`
+  was added and its output filtered: the server accepted the Ed25519 key
+  that the temporary agent offered, and the login was by public key.
+- **The password recipe**, on each router, with an entry that holds root's
+  password: `uptime` answered, with status 0.
+
+Not tried: the two recipes with a server other than Dropbear; a port other
+than 22, and the `[HOST]:PORT` form of `ssh-keygen -F`; a command stopped
+while it runs (checked on 2026-11-09 without a server only); a key with a
+passphrase; an interactive session.
+
+One finding, from the first run of the test:
+
+| Finding | Disposition |
+|---|---|
+| Low — SSH06: nothing tells a password from a private key. The agent ran the password recipe with an entry that holds a private key: it had taken the entry for a password from notes of 2026-11-04, the entry's metadata is the same for both (`kind` `server`, `has_password`), and the guide did not say to check. The maintainer approved the dialog, which showed the command and the entry's name; the login attempt as root failed with `Permission denied, please try again.` (`sshpass` status 5). The maintainer denied the agent's next request, said which entries hold what, and the test went on with the right ones. | **Fixed in the guide and in `docs/ai-agents.md`:** the guide says that the metadata does not tell the two apart, to ask the human when the entry's name, kind or tags do not, and which recipe a private key takes; `docs/ai-agents.md` tells the human to say it in the entry's name or in a tag; the CHANGELOG says what the guide gained. **Left to the maintainer:** how an entry should say what its value is — a kind for SSH keys (ADR 0008 foresees more kinds), a group for each device, or one entry with several secrets (planned in the roadmap). |
+
+What `sshpass` typed at the server's prompt in that run was not seen. A
+local check afterwards, with no server, a key and a text of four lines made
+for it (`ssh-add` asking for a passphrase on the terminal that `sshpass`
+gives it, under `strace`): OpenSSH read the first line, restored the
+terminal's settings with the call that discards input not yet read, and at
+its second prompt read nothing, `sshpass` having closed the terminal
+(status 5). ssh's password prompt itself was not measured, which needs a
+server: if it reads as `ssh-add` does, the router was sent the first line of
+the key's file, which in OpenSSH's format is the same for every key.
+
+Review of this record and of the guide's new paragraph (Codex, AI-assisted,
+2026-11-10; verdict: **not ready**, four low findings, none high or medium),
+and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Low — T01: the guide's new paragraph turned one observed failure into a rule ("the password recipe below fails", "the server refuses the login"), and "types the key at the server's password prompt" suggested a transfer that was not observed. | **Fixed:** the guide says what the recipe does — it gives the entry's value to `sshpass` as the password to type — and which recipe a private key takes. |
+| Low — T02: "no `ssh-agent` process was running right after (nor before)" was said of each router; the count before was taken for the first router's run only. | **Fixed:** the record says what was counted, and when. |
+| Low — T03: "one failed password attempt for root" stated a count that was not measured: one run, its message and `sshpass`'s status were observed. | **Fixed:** the record gives the message and the status. |
+| Low — T04: the CHANGELOG did not say what the guide gained. | **Fixed** in the guide's entry under *Unreleased*. |
+
+The reviewer checked in the code that `has_password` is true for any value
+that is not empty, and that no kind or field of the metadata says what the
+value is; ran the guide's three tests; and repeated the local measurement,
+with a key and a text made for it, with the same result, checking apart
+that restoring the terminal's settings discards the input not yet read. It
+did not check the devices, the installed package or the matrix of
+`AGENTS.md`'s checks. The maintainer's agent ran that matrix after these
+fixes: the twelve steps passed.
+
+Confirmation (Codex, AI-assisted, 2026-11-10): **ready.** T01 to T04
+confirmed fixed, with no new finding, and this record found accurate. The
+reviewer ran the guide's three tests again; it did not repeat the local
+measurement or run the matrix.

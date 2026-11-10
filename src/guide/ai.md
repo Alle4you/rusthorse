@@ -128,6 +128,12 @@ not a secret and is not redacted.
 
 ### SSH
 
+An entry's value may be a password or a private key, and its metadata does
+not say which: `has_password` is true for both. If the entry's name, kind or
+tags do not tell you, ask the human before you choose a recipe. The
+password recipe gives the entry's value to `sshpass` as the password to
+type: for a private key, use the key recipe below.
+
 ssh reads no password from the environment: `sshpass -e` passes it the one
 in `SSHPASS`. Take the username, the host and the port (`-p PORT`, when it is
 not 22) from `rusthorse show NAME --json`.

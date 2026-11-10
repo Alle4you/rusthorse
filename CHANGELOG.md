@@ -117,7 +117,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   binary: the rules, how to find entries and use `run` (SSH included, with
   `sshpass` or a key in a temporary `ssh-agent` that the recipe ends with the
   command; both refuse a host whose key ssh does not know, and a probe shows
-  whether a host answers without offering it any key), what each exit status
+  whether a host answers without offering it any key; it says that
+  `has_password` does not tell an SSH password from a private key, and to
+  ask the human when an entry's metadata does not say which recipe to use),
+  what each exit status
   means and what to do, and how to store secrets without seeing them. A test
   checks that the CLI accepts every `rusthorse` command line it shows (not the
   other programs of its recipes, such as `ssh`). The instructions

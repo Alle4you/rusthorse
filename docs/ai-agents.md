@@ -275,5 +275,10 @@ broker-specific limits.
   ends with the command. The built-in guide has both recipes, and covers
   unknown host keys (ssh is told to refuse them), refused passwords, and how
   to see whether a host answers without offering it any key. The automated
-  tests do not run these recipes.
+  tests do not run these recipes; they were tried by hand on 2026-11-10, with
+  OpenSSH 9.6 and sshpass 1.09, against two routers whose SSH server is
+  Dropbear, and no server or version is claimed supported. Rusthorse does
+  not record whether an entry's value is a password or a private key: say it
+  in the entry's name or in a tag, so that the agent chooses the right
+  recipe.
 - Review `rusthorse audit` now and then.
