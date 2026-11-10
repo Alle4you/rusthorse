@@ -153,6 +153,7 @@ explains the rest.
 | Rotate a credential | `rusthorse edit NAME --generate` (then update it at the provider) |
 | Edit in KeePassXC | `rusthorse lock` first, then open the vault file in KeePassXC |
 | Back up | `rusthorse backup DEST` (copies the encrypted vault and checks that the copy opens) |
+| Restore a backup | By hand: put the backup file in the vault's place and unlock with the password it was made with ([the steps](installation.md#backups-and-restore)) |
 
 ## Visual entry management
 

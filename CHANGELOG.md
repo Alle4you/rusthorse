@@ -238,6 +238,16 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- **Restoring a backup is done by hand, by decision.** A backup is the
+  vault file as it was, encrypted with the master password it had then, so
+  restoring it is putting that file in the vault's place. The installation
+  guide gives the steps for another computer (put the backup where the vault
+  goes, `chmod 600`, unlock; no `init`) and for the same one (`rusthorse
+  lock`, keep the file as it is, put the backup in its place, unlock), with
+  the agent running, and when `vault.kdbx.bak` can undo the last save. The
+  restore through the agent that ADR 0007 planned will not be built; the
+  manager's Import & backup page now says how to restore instead of
+  announcing it.
 - **Protocol 11**: the entry kind `ssh-key`. Clients and agents of protocol
   10 refuse each other at the version check.
 - **Protocol 10**: `configure` and `status.settings` (the agent's settings).

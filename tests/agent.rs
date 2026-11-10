@@ -3297,6 +3297,116 @@ fn backups_are_written_and_verified() {
     );
 }
 
+/// The entry names that `rusthorse list` shows.
+fn listed(h: &Harness) -> String {
+    let out = h.run(&["list"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    text(&out.stdout)
+}
+
+/// Restoring a backup on the same computer, as `docs/installation.md` says
+/// to: there is no restore command, the human locks the vault, keeps the
+/// file as it is, puts the backup in its place and unlocks. The agent goes
+/// on running. What changed since the backup is gone, the master password
+/// too, and the file that was kept holds it.
+#[test]
+fn a_backup_put_back_by_hand_is_the_vault_at_the_next_unlock() {
+    let h = Harness::new();
+    h.add_secret("KEPT_KEY", "abcdefgh", &[]);
+    h.add_secret("LOST_KEY", "ijklmnop", &[]);
+    let backup = h.dir.path().join("copy.kdbx");
+    let out = h.run(&["backup", backup.to_str().expect("utf8")]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // Since the backup: an entry removed by mistake, and another password.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["remove", "LOST_KEY"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let new = "a brand new passphrase";
+    h.ui.passwords.lock().unwrap().extend([
+        Some(PASSWORD.to_string()),
+        Some(new.to_string()),
+        Some(new.to_string()),
+    ]);
+    let out = h.run(&["passwd"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!listed(&h).contains("LOST_KEY"));
+
+    assert!(h.run(&["lock"]).status.success());
+    let kept = h.dir.path().join("vault.kdbx.before-restore");
+    std::fs::copy(h.vault_path(), &kept).expect("keep the vault as it is");
+    std::fs::copy(&backup, h.vault_path()).expect("put the backup in its place");
+    // The scripted human types the password the backup was made with, which
+    // the vault no longer had.
+    let out = h.run(&["unlock"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let names = listed(&h);
+    assert!(
+        names.contains("KEPT_KEY") && names.contains("LOST_KEY"),
+        "{names}"
+    );
+    // The agent saves into the restored vault as into any other.
+    h.add_secret("LATER_KEY", "qrstuvwx", &[]);
+    let restored =
+        Vault::open(&h.vault_path(), SecretString::new(PASSWORD.into())).expect("old password");
+    assert!(restored.find("LOST_KEY").is_ok() && restored.find("LATER_KEY").is_ok());
+    // The file that was kept is the vault as it was before.
+    let before = Vault::open(&kept, SecretString::new(new.into())).expect("the kept file opens");
+    assert!(before.find("KEPT_KEY").is_ok() && before.find("LOST_KEY").is_err());
+}
+
+/// What `docs/installation.md` says of `vault.kdbx.bak`: it is the vault as
+/// it was before the last save, so putting it back undoes the last change.
+#[test]
+fn the_file_from_before_the_last_save_undoes_that_save() {
+    let h = Harness::new();
+    h.add_secret("KEPT_KEY", "abcdefgh", &[]);
+    h.add_secret("GONE_KEY", "ijklmnop", &[]);
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["remove", "GONE_KEY"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!listed(&h).contains("GONE_KEY"));
+
+    assert!(h.run(&["lock"]).status.success());
+    std::fs::copy(h.dir.path().join("vault.kdbx.bak"), h.vault_path()).expect("put it back");
+    assert!(h.run(&["unlock"]).status.success());
+    let names = listed(&h);
+    assert!(
+        names.contains("KEPT_KEY") && names.contains("GONE_KEY"),
+        "{names}"
+    );
+}
+
+/// Restoring a backup on another computer, as `docs/installation.md` says
+/// to: an agent that has no vault finds the backup put at the vault's path,
+/// and it opens with the password the backup was made with. No `init`.
+#[test]
+fn a_backup_put_where_no_vault_is_opens_as_the_vault() {
+    let first = Harness::new();
+    first.add_secret("CARRIED_KEY", "abcdefgh", &[]);
+    let backup = first.dir.path().join("copy.kdbx");
+    let out = first.run(&["backup", backup.to_str().expect("utf8")]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    // The other computer: its agent runs, and has no vault.
+    let second = Harness::new();
+    std::fs::remove_file(second.vault_path()).expect("no vault there");
+    let out = second.run(&["unlock"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("no vault"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    std::fs::copy(&backup, second.vault_path()).expect("put the backup there");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(second.vault_path(), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 600");
+    let out = second.run(&["unlock"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(listed(&second).contains("CARRIED_KEY"));
+}
+
 #[test]
 fn a_lost_connection_after_the_request_is_reported_as_unknown() {
     use rusthorse::protocol::{

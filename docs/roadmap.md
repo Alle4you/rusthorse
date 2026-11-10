@@ -26,11 +26,15 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
   page that lists and revokes remembered approvals (the manager shows a
   placeholder for it).
 - **M3:** done — import from GNOME Keyring and `.env` files, read by the
-  agent ([ADR 0012](adr/0012-import-read-by-the-agent.md)). Not built — safe
-  restoration of a backup and the exclusive handoff to KeePassXC.
+  agent ([ADR 0012](adr/0012-import-read-by-the-agent.md)). Not built — the
+  exclusive handoff to KeePassXC. Not planned — restoring a backup through
+  the agent: the maintainer decided on 2026-11-10 that it is done by hand,
+  by putting the backup file in the vault's place
+  ([installation](installation.md#backups-and-restore); ADR 0007, amended).
 
 The [reference prototype](design/manager/index.html) uses fake data and
-simulates features not yet implemented.
+simulates features not yet implemented, and one that will not be: restoring
+a backup.
 
 ## Credential broker: secrets that never enter the client
 
@@ -196,7 +200,7 @@ Nothing else is planned for the broker.
 | **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
 | **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 done and reviewed; M2, M3 in progress | [ADR 0007](adr/0007-visual-manager.md) and the milestones above. Done: the broker's Grants page (ADR 0013), the History and Settings pages, import. Not built: a page for remembered approvals, safe restoration, the KeePassXC handoff. The manager stays an agent client. |
+| **Visual manager** | M1 done and reviewed; M2, M3 in progress | [ADR 0007](adr/0007-visual-manager.md) and the milestones above. Done: the broker's Grants page (ADR 0013), the History and Settings pages, import. Not built: a page for remembered approvals, the KeePassXC handoff. Not planned: restoring a backup through the agent (it is done by hand). The manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |

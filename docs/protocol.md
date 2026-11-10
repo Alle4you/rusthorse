@@ -778,8 +778,10 @@ never sends a master password or a value it read. See
 [ADR 0007](adr/0007-visual-manager.md). Its Grants page uses `grants` and
 `revoke_grant`; its Settings page shows `status.settings` and sends
 `configure`, only while the vault is unlocked; its History page reads the
-audit log at `status.audit_log` and sends no request of its own. No restore
-request exists yet. It sends no broker run itself: its command
+audit log at `status.audit_log` and sends no request of its own. There is
+no restore request, and none is planned: a backup is restored by hand
+([installation](installation.md#backups-and-restore)).
+It sends no broker run itself: its command
 templates for `rusthorse run --broker` are text for the human to fill in
 and run.
 

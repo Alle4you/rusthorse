@@ -369,23 +369,69 @@ rusthorse backup ~/Backups/rusthorse-$(date +%F).kdbx
 
 The agent copies the file and then decrypts the copy with the current master
 password, so a backup it reports as written is known to open. Keep backups
-somewhere other than the vault's directory. `vault.kdbx.bak`, next to the
-vault, only holds the version before the last save and is replaced on every
-save — it is not a backup.
+somewhere other than the vault's directory, and at least one of them off
+this computer: a backup that is lost with the computer restores nothing.
 
-To **restore**:
+A backup holds the vault and nothing else: the entries, with their values,
+the fields that say what each is for and the earlier versions the vault
+keeps of them. It is the whole KeePass file, so it also carries what a
+KeePass program put there that Rusthorse does not show, such as attachments
+or a recycle bin. The audit log (`~/.local/state/rusthorse/audit.jsonl`), the
+agent's settings (`~/.config/rusthorse/agent.toml`) and what the agent
+keeps in memory, such as remembered approvals and the broker's grants, are
+not in it. On another computer the agent starts with its own, which is all
+a move needs.
+
+A backup is the vault file as it was: encrypted with the master password
+the vault had then, and opened with that password, whatever the vault's
+password is now. After `rusthorse passwd`, older backups still open with
+the old password: make a new one, and if the old password leaked, delete
+the backups made with it.
+
+**Restoring is done by hand.** Restoring a backup is putting that file in
+the vault's place. Rusthorse has no restore command, and the agent does not
+restore: you copy the file, and at the next unlock the agent reads what is
+there.
+
+On **another computer** (the first was lost or stolen), install Rusthorse
+and put the backup where the vault goes. No `rusthorse init`: the backup is
+the vault.
 
 ```sh
-systemctl --user stop rusthorse-agent
-cp ~/.local/share/rusthorse/vault.kdbx ~/.local/share/rusthorse/vault.kdbx.before-restore
-cp ~/Backups/rusthorse-2026-11-01.kdbx ~/.local/share/rusthorse/vault.kdbx
+mkdir -p ~/.local/share/rusthorse
+cp /media/usb/rusthorse-2026-11-01.kdbx ~/.local/share/rusthorse/vault.kdbx
 chmod 600 ~/.local/share/rusthorse/vault.kdbx
-systemctl --user start rusthorse-agent
 rusthorse unlock && rusthorse list
 ```
 
-A backup keeps the master password it was made with: after `rusthorse
-passwd`, older backups still open with the old password.
+On the **same computer** (an entry was deleted or changed by mistake), lock
+the vault, keep the file as it is, put the backup in its place and unlock:
+
+```sh
+rusthorse lock
+cp ~/.local/share/rusthorse/vault.kdbx ~/.local/share/rusthorse/vault.kdbx.before-restore
+cp ~/Backups/rusthorse-2026-11-01.kdbx ~/.local/share/rusthorse/vault.kdbx
+rusthorse unlock && rusthorse list
+```
+
+`rusthorse lock` makes the agent drop the vault it had open; at the next
+unlock it reads the file again. Until the copy is done, do not answer an
+unlock dialog: another program may ask for the vault meanwhile, and the
+agent would open the file as it is at that moment. If that happened, lock
+again after the copy. Everything changed since the backup is gone from the
+vault, the master password included: `unlock` asks for the one the backup
+was made with. The second line keeps what you had; delete
+`vault.kdbx.before-restore` once you are sure. To get one entry back
+without losing what changed since, open the backup in KeePassXC instead,
+with its master password, and add the entry again with `rusthorse add`.
+
+`vault.kdbx.bak`, next to the vault, only holds the version before the last
+save and is replaced on every save — it is not a backup. After a save that
+succeeded it can undo that save: if the mistake was the last thing that
+changed the vault, put `vault.kdbx.bak` in the vault's place the same way.
+Look before you rely on it: there is none before the vault's first change
+or after `rusthorse passwd` (which deletes it, and says so if it cannot),
+and after a save that failed it may not be the version you want.
 
 ## Changing the master password
 

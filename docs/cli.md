@@ -842,8 +842,9 @@ rusthorse backup DEST
 
 Copies the encrypted vault file to `DEST` (which must not exist; mode `0600`)
 and then decrypts the copy with the current master password to prove it
-opens. See [installation.md](installation.md#backups-and-restore) for
-restoring.
+opens. There is no restore command: a backup is restored by hand, by
+putting the file in the vault's place; see
+[installation.md](installation.md#backups-and-restore).
 
 ## `rusthorse open`
 

@@ -9,8 +9,8 @@
   2026-11-05) and the lock on screen lock and suspend
   ([ADR 0009](0009-lock-on-screen-lock-and-suspend.md)); listing and
   revoking remembered approvals is not built. Of M3, the import windows
-  ([ADR 0012](0012-import-read-by-the-agent.md)); restoration and the
-  KeePassXC handoff are not built.
+  ([ADR 0012](0012-import-read-by-the-agent.md)); the KeePassXC handoff is
+  not built, and restoration was dropped on 2026-11-10 (section 5).
 - Date: 2026-11-01
 - Amended: 2026-11-01 — Copy of a value (section 2), at the maintainer's
   request: without it, long random keys had to be retyped. A first design
@@ -24,6 +24,19 @@
 - Amended: 2026-11-05 — Agent settings (section 3), after a review of the
   plan by Codex and the maintainer's choices: changes apply at once, need an
   unlocked vault, and the bounds are fixed; `reload_config` is dropped.
+- Amended: 2026-11-10 — Restoration (section 5), at the maintainer's
+  decision: there is no `restore` operation, in the agent or in the manager.
+  A backup is the vault file as it was, so restoring it is putting that file
+  in the vault's place, which the human does by hand; the agent reads what is
+  there at the next unlock. A restore through the agent had been designed
+  (about 2,100 lines over the vault, the agent, the CLI and the manager, and
+  protocol 12) when the maintainer asked what it gave that the file itself
+  does not: it would add a request that replaces the whole vault, which any
+  program could ask for, and a file named by the requester for the agent to
+  open, for a task that is rare. The manual procedure, for another computer
+  and for the same one, is in the
+  [installation guide](../installation.md#backups-and-restore), and
+  end-to-end tests follow its steps.
 
 ## Context
 
@@ -326,6 +339,10 @@ replacement, preserve a uniquely named verified pre-restore copy, then use
 the atomic-save durability contract. Stop concurrent writes, bump generation,
 clear grants and lock. A post-rename fsync failure is `outcome_unknown`.
 Do not claim restore is implemented; M1 links to the existing manual procedure.
+(Superseded 2026-11-10: no `restore` operation will be built. Restoring a
+backup stays the manual procedure, which the manager's page and the
+[installation guide](../installation.md#backups-and-restore) describe; see
+the amendment of that date above.)
 
 ### 6. Screen lock, suspend and KeePassXC (M2/M3)
 
@@ -405,4 +422,5 @@ then: M1 was reviewed on 2026-11-01, in the rounds the
 [review history](../threat-model.md#11-review-history) records under "ADR 0007
 and manager milestone 1", and the settings and the History page on 2026-11-05;
 this ADR was accepted on 2026-11-09. Listing and revoking remembered
-approvals, restoration and the KeePassXC handoff are still not built.)
+approvals, restoration and the KeePassXC handoff are still not built.
+On 2026-11-10 restoration through the agent was dropped: section 5.)

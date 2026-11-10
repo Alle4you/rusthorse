@@ -729,7 +729,7 @@ impl Manager {
         let later = group(
             "Restore",
             Some(
-                "Restoring a backup comes in a later version; meanwhile, follow the restore steps in the installation guide. To look at the vault in KeePassXC, open a backup copy, never the live file.",
+                "A backup is restored by hand: lock the vault, put the backup file in the vault's place and unlock with the master password the backup was made with. The installation guide has the steps. To look at the vault in KeePassXC, open a backup copy, never the live file.",
             ),
         );
         data.append(&later);

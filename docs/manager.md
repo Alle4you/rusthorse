@@ -10,9 +10,11 @@ approval dialog.
 The manager is designed in [ADR 0007](adr/0007-visual-manager.md), in three
 milestones. The first is done and reviewed, and so are the Settings and
 History pages of the second and the import windows of the third. Not built
-yet: the page that lists and revokes single remembered approvals, restoring
-a backup, and a safe hand-off to KeePassXC. No version of Rusthorse has been
-released: try the manager with fake entries first.
+yet: the page that lists and revokes single remembered approvals, and a safe
+hand-off to KeePassXC. Restoring a backup is not planned in the manager or
+in the agent: it is done by hand, by putting the backup file in the vault's
+place ([installation](installation.md#backups-and-restore)). No version of
+Rusthorse has been released: try the manager with fake entries first.
 
 ## What it does today
 
@@ -24,7 +26,7 @@ released: try the manager with fake entries first.
 | Create, edit, rename, move and delete entries; generate a random value | |
 | Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
 | Copy a value to the clipboard, after approval | |
-| Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | Restore a backup, a safe hand-off to KeePassXC (M3) |
+| Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | A safe hand-off to KeePassXC (M3). Restoring a backup is not planned in the manager: it is done by hand ([installation](installation.md#backups-and-restore)) |
 | Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
@@ -535,6 +537,10 @@ first, use each entry, then delete the originals.
 the encrypted vault and checks that the copy opens with the current master
 password. A copy whose check fails is left in place, and the message names
 it. Keep backups somewhere else as well.
+
+The manager does not restore a backup, and neither does the agent: you put
+the file in the vault's place yourself, as the page's **Restore** note says
+([the steps](installation.md#backups-and-restore)).
 
 To look at the vault in KeePassXC, open a **backup copy**: locking is not
 exclusive — another program can ask the agent to unlock the live vault while

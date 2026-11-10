@@ -844,6 +844,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | Set the broker's limit of 100 request headers itself (Codex, AI-assisted). | Ready, no findings: the third behaviour left to the maintainer by the documentation audit of 2026-11-09 is closed; the explicit limit and its boundary tests are in place. Response limits and two older issues remain for the maintainer; see below. |
 | 2026-11-10 | Sync the audit log's directory entries before its records: three reviews (Codex, AI-assisted). | Not ready with AUD01–AUD04; those confirmed fixed, then not ready with AUD05; that confirmed fixed, then ready, with no new finding. The second behaviour left by the documentation audit is closed within P12's stated limits, whose acceptance remains the maintainer's. The twelve checks passed again on main with the broker's header-limit change; see below. |
 | 2026-11-10 | Stop a request whose requester goes away during its dialog: four reviews and a final confirmation (Codex, AI-assisted). | Not ready with CON01–CON04, then CON05–CON07, then CON08, then CON09 low; the final confirmation is ready within P16 and L26's limits, whose acceptance remains the maintainer's. The twelve checks passed on main with the staged change; see below. |
+| 2026-11-10 | Keep restoring a backup a manual procedure (Codex, AI-assisted). | Not ready with RST01 and RST02 low; both confirmed fixed, then ready. The maintainer dropped restore through the agent; the manual procedure, its tests and the review's limits are recorded below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -4071,3 +4072,175 @@ by the ready verdict:
   The relevant departure window is between the checks, including the
   intervening audit operation, subsequent state-lock wait or grant
   preparation as CON09 now states; not only the wait for the audit log.
+
+**2026-11-10 — Keep restoring a backup a manual procedure.**
+
+ADR 0007 section 5 planned an agent-owned `restore` operation, a CLI
+command and a manager button ("Manager 3/6"). A design had been made,
+estimated at about 2,100 lines over the vault, the agent, the CLI and the
+manager, with protocol 12, and the maintainer had answered its two open
+questions. Before any code was written, the maintainer asked what it gave
+that KeePass and the file itself do not, and decided: no restore through
+the agent. Restoring stays a simple, direct manual procedure for two
+cases: bringing a backup up on another computer after a theft, and
+putting one back after a key was deleted by mistake. The maintainer's
+agent had carried the planned item forward without asking that question
+first. The maintainer also observed that the master password is what
+encrypts and decrypts a backup: that was already the code's behaviour,
+since a backup is a byte copy of the encrypted KDBX file.
+
+The change was written by the maintainer's agent (Claude Fable 5.2), not
+by a subagent. No code of the agent, the vault or the CLI changed.
+`docs/installation.md` now gives the two procedures: on another computer,
+put the backup at the vault's path, set mode `0600` and unlock, without
+`init`; on the same computer, lock, keep the current file, copy the backup
+over it and unlock. `rusthorse lock` and `rusthorse unlock` replace
+stopping and starting the service. The guide explains when
+`vault.kdbx.bak` can undo a save, the password a backup needs, and
+recovering one entry by opening a backup copy in KeePassXC and adding it
+again. It now says to make a new backup after changing the password and,
+if the old password leaked, delete backups made with it.
+
+The manager's Import & backup page describes manual restoration instead
+of promising a later restore feature. The decision is also in
+`docs/roadmap.md`, ADR 0007 (dated additions, leaving the original decision
+readable), `docs/manager.md`, `docs/protocol.md`, `docs/cli.md`,
+`docs/getting-started.md`, `docs/design/manager/README.md` and the
+CHANGELOG. The prototype's simulated restore remains a historical
+reference; its README says that it will not be built.
+
+Three end-to-end tests in `tests/agent.rs` pin what the procedure relies on:
+
+- `a_backup_put_back_by_hand_is_the_vault_at_the_next_unlock`: lock,
+  preserve the current file, put the backup back and unlock without
+  restarting the agent. The old password and removed entry work again,
+  another entry can be saved, and the preserved file opens with the newer
+  password and keeps its later state.
+- `the_file_from_before_the_last_save_undoes_that_save`: the `.bak` of a
+  successful removal brings the removed entry back after lock and unlock.
+- `a_backup_put_where_no_vault_is_opens_as_the_vault`: an agent with no
+  vault opens the backup put at its path, without `init` or a restart.
+
+No mutation check applies to this change, since no runtime behaviour was
+changed. The new tests pin existing behaviour; they do not promise that
+every failed save leaves a usable `.bak`, or that `lock` is exclusive.
+The reviewer did not run mutations.
+
+The first review (Codex, AI-assisted) was **not ready**, with two low
+findings and no medium or higher finding. After the wording was changed,
+the confirmation on the same day is **ready**, with both findings fixed
+and no new finding:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| RST01 — The `.bak` paragraph promised to undo the last change without the failure cases, and said `passwd` deletes it without the cleanup exception. | Low | **Fixed:** the guide limits undo to a successful save, asks the reader to check the file, says when it is absent and that a failed save may leave a different version, and says `passwd` reports a failure to delete it. The CHANGELOG now says when `.bak` *can* undo the last save. Confirmed against the initial write, hard-link and rename order, cleanup and the agent's warning. |
+| RST02 — The guide said `lock` leaves the agent holding nothing of the old file and saving nothing during the copy, although another approved unlock can reopen it. | Low | **Fixed:** the guide says the open vault is dropped, requires that no unlock dialog be answered until the copy is done, and tells the reader to lock again after copying if one was answered. Confirmed against `State::lock`, `ensure_unlocked` and the file open at unlock. It no longer promises exclusivity or the removal of every retained copy. |
+
+The reviewer read lock and unlock, the content fingerprint and unlock
+barrier, remembered approvals, grants, the keyring listing, backup and
+save, and the service's startup paths. Lock drops the open vault and
+clears remembered approvals and the keyring listing; explicit lock ends
+all grants. The last content fingerprint is kept for the next unlock.
+A new unlock reads the file; an already unlocked vault is used from
+memory. A missing settings file uses defaults, and socket and audit
+directories are prepared independently. A repository search found no
+other current promise of restore through the agent; the superseded ADR
+text and the identified prototype remain historical.
+
+The first review's external probes, using only temporary files and fake
+values, checked the cases the normal-path tests do not cover:
+
+- Interposing `rename` to fail with `EIO` after the backup hard link left
+  `.bak` and the vault at the same inode. The entry recoverable from the
+  former `.bak` was no longer there, and `cp vault.kdbx.bak vault.kdbx`
+  refused with exit 1 because they were the same file.
+- Interposing `unlink` to refuse the cleanup after a password change let
+  the save succeed with a warning. The `.bak` remained and opened with
+  the old password; the live file opened with the new one.
+- With a scripted agent, `lock`, then another request whose unlock was
+  answered, then the copy and the final `unlock` left reads using the old
+  in-memory vault. A later save was refused because the file had changed
+  and locked the vault; the next unlock read the restored file.
+- With umask `002`, `mkdir -p` made mode `0775` and `cp` made a new file
+  of mode `0664`. The agent accepted that file; the documented `chmod 600`
+  also worked. Copying over an existing `0600` file with `cp` kept that
+  mode, unlike `std::fs::copy`, which copies the source permissions.
+  The guide's commands therefore do not rely on the tests' copy semantics.
+  By reading the code, `doctor` fails the file at `0664`, accepts its mode
+  at `0600`, and does not check the vault directory's mode; `doctor` was
+  not run.
+
+**Checks by the reviewer.** The first review used `CARGO_BUILD_JOBS=5`
+and a private `TMPDIR` of mode `0700`; feature sets ran in sequence.
+Formatting, `git diff --check` and manager clippy with warnings denied
+passed. These test runs all passed, 92 executions in total:
+
+| Command | Tests selected | Result |
+|---|---|---|
+| `cargo test --all-features --test agent -- ...` | The three new tests named above. | 3 passed. |
+| `cargo test --no-default-features --test agent -- ...` | The same three tests. | 3 passed. |
+| `cargo test --all-features --lib vault::tests` | The vault module, including outside changes, failed sync and cleanup. | 34 passed. |
+| `cargo test --all-features --test agent -- ...` | Password change; a lock during approval; explicit grant revocation; changed-file unlock and its barrier before audit; the two keyring-listing cancellation tests. | 7 passed. |
+| `cargo test -p rusthorse-manager` | The manager, including its isolated widget tests. | 45 passed. |
+
+The probes linked the compiled library and used scripted dialogs; they
+made no source changes. Their files were removed, and no package or
+service was changed. This confirmation reread the corrected sentences
+against `src/vault.rs` and `src/agent.rs`, including the cleanup warning
+and backup's unchanged encrypted bytes, and reran `cargo fmt --all --check`
+and `git diff --check`, both passing. It did not rerun the earlier probes
+or behaviour tests for these text changes.
+
+**Checks reported by the maintainer's agent.** Before the three wording
+corrections, its initial formatting check failed on one line of a new
+test; it formatted that line before running the full matrix successfully.
+All twelve `AGENTS.md` steps passed with a private `TMPDIR`: formatting,
+both default-member clippy configurations, both feature-set test suites,
+documentation with warnings denied, both MSRV 1.89 checks, and clippy and
+tests for the dialog and manager. Its reported totals were 654 tests with
+all features and 544 without, counting the descriptor test's child rerun,
+9 for the dialog and 45 for the manager. After the wording corrections,
+it reported `git diff --check`, `cargo fmt --all --check` and all 25 tests
+of `cargo test --all-features --test packaging` passing. These are the
+maintainer's agent's runs, not a full matrix repeated by the reviewer.
+
+Not checked by the reviewer: a real systemd installation, KeePassXC,
+`doctor` at runtime, power loss, or every filesystem failure and concurrent
+writer interleaving. No real vault, audit log, socket or keyring was used,
+and no dialog was shown on the maintainer's screen. The remaining matrix
+steps were not repeated by the reviewer. L10 and L15 already cover old
+copies and concurrent writers; no new protection is claimed for manual
+restoration, and no property or limit was changed to record this review.
+
+Left to the maintainer; no further decision is recorded here:
+
+- The two manager items still planned in ADR 0007 deserve the same
+  question: listing and revoking single remembered approvals, and an
+  exclusive hand-off to KeePassXC. Individual revocation offers something
+  more precise than `lock`; an exclusive hand-off could solve the
+  concurrent-writer problem that `lock` does not. Neither was changed.
+- Restoring a backup also restores its master password. Changing the
+  current password does not protect older copies (L10); deleting a local
+  backup cannot take back a copy someone else already has.
+- Lock is not exclusive (L15). Keeping the service running is reasonable
+  for this short manual procedure only with no other unlock answered
+  during the copy. It also does not stop ordinary approved commands as
+  stopping the service does.
+
+After this review and its confirmation, the maintainer asked whether a
+backup carries only the keys and the vault's password. A paragraph on
+what it holds and excludes was added to `docs/installation.md`. The code
+already copied the whole encrypted KDBX and no external agent state.
+Codex (AI-assisted) confirmed this by reading `Vault::backup_to`, history
+and removal in `src/vault.rs` and keepass 0.17.0, the default paths in
+`src/paths.rs`, initialization in `src/agent.rs` and `src/broker_host.rs`,
+and settings loading and audit creation in `src/settings.rs` and
+`src/audit.rs`. The copied file also keeps groups, custom fields,
+attachments, KDF parameters, deletion records and any recycle bin; values
+in history or that bin are included even when Rusthorse does not list
+them. Deletion records themselves hold identifiers and times, not the
+removed values. Missing settings use defaults; a missing audit log is
+created at the first record; approvals and grants start empty. The
+maintainer's agent reported `git diff --check` and all 25 packaging tests
+passing after the addition. This confirmation read the code and ran
+`git diff --check`; it did not build or run tests.
