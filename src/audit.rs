@@ -2,19 +2,20 @@
 //! agent makes (unlock, lock, approvals, denials, command exits).
 //!
 //! Records never contain secret values. The file is created with mode `0600`.
-//! Approval-gated actions **fail closed**: if the record cannot be written,
-//! the request is refused.
+//! Each record is synced to disk, with the names that lead to it
+//! ([`AuditLog::record`]). Approval-gated actions **fail closed**: if the
+//! record cannot be written, the request is refused.
 
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::peer::Peer;
-use crate::util::ensure_private_dir;
+use crate::util::make_private_dir;
 
 /// One audit record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,7 +171,159 @@ impl AuditEvent {
 #[derive(Debug)]
 pub struct AuditLog {
     path: PathBuf,
-    lock: Mutex<()>,
+    /// Held while a record is written.
+    lock: Mutex<Unsynced>,
+}
+
+/// Directories that hold the name of a directory made for the log and have
+/// not been synced since: a record synced into a file is lost in a crash
+/// with the name of a directory on the way to it. Kept until their sync
+/// succeeds, so that a record after one that failed tries again, though the
+/// directories are there by then.
+#[derive(Debug, Default)]
+struct Unsynced {
+    dirs: Vec<PathBuf>,
+}
+
+impl Unsynced {
+    /// Sync `dir` before the next record is written.
+    fn add(&mut self, dir: &Path) {
+        if !self.dirs.iter().any(|d| d == dir) {
+            self.dirs.push(dir.to_path_buf());
+        }
+    }
+
+    /// Sync the directories waiting to be, each forgotten once it succeeds.
+    fn sync(&mut self) -> io::Result<()> {
+        while let Some(dir) = self.dirs.first() {
+            sync_directory(dir)?;
+            self.dirs.remove(0);
+        }
+        Ok(())
+    }
+}
+
+/// Why the directory `dir` cannot be synced.
+fn cannot_sync(dir: &Path, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!("cannot sync the directory {}: {e}", dir.display()),
+    )
+}
+
+/// Open the directory `dir`, to sync it.
+fn open_directory(dir: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(dir).map_err(|e| cannot_sync(dir, e))
+}
+
+/// Open the directory `dir` and sync it, as the vault's saves sync theirs:
+/// any error is a failure (a file system whose directories cannot be synced
+/// cannot hold the log).
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    open_directory(dir)?
+        .sync_all()
+        .map_err(|e| cannot_sync(dir, e))
+}
+
+/// Test hook: the steps of [`sync_directory_holding`] after which a test
+/// acts, as another program could.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The directory is open, and not checked yet.
+    Opened,
+    /// The directory has just been synced.
+    Synced,
+}
+
+/// What a test does after a step.
+#[cfg(test)]
+type StepHook = Box<dyn FnMut(Step)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What the test running on this thread does after each step.
+    static AT_STEP: std::cell::RefCell<Option<StepHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run the hook of the test on this thread, if it set one.
+#[cfg(test)]
+fn at_step(step: Step) {
+    AT_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(step);
+        }
+    });
+}
+
+/// Sync the directory that holds `file`, opened at `path`: that of the file
+/// the path leads to, should its name be a link. The directory is opened,
+/// checked through that open directory to hold `file` under that name, and
+/// only then synced, so that the sync covers the name checked. A rename,
+/// replacement or removal by another program that still stands at the check
+/// refuses the record; one undone before the check goes unnoticed, and the
+/// sync covers the name put back; one after the check is that program's to
+/// sync.
+fn sync_directory_holding(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    let real = std::fs::canonicalize(path)?;
+    let (Some(dir), Some(name)) = (real.parent(), real.file_name()) else {
+        return Err(io::Error::other(format!(
+            "{} is not a file in a directory",
+            real.display()
+        )));
+    };
+    let directory = open_directory(dir)?;
+    #[cfg(test)]
+    at_step(Step::Opened);
+    let opened = file.metadata()?;
+    let holds =
+        match nix::sys::stat::fstatat(&directory, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(entry) => (entry.st_dev, entry.st_ino) == (opened.dev(), opened.ino()),
+            Err(nix::errno::Errno::ENOENT) => false,
+            Err(e) => return Err(e.into()),
+        };
+    if !holds {
+        return Err(io::Error::other(format!(
+            "{} was renamed, replaced or removed while a record was written to it",
+            path.display()
+        )));
+    }
+    directory.sync_all().map_err(|e| cannot_sync(dir, e))?;
+    #[cfg(test)]
+    at_step(Step::Synced);
+    Ok(())
+}
+
+/// The directory that holds `path`'s name.
+fn directory_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Open the log at `path` for appending, links followed, creating it with
+/// mode `0600` if it is missing.
+fn open_log(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Write `line` into `file`, the log opened at `path`: the names that lead
+/// to it are synced first, and the line after it is written.
+fn append(
+    path: &Path,
+    unsynced: &mut Unsynced,
+    mut file: std::fs::File,
+    line: &[u8],
+) -> io::Result<()> {
+    sync_directory_holding(&file, path)?;
+    unsynced.sync()?;
+    file.write_all(line)?;
+    // The record of a decision must survive a crash right after it.
+    file.sync_data()
 }
 
 impl AuditLog {
@@ -178,7 +331,7 @@ impl AuditLog {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            lock: Mutex::new(()),
+            lock: Mutex::default(),
         }
     }
 
@@ -190,7 +343,7 @@ impl AuditLog {
     /// Hold the log, as a slow disk would: every record waits until the
     /// guard is dropped, and is then written as usual. For tests.
     #[cfg(test)]
-    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn hold(&self) -> impl Sized + '_ {
         self.lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -199,25 +352,33 @@ impl AuditLog {
     /// after a dialog that may stay open for minutes — so the time it was
     /// built would misdate the decision. Stamping under the lock also keeps
     /// the times in file order — unless the system clock is set back.
+    ///
+    /// The record is synced as data (`fdatasync`). Before it is written, the
+    /// names it needs are synced too: at every record, that of the file, in
+    /// the directory that holds it, once that directory is found to hold it;
+    /// and the name of every directory made for the log, in its parent, until
+    /// that sync succeeds. If one of these fails, the record fails and is not
+    /// written. If writing or syncing the record fails, the record fails
+    /// too, but part or all of it may be in the file.
     pub fn record(&self, event: &AuditEvent) -> io::Result<()> {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut unsynced = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let event = AuditEvent {
             time: now(),
             ..event.clone()
         };
-        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            ensure_private_dir(dir)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.path)?;
         let mut line = serde_json::to_vec(&event).map_err(io::Error::other)?;
         line.push(b'\n');
-        file.write_all(&line)?;
-        // The record of a decision must survive a crash right after it.
-        file.sync_data()
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let mut made = Vec::new();
+            let result = make_private_dir(dir, &mut made);
+            // Also those made before a failure: the next record syncs them.
+            for made in &made {
+                unsynced.add(directory_of(made));
+            }
+            result?;
+        }
+        let file = open_log(&self.path)?;
+        append(&self.path, &mut unsynced, file, &line)
     }
 }
 
@@ -322,7 +483,7 @@ fn read_page_within(
     max_bytes: u64,
     max_records: usize,
 ) -> io::Result<PageRead> {
-    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::os::unix::fs::FileExt;
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NONBLOCK)
@@ -856,6 +1017,368 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("opening a FIFO waited for a writer");
         assert_eq!(read, Err(io::ErrorKind::InvalidInput));
+    }
+
+    /// Gives a directory its mode `0700` back when dropped: a test that
+    /// failed with it closed still leaves a directory that can be removed.
+    struct Reopen(PathBuf);
+
+    impl Drop for Reopen {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    fn record(log: &AuditLog, detail: &str) -> io::Result<()> {
+        log.record(
+            &AuditEvent::new("run", &Peer::agent())
+                .outcome("allowed_once")
+                .detail(detail),
+        )
+    }
+
+    fn written(log: &AuditLog) -> Vec<String> {
+        tail(log.path(), 100)
+            .expect("tail")
+            .into_iter()
+            .filter_map(|event| event.detail)
+            .collect()
+    }
+
+    /// A record that fails because a directory cannot be synced.
+    fn not_synced(result: io::Result<()>, dir: &Path) {
+        let e = result.expect_err("recorded without syncing the directory");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("cannot sync the directory {}", dir.display())),
+            "{e}"
+        );
+    }
+
+    // In a directory of mode `0300` a file can be created, but the directory
+    // cannot be opened, and so not synced: a real failure of the sync.
+
+    /// A new directory, by a name the agent would also give it (no link on
+    /// the way), in a temporary directory.
+    fn new_dir(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = dir.path().canonicalize().expect("path").join(name);
+        std::fs::create_dir(&path).expect("mkdir");
+        path
+    }
+
+    #[test]
+    fn every_record_syncs_the_directory_that_holds_the_log() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        chmod(&closed, 0o300);
+        let log = AuditLog::new(closed.join("audit.jsonl"));
+        // The record creates the file, whose name cannot be synced: refused,
+        // and not written.
+        not_synced(record(&log, "first"), &closed);
+        assert!(log.path().exists());
+        // The file is there now, its name still not synced: refused again.
+        not_synced(record(&log, "second"), &closed);
+        assert!(written(&log).is_empty());
+        // Once the directory can be synced, the record is written.
+        chmod(&closed, 0o700);
+        record(&log, "third").expect("record");
+        // A record after that one syncs the directory again.
+        chmod(&closed, 0o300);
+        not_synced(record(&log, "fourth"), &closed);
+        assert_eq!(written(&log), ["third"]);
+        // Removed, and created again by the next record.
+        std::fs::remove_file(log.path()).expect("remove");
+        not_synced(record(&log, "fifth"), &closed);
+        chmod(&closed, 0o700);
+        record(&log, "sixth").expect("record");
+        assert_eq!(written(&log), ["sixth"]);
+    }
+
+    #[test]
+    fn a_log_another_program_made_again_is_synced_even_with_the_old_inode() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        let log = AuditLog::new(closed.join("audit.jsonl"));
+        record(&log, "first").expect("record");
+        // Another program removes the log and makes another, which the file
+        // system can give the removed one's inode (as ext4 often does).
+        let inode = |path: &Path| std::fs::metadata(path).expect("meta").ino();
+        let old = inode(log.path());
+        for _ in 0..20 {
+            std::fs::remove_file(log.path()).expect("remove");
+            std::fs::File::create(log.path()).expect("create");
+            if inode(log.path()) == old {
+                break;
+            }
+        }
+        chmod(&closed, 0o300);
+        not_synced(record(&log, "second"), &closed);
+        chmod(&closed, 0o700);
+        record(&log, "third").expect("record");
+        assert_eq!(written(&log), ["third"]);
+    }
+
+    #[test]
+    fn the_names_of_directories_made_for_a_log_are_synced_in_their_parents() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        chmod(&closed, 0o300);
+        // Two directories are made, in `closed` and in the first; the file's
+        // own directory can be synced, the parent of the first cannot.
+        let log = AuditLog::new(closed.join("state").join("rusthorse").join("audit.jsonl"));
+        not_synced(record(&log, "first"), &closed);
+        assert!(log.path().exists());
+        // Everything is there now, the first name still not synced.
+        not_synced(record(&log, "second"), &closed);
+        assert!(written(&log).is_empty());
+        chmod(&closed, 0o700);
+        record(&log, "third").expect("record");
+        // Synced once, the parents are not synced again.
+        chmod(&closed, 0o300);
+        record(&log, "fourth").expect("record");
+        assert_eq!(written(&log), ["third", "fourth"]);
+    }
+
+    #[test]
+    fn a_directory_made_before_a_failure_is_synced_in_its_parent_by_the_next_record() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        std::fs::create_dir(closed.join("real")).expect("mkdir");
+        std::os::unix::fs::symlink(closed.join("real"), closed.join("link")).expect("symlink");
+        chmod(&closed, 0o300);
+        // The log's directory is reached through `new`, which the record
+        // makes in `closed`; then the directory turns out to be a link,
+        // which is refused.
+        let log = AuditLog::new(closed.join("new/../link/audit.jsonl"));
+        let refused = record(&log, "first").expect_err("a link as the directory");
+        assert!(
+            refused.to_string().contains("is not a directory"),
+            "{refused}"
+        );
+        assert!(closed.join("new").is_dir());
+        // A directory in place of the link: the next record goes as far as
+        // syncing `closed`, which holds the name of `new`.
+        std::fs::remove_file(closed.join("link")).expect("remove");
+        std::fs::create_dir(closed.join("link")).expect("mkdir");
+        not_synced(record(&log, "second"), &closed);
+        chmod(&closed, 0o700);
+        record(&log, "third").expect("record");
+        assert_eq!(written(&log), ["third"]);
+    }
+
+    #[test]
+    fn a_log_reached_through_a_link_is_synced_where_the_file_is() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        let link = closed.parent().expect("base").join("audit.jsonl");
+        std::os::unix::fs::symlink(closed.join("audit.jsonl"), &link).expect("symlink");
+        chmod(&closed, 0o300);
+        let log = AuditLog::new(link);
+        not_synced(record(&log, "first"), &closed);
+        not_synced(record(&log, "second"), &closed);
+        chmod(&closed, 0o700);
+        record(&log, "third").expect("record");
+        assert_eq!(written(&log), ["third"]);
+    }
+
+    #[test]
+    fn a_log_moved_or_replaced_after_it_was_opened_is_not_written() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens any directory
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("path");
+        let closed = new_dir(&dir, "closed");
+        let _reopen = Reopen(closed.clone());
+        let path = base.join("audit.jsonl");
+        let moved = closed.join("moved.jsonl");
+        // Moved to a directory that cannot be synced, another file in its
+        // place: the directory synced does not hold the file opened.
+        let file = open_log(&path).expect("open");
+        std::fs::rename(&path, &moved).expect("move");
+        std::fs::File::create(&path).expect("substitute");
+        chmod(&closed, 0o300);
+        replaced(append(&path, &mut Unsynced::default(), file, b"moved\n").expect_err("written"));
+        chmod(&closed, 0o700);
+        assert_eq!(std::fs::read(&moved).expect("moved"), b"");
+        assert_eq!(std::fs::read(&path).expect("substitute"), b"");
+        // Replaced in its own directory.
+        let file = open_log(&path).expect("open");
+        std::fs::rename(&moved, &path).expect("replace");
+        replaced(
+            append(&path, &mut Unsynced::default(), file, b"replaced\n").expect_err("written"),
+        );
+        // Removed.
+        let file = open_log(&path).expect("open");
+        std::fs::remove_file(&path).expect("remove");
+        let removed = append(&path, &mut Unsynced::default(), file, b"removed\n");
+        assert_eq!(
+            removed.expect_err("written").kind(),
+            io::ErrorKind::NotFound
+        );
+        // Left where it was: written.
+        let file = open_log(&path).expect("open");
+        append(&path, &mut Unsynced::default(), file, b"kept\n").expect("written");
+        assert_eq!(std::fs::read(&path).expect("log"), b"kept\n");
+    }
+
+    /// Runs a test's hook after the steps of syncing the directory that
+    /// holds the log, on the test's thread, until dropped.
+    struct AtSteps;
+
+    impl AtSteps {
+        fn run(hook: impl FnMut(Step) + 'static) -> AtSteps {
+            AT_STEP.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+            AtSteps
+        }
+    }
+
+    impl Drop for AtSteps {
+        fn drop(&mut self) {
+            AT_STEP.with(|h| *h.borrow_mut() = None);
+        }
+    }
+
+    fn replaced(e: io::Error) {
+        assert!(
+            e.to_string()
+                .contains("was renamed, replaced or removed while a record was written"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_substitute_at_the_check_is_refused_though_the_file_is_put_back_after() {
+        // Another program takes the file away and puts a substitute in its
+        // place once the directory is open, and puts the file back once the
+        // directory is synced: the check comes first, and sees the
+        // substitute.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("path");
+        let path = base.join("audit.jsonl");
+        let away = base.join("away.jsonl");
+        let file = open_log(&path).expect("open");
+        let _hook = AtSteps::run({
+            let (path, away) = (path.clone(), away.clone());
+            move |step| match step {
+                Step::Opened => {
+                    std::fs::rename(&path, &away).expect("away");
+                    std::fs::File::create(&path).expect("substitute");
+                }
+                Step::Synced => std::fs::rename(&away, &path).expect("back"),
+            }
+        });
+        replaced(append(&path, &mut Unsynced::default(), file, b"refused\n").expect_err("written"));
+        assert_eq!(std::fs::read(&away).expect("the file"), b"");
+        assert_eq!(std::fs::read(&path).expect("the substitute"), b"");
+    }
+
+    #[test]
+    fn a_file_put_back_before_the_check_is_synced_after_it() {
+        // Taken away, a substitute in its place, and put back, all before
+        // the check: the sync that follows the check finds it there.
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("path");
+        let path = base.join("audit.jsonl");
+        let away = base.join("away.jsonl");
+        let file = open_log(&path).expect("open");
+        let original = file.metadata().expect("meta").ino();
+        let synced_with = std::rc::Rc::new(std::cell::Cell::new(None));
+        let _hook = AtSteps::run({
+            let (path, synced_with) = (path.clone(), std::rc::Rc::clone(&synced_with));
+            move |step| match step {
+                Step::Opened => {
+                    std::fs::rename(&path, &away).expect("away");
+                    std::fs::File::create(&path).expect("substitute");
+                    std::fs::rename(&away, &path).expect("back");
+                }
+                Step::Synced => {
+                    synced_with.set(Some(std::fs::metadata(&path).expect("meta").ino()));
+                }
+            }
+        });
+        append(&path, &mut Unsynced::default(), file, b"kept\n").expect("written");
+        assert_eq!(synced_with.get(), Some(original), "synced after the check");
+        assert_eq!(std::fs::read(&path).expect("log"), b"kept\n");
+    }
+
+    #[test]
+    fn a_file_moved_out_of_the_opened_directory_is_refused_though_the_path_finds_it() {
+        // Once the directory is open, another program moves the file into a
+        // new directory and puts that directory at the same path: the path
+        // leads to the file, the directory opened no longer holds it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("path");
+        let logs = new_dir(&dir, "logs");
+        let path = logs.join("audit.jsonl");
+        let file = open_log(&path).expect("open");
+        let _hook = AtSteps::run({
+            let (base, logs) = (base.clone(), logs.clone());
+            move |step| {
+                if step == Step::Opened {
+                    std::fs::create_dir(base.join("new")).expect("mkdir");
+                    std::fs::rename(logs.join("audit.jsonl"), base.join("new/audit.jsonl"))
+                        .expect("move the file");
+                    std::fs::rename(&logs, base.join("old")).expect("move the directory");
+                    std::fs::rename(base.join("new"), &logs).expect("put the new one there");
+                }
+            }
+        });
+        replaced(append(&path, &mut Unsynced::default(), file, b"moved\n").expect_err("written"));
+        assert_eq!(std::fs::read(&path).expect("the file"), b"");
+    }
+
+    #[test]
+    fn a_record_whose_data_cannot_be_synced_fails_and_may_be_in_the_file() {
+        // A FIFO cannot be synced to disk; a reader holds it open, so that
+        // opening it to write does not wait.
+        use std::io::Read;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open the FIFO");
+        let log = AuditLog::new(path);
+        record(&log, "refused").expect_err("synced into a FIFO");
+        let mut taken = vec![0; 4096];
+        let n = reader.read(&mut taken).expect("read");
+        assert!(
+            String::from_utf8_lossy(&taken[..n]).contains("\"detail\":\"refused\""),
+            "{:?}",
+            String::from_utf8_lossy(&taken[..n])
+        );
     }
 
     #[test]

@@ -677,6 +677,29 @@ one, so that `rusthorse run` can say that the destination did not accept the
 key. See [cli.md](cli.md#rusthorse-audit) and
 [protocol.md](protocol.md#agentbroker-control-channel-broker-protocol-2).
 
+Each record is synced to disk (`fdatasync`) when it is written, after the
+names that lead to it (`AuditLog::record`). At every record the directory
+that holds the log file — for a log reached through a symbolic link, the
+directory of the file the link leads to — is opened, checked through that
+open directory to hold the file the record goes into, by the name the log's
+path leads to, and only then synced. The parent of each directory the
+agent makes for the log is synced too, at every record until that sync
+succeeds. If a directory sync or that check fails, the record fails and is
+not written; if writing the record or `fdatasync` fails, the record fails
+too, but part or all of it may be in the file, the record of an action that
+was refused. A rename, replacement or removal by another program that
+still stands at the check fails the record; one undone before the check goes
+unnoticed, and the sync that follows covers the name put back. A program
+that renames, replaces or removes the log after the check takes the record
+with the file (out of the log, if it removes or
+replaces it), and syncing the names it gives is its own. The names of
+directories the agent did not make are taken as durable and as not
+changing, and so are a symbolic link to the log and the directories on the
+way to it. As for the vault's saves, any error of a directory sync is a
+failure: on a file system whose directories cannot be synced, or with a log
+directory the agent cannot read, every record fails, so the vault stays
+locked and approval-gated requests are refused.
+
 `rusthorse audit` and the manager's History page read the file directly:
 the CLI at its own configured path, the manager at the path the agent
 reports in `status.audit_log`. The manager reads it in pages from its end

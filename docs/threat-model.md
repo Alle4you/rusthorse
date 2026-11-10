@@ -164,7 +164,7 @@ still holds the grant, including after revocation.
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after a time without an *approved* use — 15 minutes by default; the `idle_timeout` setting changes it, up to 24 hours, and `0` turns it off (P15) — which `status`, `list`, `show` and denied requests do not postpone; `rusthorse lock`; lock on any save failure; lock when the computer is about to sleep and when the screen locks, unless those two settings are switched off, and within the limits of L20. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
-| P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`; the directory entry of a log just created is not synced). Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
+| P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`), after the names that lead to it: at every record the agent opens the directory that holds the log file, checks through it that it holds the file the record goes into, by the name the log's path leads to, and only then syncs it; it also syncs the parent of each directory it makes for the log, at every record until that sync succeeds (an agent process started later does not know of a directory that an earlier one made and could not sync). If one of these syncs or the check fails, the record fails and is not written; if writing the record or `fdatasync` fails, the record fails too, but part or all of it may be in the file: the record of an action that was refused. A rename, replacement or removal by another program that still stands at the check fails the record; one undone before the check goes unnoticed, and the sync that follows covers the name put back. A program that renames, replaces or removes the log after that check takes the record with the file (out of the log, if it removes or replaces it), and the names it gives are its own to sync. The names of directories the agent did not make are taken as durable and as not changing, and so, for a log reached through a symbolic link (the directory synced is then that of the file the link leads to), are the link and the directories on the way to it. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
 | P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome. The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
@@ -787,6 +787,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | The SSH recipes tried against servers, by hand (the maintainer and the maintainer's agent; a test, not a review). | The probe, the key recipe and the password recipe worked for what was tried, on two routers; SSH06 low (nothing tells a password from a private key, and the agent first chose the wrong recipe), fixed in the guide, with a design decision left to the maintainer. The record and the fix reviewed the same day (Codex, AI-assisted): not ready with T01–T04 low, fixed, then ready; see below. |
 | 2026-11-10 | The entry kind `ssh-key` and protocol 11, the maintainer's answer to SSH06 ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)). | A label, like the other kinds: no policy reads it and nothing checks it against the value. Reviewed the same day (Codex, AI-assisted): not ready with K01–K03 low, fixed; the confirmation found K04 and K05 low, in the record, fixed; then ready; see below. |
 | 2026-11-10 | Set the broker's limit of 100 request headers itself (Codex, AI-assisted). | Ready, no findings: the third behaviour left to the maintainer by the documentation audit of 2026-11-09 is closed; the explicit limit and its boundary tests are in place. Response limits and two older issues remain for the maintainer; see below. |
+| 2026-11-10 | Sync the audit log's directory entries before its records: three reviews (Codex, AI-assisted). | Not ready with AUD01–AUD04; those confirmed fixed, then not ready with AUD05; that confirmed fixed, then ready, with no new finding. The second behaviour left by the documentation audit is closed within P12's stated limits, whose acceptance remains the maintainer's. The twelve checks passed again on main with the broker's header-limit change; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -3468,3 +3469,213 @@ Left to the maintainer; nothing in these three areas changed:
 - **The fake agent's `wait_for`** in `broker/tests/support/mod.rs` asserts
   while holding its lock. A failed assertion can make its reader thread
   panic with `PoisonError`: noise after a test failure, not a broker defect.
+
+**2026-11-10 — Sync the audit log's directory entries before its records.**
+
+The second behaviour that the documentation audit of 2026-11-09 left to
+the maintainer is closed, within P12's limits below. A new audit log's data
+was synced, but its directory entry was not: a crash could keep an approved
+effect and lose the log's name and records. At every record the agent now
+opens the directory that holds the log file, checks through that descriptor
+that the resolved name holds the opened file (device and inode, `fstatat`
+with `AT_SYMLINK_NOFOLLOW`), and then syncs that same directory. For a
+symbolic link to the log, this is the target file's directory. It also syncs
+the parent of each directory made for the log, keeping each pending until
+its sync succeeds, including directories made before a later creation
+failed. Only then does it write the record and run `fdatasync`. A failed
+directory sync or check fails the record before any record bytes are
+written, and refuses the gated action. A failed write or `fdatasync` also
+refuses the action, but may leave part or all of its record in the file.
+
+The first version, "Sync the audit log's directory entries before its
+records", remembered the file's device and inode so as to sync its
+directory once per process and per file. The maintainer's coordinating
+agent had accepted that design on a cost argument it had not measured.
+The first review (Codex, AI-assisted) found AUD01 to AUD04 and preferred
+syncing at every record. "Sync the audit log's directory at every record,
+bound to the file" removed the cache and fixed those four findings. The
+second review confirmed them fixed and found AUD05. "Check the audit log's
+directory before syncing it, not after" changed the order to check, then
+sync. The third review found the whole change **ready**. All three versions,
+their fixes and their reviews were made on 2026-11-10.
+
+Cost was measured only after the first review. The implementer reported a
+throwaway benchmark that day on this machine: 300 records per run, ext4 on
+NVMe, a debug build, the median of eight interleaved runs under load
+(load average 4 to 6). The rounded figures were about 0.90 ms per record
+before the change, 0.92 ms with the cache and 0.98 ms with a sync at every
+record: about 0.08 ms above the base and 0.06 ms above the cache, as the
+last version's message clarified. The final order still has one sync of
+the file's directory per record. These are that day's measurements, not a
+performance promise; the reviewer read the report and did not repeat the
+benchmark.
+
+Findings and their dispositions:
+
+| Finding | Disposition |
+|---|---|
+| Medium — AUD01: making the log's directories could fail after making some of them, losing the list of names still needing a sync. A later record found those directories already there and could skip their parents. | **Fixed in the fix of AUD01 to AUD04:** `make_private_dir` adds each directory to the caller's list as soon as it is made; `record` queues their parents even when creation fails. Each stays pending until its sync succeeds. Confirmed in the second review. |
+| Medium — AUD02: another program could remove and recreate the log with the same device and inode; the cache then skipped the new name's sync. Inode reuse occurred on ext4 at the first try. | **Fixed in the fix of AUD01 to AUD04:** the identity cache and the creation flag are gone; the log's directory is synced at every record, including after an earlier success in the same agent. Confirmed in the second review. |
+| Medium — AUD03: a rotation between opening the log and resolving its path could sync the substitute's directory while writing into the moved file. | **Fixed in the fix of AUD01 to AUD04:** the name is checked through the opened directory's descriptor against the opened file, rather than trusted from a new path lookup. A mismatch refuses the record before writing. Confirmed in the second review; the ordering defect below was separate. |
+| Low — AUD04: the documents said that a record whose sync failed was not written, which was false for a failed write or `fdatasync`. | **Fixed in the fix of AUD01 to AUD04:** the no-write statement is limited to directory syncs and the check; a failed write or `fdatasync` may leave the record of a refused action. Confirmed in the second review. |
+| Medium — AUD05: syncing before checking did not prove the matching name had been synced. Another process could substitute a file before `fsync`, then restore the original before the comparison; all changes preceded the check, and `record` still returned `Ok`. | **Fixed in the fix of AUD05:** check through the directory descriptor first, then sync that descriptor. A substitution still present is refused; one undone before the check is covered by the following sync. Changes after the check remain the other program's to sync. Confirmed by the third review's external probe, within that contract. |
+
+First review (Codex, AI-assisted; **not ready**, three medium findings and
+one low): the reviewer read the durability and error paths and reproduced
+the partial-directory-creation failure, inode reuse, the open/path rotation
+and the failed-data-sync case behind AUD01 to AUD04. It checked the callers
+of `record` and their fail-closed handling, the directory helper against
+the old helper, and the documents. The cache's complexity was not justified
+by a measured cost; syncing at every record was the reviewer's preference.
+
+Second review (Codex, AI-assisted; **not ready**, AUD01 to AUD04 confirmed
+fixed, AUD05 medium): the reviewer reran the probes for the four findings,
+then interposed `fsync` and coordinated a second process to take the file
+away, put a substitute in place for the sync and restore the file before
+the check. In four runs out of four, the record succeeded although no sync
+had covered the restored name. The reviewer suggested another sync after
+the comparison. The final fix instead moves the comparison before the one
+sync: an earlier extra sync adds nothing to the contract for changes after
+the check.
+
+Third review (Codex, AI-assisted; **ready**, no new finding): the reviewer
+read the whole change and the fix of AUD05, confirmed that the callers,
+dependencies and protocol were unchanged and no `unsafe` was added, and
+checked P12, the architecture, the CHANGELOG and the comments against the
+code. An external probe used interposed `fstatat` and `fsync`, a second
+process changing names, and socket handshakes rather than sleeps. Each of
+these cases ran four times with the same result:
+
+- A substitute present at the check was refused, with no record written.
+- The original taken away and restored before the check was accepted,
+  with a following sync covering the restored name.
+- A directory replaced while the path still led to the opened file was
+  refused: the check used the opened directory, not the path again.
+- A substitution and restoration only around `fsync` still returned `Ok`;
+  those changes now happened after the check and fell under the stated
+  responsibility of the other program.
+
+The normal trace was `fstatat`, `fsync` of that directory, `write` of the
+record, then `fdatasync` of the file. Injecting `EIO` at `fsync` refused the
+record without writing; injecting it at `fdatasync` refused it after the
+bytes were written, as AUD04's corrected wording allows. Two additional
+tests on the temporary copy checked that hooks are confined to their thread
+and removed on unwinding. The hooks, their types and both calls are under
+`cfg(test)`. The whole twelve-step matrix passed on the reviewed branch,
+including the dialog and manager. The third round did not repeat the
+individual probes for AUD01 to AUD04; their regression tests passed.
+
+Mutation checks reported by the implementer in the three messages, all on
+temporary copies with their own target directories:
+
+- **The first version:** eleven mutations caught by tests: omitting the
+  log-directory sync; syncing only on creation and forgetting a failure
+  (the trap); forgetting a failure while keeping the identity check;
+  syncing only on creation while keeping failed syncs pending; omitting
+  the identity reset on creation or delaying it until the directory was
+  found; omitting the parents' sync or reporting no directories made;
+  writing before syncing; syncing the path's directory instead of the
+  link target's; and never reporting that opening created the file. The
+  creation-only variant with pending syncs kept passed the end-to-end
+  test but failed unit tests. The cache-specific tests went away with
+  the cache.
+- **The fix of AUD01 to AUD04:** tests caught omitting the directory sync
+  or the file check, syncing the wrong directory for a link, forgetting
+  failed parent syncs, noting made directories only after total success,
+  listing them only after making or checking them all, not queuing their
+  parents, and writing before the syncs. Looking up the entry by its path
+  and checking before syncing survived. Those survivors were not accepted
+  as harmless: the former gained a test with the seam; the latter became
+  the fix of AUD05.
+- **The fix of AUD05:** tests caught syncing before checking, removing
+  the sync step, looking up by path and leaving `ENOENT` unmapped. Moving
+  a hook call outside `cfg(test)` failed to compile with and without
+  features. Removing only the `fsync` call while keeping the step marker
+  survived the repository's tests.
+
+The reviewer reproduced the final round's mutations with
+`cargo test -p rusthorse --all-features --lib <test>` on a temporary copy:
+the old order failed
+`a_substitute_at_the_check_is_refused_though_the_file_is_put_back_after`;
+removing the sync step failed
+`a_file_put_back_before_the_check_is_synced_after_it`; lookup by path and
+unmapped `ENOENT` each failed
+`a_file_moved_out_of_the_opened_directory_is_refused_though_the_path_finds_it`.
+The unguarded hook call failed library builds with both feature sets.
+
+Removing only `fsync` survived every test in the repository according to
+the implementer; the reviewer reproduced its survival in the audit unit
+suite (22 tests, including the two added probes). It is **not harmless by
+design**. Only the reviewer's external probe caught that mutation: the
+trace lacked `fsync`, and with
+`strace -e inject=fsync:error=EIO:when=1` the original refused without
+writing while the mutant returned `Ok` and wrote 125 bytes. The markers
+alone do not prove a system call happened. Making an equivalent external
+check permanent is the reviewer's recommendation, left to the maintainer.
+
+The final end-to-end test covers a user-visible change: a log directory
+the agent can write and search but cannot read (mode `0300`) now refuses
+every gated action. After an initial successful run, it checks four
+approved requests refused, including one into the existing log and three
+after its removal, with no command started, the vault unchanged and no
+record appended; after mode `0700` is restored, the run and removal succeed.
+Another visible change is that a rename, replacement or removal of the log
+by another program that still stands at the check refuses that action.
+On a file system whose directories cannot be synced, the agent likewise
+refuses gated actions and keeps an attempted unlock locked, following the
+vault saves' treatment of sync errors.
+
+**Checks on main before this record was added.** The reviewer ran all
+twelve steps again on the staged audit-log change combined with "Set the
+broker's limit of 100 request headers itself", rather than relying on the
+branch's earlier results. All passed, with `CARGO_BUILD_JOBS=5`,
+`RUST_TEST_THREADS=5`, the feature sets run in sequence and the GTK tests
+using their virtual displays:
+
+| Step | Command | Result |
+|---|---|---|
+| 1 | `cargo fmt --all --check` | Passed. |
+| 2 | `cargo clippy --all-targets --all-features -- -D warnings` | Passed. |
+| 3 | `cargo clippy --all-targets -- -D warnings` | Passed. |
+| 4 | `cargo test --all-features` | 616 passed, 2 ignored. |
+| 5 | `cargo test --no-default-features` | 509 passed, 2 ignored. |
+| 6 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Passed. |
+| 7 | `cargo +1.89 check --all-targets` | Passed. |
+| 8 | `cargo +1.89 check --all-targets --all-features` | Passed. |
+| 9 | `cargo clippy -p rusthorse-dialog --all-targets -- -D warnings` | Passed. |
+| 10 | `cargo test -p rusthorse-dialog` | 4 unit and 5 virtual-display tests passed. |
+| 11 | `cargo clippy -p rusthorse-manager --all-targets -- -D warnings` | Passed. |
+| 12 | `cargo test -p rusthorse-manager` | 45 passed. |
+
+With and without features respectively: 225/224 library tests, 20/20 CLI
+tests, 181/160 agent tests, 1/1 descriptor-alignment tests, 4/4 KeePass
+compatibility tests, 25/25 packaging tests, 45/45 broker unit tests, 80/30
+broker integration tests and 35/0 system tests passed. The descriptor-limit
+test's child rerun is not counted twice. The two existing ignored tests
+were the real KDF timing and the test requiring `keepassxc-cli`; they were
+not run. Tests ran as uid 1000, so the permission checks did not skip as
+root. The suites' temporary directory was empty afterwards.
+
+Not checked by these reviews: power loss or physical file-system recovery.
+The traces establish the calls and their order, not what the hardware
+persists. The third round did not force a change inside the kernel while
+`fsync` was running. No general guarantee for other file systems or for an
+uncooperative program rotating the log follows from these probes. The
+benchmark was reported by the implementer, not independently measured.
+
+Left to the maintainer, with no acceptance or further fix recorded here:
+
+- **P12's residual across restarts.** A later agent process does not know
+  of a directory an earlier process made and could not sync. The reviewer
+  asks for the maintainer's explicit acceptance of that limit.
+- **P12's contract for other programs and paths.** After the check, the
+  names another program gives the file are its own to sync. Directories
+  the agent did not make, and a symbolic link to the log with the
+  directories on the way to it, are taken as durable and not changing.
+  These assumptions also need the maintainer's explicit acceptance; the
+  ready verdict is within them.
+- **The same gap elsewhere, outside this change.** Read in the code, not
+  exercised by a crash test: creating a vault (`Vault::unsaved`, then
+  `ensure_private_dir`) and `settings::save` make missing directories but
+  sync only the file's own directory, not each newly made directory's
+  parent. Nothing in these paths was changed to close that gap.

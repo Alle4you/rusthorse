@@ -2,7 +2,7 @@
 
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nix::unistd::getuid;
@@ -10,10 +10,16 @@ use nix::unistd::getuid;
 /// Create `path` (and missing parents) with mode `0700`, and make sure it is
 /// owned by the current user and not accessible to anyone else.
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
+    make_private_dir(path, &mut Vec::new())
+}
+
+/// [`ensure_private_dir`], which also adds to `made` the directories that
+/// were missing, parents first, each as soon as it is made — so that a
+/// failure further on loses none. Each was made then, by this call or by
+/// another program meanwhile, and its name is in its parent, which must be
+/// synced for that name to survive a crash.
+pub fn make_private_dir(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> {
+    make_dirs(path, made)?;
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() {
         return Err(io::Error::other(format!(
@@ -30,6 +36,43 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     if meta.permissions().mode() & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    Ok(())
+}
+
+/// Create `path` and its missing parents with mode `0700`, as
+/// `DirBuilder::recursive` does, adding to `made` each one that was missing,
+/// parents first.
+fn make_dirs(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {
+            made.push(path.to_path_buf());
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) if path.is_dir() => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    match path.parent() {
+        Some(parent) => make_dirs(parent, made)?,
+        None => {
+            return Err(io::Error::other(format!(
+                "cannot create {}",
+                path.display()
+            )));
+        }
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        // Missing a moment ago: another program made it meanwhile.
+        Err(_) if path.is_dir() => {}
+        Err(e) => return Err(e),
+    }
+    made.push(path.to_path_buf());
     Ok(())
 }
 
@@ -198,6 +241,52 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`make_private_dir`] says it made, and whether it succeeded.
+    fn made(path: &Path) -> (Vec<PathBuf>, bool) {
+        let mut made = Vec::new();
+        let done = make_private_dir(path, &mut made).is_ok();
+        (made, done)
+    }
+
+    #[test]
+    fn a_private_directory_says_which_directories_it_made() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deep = dir.path().join("a").join("b").join("c");
+        let (list, done) = made(&deep);
+        assert!(done);
+        assert_eq!(
+            list,
+            [
+                dir.path().join("a"),
+                dir.path().join("a/b"),
+                dir.path().join("a/b/c"),
+            ]
+        );
+        for path in &list {
+            let mode = std::fs::metadata(path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", path.display());
+        }
+        // Once there, none is made again; one missing below them is.
+        assert_eq!(made(&deep), (vec![], true));
+        let below = deep.join("d");
+        assert_eq!(made(&below), (vec![below], true));
+        // A file in the way is not a directory.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").expect("write");
+        assert_eq!(made(&file.join("x")), (vec![], false));
+        assert_eq!(made(&file), (vec![], false));
+    }
+
+    #[test]
+    fn the_directories_made_before_a_failure_are_still_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `a` is made, then a name too long for any directory is refused.
+        let long = "x".repeat(256);
+        let (list, done) = made(&dir.path().join("a").join(&long));
+        assert!(!done);
+        assert_eq!(list, [dir.path().join("a")]);
+    }
 
     #[test]
     fn replaced_files_are_told_apart_by_identity_not_name() {

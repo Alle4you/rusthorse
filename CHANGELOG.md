@@ -344,6 +344,15 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Fixed
 
+- The audit log's name is synced, not only its data: before each record,
+  and so before its action goes ahead, the agent checks that the directory
+  that holds the log holds the file the record goes into, then syncs it, and
+  syncs the parent of each directory it makes for the log. Before, a
+  crash right after the first records of a new log could keep their approved
+  effects and lose the log's name, records and all. A sync or a check that
+  fails fails the record, and the action is refused, as when the log cannot
+  be written; on a file system whose directories cannot be synced, or with a
+  log directory the agent cannot read, the vault now stays locked.
 - A vault that KeePassXC saved as KDBX 4.0 (as it does when nothing in the
   file needs 4.1) can be saved again: Rusthorse writes it back as KDBX 4.1,
   the version it writes. Before, every change to it failed with an

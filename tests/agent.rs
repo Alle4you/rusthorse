@@ -1692,6 +1692,96 @@ fn an_unwritable_audit_log_keeps_the_vault_locked() {
     assert!(!h.run(&["list"]).status.success());
 }
 
+/// Gives a directory its mode `0700` back when dropped: a test that failed
+/// with it closed still leaves a directory that can be removed.
+struct Reopen(PathBuf);
+
+impl Drop for Reopen {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[test]
+fn an_audit_log_whose_name_cannot_be_synced_refuses_what_it_would_record() {
+    if nix::unistd::geteuid().is_root() {
+        return; // root opens any directory
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    h.add_secret("TOKEN", "abcdefgh", &[]);
+    let marker = h.dir.path().join("ran");
+    let touch = [
+        "run",
+        "TOKEN",
+        "--",
+        "touch",
+        marker.to_str().expect("utf8"),
+    ];
+    // Allowed: where the names of the log and of the directory made for it
+    // can be synced, the run goes ahead.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&touch);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).expect("remove the marker");
+    // The log's directory is closed: of mode 0300, a file can be created in
+    // it, but it cannot be opened, and so not synced.
+    let state = h.audit.parent().expect("its directory").to_path_buf();
+    let _reopen = Reopen(state.clone());
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    let vault = std::fs::read(h.vault_path()).expect("vault");
+    let mut kept = h.audit_text();
+    // The first request finds the log written before; then the log is
+    // removed, the next request creates it again and the others find it
+    // there, its name still not synced. Each is refused once approved.
+    let remove = ["remove", "TOKEN"];
+    for (attempt, args, status) in [
+        ("a run into the log written before", &touch[..], 125),
+        ("a run that creates the log again", &touch[..], 125),
+        ("a removal that finds it there", &remove[..], 1),
+        ("a run that finds it there", &touch[..], 125),
+    ] {
+        if attempt.contains("creates") {
+            std::fs::remove_file(&h.audit).expect("remove the log");
+            kept.clear();
+        }
+        h.decide(&[Decision::AllowOnce]);
+        let asked = h.ui.approvals_asked.load(Ordering::SeqCst);
+        let out = h.run(args);
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(status), "{attempt}: {stderr}");
+        assert!(
+            stderr.contains("cannot write the audit log")
+                && stderr.contains("cannot sync the directory"),
+            "{attempt}: {stderr}"
+        );
+        let approved = h.ui.approvals_asked.load(Ordering::SeqCst);
+        assert_eq!(approved, asked + 1, "{attempt}: refused before the dialog");
+        assert!(!marker.exists(), "{attempt}: the command ran");
+        assert_eq!(
+            std::fs::read(h.vault_path()).expect("vault"),
+            vault,
+            "{attempt}: the vault changed"
+        );
+        assert!(h.audit.exists(), "{attempt}: no log");
+        assert_eq!(h.audit_text(), kept, "{attempt}: recorded");
+    }
+    // Once its directory can be synced, the same requests go ahead.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&touch);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(marker.exists());
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["remove", "TOKEN"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_ne!(std::fs::read(h.vault_path()).expect("vault"), vault);
+    assert_eq!(audit_outcomes(&h, "run"), ["allowed_once", "exited"]);
+    assert_eq!(audit_outcomes(&h, "remove"), ["allowed_once"]);
+}
+
 #[test]
 fn a_failed_import_changes_nothing_in_memory_or_on_disk() {
     use rusthorse::protocol::{EntryFields, ImportedEntry, NewEntry, Request, Response};
