@@ -487,7 +487,7 @@ The vault is a standard KeePass **KDBX 4** file, written with the
 | url | `URL` | no | yes |
 | host | `Host` (custom) | no | yes |
 | port | `Port` (custom) | no | yes |
-| kind | `Kind` (custom): `api-key`, `login`, `server` or `device` | no | yes |
+| kind | `Kind` (custom): `api-key`, `login`, `server`, `device` or `ssh-key` | no | yes |
 | notes | `Notes` | yes | **no** |
 | tags | `Tags` | — | yes |
 | group | entry's group path | — | yes |
@@ -499,7 +499,7 @@ state in the entry's KeePass history, so KeePassXC can show and restore old
 versions; a move to another group (`edit --group`) also records the previous
 group and the time of the move (`PreviousParentGroup`, `LocationChanged`).
 
-A `Kind` field that holds anything other than the four kinds (written by
+A `Kind` field that holds anything other than the five kinds (written by
 another client) is reported as one of the other fields, by name only, and
 the entry has no kind. A metadata field that the file marks as protected —
 `Kind` included — is withheld like a value. The kind only labels fields

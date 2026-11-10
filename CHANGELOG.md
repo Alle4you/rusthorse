@@ -165,7 +165,9 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   `--no-lock-on-suspend` and `--no-lock-on-screen-lock` turn it off. Builds
   without the new default feature `session-lock` have no D-Bus watchers.
 - Entry **kinds** ([ADR 0008](docs/adr/0008-entry-kinds.md)): `api-key`,
-  `login`, `server` or `device`, set with `add --kind` and `edit --kind`
+  `login`, `server`, `device` or `ssh-key` (an entry whose value is a private
+  key for SSH: the guide for AI agents names the recipe for it), set with
+  `add --kind` and `edit --kind`
   (`--kind other` or `--clear kind` removes it), shown by `show`, filtered by
   `list --kind`, and stored in the KDBX field `Kind`. The kind names the
   fields — the URL of an API key is its endpoint — and decides which ones the
@@ -236,6 +238,8 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- **Protocol 11**: the entry kind `ssh-key`. Clients and agents of protocol
+  10 refuse each other at the version check.
 - **Protocol 10**: `configure` and `status.settings` (the agent's settings).
   Clients and agents of protocol 9 refuse each other at the version check.
 - **The agent's duration options have bounds**: `--idle-timeout` `0` or 1s

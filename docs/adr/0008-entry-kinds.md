@@ -13,6 +13,9 @@
   and one through the credential broker; the snippet of section 6, which
   added `--url` for an API key with an endpoint, is gone. `run --url`
   (section 5) is unchanged.
+- Amended: 2026-11-10, by the maintainer's decision: a fifth kind,
+  `ssh-key`, and protocol 11
+  ([below](#amendment-2026-11-10-the-kind-ssh-key)).
 
 ## Context
 
@@ -49,6 +52,9 @@ existing entry is.
 | `server` | A server reached by host and port (SSH, a database, …) | Username, Host, Port | — |
 | `device` | A device such as a router or a camera | Username, URL, Host | Admin page |
 | (none) | Anything else | all | URL |
+
+(Since 2026-11-10 there is a fifth kind, `ssh-key`: see
+[the amendment](#amendment-2026-11-10-the-kind-ssh-key).)
 
 The kind is **presentation only**. It decides which fields a form offers and
 how they are labelled, and it is shown with the entry. No policy reads it: it
@@ -173,3 +179,42 @@ rusthorse run OPENAI_API_KEY=<uuid> \
   (Amended 2026-11-04: an entry's endpoint is context, not a destination
   policy: the planned broker takes each grant's destination from the run,
   for the human to approve, and the stored endpoint gives no default.)
+
+## Amendment, 2026-11-10: the kind `ssh-key`
+
+**Context.** A device often has two credentials for SSH: a password and a
+private key, each the value of an entry of its own. Their metadata was the
+same — kind `server` or `device`, a username, a host — so nothing told an AI
+agent which recipe of its guide to use: a password goes to `sshpass`, a key
+into a temporary `ssh-agent`. In the manual test of 2026-11-10 the
+maintainer's agent took a key for a password
+([review history](../threat-model.md#11-review-history), SSH06). "More
+kinds", an SSH key among them, were foreseen above.
+
+**Decision.** A fifth kind, **`ssh-key`**: the entry's value is a private
+key for SSH, and its username, host and port say where it logs in. A form
+offers Username, Host and Port, as for `server`, and the URL keeps its plain
+name. Like `api-key`, it says what the value is; a device's password stays
+an entry of kind `device` or `server`.
+
+The rest of the decision above holds for it. It is presentation only: no
+policy reads it, and nothing checks it against the value — an entry of kind
+`ssh-key` may hold anything, and an entry of another kind may hold a key.
+Rusthorse does not look at a value to find out what it is: that would put a
+fact about a secret in metadata, which is read without approval. The label
+is as right as whoever set it, and the guide for AI agents says so: it
+names the recipe for an entry of this kind, and tells the agent to ask the
+human about an entry that does not say what it holds.
+
+**Protocol 11.** `ssh-key` is a new value of `kind`. An agent of protocol 10
+does not know it, and a client of protocol 10 cannot read an entry that has
+it, so the version changes, as foreseen above for every new kind.
+
+**Storage.** The `Kind` field holds `ssh-key`. A Rusthorse build older than
+this amendment reads that as a `Kind` it does not know: the entry has no
+kind there, and `Kind` is listed among its other fields.
+
+**Not decided here.** Which credentials belong to one device is said, for
+now, by the group they are in — one group for each device. One entry that
+holds several secrets is planned ([roadmap](../roadmap.md)) and needs an ADR
+of its own.

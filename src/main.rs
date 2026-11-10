@@ -321,6 +321,8 @@ enum KindArg {
     Server,
     /// A device such as a router; --url is its admin page.
     Device,
+    /// A private key for SSH, as the entry's value (--stdin stores one).
+    SshKey,
     /// No particular kind.
     Other,
 }
@@ -332,6 +334,7 @@ impl KindArg {
             KindArg::Login => Some(EntryKind::Login),
             KindArg::Server => Some(EntryKind::Server),
             KindArg::Device => Some(EntryKind::Device),
+            KindArg::SshKey => Some(EntryKind::SshKey),
             KindArg::Other => None,
         }
     }

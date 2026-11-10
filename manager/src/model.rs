@@ -191,7 +191,7 @@ pub(crate) fn offers(kind: Option<EntryKind>, field: Field) -> bool {
         (
             Some(EntryKind::ApiKey | EntryKind::Login),
             Field::Host | Field::Port
-        ) | (Some(EntryKind::Server), Field::Url)
+        ) | (Some(EntryKind::Server | EntryKind::SshKey), Field::Url)
             | (Some(EntryKind::Device), Field::Port)
     )
 }
@@ -204,12 +204,13 @@ pub(crate) fn shows(kind: Option<EntryKind>, field: Field, has_text: bool, withh
 }
 
 /// The choices of the form's Kind row, in order: "Other" first.
-pub(crate) const KIND_CHOICES: [Option<EntryKind>; 5] = [
+pub(crate) const KIND_CHOICES: [Option<EntryKind>; 6] = [
     None,
     Some(EntryKind::ApiKey),
     Some(EntryKind::Login),
     Some(EntryKind::Server),
     Some(EntryKind::Device),
+    Some(EntryKind::SshKey),
 ];
 
 /// How a kind is named in the form and the details.
@@ -1193,7 +1194,10 @@ pub(crate) mod tests {
         assert_eq!(offered(Some(EntryKind::Login)), [Username, Url]);
         assert_eq!(offered(Some(EntryKind::Server)), [Username, Host, Port]);
         assert_eq!(offered(Some(EntryKind::Device)), [Username, Url, Host]);
-        assert_eq!(KIND_CHOICES.len(), EntryKind::ALL.len() + 1);
+        assert_eq!(offered(Some(EntryKind::SshKey)), [Username, Host, Port]);
+        // Every kind is a choice of the form, once, after "Other".
+        assert_eq!(KIND_CHOICES[0], None);
+        assert_eq!(KIND_CHOICES[1..], EntryKind::ALL.map(Some));
         // A kind never hides a row with text, nor one the file withholds.
         let api = Some(EntryKind::ApiKey);
         assert!(!shows(api, Host, false, false));

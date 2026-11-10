@@ -532,6 +532,20 @@ fn desktop_flow() {
     kind.set_selected(4);
     assert_eq!(inputs[3].title(), "Admin page");
     assert!(!inputs[5].is_visible());
+    // An SSH key: username, host and port. The URL keeps its plain name, and
+    // its row stays, because it has a value.
+    let choices = kind
+        .model()
+        .and_downcast::<gtk::StringList>()
+        .expect("the kinds");
+    assert_eq!(choices.string(5).as_deref(), Some("SSH key"));
+    kind.set_selected(5);
+    assert_eq!(inputs[3].title(), "URL");
+    assert!(inputs[2].is_visible() && inputs[4].is_visible() && inputs[5].is_visible());
+    assert!(
+        inputs[3].is_visible(),
+        "an SSH key offers no URL, but this one has a value"
+    );
     // A row the file withholds stays, with its warning, whatever the kind.
     let loose: Vec<adw::EntryRow> = (0..7).map(|_| adw::EntryRow::new()).collect();
     shape_rows(

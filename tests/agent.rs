@@ -7323,6 +7323,83 @@ fn kinds_are_set_listed_and_cleared_and_run_passes_the_endpoint() {
     );
 }
 
+/// The kind `ssh-key` says that an entry's value is a private key, so that
+/// an AI agent can tell it from a server reached with a password
+/// (`list --kind ssh-key`). It is a label like the other kinds: nothing
+/// checks it against the value.
+#[test]
+fn an_ssh_key_entry_is_told_apart_by_its_kind() {
+    let h = Harness::new();
+    h.add_secret(
+        "lab-password",
+        "pi-pass-123456",
+        &[
+            "--kind",
+            "server",
+            "--username",
+            "root",
+            "--host",
+            "10.0.0.5",
+        ],
+    );
+    // The value is no key: the kind is not checked against it.
+    h.add_secret(
+        "lab-key",
+        "FAKE-not-a-key-123456",
+        &[
+            "--kind",
+            "ssh-key",
+            "--username",
+            "root",
+            "--host",
+            "10.0.0.5",
+            "--port",
+            "2222",
+        ],
+    );
+
+    let out = h.run(&["show", "lab-key"]);
+    assert!(
+        text(&out.stdout).contains("kind:       ssh-key (SSH key)"),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = h.run(&["list", "--kind", "ssh-key", "--json"]);
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("\"lab-key\"")
+            && listed.contains("\"kind\": \"ssh-key\"")
+            && !listed.contains("lab-password"),
+        "{listed}"
+    );
+    let out = h.run(&["list", "--kind", "server"]);
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("lab-password") && !listed.contains("lab-key"),
+        "{listed}"
+    );
+
+    // An existing entry gets the kind with `edit`; the dialog names it.
+    h.decide(&[Decision::AllowOnce]);
+    let out = h.run(&["edit", "lab-password", "--kind", "ssh-key"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(
+        request
+            .details
+            .iter()
+            .any(|(k, v)| k == "New kind" && v == "SSH key"),
+        "{:?}",
+        request.details
+    );
+    let out = h.run(&["list", "--kind", "ssh-key"]);
+    let listed = text(&out.stdout);
+    assert!(
+        listed.contains("lab-password") && listed.contains("lab-key"),
+        "{listed}"
+    );
+}
+
 #[test]
 fn the_run_dialog_shows_destination_settings_without_credentials() {
     let h = Harness::new();

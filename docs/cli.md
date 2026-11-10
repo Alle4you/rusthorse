@@ -267,6 +267,7 @@ An entry can say what it is for, with `--kind` in `add` and `edit`:
 | `login` | A sign-in to a website or web console | The sign-in page |
 | `server` | A server reached by host and port (SSH, a database, …) | — |
 | `device` | A device such as a router or a camera | Its admin page |
+| `ssh-key` | A private key for SSH, held as the entry's value; `--username`, `--host` and `--port` say where it logs in | — |
 | `other` | No particular kind (the default) | Any access link |
 
 The kind names the fields and decides which ones the manager's form offers
@@ -274,6 +275,11 @@ The kind names the fields and decides which ones the manager's form offers
 is stored in the KDBX field `Kind`, which KeePassXC shows as an attribute.
 It grants and restricts nothing. See
 [ADR 0008](adr/0008-entry-kinds.md).
+
+The kind is a label that you set: nothing checks it against the entry's
+value. `ssh-key` tells an AI agent that the value is a private key and not a
+password, so that it uses the right recipe of its guide; an entry of another
+kind may hold a key too, and the agent is told to ask when it cannot tell.
 
 ## `rusthorse add`
 
@@ -307,13 +313,16 @@ creating it if needed (`Work/Servers`). A path into the recycle bin that
 another KeePass client keeps is refused, before the value is asked for: an
 entry there would be hidden from every listing, as if deleted.
 
-Examples — an API key with its endpoint, and a router with its access
-details:
+Examples — an API key with its endpoint, a router with its access details,
+and a private key for SSH to that router, read from its file (a key has
+several lines, and the dialog's field takes one):
 
 ```sh
 rusthorse add OPENAI_API_KEY --kind api-key --url https://api.openai.com/v1 --tag ai
 rusthorse add core-router --kind device --username admin --url https://10.0.0.1/ \
     --host 10.0.0.1 --port 443 --tag network --notes "Rack 2, console on J3"
+rusthorse add core-router-key --kind ssh-key --username admin --host 10.0.0.1 \
+    --group Network/core-router --stdin < ~/.ssh/core-router
 ```
 
 ## `rusthorse edit`

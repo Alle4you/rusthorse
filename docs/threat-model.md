@@ -344,8 +344,9 @@ While the vault is unlocked, any process of your user can list entry names,
 kinds, usernames, URLs, hosts, ports and tags (fields marked protected in the
 KDBX file are withheld). This is deliberate — an agent needs to know what
 exists and where it points — but do not put secrets in those fields. A kind
-is a label: nothing grants or restricts access by it
-([ADR 0008](adr/0008-entry-kinds.md)).
+is a label: nothing grants or restricts access by it, and nothing checks it
+against the value — the kind `ssh-key` says that a value is a private key
+because someone set it so ([ADR 0008](adr/0008-entry-kinds.md)).
 
 ### L7 — Memory hygiene is best effort
 
@@ -784,6 +785,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-09 | The SSH recipes of the guide for AI agents, `d88f7a5` and `eb75d19` (Codex, AI-assisted). | Not ready: SSH01 medium (the probe "without a secret" offered the human's own keys), SSH02–SSH05 low; fixed in the same change; see below. |
 | 2026-11-09 | The documentation correction, whole, and the SSH fixes (Codex, AI-assisted). | Not ready: SSH01–SSH05 confirmed fixed; DOC01–DOC06 low, fixed. Confirmation the same day: ready, no new finding; see below. |
 | 2026-11-10 | The SSH recipes tried against servers, by hand (the maintainer and the maintainer's agent; a test, not a review). | The probe, the key recipe and the password recipe worked for what was tried, on two routers; SSH06 low (nothing tells a password from a private key, and the agent first chose the wrong recipe), fixed in the guide, with a design decision left to the maintainer. The record and the fix reviewed the same day (Codex, AI-assisted): not ready with T01–T04 low, fixed, then ready; see below. |
+| 2026-11-10 | The entry kind `ssh-key` and protocol 11, the maintainer's answer to SSH06 ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)). | A label, like the other kinds: no policy reads it and nothing checks it against the value. Reviewed the same day (Codex, AI-assisted): not ready with K01–K03 low, fixed; the confirmation found K04 and K05 low, in the record, fixed; then ready; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -3320,3 +3322,66 @@ Confirmation (Codex, AI-assisted, 2026-11-10): **ready.** T01 to T04
 confirmed fixed, with no new finding, and this record found accurate. The
 reviewer ran the guide's three tests again; it did not repeat the local
 measurement or run the matrix.
+
+**2026-11-10 — The entry kind `ssh-key` (ADR 0008, amended).**
+
+SSH06 left a decision to the maintainer, who took it the same day: a fifth
+kind, `ssh-key`, for an entry whose value is a private key, so that an AI
+agent can tell it from a password by the entry's metadata; and one group for
+each device, which needs no code. What was built: the word in the protocol,
+where it is stored, sent and parsed, with protocol 11; `--kind ssh-key` in
+the CLI; the Kind row of the manager's form, which offers Username, Host and
+Port for it; the guide's rule — the kind names the key recipe, and the agent
+asks about an entry that does not say what it holds; the documents.
+
+What it does not do, by design: it is a label, as every kind is. No policy
+depends on it, and nothing checks it against the value — an entry of kind
+`ssh-key` may hold anything, and an entry of another kind may hold a key. The
+dialogs of `add` and `edit` show its name, as they show any kind's; what
+needs approval and what is recorded did not change. Rusthorse does not look
+at a value to find out what it is, which would put a fact about a secret in
+metadata that is read without approval (L6). A label that is wrong misleads
+as the old notes did; the guide tells the agent to ask when an entry does not
+say.
+
+Tests: one end to end (an entry added with the kind, shown, found by
+`list --kind ssh-key` and not by `list --kind server`, and an existing entry
+given the kind with `edit`, whose dialog names it), and unit tests of the
+words as stored and sent, of a `Kind` typed in another client, and of the
+manager's form. Eight mutations, on a copy of the repository with a target
+directory of its own, each failed a test or the build: the CLI's option
+giving another kind; the stored word changed; the form offering the URL for
+the kind; the kind missing from the form's choices; the protocol version
+back at 10 (an assertion at compile time, moved to 11); the kind missing
+from the guide's list; its name for people changed; the kind not read from
+a file.
+
+Review (Codex, AI-assisted, 2026-11-10; verdict: **not ready**, three low
+findings; none high or medium, and no defect of security or of
+compatibility in the implementation), its confirmation (K01 to K03
+confirmed fixed; **not ready** again, with two low findings in this
+record), and what was done:
+
+| Finding | Disposition |
+|---|---|
+| Low — K01: two statements of the current version in `docs/protocol.md` still said 10: its heading, and the requests the manager uses. | **Fixed:** both say 11; the history of the versions keeps its 10. |
+| Low — K02: this record said that no dialog reads the kind. The dialogs of `add` and `edit` show its name; the end-to-end test checks the dialog of `edit`. | **Fixed:** the record says what the dialogs show, and that what needs approval and what is recorded did not change. |
+| Low — K03: no widget test chose the new kind in the manager's form: a mutation that gave it another kind's name for the URL ("Endpoint URL") passed the manager's 45 tests. The code was right; the gap was in the tests. | **Fixed:** the manager's widget test of the form chooses "SSH key" and checks its rows and the URL's plain name. With the reviewer's mutation, on a copy with a target directory of its own, that test fails. |
+| Low — K04, from the confirmation: this record said that `--stdin` keeps a value of several lines whole. It keeps the line breaks inside the value and removes those at its end, as the CLI reference says. | **Fixed** in the record. |
+| Low — K05, from the confirmation: this record said that the end-to-end test checks the dialogs of `add` and `edit`. It checks the dialog of `edit`; that the dialog of `add` shows the kind's name was read in the code. | **Fixed** in the record. |
+
+Also checked by the reviewer, and found right: no decision about access, no
+behaviour of the broker and no generated command depends on the kind; with
+the protocol's types as they were before this change, `ssh-key` is refused in
+`add`, in `edit` and in an entry read, and the agent answers
+`invalid_request` before it acts, so the version had to change; an unknown
+`Kind` is listed by name, and a protected one withheld; the new example of
+the CLI reference runs, and `--stdin` keeps the line breaks inside a value
+and removes those at its end. The maintainer's agent ran the whole matrix of
+`AGENTS.md`'s checks after the fixes: the twelve steps passed. The reviewer
+did not run that matrix, or repeat the eight mutations.
+
+Second confirmation (Codex, AI-assisted, 2026-11-10): **ready.** K04 and K05
+confirmed fixed, with no new finding, and the whole record found accurate.
+The reviewer ran no test in that round. The maintainer's agent ran the
+matrix once more on the tree as committed: the twelve steps passed.

@@ -4,7 +4,7 @@ This is the protocol between clients and the Rusthorse agent. The `rusthorse`
 CLI is the reference client; this document is for anyone writing another one
 (a GUI, an editor plugin, a browser bridge).
 
-Protocol version: **10** (`PROTOCOL_VERSION` in
+Protocol version: **11** (`PROTOCOL_VERSION` in
 [`src/protocol.rs`](../src/protocol.rs)).
 
 | Version | Changes |
@@ -19,6 +19,7 @@ Protocol version: **10** (`PROTOCOL_VERSION` in
 | 8 | `broker_run`, `broker_edit`, `grants`, `revoke_grant`; optional entry profile and broker status fields. Separate request tags make a protocol-7 agent refuse broker operations whole even if the agent changes between the version check and the request. Added later, optional: `GrantInfo.unauthorized`, `exited.unauthorized`. |
 | 9 | The broker without profiles or presets ([ADR 0013](adr/0013-credential-broker.md#the-broker-without-profiles-or-presets)): `broker_run_v2`, whose broker bindings each name their `destination` and whose `limits` set the grants' limits, with unknown fields refused. `broker_run` and `broker_edit` are gone (refused), and so are `EntryInfo.broker`, `EntryChanges.broker`, `"broker"` in `EntryChanges.clear` and `GrantInfo.preset`; `EntryChanges` refuses fields it does not know. `GrantInfo.destination` and `exited.unauthorized[].destination` mean the approved origin, no longer the profile's origin and base path; `GrantInfo.base_path` (optional) is new. A run through the broker is a new request rather than `broker_run` with more fields: a protocol-8 agent would accept that and ignore the destinations and the limits. |
 | 10 | The agent's settings ([ADR 0007, section 3](adr/0007-visual-manager.md#3-persistent-agent-configuration-m2)): `configure` (see [Configure](#configure)) and `status.settings` (optional). For `configure`, every error other than `outcome_unknown` also means that the settings file was not replaced and no setting changed. |
+| 11 | The entry kind `ssh-key` ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)): a new value of `kind` (see [Entry kinds](#entry-kinds)). An agent of version 10 does not know it and a client of version 10 cannot read an entry that has it, so the version changed. |
 
 Clients should send `status` first and refuse to continue when
 `protocol_version` differs from theirs (the `rusthorse` CLI does). Versions
@@ -321,7 +322,8 @@ dialog. An entry overwritten with `replace` stays in its group.
 
 ### Entry kinds
 
-`kind` says what an entry is for. It is one of:
+`kind` says what an entry is for — or, for `api-key` and `ssh-key`, what
+its value is. It is one of:
 
 | `kind` | For | What the `url` is |
 |---|---|---|
@@ -329,11 +331,13 @@ dialog. An entry overwritten with `replace` stays in its group.
 | `login` | A sign-in to a website or web console | The sign-in page |
 | `server` | A server reached by host and port (SSH, a database, …) | — |
 | `device` | A device such as a router or a camera | Its admin page |
+| `ssh-key` | A private key for SSH, held as the entry's value; username, host and port say where it logs in (protocol 11) | — |
 
 An entry without `kind` is of no particular kind. The kind changes how
 clients label and offer the fields; the agent attaches no meaning to it — it
 grants nothing, restricts nothing and is not checked against the other
-fields. It is metadata like the URL: readable without approval.
+fields or against the value. It is metadata like the URL: readable without
+approval.
 
 The vault stores it in the KDBX custom field `Kind`, as the text above. A
 `Kind` field holding anything else (written by another KeePass client, say) is
@@ -350,7 +354,7 @@ listed here is refused (since protocol 9), and the edit with it.
 | `rename` | string | New name. |
 | `username`, `url`, `host`, `notes` | string | New value (an empty string removes the field). |
 | `port` | integer 0–65535 | New port. |
-| `kind` | `"api-key"`, `"login"`, `"server"` or `"device"` | New kind (protocol 5). To remove the kind, put `"kind"` in `clear`. |
+| `kind` | `"api-key"`, `"login"`, `"server"`, `"device"` or `"ssh-key"` | New kind (protocol 5; `"ssh-key"` since protocol 11). To remove the kind, put `"kind"` in `clear`. |
 | `group` | string | Move the entry to the group at this path (protocol 7), e.g. `"Work/Servers"`, created if missing; `""` or `"/"` is the top level. See below. |
 | `clear` | array of `"username"`, `"url"`, `"host"`, `"port"`, `"notes"`, `"kind"` | Fields to remove. Since protocol 9, `"broker"` is not one of them: a request that names it is refused. |
 | `add_tags`, `remove_tags` | array of strings | Tag changes. |
@@ -521,7 +525,7 @@ a removed grant disappears; the manager may retain an ended row locally.
 ```json
 {
   "type": "status",
-  "protocol_version": 10,
+  "protocol_version": 11,
   "agent_version": "0.1.0",
   "vault": "/home/me/.local/share/rusthorse/vault.kdbx",
   "vault_exists": true,
@@ -680,6 +684,10 @@ grants may have been revoked even when a later audit write fails.
 - Removing or changing the meaning of a field or of an error code —
   including what an error guarantees about the request's effects — or
   changing framing, bumps `PROTOCOL_VERSION`.
+- Protocol 11 added the entry kind `ssh-key`. A client of protocol 11
+  refuses an agent of protocol 10 at its version check; met after that
+  check, an agent of protocol 10 refuses a request that names the kind,
+  which it cannot read.
 - Protocol 10 added `configure`. A client of protocol 10 refuses an agent of
   protocol 9 at its version check, and an agent of protocol 9 refuses
   `configure`, which it does not know.
@@ -693,7 +701,7 @@ grants may have been revoked even when a later audit write fails.
 
 ## Visual manager client
 
-`rusthorse-manager` uses the version-10 requests above, with the same approvals
+`rusthorse-manager` uses the version-11 requests above, with the same approvals
 as the CLI. It targets entries by UUID, sends `reveal` with purpose `show` or
 `copy` for its Show and Copy actions, sends `create_vault` when there is no
 vault yet, imports with `keyring_items`, `dotenv_names` and `import_from`, and

@@ -277,8 +277,10 @@ broker-specific limits.
   to see whether a host answers without offering it any key. The automated
   tests do not run these recipes; they were tried by hand on 2026-11-10, with
   OpenSSH 9.6 and sshpass 1.09, against two routers whose SSH server is
-  Dropbear, and no server or version is claimed supported. Rusthorse does
-  not record whether an entry's value is a password or a private key: say it
-  in the entry's name or in a tag, so that the agent chooses the right
-  recipe.
+  Dropbear, and no server or version is claimed supported. Give an entry
+  whose value is a private key the kind `ssh-key` (`rusthorse edit NAME
+  --kind ssh-key`, or the Kind row of the manager's form): the guide tells
+  the agent to use the key recipe for it. The kind is a label that you set —
+  Rusthorse does not look at the value — so the agent is told to ask about
+  an entry that does not say what it holds.
 - Review `rusthorse audit` now and then.

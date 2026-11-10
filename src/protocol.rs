@@ -62,15 +62,20 @@ use crate::broker_grant::{AutomaticLocks, GrantLimits};
 ///
 /// 10: the agent's settings (ADR 0007, section 3): the `configure` request
 /// and `status.settings`.
-pub const PROTOCOL_VERSION: u32 = 10;
+///
+/// 11: the entry kind `ssh-key` (ADR 0008, amended): a new value of `kind`.
+/// A version-10 agent refuses a request that names it, and a version-10
+/// client cannot read a list that holds such an entry.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 // Clients trust that errors other than `outcome_unknown` mean nothing changed
 // (version 3 and later, N31), and that an approval for `reveal.purpose` says
 // what the manager does (version 4; builds that reported 3 promised a single
 // paste for `copy`), that the agent keeps an entry's `kind` (version 5), and
-// that a run through the broker goes where it names (version 9). The
-// version must never go back below 9.
-const _: () = assert!(PROTOCOL_VERSION >= 9);
+// that a run through the broker goes where it names (version 9), and that
+// the agent knows the kind `ssh-key`, which its clients send and read
+// (version 11). The version must never go back below 11.
+const _: () = assert!(PROTOCOL_VERSION >= 11);
 
 /// Largest accepted frame body, in bytes.
 pub const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
@@ -446,9 +451,11 @@ impl Request {
     }
 }
 
-/// What an entry is for. It decides which fields a form offers and how they
-/// are labelled (the URL of an API key is its endpoint); it never hides a
-/// field that has a value, and it grants or restricts nothing.
+/// What an entry is for — or, for `api-key` and `ssh-key`, what its value
+/// is. It decides which fields a form offers and how they are labelled (the
+/// URL of an API key is its endpoint); it never hides a field that has a
+/// value, and it grants or restricts nothing. It is a label that a person
+/// or a client sets: nothing checks it against the value.
 ///
 /// Stored in the KDBX custom field `Kind` as [`EntryKind::as_str`]. An entry
 /// without one is of no particular kind ("Other": every field is offered).
@@ -463,19 +470,30 @@ pub enum EntryKind {
     Server,
     /// A device such as a router or a camera: host, admin page, username.
     Device,
+    /// A private key for SSH, held as the entry's value: username, host
+    /// and port say where it logs in.
+    SshKey,
 }
 
 impl EntryKind {
     /// Every kind, in the order forms offer them.
-    pub const ALL: [EntryKind; 4] = [Self::ApiKey, Self::Login, Self::Server, Self::Device];
+    pub const ALL: [EntryKind; 5] = [
+        Self::ApiKey,
+        Self::Login,
+        Self::Server,
+        Self::Device,
+        Self::SshKey,
+    ];
 
-    /// The stored and serialized form: `api-key`, `login`, `server`, `device`.
+    /// The stored and serialized form: `api-key`, `login`, `server`,
+    /// `device`, `ssh-key`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ApiKey => "api-key",
             Self::Login => "login",
             Self::Server => "server",
             Self::Device => "device",
+            Self::SshKey => "ssh-key",
         }
     }
 
@@ -495,6 +513,7 @@ impl EntryKind {
             Self::Login => "Website login",
             Self::Server => "Server",
             Self::Device => "Device",
+            Self::SshKey => "SSH key",
         }
     }
 
@@ -1724,6 +1743,10 @@ mod tests {
             assert_eq!(EntryKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(EntryKind::parse("api_key"), None);
+        // The words themselves: they are stored in vault files and sent.
+        let words = EntryKind::ALL.map(EntryKind::as_str);
+        assert_eq!(words, ["api-key", "login", "server", "device", "ssh-key"]);
+        assert_eq!(EntryKind::parse("ssh_key"), None);
         // In an entry the kind sits with the other fields, and is omitted
         // when there is none (what a protocol-4 client would have sent).
         let info = EntryInfo {

@@ -163,6 +163,7 @@ that kind uses:
 | Website login | Username, URL | URL |
 | Server | Username, Host, Port | — |
 | Device | Username, URL, Host | Admin page |
+| SSH key | Username, Host, Port | — |
 | Other | all of them | URL |
 
 A field that already has a value stays in the form whatever the kind, so

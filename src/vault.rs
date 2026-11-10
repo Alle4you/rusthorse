@@ -14,7 +14,7 @@
 //! | tags       | `Tags`             | —         |
 //! | kind       | `Kind`             | no        |
 //!
-//! `Kind` holds `api-key`, `login`, `server` or `device`
+//! `Kind` holds `api-key`, `login`, `server`, `device` or `ssh-key`
 //! ([`EntryKind::as_str`]). Any other text there is left alone: the entry
 //! has no kind, and `Kind` is listed with the other fields.
 //! Every other field is listed by name only, its value never read: among
@@ -2101,6 +2101,8 @@ mod tests {
         // Typed by a person in another client: case and spaces forgiven.
         set(&mut vault, " API-Key ", false);
         assert_eq!(vault.info(id).fields.kind, Some(EntryKind::ApiKey));
+        set(&mut vault, "SSH-Key", false);
+        assert_eq!(vault.info(id).fields.kind, Some(EntryKind::SshKey));
         // Not one of ours: no kind, and the field stays visible by name.
         set(&mut vault, "personal", false);
         let info = vault.info(id);

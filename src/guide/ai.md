@@ -48,7 +48,7 @@ None of these commands shows a value, and none needs approval:
 
 ```sh
 rusthorse list                    # name, username, endpoint (URL or host:port), tags
-rusthorse list --kind api-key     # kinds: api-key, login, server, device, other
+rusthorse list --kind api-key     # kinds: api-key, login, server, device, ssh-key, other
 rusthorse list --search github    # name, group, username, URL, host or tags contain it
 rusthorse list --tag ai
 rusthorse list --json             # the same as a JSON array
@@ -128,11 +128,13 @@ not a secret and is not redacted.
 
 ### SSH
 
-An entry's value may be a password or a private key, and its metadata does
-not say which: `has_password` is true for both. If the entry's name, kind or
-tags do not tell you, ask the human before you choose a recipe. The
-password recipe gives the entry's value to `sshpass` as the password to
-type: for a private key, use the key recipe below.
+An entry's value may be a password or a private key: `has_password` is true
+for both. The kind `ssh-key` says that an entry's value is a private key:
+use the key recipe below for it (`rusthorse list --kind ssh-key` finds such
+entries). The kind is a label that a person sets, and an entry of another
+kind, or of none, may hold a key too: if its name or tags do not tell you,
+ask the human before you choose a recipe. The password recipe gives the
+entry's value to `sshpass` as the password to type.
 
 ssh reads no password from the environment: `sshpass -e` passes it the one
 in `SSHPASS`. Take the username, the host and the port (`-p PORT`, when it is
