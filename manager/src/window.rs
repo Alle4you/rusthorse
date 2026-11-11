@@ -3245,17 +3245,52 @@ impl Manager {
         let g = group(
             "Destination",
             Some(
-                "A new absolute path (no ~). An existing file is never replaced. The agent copies the encrypted vault and checks that the copy opens; it may ask you to unlock first.",
+                "Choose a folder and a file name, or type a new absolute path (no ~). An existing file is never replaced, even when the file dialog offers to replace it. The agent copies the encrypted vault and checks that the copy opens; it may ask you to unlock first.",
             ),
         );
         let path = adw::EntryRow::builder()
             .title("File path")
             .use_markup(false)
             .build();
+        let choose = button("Choose…", Some("document-save-as-symbolic"));
+        choose.set_tooltip_text(Some("Choose the folder and the file name…"));
+        choose.update_property(&[gtk::accessible::Property::Label(
+            "Choose the folder and the file name of the backup",
+        )]);
+        choose.set_valign(gtk::Align::Center);
+        path.add_suffix(&choose);
         g.add(&path);
         body.append(&g);
         let error = styled("", &["error"]);
         body.append(&error);
+        // The button is inside the row and the window: the handler holds
+        // them weakly, or they would keep each other alive.
+        let w = window.downgrade();
+        let row = path.downgrade();
+        let shown = error.downgrade();
+        choose.connect_clicked(move |_| {
+            let (Some(w), Some(typed)) = (w.upgrade(), row.upgrade().map(|r| r.text())) else {
+                return;
+            };
+            let row = row.clone();
+            let shown = shown.clone();
+            backup_dialog(&typed).save(Some(&w), gio::Cancellable::NONE, move |result| {
+                // Cancelled or dismissed: the path stays as it was.
+                let Ok(file) = result else { return };
+                let (Some(row), Some(shown)) = (row.upgrade(), shown.upgrade()) else {
+                    return;
+                };
+                match file.path().and_then(|p| p.to_str().map(String::from)) {
+                    Some(chosen) => {
+                        row.set_text(&chosen);
+                        shown.set_text("");
+                    }
+                    None => {
+                        shown.set_text("Rusthorse backs up only to a local file with a UTF-8 path.")
+                    }
+                }
+            });
+        });
         let header = adw::HeaderBar::builder()
             .show_end_title_buttons(false)
             .show_start_title_buttons(false)
@@ -3297,6 +3332,32 @@ impl Manager {
         });
         window.present();
         *self.editor.borrow_mut() = Some(window);
+    }
+}
+
+/// The file dialog of **Create verified backup**: it starts at the path in
+/// the form when that is absolute, or offers a name with today's date, as
+/// the installation guide's example does.
+fn backup_dialog(typed: &str) -> gtk::FileDialog {
+    let dialog = gtk::FileDialog::builder()
+        .title("Save the backup as")
+        .modal(true)
+        .build();
+    let typed = std::path::Path::new(typed);
+    if typed.is_absolute() && typed.file_name().is_some() {
+        dialog.set_initial_file(Some(&gio::File::for_path(typed)));
+    } else {
+        dialog.set_initial_name(Some(&backup_name(glib::DateTime::now_local().ok())));
+    }
+    dialog
+}
+
+/// The name the file dialog of a backup offers: `rusthorse-` and the date
+/// (YYYY-MM-DD), or `rusthorse-backup` when the date is not known.
+fn backup_name(now: Option<glib::DateTime>) -> String {
+    match now.and_then(|d| d.format("%F").ok()) {
+        Some(date) => format!("rusthorse-{date}.kdbx"),
+        None => "rusthorse-backup.kdbx".into(),
     }
 }
 

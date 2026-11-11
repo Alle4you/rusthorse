@@ -532,9 +532,13 @@ first, use each entry, then delete the originals.
 
 ### Back up the vault
 
-**Import & backup → Create verified backup…** asks for a new absolute path
-(`~` is not expanded; an existing file is never replaced). The agent copies
-the encrypted vault and checks that the copy opens with the current master
+**Import & backup → Create verified backup…** asks for a new absolute path.
+**Choose…** opens a file dialog, where you pick the folder and the file name
+(it offers `rusthorse-YYYY-MM-DD.kdbx`, with today's date, or starts at the
+path already in the form); or type the path (`~` is not expanded). An
+existing file is never replaced, even when the file dialog offers to replace
+it: the agent refuses, and you choose another name. The agent copies the
+encrypted vault and checks that the copy opens with the current master
 password. A copy whose check fails is left in place, and the message names
 it. Keep backups somewhere else as well.
 
@@ -624,16 +628,17 @@ on that session, and GVfs, the accessibility bus, the settings portal and
 Mesa's shader cache are turned off, so that no desktop service starts for
 the tests, outlives them or writes into their directory. The main widget test
 starts a real agent in the test process, on a fake vault, socket and audit
-log, with scripted dialogs; it drives the window, reads the clipboard with
-`xclip` as another program would, and focuses windows with `xdotool`. Missing
-tools (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it fail rather
-than pass untested. It also checks that the History page shows the unlock that
-agent recorded. The Grants page, the History page, the Settings page and an
-entry's two commands are tested against a fake agent in the test process
-instead — a test agent cannot start a broker, and the history needs a log
-written for the test: it answers from a script, records every request, and can
-hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
-screenshots of the window in the light and dark styles, of the Show window,
-of the Grants page (also with a grant that ended while it was shown, and
-with a key the destination refused), of the History page, of the Settings page
-and of an entry's two commands.
+log, with scripted dialogs; it drives the window (the backup's file dialog
+is GTK's own there, as no portal serves that session), reads the clipboard
+with `xclip` as another program would, and focuses windows with `xdotool`.
+Missing tools (`xvfb-run`, `dbus-run-session`, `xclip`, `xdotool`) make it
+fail rather than pass untested. It also checks that the History page shows the
+unlock that agent recorded. The Grants page, the History page, the Settings
+page and an entry's two commands are tested against a fake agent in the test
+process instead — a test agent cannot start a broker, and the history needs a
+log written for the test: it answers from a script, records every request, and
+can hold an answer back. Set `MANAGER_TEST_SCREENSHOTS=/some/dir` to save
+screenshots of the window in the light and dark styles, of the Show window, of
+the Grants page (also with a grant that ended while it was shown, and with a
+key the destination refused), of the History page, of the Settings page and of
+an entry's two commands.

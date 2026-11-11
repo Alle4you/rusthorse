@@ -132,6 +132,11 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   the items or names (after the agent asks you), mark each name new,
   existing, not allowed, repeated or locked, and import the ticked ones in
   batches.
+- **Choose where a backup goes**: the manager's **Create verified backup…**
+  form has **Choose…**, which opens a file dialog to pick the folder and the
+  file name (it offers `rusthorse-YYYY-MM-DD.kdbx`), instead of only a field
+  for an absolute path, which can still be typed. An existing file is still
+  never replaced.
 - **Imports are read by the agent**: new requests `keyring_items`,
   `dotenv_names` and `import_from`. The client names keyring items or
   variables and the entry names; the agent reads the values, and its dialog

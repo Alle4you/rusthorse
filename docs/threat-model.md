@@ -4244,3 +4244,84 @@ created at the first record; approvals and grants start empty. The
 maintainer's agent reported `git diff --check` and all 25 packaging tests
 passing after the addition. This confirmation read the code and ran
 `git diff --check`; it did not build or run tests.
+
+**2026-11-11 — Choose where a backup goes in the manager.**
+
+The maintainer asked to choose the backup's folder instead of typing an
+absolute path. The form now has **Choose…**, which opens
+`gtk::FileDialog::save` over it. It starts at a typed absolute path with a
+file name, or offers `rusthorse-YYYY-MM-DD.kdbx`
+(`rusthorse-backup.kdbx` if the date is unavailable). The chosen file fills
+the field; cancellation leaves it unchanged. A selected file without a
+local UTF-8 path shows an error. The request remains
+`Request::Backup { path }`: no protocol, agent or security invariant changed.
+`Vault::backup_to` still refuses existing files with `create_new(true)`,
+even when the file dialog offers to replace one.
+
+**Implementer's checks (Claude Code, AI-assisted).** Mutations ran in a
+temporary copy with its own target directory, against
+`window::tests::desktop_flow`:
+
+- M1: do not put the chosen path in the field — caught.
+- M2: do not start at the typed path — caught.
+- M3: omit the form as the dialog's parent — caught.
+- M5: offer a name without the date — caught.
+- M4: clear the field on cancellation — survived the first version of
+  the test.
+
+A click emitted by the test outside the main loop makes FileDialog's
+GTask deliver its callback from an idle. The old assertion ran before
+that callback. With `drain()` before the assertion, M4 fails. All five
+mutations were rerun after that correction and caught; the unmutated
+version passed. Under load, 12 executions of `desktop_flow`, four at a
+time with two processes occupying CPUs, all passed. These are the
+implementer's results, not mutation runs repeated by the reviewer.
+
+**Independent review (Codex, AI-assisted, 2026-11-11).** One low finding,
+fixed during review; no medium or higher finding or outstanding finding
+in the final version:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| T01: cancellation checked too early. | Low | Fixed: `drain()`; M4 fails. |
+
+The reviewer's standalone GTK 4.14.5 probe used a deliberately faulty
+callback that cleared the field on cancellation. Before `drain()`, the
+callback had not run and the unchanged-field assertion passed; afterwards,
+it had run and the field was empty. Production cancellation already left
+the field unchanged. Six additional `desktop_flow` executions, three
+simultaneously, passed before the test correction. Formatting, manager
+clippy and its 45 tests passed before and after it; their private
+temporary directories were empty afterwards. Reading the handlers found
+no new reference cycle; reading GTK 4.14.5's portal implementation
+checked the parent, modality and returned file handling. This was not a
+runtime test with a real portal or instrumentation for widget leaks.
+
+**Final checks by the reviewer.** The working tree matched the staged tree
+`e86de9e37794381b5d9407c176e9a4431639a4f2` on `main` throughout the matrix.
+All twelve `AGENTS.md` checks passed: formatting; both workspace clippy
+configurations; both feature-set test suites; documentation with warnings
+denied; both MSRV 1.89 checks; and clippy and tests for the dialog and
+manager. Commands ran sequentially with `CARGO_BUILD_JOBS=5`,
+`RUST_TEST_THREADS=5` and a private `TMPDIR` of mode `0700`; GTK tests
+used their virtual displays. All output was read.
+
+| Test command | Passed | Ignored |
+|---|---|---|
+| `cargo test --all-features` | 653 | 2 |
+| `cargo test --no-default-features` | 543 | 2 |
+| `cargo test -p rusthorse-dialog` | 9 (4 unit, 5 Xvfb) | 0 |
+| `cargo test -p rusthorse-manager` | 45 | 0 |
+
+The descriptor-limit test's child rerun is not counted twice. The two
+existing ignored tests are the real KDF timing and the one requiring
+`keepassxc-cli`; neither was run. The suites included the agent's
+end-to-end tests (195 with all features, 172 without) and the broker's
+system tests (35 with all features, none without). The temporary directory
+was empty after every step. No package was installed or service changed.
+The matrix preceded this documentation-only record, left unstaged.
+
+Not verified: a real `xdg-desktop-portal` (the widget test uses GTK's own
+dialog because no portal serves its session), or a non-UTF-8 selection in
+the manager. No dialog was shown on the maintainer's screen, and no real
+vault, socket or keyring was used.

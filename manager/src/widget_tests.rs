@@ -57,6 +57,13 @@ fn spin_until(check: impl Fn() -> bool) {
     }
 }
 
+/// Run everything the main loop has pending now.
+fn drain() {
+    while glib::MainContext::default().pending() {
+        glib::MainContext::default().iteration(false);
+    }
+}
+
 #[track_caller]
 fn settle(s: &Rc<Manager>) {
     spin_until(|| s.job.borrow().is_none());
@@ -84,6 +91,52 @@ fn button(root: &impl IsA<gtk::Widget>, text: &str) -> gtk::Button {
                     .is_some_and(|c| c.label() == text)
         })
         .unwrap_or_else(|| panic!("button missing: {text}"))
+}
+
+/// The file dialog open now, if any: GTK's own, as no portal serves the
+/// tests' session bus. (GtkFileDialog shows it through the older file
+/// chooser API, deprecated for applications.)
+#[allow(deprecated)]
+fn open_file_chooser() -> Option<gtk::FileChooserDialog> {
+    gtk::Window::list_toplevels().into_iter().find_map(|w| {
+        w.downcast::<gtk::FileChooserDialog>()
+            .ok()
+            .filter(|d| d.is_visible())
+    })
+}
+
+/// Click a form's Choose… and wait for the file dialog it opens over it.
+#[allow(deprecated)]
+#[track_caller]
+fn file_chooser(form: &adw::Window) -> gtk::FileChooserDialog {
+    spin_until(|| open_file_chooser().is_none());
+    button(form, "Choose…").emit_clicked();
+    spin_until(|| open_file_chooser().is_some());
+    let chooser = open_file_chooser().unwrap();
+    assert_eq!(
+        chooser.transient_for().as_ref(),
+        Some(form.upcast_ref::<gtk::Window>())
+    );
+    chooser
+}
+
+/// The folder and the file name the file dialog offers.
+#[allow(deprecated)]
+fn chooser_offers(chooser: &gtk::FileChooserDialog) -> (Option<PathBuf>, Option<String>) {
+    (
+        chooser.current_folder().and_then(|f| f.path()),
+        chooser.current_name().map(String::from),
+    )
+}
+
+/// In the file dialog, go to `file`'s folder, type its name and click Save.
+#[allow(deprecated)]
+fn save_as(chooser: &gtk::FileChooserDialog, file: &std::path::Path) {
+    chooser
+        .set_current_folder(Some(&gio::File::for_path(file.parent().unwrap())))
+        .unwrap();
+    chooser.set_current_name(file.file_name().unwrap().to_str().unwrap());
+    button(chooser, "_Save").emit_clicked();
 }
 
 /// The button with this widget name.
@@ -922,7 +975,33 @@ fn desktop_flow() {
     let editor = s.editor.borrow().as_ref().unwrap().clone();
     let path = entry_rows(&editor).remove(0);
     let backup = dir.path().join("backup.kdbx");
-    path.set_text(backup.to_str().unwrap());
+    // Choose… opens a file dialog over the form, offering a name with
+    // today's date; the file chosen there fills the path.
+    let date = glib::DateTime::from_local(2026, 11, 1, 9, 30, 0.0).ok();
+    assert_eq!(backup_name(date), "rusthorse-2026-11-01.kdbx");
+    assert_eq!(backup_name(None), "rusthorse-backup.kdbx");
+    let before = backup_name(glib::DateTime::now_local().ok());
+    let chooser = file_chooser(&editor);
+    let after = backup_name(glib::DateTime::now_local().ok());
+    let (_, offered) = chooser_offers(&chooser);
+    assert!(
+        offered.as_ref() == Some(&before) || offered.as_ref() == Some(&after),
+        "{offered:?}"
+    );
+    save_as(&chooser, &backup);
+    spin_until(|| path.text() == backup.to_str().unwrap());
+    // Again, it starts at that path; cancelled, it leaves the path as it was.
+    let chooser = file_chooser(&editor);
+    assert_eq!(
+        chooser_offers(&chooser),
+        (Some(dir.path().to_path_buf()), Some("backup.kdbx".into()))
+    );
+    button(&chooser, "_Cancel").emit_clicked();
+    spin_until(|| open_file_chooser().is_none());
+    // Answered outside the main loop (the test's click), the dialog calls
+    // back from an idle: let it run before looking at the path.
+    drain();
+    assert_eq!(path.text(), backup.to_str().unwrap());
     button(&editor, "Back up").emit_clicked();
     settle(&s);
     assert!(backup.is_file());
