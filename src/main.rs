@@ -1056,6 +1056,7 @@ fn run_agent(args: AgentArgs, socket: PathBuf) -> anyhow::Result<()> {
         // Each grant lasts as long as its run says (`--broker-lifetime`).
         broker_lifetime: None,
         settings: Some(sources),
+        audit_fifo_waits: false,
     };
     let ui = DesktopUi::new(effective.remember, effective.dialog_timeout);
     let listener = Agent::bind(&config.socket)?;

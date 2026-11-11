@@ -171,6 +171,9 @@ impl AuditEvent {
 #[derive(Debug)]
 pub struct AuditLog {
     path: PathBuf,
+    /// Whether a FIFO in place of the file is opened and written to, waiting
+    /// for a reader (see [`AuditLog::waiting_on_a_fifo`]).
+    fifo_waits: bool,
     /// Held while a record is written.
     lock: Mutex<Unsynced>,
     /// Records waiting for the log, for tests that hold it.
@@ -310,13 +313,41 @@ fn directory_of(path: &Path) -> &Path {
 }
 
 /// Open the log at `path` for appending, links followed, creating it with
-/// mode `0600` if it is missing.
-fn open_log(path: &Path) -> io::Result<std::fs::File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
+/// mode `0600` if it is missing. Opening does not wait (`O_NONBLOCK`,
+/// cleared once it is open), and only a regular file is written to: a FIFO
+/// in its place — whose opening would wait for a reader, with the log held,
+/// and whose writes, once it has one, would wait while it is full — fails
+/// the record at once, as does any other file that is not a regular one.
+/// Unless `fifo_waits` ([`AuditLog::waiting_on_a_fifo`], for tests): then
+/// the log is opened as it is, a FIFO waiting for a reader.
+fn open_log(path: &Path, fifo_waits: bool) -> io::Result<std::fs::File> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).mode(0o600);
+    if fifo_waits {
+        return options.open(path);
+    }
+    let not_regular = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        )
+    };
+    let file = match options.custom_flags(nix::libc::O_NONBLOCK).open(path) {
+        Ok(file) => file,
+        // A FIFO that nobody reads (or a socket, or a device not there).
+        Err(e) if e.raw_os_error() == Some(nix::libc::ENXIO) => return Err(not_regular()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL)?);
+    fcntl(
+        &file,
+        FcntlArg::F_SETFL(flags.difference(OFlag::O_NONBLOCK)),
+    )?;
+    Ok(file)
 }
 
 /// Write `line` into `file`, the log opened at `path`: the names that lead
@@ -339,9 +370,25 @@ impl AuditLog {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            fifo_waits: false,
             lock: Mutex::default(),
             #[cfg(test)]
             waiting: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// This log, but one that opens a FIFO in place of its file as it is,
+    /// and writes to it, waiting for a reader — and every other record
+    /// behind it, the log held — and whose records then fail (a FIFO
+    /// cannot be synced). For tests only, in which such a FIFO stands for a
+    /// disk that holds records up ([`AgentConfig::audit_fifo_waits`]); a
+    /// log of [`AuditLog::new`] refuses a FIFO at once.
+    ///
+    /// [`AgentConfig::audit_fifo_waits`]: crate::agent::AgentConfig::audit_fifo_waits
+    pub fn waiting_on_a_fifo(self) -> Self {
+        Self {
+            fifo_waits: true,
+            ..self
         }
     }
 
@@ -400,7 +447,7 @@ impl AuditLog {
             }
             result?;
         }
-        let file = open_log(&self.path)?;
+        let file = open_log(&self.path, self.fifo_waits)?;
         append(&self.path, &mut unsynced, file, &line)
     }
 }
@@ -1245,7 +1292,7 @@ mod tests {
         let moved = closed.join("moved.jsonl");
         // Moved to a directory that cannot be synced, another file in its
         // place: the directory synced does not hold the file opened.
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         std::fs::rename(&path, &moved).expect("move");
         std::fs::File::create(&path).expect("substitute");
         chmod(&closed, 0o300);
@@ -1254,13 +1301,13 @@ mod tests {
         assert_eq!(std::fs::read(&moved).expect("moved"), b"");
         assert_eq!(std::fs::read(&path).expect("substitute"), b"");
         // Replaced in its own directory.
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         std::fs::rename(&moved, &path).expect("replace");
         replaced(
             append(&path, &mut Unsynced::default(), file, b"replaced\n").expect_err("written"),
         );
         // Removed.
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         std::fs::remove_file(&path).expect("remove");
         let removed = append(&path, &mut Unsynced::default(), file, b"removed\n");
         assert_eq!(
@@ -1268,7 +1315,7 @@ mod tests {
             io::ErrorKind::NotFound
         );
         // Left where it was: written.
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         append(&path, &mut Unsynced::default(), file, b"kept\n").expect("written");
         assert_eq!(std::fs::read(&path).expect("log"), b"kept\n");
     }
@@ -1344,6 +1391,56 @@ mod tests {
         assert_eq!(written(&log), ["first"]);
     }
 
+    /// A FIFO in place of the log file, read or not, fails a record at
+    /// once, nothing written to it, and the log is not held.
+    #[test]
+    fn a_fifo_in_place_of_the_log_fails_records_at_once() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = new_dir(&dir, "logs");
+        let path = logs.join("audit.jsonl");
+        let aside = logs.join("aside.jsonl");
+        let log = std::sync::Arc::new(AuditLog::new(path.clone()));
+        record(&log, "first").expect("record");
+        std::fs::rename(&path, &aside).expect("aside");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let refused = |detail: &'static str| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn({
+                let log = std::sync::Arc::clone(&log);
+                move || {
+                    let _ = tx.send(record(&log, detail).map_err(|e| (e.kind(), e.to_string())));
+                }
+            });
+            let (kind, why) = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("opening a FIFO waited for a reader")
+                .expect_err("recorded in a FIFO");
+            assert_eq!(kind, io::ErrorKind::InvalidInput);
+            assert!(why.ends_with("is not a regular file"), "{why}");
+        };
+        // Nobody reads it.
+        refused("second");
+        // Somebody does: nothing reaches it.
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&path)
+            .expect("reader");
+        refused("third");
+        let mut taken = [0u8; 64];
+        match reader.read(&mut taken) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("written to the FIFO: {other:?}"),
+        }
+        drop(reader);
+        std::fs::remove_file(&path).expect("remove the FIFO");
+        std::fs::rename(&aside, &path).expect("back");
+        record(&log, "fourth").expect("record");
+        assert_eq!(written(&log), ["first", "fourth"]);
+    }
+
     fn replaced(e: io::Error) {
         assert!(
             e.to_string()
@@ -1362,7 +1459,7 @@ mod tests {
         let base = dir.path().canonicalize().expect("path");
         let path = base.join("audit.jsonl");
         let away = base.join("away.jsonl");
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         let _hook = AtSteps::run({
             let (path, away) = (path.clone(), away.clone());
             move |step| match step {
@@ -1388,7 +1485,7 @@ mod tests {
         let base = dir.path().canonicalize().expect("path");
         let path = base.join("audit.jsonl");
         let away = base.join("away.jsonl");
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         let original = file.metadata().expect("meta").ino();
         let synced_with = std::rc::Rc::new(std::cell::Cell::new(None));
         let _hook = AtSteps::run({
@@ -1419,7 +1516,7 @@ mod tests {
         let base = dir.path().canonicalize().expect("path");
         let logs = new_dir(&dir, "logs");
         let path = logs.join("audit.jsonl");
-        let file = open_log(&path).expect("open");
+        let file = open_log(&path, false).expect("open");
         let _hook = AtSteps::run({
             let (base, logs) = (base.clone(), logs.clone());
             move |step| {
@@ -1439,17 +1536,20 @@ mod tests {
     #[test]
     fn a_record_whose_data_cannot_be_synced_fails_and_may_be_in_the_file() {
         // A FIFO cannot be synced to disk; a reader holds it open, so that
-        // opening it to write does not wait.
+        // opening it to write does not wait. (Only a log for tests writes to
+        // a FIFO: another refuses it before writing.)
         use std::io::Read;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit.jsonl");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        // Read without waiting: what was not written fails the test.
         let mut reader = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
             .open(&path)
             .expect("open the FIFO");
-        let log = AuditLog::new(path);
+        let log = AuditLog::new(path).waiting_on_a_fifo();
         record(&log, "refused").expect_err("synced into a FIFO");
         let mut taken = vec![0; 4096];
         let n = reader.read(&mut taken).expect("read");

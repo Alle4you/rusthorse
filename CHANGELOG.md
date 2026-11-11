@@ -390,6 +390,12 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   a directory now fails the sync at once, as any other failure of that sync
   would; a vault path that is not a regular file is refused (until now a
   directory there failed later, when read).
+- A FIFO put in place of the audit log fails each record at once, with
+  nothing written to it. Before, opening it made the record wait for a
+  reader, with every other record behind it, and so every approval-gated
+  request and unlock, until a program read it. The log file is opened
+  without waiting and written to only if it is a regular file; as when the
+  log cannot be written, the action is refused.
 - A request whose requester goes away — `rusthorse` interrupted or killed,
   the manager's window closed, an AI agent's tool call stopped — while a
   dialog for it is open is cancelled, as the protocol had said: the dialog

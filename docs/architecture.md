@@ -744,7 +744,14 @@ as a directory only (`O_DIRECTORY`): a FIFO or another file that a program
 put in place of one fails the record at once, instead of making the agent
 wait, with the log held, for a writer to the FIFO. The same holds for the
 directories that the vault's saves and backups and the settings file's
-saves sync (see [Saving](#saving)).
+saves sync (see [Saving](#saving)). The log file itself is opened without
+waiting (`O_NONBLOCK`, cleared once it is open) and written to only if it
+is a regular file: a FIFO in its place — which would make the record wait
+for a reader, and, once it has one, wait while the FIFO is full, every
+other record behind it — or any other file that is not a regular one fails
+the record at once, with nothing written to it. (Only the tests turn this
+off, `AgentConfig::audit_fifo_waits`, so that a FIFO there can stand for a
+disk that holds records up; `rusthorse agent` never does.)
 
 `rusthorse audit` and the manager's History page read the file directly:
 the CLI at its own configured path, the manager at the path the agent

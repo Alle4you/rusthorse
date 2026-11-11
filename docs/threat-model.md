@@ -164,7 +164,7 @@ still holds the grant, including after revocation.
 | P9 | The decrypted vault is not held longer than needed. | Auto-lock after a time without an *approved* use — 15 minutes by default; the `idle_timeout` setting changes it, up to 24 hours, and `0` turns it off (P15) — which `status`, `list`, `show` and denied requests do not postpone; `rusthorse lock`; lock on any save failure; lock when the computer is about to sleep and when the screen locks, unless those two settings are switched off, and within the limits of L20. Broker requests do not postpone the idle lock. A FIFO that a program puts in place of the vault file or of a directory that a save, a backup or a save of the settings syncs is not waited on (the step that would open it fails, or, once a backup has checked the vault file, goes on with that file), so it does not make the agent wait with its state held, which would hold off these locks (L12). The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
-| P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`), after the names that lead to it: at every record the agent opens the directory that holds the log file, as a directory only (a FIFO or other file put in its place fails the record at once, instead of making the agent wait for a writer with the log held), checks through it that it holds the file the record goes into, by the name the log's path leads to, and only then syncs it; it also syncs the parent of each directory it makes for the log, at every record until that sync succeeds (an agent process started later does not know of a directory that an earlier one made and could not sync). If one of these syncs or the check fails, the record fails and is not written; if writing the record or `fdatasync` fails, the record fails too, but part or all of it may be in the file: the record of an action that was refused. A rename, replacement or removal by another program that still stands at the check fails the record; one undone before the check goes unnoticed, and the sync that follows covers the name put back. A program that renames, replaces or removes the log after that check takes the record with the file (out of the log, if it removes or replaces it), and the names it gives are its own to sync. The names of directories the agent did not make are taken as durable and as not changing, and so, for a log reached through a symbolic link (the directory synced is then that of the file the link leads to), are the link and the directories on the way to it. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
+| P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`), after the names that lead to it: at every record the agent opens the log file without waiting and writes to it only if it is a regular file, and opens the directory that holds it as a directory only (a FIFO or other file put in place of either fails the record at once, nothing written, instead of making the agent wait for a reader or a writer with the log held), checks through it that it holds the file the record goes into, by the name the log's path leads to, and only then syncs it; it also syncs the parent of each directory it makes for the log, at every record until that sync succeeds (an agent process started later does not know of a directory that an earlier one made and could not sync). If one of these syncs or the check fails, the record fails and is not written; if writing the record or `fdatasync` fails, the record fails too, but part or all of it may be in the file: the record of an action that was refused. A rename, replacement or removal by another program that still stands at the check fails the record; one undone before the check goes unnoticed, and the sync that follows covers the name put back. A program that renames, replaces or removes the log after that check takes the record with the file (out of the log, if it removes or replaces it), and the names it gives are its own to sync. The names of directories the agent did not make are taken as durable and as not changing, and so, for a log reached through a symbolic link (the directory synced is then that of the file the link leads to), are the link and the directories on the way to it. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
 | P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". Creating a vault syncs, before writing it, the directory that holds each directory it makes for it, and fails, writing nothing, if a sync fails; a later attempt does not know of a directory an earlier one made and could not sync, and the names of directories it did not make are taken as durable. | Accidents |
 | P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome; the directories made for it have their names synced first, as for a new vault (P14). The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
@@ -4561,3 +4561,96 @@ replaced, a failed sync is still `outcome_unknown`; a backup that fails
 can leave its copy at the destination, as before. `O_NONBLOCK` left on a
 regular file's descriptor does not change reads on Linux, and does not
 keep a file system from stalling (L12).
+
+**2026-11-11 — Refuse a FIFO in place of the audit log at once.**
+
+K01, found in the review above, in code older than it: `open_log` opened
+the log for appending without `O_NONBLOCK`, and with no check of what it
+opened, under the log's lock. A FIFO put in place of the log made a record wait for a
+reader — and every other record behind it, so every approval-gated
+request and unlock — and, once it had one, wait again while the FIFO was
+full. No record is made under the state lock, so the vault's locks still
+took effect. The log is now opened with `O_NONBLOCK` (cleared once it is
+open), `ENXIO` (a FIFO nobody reads) is reported as not a regular file,
+and a descriptor that is not a regular file is refused before anything
+is written. `audit::tests::a_fifo_in_place_of_the_log_fails_records_at_once`
+covers a FIFO without and with a reader (nothing reaches it) and the
+record that follows once the log is back.
+
+Ten end-to-end tests (the three of `BlockedAudit` in `tests/agent.rs`,
+the seven of `break_audit` and `hold_audit` in `broker/tests/system.rs`)
+and one unit test used such a FIFO on purpose, for a disk that holds
+records up or fails their sync after writing them. They keep it through
+`AgentConfig::audit_fifo_waits` (`AuditLog::waiting_on_a_fifo`), which
+restores the old open; `Harness::with_audit_fifo` and
+`System::with_audit_pipe` set it, and every other agent, `rusthorse
+agent` included, leaves it off. It is a field of the library's
+configuration, like the other settings only tests use (`send_buffer`,
+`broker_program`), not a flag, variable or setting the program reads.
+The unit test now reads its FIFO without waiting, so that a knob that
+does nothing fails it instead of hanging it.
+
+**Implementer's checks (Claude Code, AI-assisted).** In temporary copies,
+each with its own target directory: N1 (no `O_NONBLOCK`), N2 (no
+regular-file check), N3 (no `ENXIO` mapping) and N5 (the knob ignored in
+`open_log`) were caught by `cargo test --all-features --lib -- audit::`;
+N6 (the knob ignored in `Agent::new`) by the three tests of
+`BlockedAudit` (Cargo stopped there, before the broker's); N7
+(`rusthorse agent` turning the knob on) by the test added for L01. N4
+(`O_NONBLOCK` left set) survives, harmless by design: on Linux it does
+not change writes to a regular file, and the flag is cleared only so
+that the descriptor is the one an ordinary open gives.
+
+**Independent review (Codex, AI-assisted, 2026-11-11).**
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| L01: no test kept `rusthorse agent` from turning the knob on; with `main.rs` changed to `true`, the 195 end-to-end tests passed while a FIFO log held up `rusthorse lock`. | Low | Fixed: `the_agent_program_refuses_a_fifo_in_place_of_its_audit_log_at_once` starts the real program on private paths, puts a FIFO in place of its log, and requires `rusthorse lock` to fail within the tests' limit, then to succeed once the FIFO is gone. |
+
+The reviewer found K01 fixed and no way for the released program to turn
+the knob on: `--audit-fifo-waits` is refused (exit 2), no environment
+variable turns it on, and `audit_fifo_waits` in the settings file is an
+unknown key. Probes against the library, traced with `strace -f`: a FIFO
+without and with a reader, a link to a FIFO, a socket and a pseudo
+terminal were refused (`InvalidInput`) with nothing written, a directory
+with `IsADirectory`; after a refusal the same log wrote two records. A
+reader that appears between the open and `fstat` does not make a FIFO a
+regular file. The ten tests that use the knob still exercise waiting,
+sync failure, revocation, limits and recovery; no other test writes to a
+FIFO log without it. Clearing `O_NONBLOCK` is correct but not needed on
+Linux regular files, and neither it nor the check bounds a stalled file
+system or driver (L12). The reviewer ran `cargo test --all-features
+--lib -- audit::` (22 passed), `--test agent` (195) and the broker's
+system tests (35), and `cargo doc` with `-D warnings`; the error contract
+is unchanged.
+
+**Final matrix (Codex, AI-assisted, 2026-11-11).** The working tree
+matched staged tree `fe82d669ecd593eba6f3e7620557c376f35ea76b` before and
+after each of the twelve checks. This matrix covers the code of both
+kuz (committed as `3ffe25c`, included in this tree) and this K01 fix with
+the L01 regression test. Commands ran sequentially after
+`source ~/.cargo/env`, with `CARGO_BUILD_JOBS=5`, `RUST_TEST_THREADS=5`
+and a private `TMPDIR` of mode 0700; GTK tests used their own virtual
+displays. All output was read and all steps exited zero. Agent
+end-to-end tests passed (196 with all features, 173 without), as did the
+35 broker system tests enabled with all features. The descriptor-limit
+test's child rerun is counted only once. The two existing ignored tests
+are the real KDF timing and the one requiring `keepassxc-cli`; neither
+was run. The private temporary directory was empty after every step.
+No package was installed or service changed. This record was appended
+after the checks and left unstaged.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | Pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Pass |
+| `cargo clippy --all-targets -- -D warnings` | Pass |
+| `cargo test --all-features` | 663 passed, 2 ignored |
+| `cargo test --no-default-features` | 553 passed, 2 ignored |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Pass |
+| `cargo +1.89 check --all-targets` | Pass |
+| `cargo +1.89 check --all-targets --all-features` | Pass |
+| `cargo clippy -p rusthorse-dialog --all-targets -- -D warnings` | Pass |
+| `cargo test -p rusthorse-dialog` | 9 passed (4 unit, 5 Xvfb) |
+| `cargo clippy -p rusthorse-manager --all-targets -- -D warnings` | Pass |
+| `cargo test -p rusthorse-manager` | 45 passed |

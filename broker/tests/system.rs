@@ -162,6 +162,10 @@ struct Settings {
     idle_timeout: Duration,
     /// The longest a grant lasts (the agent's hook for tests).
     broker_lifetime: Option<Duration>,
+    /// A pipe in place of the audit log is written to, waiting for a
+    /// reader (the agent's hook for tests): [`System::break_audit`] and
+    /// [`System::hold_audit`] need it.
+    audit_fifo_waits: bool,
 }
 
 impl Default for Settings {
@@ -169,6 +173,7 @@ impl Default for Settings {
         Settings {
             idle_timeout: Duration::ZERO,
             broker_lifetime: None,
+            audit_fifo_waits: false,
         }
     }
 }
@@ -241,6 +246,15 @@ impl System {
         System::with(Settings::default())
     }
 
+    /// An agent whose audit log a test can break or hold with a pipe in
+    /// its place ([`System::break_audit`], [`System::hold_audit`]).
+    fn with_audit_pipe() -> System {
+        System::with(Settings {
+            audit_fifo_waits: true,
+            ..Settings::default()
+        })
+    }
+
     fn with(settings: Settings) -> System {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = dir.path().join("vault.kdbx");
@@ -274,6 +288,7 @@ impl System {
             broker_ready_timeout: Some(Duration::from_secs(10)),
             broker_lifetime: settings.broker_lifetime,
             settings: None,
+            audit_fifo_waits: settings.audit_fifo_waits,
         };
         let listener = Agent::bind(&socket).expect("bind the agent's socket");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -797,7 +812,8 @@ impl System {
 
     /// Make the audit log unwritable until the guard is dropped: a pipe in
     /// its place, read at once ([`AuditPipe`]): every record fails, and
-    /// nobody waits.
+    /// nobody waits. (An agent of [`System::with_audit_pipe`] only: another
+    /// refuses the pipe without writing to it.)
     fn break_audit(&self) -> AuditPipe {
         let mut pipe = AuditPipe::install(&self.audit, Arc::clone(&self.tapped), false);
         pipe.open();
@@ -807,7 +823,7 @@ impl System {
     /// Hold the audit log until the test opens the guard: a full pipe in its
     /// place, which nobody reads yet ([`AuditPipe`]). A record waits until
     /// [`AuditPipe::open`] — and every other record of the agent, behind it
-    /// — and then fails.
+    /// — and then fails. (An agent of [`System::with_audit_pipe`] only.)
     fn hold_audit(&self) -> AuditPipe {
         AuditPipe::install(&self.audit, Arc::clone(&self.tapped), true)
     }
@@ -2352,7 +2368,7 @@ fn the_key_echoed_by_the_destination_is_redacted_on_its_way_back() {
 fn a_request_limit_of_n_lets_n_through_however_many_arrive_at_once() {
     const LIMIT: u64 = 3;
     const AT_ONCE: usize = 10;
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
@@ -2438,7 +2454,7 @@ fn a_request_limit_of_n_lets_n_through_however_many_arrive_at_once() {
 /// method's label.
 #[test]
 fn requests_in_flight_are_limited_and_counted_by_number_whatever_order_they_end_in() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
@@ -2817,7 +2833,7 @@ fn a_grant_whose_lifetime_passes_cuts_its_streams() {
 /// record, once written, does not admit it.
 #[test]
 fn an_admission_waiting_for_its_record_is_refused_when_the_grant_is_revoked() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
     sys.set_destination("KEY", &destination.origin());
@@ -3083,7 +3099,7 @@ fn an_unlock_cancelled_by_a_lock_keeps_the_last_fingerprint_and_the_next_one_end
 /// fails, the unlock fails, and the vault stays locked.
 #[test]
 fn the_unlock_barrier_cuts_streams_before_the_unlock_is_recorded() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("KEY", CREDENTIAL), ("OTHER", OTHER_KEY)]);
@@ -3587,7 +3603,7 @@ fn a_broker_exits_by_itself_once_its_channel_ends_even_with_a_resolution_hanging
 /// not spent. With the log back, the next request is forwarded.
 #[test]
 fn an_admission_that_cannot_be_recorded_is_not_forwarded() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let destination = Destination::new(&sys.ca, plain());
     sys.seed(&[("KEY", CREDENTIAL)]);
     sys.set_destination("KEY", &destination.origin());
@@ -3622,7 +3638,7 @@ fn an_admission_that_cannot_be_recorded_is_not_forwarded() {
 /// record's with its reason.)
 #[test]
 fn a_finished_record_that_cannot_be_written_ends_the_grant() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let gate = Gate::default();
     let destination = Destination::new(&sys.ca, held(gate.clone()));
     sys.seed(&[("KEY", CREDENTIAL)]);
@@ -3683,7 +3699,7 @@ fn a_finished_record_that_cannot_be_written_ends_the_grant() {
 /// own record cannot be written, which its answer reports.
 #[test]
 fn revocation_works_while_the_audit_log_cannot_be_written() {
-    let sys = System::new();
+    let sys = System::with_audit_pipe();
     let streams = Streams::default();
     let destination = Destination::new(&sys.ca, streams.handler());
     sys.seed(&[("A", CREDENTIAL), ("B", OTHER_KEY)]);

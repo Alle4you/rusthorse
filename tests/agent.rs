@@ -177,6 +177,9 @@ struct Options<'a> {
     /// A settings file holding this text (none for `None`), and these
     /// explicit flags.
     settings: Option<(Option<&'a str>, rusthorse::settings::Layer)>,
+    /// A FIFO in place of the audit log is written to, waiting for a reader
+    /// (the agent's hook for tests): [`BlockedAudit`] needs it.
+    audit_fifo_waits: bool,
 }
 
 impl Default for Options<'_> {
@@ -190,6 +193,7 @@ impl Default for Options<'_> {
             broker_ready_timeout: BROKER_READY_TIMEOUT,
             broker_lifetime: None,
             settings: None,
+            audit_fifo_waits: false,
         }
     }
 }
@@ -197,6 +201,15 @@ impl Default for Options<'_> {
 impl Harness {
     fn new() -> Harness {
         Harness::with_timeouts(Duration::ZERO, Duration::from_secs(10))
+    }
+
+    /// An agent whose audit log a test can block with a FIFO in its place
+    /// ([`BlockedAudit`]).
+    fn with_audit_fifo() -> Harness {
+        Harness::build(Options {
+            audit_fifo_waits: true,
+            ..Options::default()
+        })
     }
 
     fn with_idle_timeout(idle_timeout: Duration) -> Harness {
@@ -286,6 +299,7 @@ impl Harness {
             broker_ready_timeout,
             broker_lifetime,
             settings,
+            audit_fifo_waits,
         } = options;
         let dir = tempfile::tempdir().expect("tempdir");
         // A settings file in the test's directory, holding `text` (none
@@ -340,6 +354,7 @@ impl Harness {
             broker_ready_timeout: Some(broker_ready_timeout),
             broker_lifetime,
             settings,
+            audit_fifo_waits,
         };
         let listener = Agent::bind(&socket).expect("bind");
         let agent = Agent::new(config, Box::new(SharedUi(Arc::clone(&ui))));
@@ -1533,6 +1548,72 @@ fn init_with_another_spelling_of_the_agents_vault_still_uses_the_agent() {
         assert_eq!(h.ui.password_prompts.lock().unwrap().len(), 2, "{spelling}");
         assert!(h.vault_path().exists(), "{spelling}");
     }
+}
+
+#[test]
+fn the_agent_program_refuses_a_fifo_in_place_of_its_audit_log_at_once() {
+    // The real program, on private paths; it watches no bus and shows no
+    // dialog. Only the tests' agents let a FIFO there hold records up
+    // (`audit_fifo_waits`): `rusthorse agent` fails the record at once.
+    struct Stop(std::process::Child);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("run").join("agent.sock");
+    let audit = dir.path().join("audit.jsonl");
+    let _agent = Stop(
+        Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .args([
+                "agent",
+                "--no-lock-on-suspend",
+                "--no-lock-on-screen-lock",
+                "--config",
+            ])
+            .arg(dir.path().join("agent.toml"))
+            .current_dir(dir.path())
+            .env("RUSTHORSE_SOCKET", &socket)
+            .env("RUSTHORSE_VAULT", dir.path().join("vault.kdbx"))
+            .env("RUSTHORSE_AUDIT_LOG", &audit)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the agent"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "the agent did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    nix::unistd::mkfifo(&audit, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    // A lock is recorded: `finish` fails the test if it waits.
+    let lock = || {
+        Command::new(env!("CARGO_BIN_EXE_rusthorse"))
+            .arg("lock")
+            .env("RUSTHORSE_SOCKET", &socket)
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .finish()
+    };
+    let refused = lock();
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    assert!(
+        text(&refused.stderr).contains("is not a regular file"),
+        "{}",
+        text(&refused.stderr)
+    );
+    // The log is not held: once the FIFO is gone, the next record is written.
+    std::fs::remove_file(&audit).expect("remove the FIFO");
+    let locked = lock();
+    assert!(locked.status.success(), "{}", text(&locked.stderr));
+    let records = std::fs::read_to_string(&audit).expect("the log");
+    assert!(records.contains(r#""action":"lock""#), "{records}");
 }
 
 #[test]
@@ -4361,6 +4442,8 @@ fn logged_within(log: &Path, event: &str, limit: Duration) -> Option<serde_json:
 /// [`BlockedAudit::release`]. A record waits to open it; once it can, it
 /// fails (a FIFO cannot be synced to disk), as a log on a failing disk
 /// would. Dropping it puts the log back: the records that follow are kept.
+/// For an agent of [`Harness::with_audit_fifo`] only: another refuses the
+/// FIFO at once.
 struct BlockedAudit {
     path: PathBuf,
     reader: Option<std::fs::File>,
@@ -5430,7 +5513,7 @@ fn a_run_whose_command_cannot_start_ends_its_grants_before_it_waits_for_the_audi
     if !python3() {
         return;
     }
-    let h = Harness::new();
+    let h = Harness::with_audit_fifo();
     seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "held_ready");
     let ready = log.with_extension("jsonl.ready");
@@ -6129,7 +6212,7 @@ fn the_unlock_barrier_tells_the_brokers_before_it_waits_for_the_audit_log() {
     if !python3() {
         return;
     }
-    let h = Harness::new();
+    let h = Harness::with_audit_fifo();
     seed(&h, &[("KEY", FAKE_KEY), ("OTHER", "abcdefgh")]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
@@ -6196,7 +6279,7 @@ fn a_lock_does_not_wait_for_the_record_of_an_unlock() {
     if !python3() {
         return;
     }
-    let h = Harness::new();
+    let h = Harness::with_audit_fifo();
     seed(&h, &[("KEY", FAKE_KEY)]);
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);

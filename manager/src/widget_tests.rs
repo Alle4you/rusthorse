@@ -468,6 +468,7 @@ fn desktop_flow() {
             broker_lifetime: None,
             settings: None,
             keyring: Default::default(),
+            audit_fifo_waits: false,
         },
         Box::new(Scripted(
             Arc::clone(&allowed),
@@ -1353,6 +1354,7 @@ fn first_start() {
             broker_lifetime: None,
             settings: None,
             keyring: Default::default(),
+            audit_fifo_waits: false,
         },
         Box::new(Scripted(
             Arc::new(AtomicBool::new(true)),
@@ -1469,6 +1471,7 @@ fn import_windows() {
                 plain: true,
                 ..Default::default()
             },
+            audit_fifo_waits: false,
         },
         Box::new(Scripted(
             Arc::clone(&allowed),

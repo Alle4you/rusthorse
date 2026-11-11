@@ -138,6 +138,12 @@ pub struct AgentConfig {
     /// and `session_lock` are used as given, `status` reports no settings,
     /// and `configure` is refused.
     pub settings: Option<crate::settings::Sources>,
+    /// Whether a FIFO in place of the audit log is opened and written to,
+    /// waiting for a reader, with the log held
+    /// ([`AuditLog::waiting_on_a_fifo`]). `false` in production, where a
+    /// FIFO there fails every record at once. Only tests set it, in which
+    /// such a FIFO stands for a disk that holds records up.
+    pub audit_fifo_waits: bool,
 }
 
 /// A failed request: what goes back to the client as [`Response::Error`] —
@@ -335,7 +341,12 @@ impl session_lock::Locker for Agent {
 impl Agent {
     /// Build an agent that asks its questions through `ui`.
     pub fn new(mut config: AgentConfig, ui: Box<dyn Ui>) -> Arc<Agent> {
-        let audit = Arc::new(AuditLog::new(config.audit_log.clone()));
+        let audit = AuditLog::new(config.audit_log.clone());
+        let audit = Arc::new(if config.audit_fifo_waits {
+            audit.waiting_on_a_fifo()
+        } else {
+            audit
+        });
         let registry = Registry::new(Arc::clone(&audit) as Arc<dyn broker_host::Recorder>);
         let settings = match &config.settings {
             Some(sources) => {
@@ -4196,6 +4207,7 @@ mod tests {
                 broker_ready_timeout: None,
                 broker_lifetime: None,
                 settings: None,
+                audit_fifo_waits: false,
             },
             Box::new(NoDialogs),
         );
@@ -4257,6 +4269,7 @@ mod tests {
                 broker_ready_timeout: None,
                 broker_lifetime: None,
                 settings: None,
+                audit_fifo_waits: false,
             },
             Box::new(NoDialogs),
         );
@@ -4327,6 +4340,7 @@ mod tests {
                 broker_ready_timeout: Some(Duration::from_secs(2)),
                 broker_lifetime: None,
                 settings: None,
+                audit_fifo_waits: false,
             }
         }
     }
@@ -4711,6 +4725,7 @@ mod tests {
                 broker_ready_timeout: None,
                 broker_lifetime: None,
                 settings: None,
+                audit_fifo_waits: false,
             },
             Box::new(TypesPassword(Mutex::new(Some(asked)))),
         );
@@ -4787,6 +4802,7 @@ mod tests {
                 broker_ready_timeout: None,
                 broker_lifetime: None,
                 settings: None,
+                audit_fifo_waits: false,
             },
             Box::new(NoDialogs),
         );
