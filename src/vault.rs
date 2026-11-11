@@ -47,7 +47,7 @@ use keepass::{Database, DatabaseKey};
 use crate::protocol::{
     EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, SecretString,
 };
-use crate::util::ensure_private_dir;
+use crate::util::{make_private_dir, sync_parents};
 
 /// Custom KDBX field holding the host name or IP address.
 pub const FIELD_HOST: &str = "Host";
@@ -408,7 +408,14 @@ impl Vault {
             return Err(VaultError::Exists(path.to_path_buf()));
         }
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            ensure_private_dir(dir)?;
+            let mut made = Vec::new();
+            let result = make_private_dir(dir, &mut made);
+            // The name of each directory made is in its parent, synced
+            // before the vault goes into it (its own directory is synced
+            // once the vault is in place) — also those made before a
+            // failure, which a later attempt would find and not know.
+            sync_parents(&made)?;
+            result?;
         }
         let mut db = Database::with_config(kdf.database_config());
         db.root_mut().name = "Rusthorse".to_string();
@@ -1896,6 +1903,44 @@ mod tests {
         )
         .expect("new vault");
         vault.write_file(false).expect("create");
+        Vault::open(&path, secret("correct horse")).expect("the new vault opens");
+    }
+
+    #[test]
+    fn a_new_vault_syncs_the_directories_it_made() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens a directory whatever its mode
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory in which directories can be made, but which cannot be
+        // opened to be synced.
+        let closed = dir.path().join("closed");
+        fs::create_dir(&closed).expect("mkdir");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o300)).expect("chmod");
+        let create = |path: &Path| {
+            Vault::create(path, secret("correct horse"), KdfParams::INSECURE_FOR_TESTS)
+        };
+        let path = closed.join("a").join("b").join("vault.kdbx");
+        let failed = create(&path).expect_err("its parent cannot be synced");
+        let why = failed.to_string();
+        assert!(
+            why.contains(&format!("cannot sync the directory {}", closed.display())),
+            "{why}"
+        );
+        assert!(!path.exists(), "a vault was written");
+        // The same when making the directories fails half way: `c` is made,
+        // then a name too long for any directory is refused.
+        let failed = create(&closed.join("c").join("x".repeat(256)).join("vault.kdbx"))
+            .expect_err("half way");
+        let why = failed.to_string();
+        assert!(
+            why.contains(&format!("cannot sync the directory {}", closed.display())),
+            "{why}"
+        );
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let path = closed.join("d").join("vault.kdbx");
+        create(&path).expect("create");
         Vault::open(&path, secret("correct horse")).expect("the new vault opens");
     }
 

@@ -368,6 +368,14 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   fails fails the record, and the action is refused, as when the log cannot
   be written; on a file system whose directories cannot be synced, or with a
   log directory the agent cannot read, the vault now stays locked.
+- Creating a vault and saving the agent's settings sync the directory that
+  holds each directory they make, before the file goes into it, as the
+  audit log does. Before, only the file's own directory was synced, so a
+  crash right after `init` or a first save of the settings could lose the
+  new file with the name of a directory made for it. A sync that fails
+  fails the creation or the save, which writes nothing: a directory in
+  which a new vault's or the settings' directory can be made, but which
+  cannot be read, now refuses them.
 - A request whose requester goes away — `rusthorse` interrupted or killed,
   the manager's window closed, an AI agent's tool call stopped — while a
   dialog for it is open is cancelled, as the protocol had said: the dialog

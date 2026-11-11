@@ -13,13 +13,13 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::parse_duration;
+use crate::util::{make_dirs, parse_duration, sync_parents};
 
 /// The longest the vault may stay unlocked without use, when it locks by
 /// itself.
@@ -705,7 +705,8 @@ pub struct SaveError {
 /// either the old settings or the new ones, never part of them: a private
 /// temporary file in the same directory, written and synced, renamed over
 /// `path` — a link there is replaced, not followed — and the directory
-/// synced. Missing directories are created `0700`; existing ones are left
+/// synced. Missing directories are created `0700`, and the directory that
+/// holds each is synced before the file is written; existing ones are left
 /// as they are, and must be such that nobody but the user and root can
 /// remove or replace the file (`check_directories`): else nothing is
 /// written.
@@ -721,11 +722,14 @@ pub fn save(path: &Path, layer: &Layer) -> Result<(), SaveError> {
     check_directories(path, Walk::BeforeCreate).map_err(|e| before(io::Error::other(e)))?;
     #[cfg(test)]
     hook("before_create");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(before)?;
+    let mut made = Vec::new();
+    let created = make_dirs(dir, &mut made);
+    // The name of each directory made is in its parent, synced before the
+    // file goes into it (its own directory is synced once the file is in
+    // place) — also those made before a failure, which a later save would
+    // find and not know.
+    sync_parents(&made).map_err(before)?;
+    created.map_err(before)?;
     #[cfg(test)]
     hook("after_create");
     // Again, strictly, now that every directory exists: one made meanwhile
@@ -1162,6 +1166,47 @@ mod tests {
                 why.error
             );
         }
+    }
+
+    #[test]
+    fn saving_syncs_the_directories_it_made() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens a directory whatever its mode
+        }
+        let dir = private_tempdir();
+        // A directory in which directories can be made, but which cannot be
+        // opened to be synced.
+        let closed = dir.path().join("closed");
+        std::fs::create_dir(&closed).expect("mkdir");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+        let mut layer = Layer::default();
+        layer.set(Key::IdleTimeout, secs(60)).expect("set");
+        let path = closed.join("rusthorse").join("agent.toml");
+        let failed = save(&path, &layer).expect_err("its parent cannot be synced");
+        assert!(!failed.replaced);
+        let why = failed.error.to_string();
+        assert!(
+            why.contains(&format!("cannot sync the directory {}", closed.display())),
+            "{why}"
+        );
+        assert!(!path.exists(), "the file was written");
+        // The same when making the directories fails half way: `c` is made,
+        // then a name too long for any directory is refused.
+        let failed = save(
+            &closed.join("c").join("x".repeat(256)).join("agent.toml"),
+            &layer,
+        )
+        .expect_err("half way");
+        assert!(!failed.replaced);
+        let why = failed.error.to_string();
+        assert!(
+            why.contains(&format!("cannot sync the directory {}", closed.display())),
+            "{why}"
+        );
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let path = closed.join("d").join("agent.toml");
+        save(&path, &layer).expect("save");
+        assert_eq!(load(&path), Ok(layer));
     }
 
     #[test]

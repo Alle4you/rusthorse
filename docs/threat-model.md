@@ -166,8 +166,8 @@ still holds the grant, including after revocation.
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
 | P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`), after the names that lead to it: at every record the agent opens the directory that holds the log file, checks through it that it holds the file the record goes into, by the name the log's path leads to, and only then syncs it; it also syncs the parent of each directory it makes for the log, at every record until that sync succeeds (an agent process started later does not know of a directory that an earlier one made and could not sync). If one of these syncs or the check fails, the record fails and is not written; if writing the record or `fdatasync` fails, the record fails too, but part or all of it may be in the file: the record of an action that was refused. A rename, replacement or removal by another program that still stands at the check fails the record; one undone before the check goes unnoticed, and the sync that follows covers the name put back. A program that renames, replaces or removes the log after that check takes the record with the file (out of the log, if it removes or replaces it), and the names it gives are its own to sync. The names of directories the agent did not make are taken as durable and as not changing, and so, for a log reached through a symbolic link (the directory synced is then that of the file the link leads to), are the link and the directories on the way to it. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
 | P13 | The agent stays available under request floods. | The whole request must arrive within 10 s of connecting (a deadline, not a per-read timeout); at most 64 connections and 8 requests waiting for a dialog at once; frames ≤ 4 MiB; imports ≤ 100 entries; vault files ≤ 128 MiB. | A1, A2 (availability) |
-| P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". | Accidents |
-| P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome. The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
+| P14 | Approved changes are all-or-nothing and match the disk. | Every change runs as a transaction that is rolled back if any part fails (for example one invalid entry in an import); if saving fails, the vault is locked so memory never holds unsaved changes. A save that fails after the file was replaced (syncing the directory) is reported as an unknown outcome, never as "not saved". Creating a vault syncs, before writing it, the directory that holds each directory it makes for it, and fails, writing nothing, if a sync fails; a later attempt does not know of a directory an earlier one made and could not sync, and the names of directories it did not make are taken as durable. | Accidents |
+| P15 | The agent's settings change only as the human decided, short of an edit of their file. | Five settings — the idle lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — come from defaults, then the settings file (`agent.toml`), then the flags of `rusthorse agent`, within fixed bounds. While the agent runs only `configure` changes them, sent by the manager's Settings page: the vault must be unlocked (the master password is asked first when it is not); the agent's dialog shows each old and new value, warns of each change that protects less, and cannot be remembered; the approval is recorded before the file is written; one change at a time; a setting a flag fixes and a value out of bounds are refused; a lock or another change while the dialog was open cancels it; an approved change applies at once and forgets remembered approvals. The file is replaced whole (old settings or new, never part), and a failure after the replacement is reported as an unknown outcome; the directories made for it have their names synced first, as for a new vault (P14). The agent does not start with a settings file that is not a regular file of the user's, that its group or others can write, or that is reached through a directory or a link that would let someone other than the user and root remove or replace it (one of theirs, or one that its group or others can write to and that is not sticky), and it saves only where nobody else can remove or replace the file; a missing file means the defaults. None of this guards the file against a program running as the user, which can edit it and restart the agent (L1). | A1; A4 (the file); not A2 or A3 (L1, L2) |
 | P16 | A request is not carried out for a requester that has gone. | From the moment a request is read, the agent watches its connection for a close by the requester — also a shutdown both ways, as the manager cancels — and, for a `run` or `broker_run_v2`, a half-close, which cancels a run; it polls the connection, never reads it. A dialog open for the request is taken down, its program killed as at the dialog's deadline, and recorded as `requester_gone`; a dialog the request waits for, or a later one of the same request, is not shown. After the dialogs, the last check of the requester before an effect comes after every wait the agent makes on the way to it for a dialog's turn, for the lock of its state (which a save or a backup holds for a while), for an audit record, for brokers to end or to start, and for a read from outside (the keyring, a file). The registry of grants has a lock of its own, held only for short work in memory (on the grants and their counters, reading the clocks, writing a new broker's install without waiting); a wait for it is not followed by a check (L26). What remains unguarded is a departure during the effect (L26). The effects so checked: the vault file or the settings file written, a backup written, a value read for the answer, a run's values read, each grant's `created` record and then its brokers started, a command started (with grants, once they are ready, ending them first), the vault an unlock opened put in use (it stays locked), a vault created and then put in use, an import's values read, a `.env` file or the keyring read, a keyring listing kept for the program that asked. A `backup`, which has no dialog of its own, is checked the same way. It then records `aborted`, does nothing more, and sends no answer, even when it cannot record that. An unlock, a password change and the creation of a vault write their `unlocked`, `changed` or `created` record before they act, and are checked right before that record and again right before they act: only a requester that leaves between those two checks leaves that record, followed by `aborted` (the vault stays locked, the password unchanged, no vault created). Between them the record waits for the audit log and is written, and, for an unlock and a password change, the agent then waits for the lock of its state, under which the second check is made. So does a grant, followed by `ended`, whose requester leaves between the check before its `created` record and the next check: the record, then a wait for the registry's lock to note it, and, after the last grant's record, the tokens drawn and the installs prepared (the registry's lock again). Grants created for a run whose requester leaves while their brokers start are recorded `created`, then `ended`. A requester that leaves after the last check, or whose connection another process still holds, is served as before; what a wait for the registry's lock, the human's answer and a missing `aborted` leave behind is in L26. | Accidents (a requester interrupted, timed out or closed); not a control against A1 or A2, which can stay |
 
 Broker-specific bounds are in [ADR 0013](adr/0013-credential-broker.md): 16
@@ -4364,3 +4364,54 @@ The expansion refusal remains the broker's own `401`, not a parser
 (3 passed) and
 `cargo test -p rusthorse-broker --all-features --test broker`
 (80 passed). These probes and tests ran in the first review of this change.
+
+**2026-11-11 — Sync the directories made for a new vault or the settings.**
+
+Closes "The same gap elsewhere" in the audit-sync review of 2026-11-10.
+`make_dirs` is public, and `util::sync_parents` syncs the parent of each
+directory made. `Vault::unsaved` and `settings::save` call it before
+writing, including for directories made before creation fails. A sync
+error takes precedence over the creation error. A failed parent sync
+writes no vault or settings file; the error contract is unchanged.
+
+**Implementer's checks (Claude Code, AI-assisted).** Mutations ran in a
+temporary copy with its own target directory, using
+`cargo test --all-features --lib -- vault:: settings:: util::`:
+
+- V1: omit the vault's parent syncs — caught.
+- V2: sync only after all vault directories were made — caught.
+- S1 and S2: the corresponding settings mutations — both caught.
+- U1: sync each directory itself rather than its parent — caught.
+- U2: sync only the first parent — caught by a test added afterwards.
+- U3: open the parents without calling `fsync` — survived.
+
+U3 is not harmless. As with the audit log's missing-`fsync` mutation,
+coverage of the actual syscall is still external: the reviewer's
+`strace` and `EIO` probes below. Making that check permanent remains
+with the maintainer. The reviewer did not rerun these mutations.
+
+**Independent review (Codex, AI-assisted, 2026-11-11).** D01 exposed a
+parent replaced by a FIFO: opening it blocked before `BeforeWrite`,
+while `configure` held the state mutex. The fix opens parents with
+`O_DIRECTORY`. The implementer's mutation removing that flag makes
+`util::tests::the_directory_holding_each_one_made_is_synced` time out.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| D01: opening a parent FIFO blocked. | Medium | Fixed: `O_DIRECTORY`. |
+
+The reviewer confirmed the fix with interposed directory replacements:
+settings and vault creation returned `NotADirectory` without writing;
+settings reported `replaced=false`. Directories and links to directories
+still worked. Earlier traces confirmed parent syncs before opening the
+temporary file. Injecting `EIO` at either of two parent syncs wrote no
+file; at the final directory sync, after publication, the vault returned
+`NotDurable` and settings returned `replaced=true`. The existing mappings
+preserve `outcome_unknown`, and local `init` exits 124 for `NotDurable`.
+The filtered vault/settings/util suites passed in both feature builds:
+58 passed and one KDF benchmark ignored in each. No power-loss test ran.
+
+Remaining limit (P14): a later attempt does not know of a directory an
+earlier attempt made and failed to sync. Names of directories the agent
+did not make are taken as durable. The final review found the change ready
+within those limits; A01, found in existing audit code, is recorded next.

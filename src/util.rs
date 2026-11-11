@@ -1,7 +1,7 @@
 //! Small helpers shared by the CLI and the agent.
 
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -39,10 +39,38 @@ pub fn make_private_dir(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> 
     Ok(())
 }
 
+/// Sync the directory that holds each directory in `made` (as
+/// [`make_private_dir`] and [`make_dirs`] list them), so that their names
+/// survive a crash: a file synced into a directory just made is lost with
+/// that directory's name. As for the vault's saves, any error is a failure.
+/// Each is opened as a directory only: what another program may have put
+/// in its place, a FIFO above all, fails at once instead of being opened.
+pub fn sync_parents(made: &[PathBuf]) -> io::Result<()> {
+    for dir in made {
+        let parent = dir
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot sync the directory {}: {e}", parent.display()),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// Create `path` and its missing parents with mode `0700`, as
 /// `DirBuilder::recursive` does, adding to `made` each one that was missing,
-/// parents first.
-fn make_dirs(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> {
+/// parents first, each as soon as it is made. Existing directories are left
+/// as they are.
+pub fn make_dirs(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -286,6 +314,40 @@ mod tests {
         let (list, done) = made(&dir.path().join("a").join(&long));
         assert!(!done);
         assert_eq!(list, [dir.path().join("a")]);
+    }
+
+    #[test]
+    fn the_directory_holding_each_one_made_is_synced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (list, done) = made(&dir.path().join("a").join("b"));
+        assert!(done);
+        sync_parents(&list).expect("sync");
+        // A relative name is in the current directory.
+        sync_parents(&[PathBuf::from("relative")]).expect("sync .");
+        // One that cannot be opened is an error that names it.
+        let gone = dir.path().join("gone");
+        let why = sync_parents(&[gone.join("x")]).expect_err("missing");
+        assert_eq!(why.kind(), io::ErrorKind::NotFound);
+        assert!(
+            why.to_string()
+                .contains(&format!("cannot sync the directory {}", gone.display())),
+            "{why}"
+        );
+        // Each one: a failure after one that succeeds is still a failure.
+        sync_parents(&[list[0].clone(), gone.join("x")]).expect_err("the second");
+        // What another program put in a parent's place is not opened: a
+        // FIFO, which would wait for a writer, fails at once.
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let made = fifo.join("x");
+        std::thread::spawn(move || {
+            let _ = tx.send(sync_parents(&[made]).map_err(|e| e.kind()));
+        });
+        let synced = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer");
+        assert_eq!(synced, Err(io::ErrorKind::NotADirectory));
     }
 
     #[test]

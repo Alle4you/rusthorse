@@ -455,9 +455,11 @@ change when the agent was started without a settings file (an agent embedded
 in a test); it needs the vault unlocked (asking for the master password
 first), and the human's approval of each old and new value. The answer is
 recorded first, fail closed; after Allow, under the state's lock and only if
-the generation did not change, the agent replaces the file (a private
-temporary file, synced, renamed, the directory synced), sets the settings in
-effect, forgets remembered approvals and bumps the generation. Then it tells
+the generation did not change, the agent replaces the file (missing
+directories made, and the directory that holds each synced, as for a new
+vault; a private temporary file, synced, renamed, the directory synced),
+sets the settings in effect, forgets remembered approvals and bumps the
+generation. Then it tells
 the dialogs their new timeout and "Allow for…" duration (a dialog already open
 keeps its own), starts or stops the watchers of a lock trigger that changed,
 and checks the idle lock at once: the approval is not a use of the vault, so
@@ -526,6 +528,13 @@ Every change is saved immediately:
    is `fsync`ed. A new vault is linked into place instead (and the temporary
    name removed): a link fails if `vault.kdbx` exists, so creating a vault
    never replaces one that another program created meanwhile.
+
+Creating a vault makes its missing directories (mode `0700`) and, before
+step 1, `fsync`s the directory that holds each one it made — also those
+made before a failure — so that a crash cannot keep the vault and lose the
+name of its directory. A sync that fails fails the creation, before
+anything is written; a later attempt does not know of a directory an
+earlier one made and could not sync.
 
 Before step 1, and again between steps 1 and 2, the agent compares the file's
 device, inode, size and modification time with what it loaded. If another
