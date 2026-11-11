@@ -43,18 +43,14 @@ pub fn make_private_dir(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> 
 /// [`make_private_dir`] and [`make_dirs`] list them), so that their names
 /// survive a crash: a file synced into a directory just made is lost with
 /// that directory's name. As for the vault's saves, any error is a failure.
-/// Each is opened as a directory only: what another program may have put
-/// in its place, a FIFO above all, fails at once instead of being opened.
+/// Each is opened with [`open_directory`].
 pub fn sync_parents(made: &[PathBuf]) -> io::Result<()> {
     for dir in made {
         let parent = dir
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_DIRECTORY)
-            .open(parent)
+        open_directory(parent)
             .and_then(|d| d.sync_all())
             .map_err(|e| {
                 io::Error::new(
@@ -64,6 +60,17 @@ pub fn sync_parents(made: &[PathBuf]) -> io::Result<()> {
             })?;
     }
     Ok(())
+}
+
+/// Open the directory `path`, to sync it, as a directory only
+/// (`O_DIRECTORY`): what another program may have put in its place — a
+/// FIFO, whose opening would wait for a writer, above all — fails at once
+/// instead of being opened. A link to a directory is followed.
+pub fn open_directory(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY)
+        .open(path)
 }
 
 /// Create `path` and its missing parents with mode `0700`, as

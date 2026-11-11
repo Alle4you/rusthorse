@@ -719,7 +719,13 @@ changing, and so are a symbolic link to the log and the directories on the
 way to it. As for the vault's saves, any error of a directory sync is a
 failure: on a file system whose directories cannot be synced, or with a log
 directory the agent cannot read, every record fails, so the vault stays
-locked and approval-gated requests are refused.
+locked and approval-gated requests are refused. Each directory is opened
+as a directory only (`O_DIRECTORY`): a FIFO or another file that a program
+put in place of one fails the record at once, instead of making the agent
+wait, with the log held, for a writer to the FIFO. The same holds for the
+parents synced for the directories made for a new vault or the settings
+file, not for the directory that holds the vault or the settings file,
+which their saves open as before.
 
 `rusthorse audit` and the manager's History page read the file directly:
 the CLI at its own configured path, the manager at the path the agent

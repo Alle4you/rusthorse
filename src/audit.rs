@@ -214,9 +214,10 @@ fn cannot_sync(dir: &Path, e: io::Error) -> io::Error {
     )
 }
 
-/// Open the directory `dir`, to sync it.
+/// Open the directory `dir`, to sync it, as a directory only: a FIFO put
+/// in its place fails the record at once, instead of holding the log.
 fn open_directory(dir: &Path) -> io::Result<std::fs::File> {
-    std::fs::File::open(dir).map_err(|e| cannot_sync(dir, e))
+    crate::util::open_directory(dir).map_err(|e| cannot_sync(dir, e))
 }
 
 /// Open the directory `dir` and sync it, as the vault's saves sync theirs:
@@ -233,6 +234,8 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
+    /// The path is resolved, and its directory not opened yet.
+    Resolved,
     /// The directory is open, and not checked yet.
     Opened,
     /// The directory has just been synced.
@@ -275,6 +278,8 @@ fn sync_directory_holding(file: &std::fs::File, path: &Path) -> io::Result<()> {
             real.display()
         )));
     };
+    #[cfg(test)]
+    at_step(Step::Resolved);
     let directory = open_directory(dir)?;
     #[cfg(test)]
     at_step(Step::Opened);
@@ -1285,6 +1290,60 @@ mod tests {
         }
     }
 
+    /// A FIFO put in place of a directory the record syncs fails the
+    /// record at once, and the next one too: opening it to read would have
+    /// waited for a writer, with the log held.
+    #[test]
+    fn a_fifo_in_place_of_a_directory_fails_records_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = new_dir(&dir, "logs");
+        let away = dir.path().canonicalize().expect("path").join("away");
+        let log = std::sync::Arc::new(AuditLog::new(logs.join("audit.jsonl")));
+        record(&log, "first").expect("record");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let (log, logs, away) = (std::sync::Arc::clone(&log), logs.clone(), away.clone());
+            move || {
+                // The log's directory, once the record has resolved its path.
+                let _hook = AtSteps::run(move |step| {
+                    if step == Step::Resolved {
+                        std::fs::rename(&logs, &away).expect("away");
+                        nix::unistd::mkfifo(&logs, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+                    }
+                });
+                let _ = tx.send(record(&log, "second").map_err(|e| e.kind()));
+            }
+        });
+        let second = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer");
+        assert_eq!(second, Err(io::ErrorKind::NotADirectory));
+        std::fs::remove_file(&logs).expect("remove the FIFO");
+        std::fs::rename(&away, &logs).expect("back");
+        assert_eq!(written(&log), ["first"]);
+        // A directory waiting for its sync, a FIFO by then: every record
+        // fails at once, the log never held.
+        let fifo = dir.path().canonicalize().expect("path").join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        log.lock.lock().expect("lock").add(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let log = std::sync::Arc::clone(&log);
+            move || {
+                for detail in ["third", "fourth"] {
+                    let _ = tx.send(record(&log, detail).map_err(|e| e.kind()));
+                }
+            }
+        });
+        for _ in 0..2 {
+            let refused = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("opening a FIFO waited for a writer");
+            assert_eq!(refused, Err(io::ErrorKind::NotADirectory));
+        }
+        assert_eq!(written(&log), ["first"]);
+    }
+
     fn replaced(e: io::Error) {
         assert!(
             e.to_string()
@@ -1312,6 +1371,7 @@ mod tests {
                     std::fs::File::create(&path).expect("substitute");
                 }
                 Step::Synced => std::fs::rename(&away, &path).expect("back"),
+                Step::Resolved => {}
             }
         });
         replaced(append(&path, &mut Unsynced::default(), file, b"refused\n").expect_err("written"));
@@ -1342,6 +1402,7 @@ mod tests {
                 Step::Synced => {
                     synced_with.set(Some(std::fs::metadata(&path).expect("meta").ino()));
                 }
+                Step::Resolved => {}
             }
         });
         append(&path, &mut Unsynced::default(), file, b"kept\n").expect("written");

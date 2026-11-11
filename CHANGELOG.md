@@ -367,7 +367,10 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   effects and lose the log's name, records and all. A sync or a check that
   fails fails the record, and the action is refused, as when the log cannot
   be written; on a file system whose directories cannot be synced, or with a
-  log directory the agent cannot read, the vault now stays locked.
+  log directory the agent cannot read, the vault now stays locked. Each
+  directory is opened as a directory only: a FIFO that a program put in
+  place of one fails the record at once, instead of making the agent wait
+  for a writer with the log held.
 - Creating a vault and saving the agent's settings sync the directory that
   holds each directory they make, before the file goes into it, as the
   audit log does. Before, only the file's own directory was synced, so a
