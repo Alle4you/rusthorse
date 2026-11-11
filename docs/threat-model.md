@@ -161,7 +161,7 @@ still holds the grant, including after revocation.
 | P6 | The master password never passes through a requester, nor does a new secret value, unless the requester itself supplies it. | The agent asks for them in its own dialogs; the protocol has no field for the master password. Imports from GNOME Keyring and `.env` files are read by the agent (`import_from`, [ADR 0012](adr/0012-import-read-by-the-agent.md)): the requester names items and entry names, and the dialog names the source; only the older `import` request carries values from a client, and its dialog says so, as do those of `add --stdin` and `edit --stdin`, whose value the requester supplies and already knows. zenity's answer comes back over a socket pair, which other processes cannot open through `/proc/<pid>/fd` (a pipe could be). A *new* vault's password is asked by the agent too (`create_vault`, sent by `rusthorse init` and the manager's Create vault…, [ADR 0011](adr/0011-first-start-from-the-manager.md)); the one exception is `rusthorse init` when no agent serves that vault, which reads it in the CLI (terminal or dialog). | A1, A2 (not on X11, L2) |
 | P7 | Dialogs are not answered by the requester and say what they mean. | Separate processes on the desktop, not in the terminal: `rusthorse-dialog` ([ADR 0006](adr/0006-own-dialog-program.md)) or, when it is not installed, zenity — started from an absolute path with a minimal environment and `/` as working directory, answering through a socket pair; `rusthorse-dialog` also gets its request through that socket (framed, versioned, with an identifier the answer must repeat), runs under a deadline after which it is killed, reads no per-user GTK configuration, shows plain text only, and keeps **Allow** disabled until the end of a request that does not fit has been in view; requester-controlled text is escaped (only ordinary characters are drawn as themselves, every other one as a `\u{…}` escape; markup characters for zenity's question dialog, backslashes and underscores for its entry dialog); entries are identified by full path and the start of their UUID in the dialogs of `run`, `reveal`, `edit` and `remove`, so two entries with the same title in different groups do not look alike (unless a file written by another program gave them UUIDs that start alike, L9), while those of `add` and of an import show the name the requester gave, without group or UUID; requests whose dialog text would exceed 4000 characters (or 1000 for the command line, program path or directory of a `run`, and for each detail of a run with `--broker`) are refused, never truncated, and with zenity also those too tall to read at once (estimated for an 11-point font); default button **Deny**; unanswered dialogs are denied; only exact, expected answers count as approval. | A1, A2 (not on X11 or through accessibility, L2) |
 | P8 | Only your user can talk to the agent. | Socket in a `0700` directory, mode `0600`, `SO_PEERCRED` uid check. The broker's separate loopback HTTP listener requires its grant's token in a header value it forwards: every token-shaped string there (`rh_` and 64 hexadecimal digits, in any case) must be that token byte for byte, compared in constant time, and one anywhere else in the request's head is refused, the token itself included; it validates Host and refuses Origin. TCP has no Unix peer credentials (L21). | A4 |
-| P9 | The decrypted vault is not held longer than needed. | Auto-lock after a time without an *approved* use — 15 minutes by default; the `idle_timeout` setting changes it, up to 24 hours, and `0` turns it off (P15) — which `status`, `list`, `show` and denied requests do not postpone; `rusthorse lock`; lock on any save failure; lock when the computer is about to sleep and when the screen locks, unless those two settings are switched off, and within the limits of L20. Broker requests do not postpone the idle lock. The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
+| P9 | The decrypted vault is not held longer than needed. | Auto-lock after a time without an *approved* use — 15 minutes by default; the `idle_timeout` setting changes it, up to 24 hours, and `0` turns it off (P15) — which `status`, `list`, `show` and denied requests do not postpone; `rusthorse lock`; lock on any save failure; lock when the computer is about to sleep and when the screen locks, unless those two settings are switched off, and within the limits of L20. Broker requests do not postpone the idle lock. A FIFO that a program puts in place of the vault file or of a directory that a save, a backup or a save of the settings syncs is not waited on (the step that would open it fails, or, once a backup has checked the vault file, goes on with that file), so it does not make the agent wait with its state held, which would hold off these locks (L12). The decrypted vault is dropped at lock, but a grant whose run says `continue` keeps its credential in its broker through automatic locks (L22). | A1, A2, A6 (window) |
 | P10 | The agent's memory is not readable by other same-user processes and is not dumped. | `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0` on the agent. Dialogs and approved commands inherit `RLIMIT_CORE=0`, but `execve` makes them dumpable again, and with a piped `core_pattern` (systemd-coredump) whether a crash is stored is up to that handler. Each broker applies the same hardening before reading Install. Zeroizing buffers do not erase every library or allocator copy (L7). | A1, A2 |
 | P11 | The vault is confidential at rest. | KDBX4: AES-256, Argon2id (64 MiB, 20 passes for new vaults); files `0600`, directories `0700`. | A4, A5 |
 | P12 | Every decision leaves a record. | JSON Lines audit log, each record synced to disk when it is written (the file's data, `fdatasync`), after the names that lead to it: at every record the agent opens the directory that holds the log file, as a directory only (a FIFO or other file put in its place fails the record at once, instead of making the agent wait for a writer with the log held), checks through it that it holds the file the record goes into, by the name the log's path leads to, and only then syncs it; it also syncs the parent of each directory it makes for the log, at every record until that sync succeeds (an agent process started later does not know of a directory that an earlier one made and could not sync). If one of these syncs or the check fails, the record fails and is not written; if writing the record or `fdatasync` fails, the record fails too, but part or all of it may be in the file: the record of an action that was refused. A rename, replacement or removal by another program that still stands at the check fails the record; one undone before the check goes unnoticed, and the sync that follows covers the name put back. A program that renames, replaces or removes the log after that check takes the record with the file (out of the log, if it removes or replaces it), and the names it gives are its own to sync. The names of directories the agent did not make are taken as durable and as not changing, and so, for a log reached through a symbolic link (the directory synced is then that of the file the link leads to), are the link and the directories on the way to it. Unlocking and approval-gated actions fail closed: if the record cannot be written, the vault stays locked or the action does not happen. Broker admission also requires a durable record before forwarding, and grant creation before command start. Completion and grant-end records are best effort; a failed request-completion record revokes the grant. Revocation contains the broker before waiting for audit, and abrupt process death can leave missing end records (L23). | A1 (detection; L13) |
@@ -421,7 +421,10 @@ processes. Never put a secret on a command line; pass it through `run`.
 Any process of your user can lock the vault, keep dialogs coming (one at a
 time, at most eight waiting), or stop the agent. Opening a crafted vault file
 with extreme KDF parameters can make unlocking very slow (files over 128 MiB
-are refused, but KDF parameters are not yet bounded). These are annoyances,
+are refused, but KDF parameters are not yet bounded). A save or a backup on
+a file system that stops answering holds the agent's state until it
+returns, and with it every lock, the vault unlocked; a FIFO put in place of
+the vault file or of a directory they sync does not (P9). These are annoyances,
 not disclosures. Under extreme resource exhaustion — the agent cannot create
 the threads that relay a command's output after the command has started —
 the request fails without an answer (the client reports exit 124, outcome
@@ -4492,3 +4495,69 @@ tests enabled with all features. The private temporary directory was
 empty after every step. No package was installed or service changed.
 A02 was confirmed corrected before this matrix; all three changes are
 ready within the limits and maintainer follow-ups recorded above.
+
+**2026-11-11 — Do not wait on a FIFO in place of the vault's directories
+or files.**
+
+Follow-up of A02: the final directory syncs of `Vault::write_file`, its
+old-password `.bak` cleanup, `settings::save` and `Vault::backup_to`
+used `File::open`. All of them run under the agent's state lock, which
+`lock_if_idle`, `Request::Lock` and `lock_for` (suspend, screen lock)
+take: a FIFO put in place of the directory made the save wait for a
+writer, with the vault unlocked and no lock possible (P9). They now go
+through `util::sync_directory` (`util::open_directory`, `O_DIRECTORY`),
+which `sync_parents` uses too. The same class was found in two more
+places under that lock. `Vault::backup_to` checked the vault file by
+name and read it again by name: a FIFO swapped in between made the read
+wait, and a backup needs no approval, so a requester could repeat it. It
+now checks the fingerprint on the descriptor it reads, opened with
+`O_NONBLOCK`. The backup's verification reopened the copy with
+`File::open`; `Vault::open_with`, used by it and by unlock, now opens
+with `O_NONBLOCK` and refuses anything but a regular file
+(`invalid_request`; a directory failed later before, as `internal`). Test-only
+hooks (`Vault::at`, and `before_dir_sync` in the settings) run at each
+point; four tests put a FIFO there and require an answer within 10 s.
+
+**Implementer's checks (Claude Code, AI-assisted).** In temporary copies,
+each with its own target directory, every mutation was caught by
+`cargo test --all-features --lib -- vault:: settings:: util::`:
+
+- M1, M2, M3: `File::open` at the vault's sync after the rename, after
+  the `.bak` cleanup, and at the backup's directory.
+- M4: `File::open` at the settings' final sync.
+- M5: no `O_NONBLOCK` in `Vault::open_with`.
+- M6: no regular-file check in `Vault::open_with`.
+- M7: `File::open` inside `util::sync_directory`.
+- M8: the backup's check and read by name again (hook kept between).
+- M9: no `O_NONBLOCK` on the backup's source.
+
+On the tree reviewed below, before the records: `cargo fmt --all
+--check`, both clippy runs, `cargo doc` with `-D warnings` and both MSRV
+checks passed; `cargo test --all-features` passed 661 tests (2 ignored)
+and `cargo test --no-default-features` 551 (2 ignored).
+
+**Independent review (Codex, AI-assisted, 2026-11-11).**
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| K01: the audit log file is opened without `O_NONBLOCK`, under the log's lock: a FIFO in its place made every record wait for a reader. Pre-existing. | Medium | Fixed next, in its own change (below). |
+| K02: the docs said that a FIFO fails the step at once; a backup that has checked the vault file copies it whatever is put in its place later, and a failed sync after the `.bak` cleanup is a warning. | Low | Fixed: the architecture and P9 say that a FIFO is not waited on, and what each case gives. |
+| K03: an interposed `fsync` that did nothing on directories suppressed 137 calls, and the 83 selected tests still passed. | Info | Known (the surviving U3 mutation of the audit-log change); a permanent external check is a maintainer follow-up. |
+
+The reviewer enumerated the opens under the state lock or the log's
+lock: none of those in this change can wait on a FIFO (exclusive
+creations fail on an existing name). Under the log's lock, the log file
+itself could (K01), and so could the time zone file that
+`chrono::Local::now()` reads when `TZ` names a FIFO (as in CON08): only
+where the agent was started with such a `TZ`, which whoever starts it
+chooses, as the rest of its environment. Under the state lock, a time
+zone read when a grant is entered was not shown to wait with a constant
+`TZ`. Probes: backups with a missing source (`vault_changed`),
+the same bytes under another inode (`vault_changed`), an unreadable
+source (an I/O error), FIFOs, directories and links to FIFOs at the
+vault path, the directory and the backup's destination (all refused at
+once). The error contract holds: after the vault or the settings file is
+replaced, a failed sync is still `outcome_unknown`; a backup that fails
+can leave its copy at the destination, as before. `O_NONBLOCK` left on a
+regular file's descriptor does not change reads on Linux, and does not
+keep a file system from stalling (L12).

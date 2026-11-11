@@ -33,7 +33,7 @@
 //! the file meanwhile (ADR 0013, the unlock barrier).
 
 use std::collections::hash_map::{DefaultHasher, RandomState};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -47,7 +47,7 @@ use keepass::{Database, DatabaseKey};
 use crate::protocol::{
     EntryChanges, EntryFields, EntryInfo, EntryKind, Field, NewEntry, SecretString,
 };
-use crate::util::{make_private_dir, sync_parents};
+use crate::util::{make_private_dir, sync_directory, sync_parents};
 
 /// Custom KDBX field holding the host name or IP address.
 pub const FIELD_HOST: &str = "Host";
@@ -364,6 +364,16 @@ pub struct Vault {
     /// Test hook: make syncing the directory fail after the rename.
     #[cfg(test)]
     fail_dir_sync: bool,
+    /// Test hooks: each runs once at its point, given the path that the
+    /// agent is about to open or use again — the directory about to be
+    /// synced: `before_dir_sync` (a save, after the rename),
+    /// `before_cleanup_sync` (after the old-password backup was deleted),
+    /// `before_backup_dir_sync` (a backup, after its copy was written); the
+    /// vault file: `before_backup_read` (a backup, once the file was
+    /// checked) — as another program could put something in its place
+    /// then.
+    #[cfg(test)]
+    at: Vec<(&'static str, SaveHook)>,
 }
 
 impl std::fmt::Debug for Vault {
@@ -436,6 +446,8 @@ impl Vault {
             fail_cleanup: false,
             #[cfg(test)]
             fail_dir_sync: false,
+            #[cfg(test)]
+            at: Vec::new(),
         })
     }
 
@@ -459,7 +471,14 @@ impl Vault {
         password: SecretString,
         key: Option<&FingerprintKey>,
     ) -> Result<Vault, VaultError> {
-        let mut file = match File::open(path) {
+        // Opening does not wait — a FIFO in the vault's place would block,
+        // with the state held when it is a backup's copy — and only a
+        // regular file is read.
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(path)
+        {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(VaultError::Missing(path.to_path_buf()));
@@ -467,6 +486,12 @@ impl Vault {
             Err(e) => return Err(e.into()),
         };
         let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(VaultError::Invalid(format!(
+                "{} is not a regular file; refusing to load it",
+                path.display()
+            )));
+        }
         if meta.len() > MAX_VAULT_BYTES {
             return Err(VaultError::Invalid(format!(
                 "{} is larger than {} MiB; refusing to load it",
@@ -510,6 +535,8 @@ impl Vault {
             fail_cleanup: false,
             #[cfg(test)]
             fail_dir_sync: false,
+            #[cfg(test)]
+            at: Vec::new(),
         })
     }
 
@@ -548,6 +575,14 @@ impl Vault {
     #[cfg(test)]
     pub(crate) fn fail_directory_sync(&mut self) {
         self.fail_dir_sync = true;
+    }
+
+    /// Run the test hook set for `point` (see [`Vault::at`]), if any.
+    #[cfg(test)]
+    fn hook(&mut self, point: &str, path: &Path) {
+        if let Some(at) = self.at.iter().position(|(p, _)| *p == point) {
+            (self.at.remove(at).1)(path);
+        }
     }
 
     /// Use `new` as the master password from the next save on. That save
@@ -690,14 +725,19 @@ impl Vault {
         if content.is_some() {
             self.content = content;
         }
+        // Opened as a directory only: a FIFO put in its place fails the sync
+        // at once, instead of making the agent wait, with the state held, for
+        // a writer.
+        #[cfg(test)]
+        self.hook("before_dir_sync", &dir);
         #[cfg(test)]
         let synced = if self.fail_dir_sync {
             Err(std::io::Error::other("injected directory sync failure"))
         } else {
-            File::open(&dir).and_then(|d| d.sync_all())
+            sync_directory(&dir)
         };
         #[cfg(not(test))]
-        let synced = File::open(&dir).and_then(|d| d.sync_all());
+        let synced = sync_directory(&dir);
         if let Err(e) = synced {
             // Deleting an old-password `.bak` waits for a save that is
             // confirmed: after a crash, that file may be the only copy.
@@ -714,12 +754,16 @@ impl Vault {
             #[cfg(not(test))]
             let removed = fs::remove_file(&backup);
             self.cleanup_error = match removed {
-                Ok(()) => File::open(&dir).and_then(|d| d.sync_all()).err().map(|e| {
-                    format!(
-                        "{}: deleted, but the directory was not synced: {e}",
-                        backup.display()
-                    )
-                }),
+                Ok(()) => {
+                    #[cfg(test)]
+                    self.hook("before_cleanup_sync", &dir);
+                    sync_directory(&dir).err().map(|e| {
+                        format!(
+                            "{}: deleted, but the directory was not synced: {e}",
+                            backup.display()
+                        )
+                    })
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => Some(format!("{}: {e}", backup.display())),
             };
@@ -909,11 +953,28 @@ impl Vault {
     /// must not exist; then decrypt the copy with the current master password
     /// to prove it is a usable backup. Returns the number of entries in it.
     pub fn backup_to(&mut self, dest: &Path) -> Result<usize, VaultError> {
-        let current = fs::metadata(&self.path).ok().map(|m| Fingerprint::of(&m));
-        if current != self.fingerprint {
+        // The file is checked and read through one descriptor, opened
+        // without waiting: a FIFO put in its place, before or after the
+        // check, would otherwise make the agent wait for a writer, with the
+        // state held.
+        let mut source = match OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&self.path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VaultError::ChangedOnDisk);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if Some(Fingerprint::of(&source.metadata()?)) != self.fingerprint {
             return Err(VaultError::ChangedOnDisk);
         }
-        let bytes = fs::read(&self.path)?;
+        #[cfg(test)]
+        self.hook("before_backup_read", &self.path.clone());
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -933,7 +994,9 @@ impl Vault {
             file.write_all(&bytes)?;
             file.sync_all()?;
             if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
-                File::open(dir)?.sync_all()?;
+                #[cfg(test)]
+                self.hook("before_backup_dir_sync", dir);
+                sync_directory(dir)?;
             }
             Ok(())
         })();
@@ -2080,6 +2143,164 @@ mod tests {
         );
     }
 
+    /// What `f` gives, on another thread, within 10 s: a FIFO opened where
+    /// a directory or a vault file should be would make it wait for a
+    /// writer.
+    fn at_once<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer")
+    }
+
+    /// A hook that puts the directory it is given aside, at `away`, and a
+    /// FIFO in its place.
+    fn fifo_for(away: &Path) -> SaveHook {
+        let away = away.to_path_buf();
+        Box::new(move |dir: &Path| {
+            fs::rename(dir, &away).expect("put aside");
+            nix::unistd::mkfifo(dir, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        })
+    }
+
+    /// Undo [`fifo_for`].
+    fn put_back(dir: &Path, away: &Path) {
+        fs::remove_file(dir).expect("remove the FIFO");
+        fs::rename(away, dir).expect("put back");
+    }
+
+    /// The kind of the I/O error in `result`, if it is one.
+    fn io_kind<T>(result: Result<T, VaultError>) -> Result<T, Option<std::io::ErrorKind>> {
+        result.map_err(|e| match e {
+            VaultError::NotDurable(e) | VaultError::Io(e) => Some(e.kind()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_the_vault_directory_fails_its_sync_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        let sub = path.parent().expect("dir").to_path_buf();
+        let away = dir.path().join("away");
+        vault
+            .add(&entry("old"), &secret("abcd"), false)
+            .expect("add");
+        vault.save().expect("save");
+        vault
+            .add(&entry("new"), &secret("efgh"), false)
+            .expect("add");
+        // After the rename, before the directory sync: the save is done but
+        // not confirmed.
+        vault.at.push(("before_dir_sync", fifo_for(&away)));
+        let (saved, mut vault) = at_once(move || (io_kind(vault.save()), vault));
+        assert_eq!(saved, Err(Some(std::io::ErrorKind::NotADirectory)));
+        put_back(&sub, &away);
+        let reopened = Vault::open(&path, secret("correct horse")).expect("new file");
+        assert!(reopened.find("new").is_ok());
+        // After a password change, the old-password copy deleted, before
+        // the directory sync: reported, the save itself done.
+        vault.change_password(secret("another passphrase"));
+        vault.at.push(("before_cleanup_sync", fifo_for(&away)));
+        let (saved, mut vault) = at_once(move || (io_kind(vault.save()), vault));
+        assert_eq!(saved, Ok(()));
+        put_back(&sub, &away);
+        let why = vault.take_cleanup_error().expect("reported");
+        assert!(
+            why.contains("deleted, but the directory was not synced"),
+            "{why}"
+        );
+        assert!(!path.with_file_name("vault.kdbx.bak").exists());
+        Vault::open(&path, secret("another passphrase")).expect("saved");
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_a_backup_or_its_directory_fails_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut vault, path) = new_vault(&dir);
+        vault
+            .add(&entry("one"), &secret("abcd"), false)
+            .expect("add");
+        vault.save().expect("save");
+        let backups = dir.path().join("backups");
+        fs::create_dir(&backups).expect("mkdir");
+        let away = dir.path().join("away");
+        // Its directory, once the copy is written and synced.
+        vault.at.push(("before_backup_dir_sync", fifo_for(&away)));
+        let dest = backups.join("first.kdbx");
+        let (written, mut vault) = at_once(move || (io_kind(vault.backup_to(&dest)), vault));
+        assert_eq!(written, Err(Some(std::io::ErrorKind::NotADirectory)));
+        put_back(&backups, &away);
+        // The vault file, once checked: what is copied is what was checked.
+        let aside = dir.path().join("aside.kdbx");
+        let to = aside.clone();
+        vault.at.push((
+            "before_backup_read",
+            Box::new(move |file: &Path| {
+                fs::rename(file, &to).expect("put aside");
+                nix::unistd::mkfifo(file, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+            }),
+        ));
+        let dest = backups.join("checked.kdbx");
+        let (copied, mut vault) = at_once({
+            let dest = dest.clone();
+            move || (io_kind(vault.backup_to(&dest)), vault)
+        });
+        assert_eq!(copied, Ok(1));
+        fs::remove_file(&path).expect("remove the FIFO");
+        fs::rename(&aside, &path).expect("put back");
+        assert_eq!(
+            fs::read(&dest).expect("the copy"),
+            fs::read(&path).expect("the vault")
+        );
+        // A FIFO in place of the vault file is not opened to wait.
+        fs::rename(&path, &aside).expect("put aside");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let (refused, mut vault) = at_once({
+            let dest = backups.join("refused.kdbx");
+            move || {
+                let refused = vault.backup_to(&dest).map(drop);
+                (
+                    refused.map_err(|e| matches!(e, VaultError::ChangedOnDisk)),
+                    vault,
+                )
+            }
+        });
+        assert_eq!(refused, Err(true), "changed on disk");
+        fs::remove_file(&path).expect("remove the FIFO");
+        fs::rename(&aside, &path).expect("put back");
+        // The copy, before it is opened to be verified.
+        vault.before_verify = Some(Box::new(|dest: &Path| {
+            fs::remove_file(dest).expect("remove the copy");
+            nix::unistd::mkfifo(dest, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        }));
+        let dest = backups.join("second.kdbx");
+        let verified = at_once(move || vault.backup_to(&dest).map_err(|e| e.to_string()));
+        let why = verified.expect_err("a FIFO is not a backup");
+        assert!(why.contains("was written but does not open"), "{why}");
+        assert!(why.contains("is not a regular file"), "{why}");
+    }
+
+    #[test]
+    fn only_a_regular_file_is_opened_and_a_fifo_does_not_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let why = Vault::open(dir.path(), secret("correct horse"))
+            .expect_err("a directory")
+            .to_string();
+        assert!(why.contains("is not a regular file"), "{why}");
+        let fifo = dir.path().join("vault.kdbx");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        let opened = at_once(move || {
+            Vault::open(&fifo, secret("correct horse"))
+                .map(drop)
+                .map_err(|e| e.to_string())
+        });
+        let why = opened.expect_err("a FIFO");
+        assert!(why.contains("is not a regular file"), "{why}");
+    }
+
     #[test]
     fn names_are_validated() {
         assert!(validate_name("GitHub token").is_ok());
@@ -2321,7 +2542,7 @@ mod tests {
     fn oversized_files_are_refused_before_decryption() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("big.kdbx");
-        let file = File::create(&path).expect("create");
+        let file = fs::File::create(&path).expect("create");
         file.set_len(MAX_VAULT_BYTES + 1).expect("sparse file");
         assert!(matches!(
             Vault::open(&path, secret("x")),
@@ -2445,7 +2666,7 @@ mod tests {
         fs::remove_file(&path).expect("rm");
         fs::write(&path, &bytes).expect("write");
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
-        File::options()
+        fs::File::options()
             .write(true)
             .open(&path)
             .expect("open")

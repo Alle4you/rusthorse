@@ -11,7 +11,7 @@
 //! through the protocol is the agent's dialog, not the file's mode.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::{make_dirs, parse_duration, sync_parents};
+use crate::util::{make_dirs, parse_duration, sync_directory, sync_parents};
 
 /// The longest the vault may stay unlocked without use, when it locks by
 /// itself.
@@ -673,8 +673,8 @@ type Hooks = Vec<(&'static str, Box<dyn FnOnce()>)>;
 #[cfg(test)]
 thread_local! {
     /// For tests: what to do, once, at a point of [`save`]
-    /// (`before_create`, `after_create`, `after_check`), as another user
-    /// could meanwhile.
+    /// (`before_create`, `after_create`, `after_check`, `before_dir_sync`),
+    /// as another user could meanwhile.
     static HOOKS: std::cell::RefCell<Hooks> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -756,12 +756,14 @@ pub fn save(path: &Path, layer: &Layer) -> Result<(), SaveError> {
         let _ = std::fs::remove_file(&temp);
         return Err(before(e));
     }
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|error| SaveError {
-            replaced: true,
-            error,
-        })
+    #[cfg(test)]
+    hook("before_dir_sync");
+    // As a directory only: a FIFO put in its place fails at once, instead of
+    // making the agent wait, with the state held, for a writer.
+    sync_directory(dir).map_err(|error| SaveError {
+        replaced: true,
+        error,
+    })
 }
 
 #[cfg(test)]
@@ -1206,6 +1208,45 @@ mod tests {
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let path = closed.join("d").join("agent.toml");
         save(&path, &layer).expect("save");
+        assert_eq!(load(&path), Ok(layer));
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_the_settings_directory_fails_its_sync_at_once() {
+        let dir = private_tempdir();
+        let inner = dir.path().join("rusthorse");
+        let path = inner.join("agent.toml");
+        let away = dir.path().join("away");
+        let mut layer = Layer::default();
+        layer.set(Key::IdleTimeout, secs(60)).expect("set");
+        save(&path, &layer).expect("save");
+        layer.set(Key::IdleTimeout, secs(120)).expect("set");
+        // After the rename, before the directory sync (the hooks are the
+        // thread's own).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let (path, inner, away, layer) =
+                (path.clone(), inner.clone(), away.clone(), layer.clone());
+            move || {
+                HOOKS.with(|hooks| {
+                    hooks.borrow_mut().push((
+                        "before_dir_sync",
+                        Box::new(move || {
+                            std::fs::rename(&inner, &away).expect("put aside");
+                            nix::unistd::mkfifo(&inner, nix::sys::stat::Mode::S_IRWXU)
+                                .expect("mkfifo");
+                        }),
+                    ))
+                });
+                let _ = tx.send(save(&path, &layer).map_err(|e| (e.replaced, e.error.kind())));
+            }
+        });
+        let saved = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opening a FIFO waited for a writer");
+        assert_eq!(saved, Err((true, io::ErrorKind::NotADirectory)));
+        std::fs::remove_file(&inner).expect("remove the FIFO");
+        std::fs::rename(&away, &inner).expect("put back");
         assert_eq!(load(&path), Ok(layer));
     }
 

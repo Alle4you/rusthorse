@@ -379,6 +379,17 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
   fails the creation or the save, which writes nothing: a directory in
   which a new vault's or the settings' directory can be made, but which
   cannot be read, now refuses them.
+- Saving the vault or the agent's settings, and making a backup, no longer
+  wait on a FIFO that a program put in place of a directory or of the vault
+  file: the directory each syncs is opened as a directory only, a backup
+  checks and reads the vault file through one descriptor, and opening a
+  vault file — to unlock it, or a backup's copy to verify it — does not wait
+  and reads only a regular file. Before, such a FIFO made the agent wait for
+  a writer with its state held, and so held off every lock (idle, `rusthorse
+  lock`, suspend, screen lock) with the vault unlocked. A FIFO in place of
+  a directory now fails the sync at once, as any other failure of that sync
+  would; a vault path that is not a regular file is refused (until now a
+  directory there failed later, when read).
 - A request whose requester goes away — `rusthorse` interrupted or killed,
   the manager's window closed, an AI agent's tool call stopped — while a
   dialog for it is open is cancelled, as the protocol had said: the dialog

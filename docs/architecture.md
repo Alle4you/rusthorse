@@ -457,7 +457,8 @@ first), and the human's approval of each old and new value. The answer is
 recorded first, fail closed; after Allow, under the state's lock and only if
 the generation did not change, the agent replaces the file (missing
 directories made, and the directory that holds each synced, as for a new
-vault; a private temporary file, synced, renamed, the directory synced),
+vault; a private temporary file, synced, renamed, the directory synced, as
+a directory only),
 sets the settings in effect, forgets remembered approvals and bumps the
 generation. Then it tells
 the dialogs their new timeout and "Allow for…" duration (a dialog already open
@@ -551,6 +552,25 @@ answers `outcome_unknown` (the change may not survive a crash) rather than
 "not saved", and locks the vault so that the next unlock reads whatever the
 file then holds. After a password change, the old-password `vault.kdbx.bak`
 is deleted only once a save has completed.
+
+The directories that saves and backups sync — the vault's, after the
+rename and after the old-password copy is deleted; the one that holds each
+directory made for a new vault; a backup's — are opened as directories
+only (`O_DIRECTORY`), as are those that the settings file's saves and the
+audit log sync. A vault file — to unlock it, or a backup's copy to verify
+it — is opened without waiting (`O_NONBLOCK`) and read only if it is a
+regular file, and a backup checks the vault file and copies it through the
+same descriptor. What a program puts in place of one is not waited on. In
+place of a directory, a FIFO or another file fails that sync at once, as
+any other failure of it would: after the rename, the save's outcome is
+unknown; after the old-password copy is deleted, the save is done and the
+failed sync reported. In place of the vault file, it fails the unlock (not
+a regular file) or a save's or backup's check (`vault_changed`); in place
+of a backup's copy, the copy does not verify. Once a backup has checked the vault file, what is
+put in its place is not read: the backup copies the file it checked.
+Before, the agent waited for a writer to such a FIFO — for a save or a
+backup with the state held, which held off every lock with the vault
+unlocked.
 
 Deleted entries are recorded in the KDBX `DeletedObjects` list, so that
 merging with an older copy does not bring them back. Vault files larger than
@@ -723,9 +743,8 @@ locked and approval-gated requests are refused. Each directory is opened
 as a directory only (`O_DIRECTORY`): a FIFO or another file that a program
 put in place of one fails the record at once, instead of making the agent
 wait, with the log held, for a writer to the FIFO. The same holds for the
-parents synced for the directories made for a new vault or the settings
-file, not for the directory that holds the vault or the settings file,
-which their saves open as before.
+directories that the vault's saves and backups and the settings file's
+saves sync (see [Saving](#saving)).
 
 `rusthorse audit` and the manager's History page read the file directly:
 the CLI at its own configured path, the manager at the path the agent

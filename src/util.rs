@@ -43,21 +43,19 @@ pub fn make_private_dir(path: &Path, made: &mut Vec<PathBuf>) -> io::Result<()> 
 /// [`make_private_dir`] and [`make_dirs`] list them), so that their names
 /// survive a crash: a file synced into a directory just made is lost with
 /// that directory's name. As for the vault's saves, any error is a failure.
-/// Each is opened with [`open_directory`].
+/// Each is synced with [`sync_directory`].
 pub fn sync_parents(made: &[PathBuf]) -> io::Result<()> {
     for dir in made {
         let parent = dir
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        open_directory(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("cannot sync the directory {}: {e}", parent.display()),
-                )
-            })?;
+        sync_directory(parent).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot sync the directory {}: {e}", parent.display()),
+            )
+        })?;
     }
     Ok(())
 }
@@ -71,6 +69,12 @@ pub fn open_directory(path: &Path) -> io::Result<std::fs::File> {
         .read(true)
         .custom_flags(nix::libc::O_DIRECTORY)
         .open(path)
+}
+
+/// Sync the directory `path` (`fsync`), opened with [`open_directory`], so
+/// that the names put in it or removed from it survive a crash.
+pub fn sync_directory(path: &Path) -> io::Result<()> {
+    open_directory(path)?.sync_all()
 }
 
 /// Create `path` and its missing parents with mode `0700`, as
