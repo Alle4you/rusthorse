@@ -4325,3 +4325,42 @@ Not verified: a real `xdg-desktop-portal` (the widget test uses GTK's own
 dialog because no portal serves its session), or a non-UTF-8 selection in
 the manager. No dialog was shown on the maintainer's screen, and no real
 vault, socket or keyring was used.
+
+**2026-11-11 — Tell the broker parser's 400 and 431 apart.**
+
+Closes the wording recommendation in the header-limit review of
+2026-11-10. `docs/cli.md` and `src/guide/ai.md` called even a head that
+only exceeds a limit "a malformed request". They now distinguish an
+unparseable request (`400`) from a head over 32 KiB or 100 header lines
+(`431`), both with empty bodies. Broker behaviour did not change.
+
+**Independent review (Codex, AI-assisted, 2026-11-11): ready.**
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| None | — | Ready. |
+
+The reviewer read the configured limits and Hyper 1.12.0 in Cargo's
+registry: both header-size and buffer-size errors map to `TooLarge`,
+answered with `431`. A probe drove the real broker through a simulated
+control channel, with a fake credential. Requests lacked a token except
+the last case, which supplied the grant's valid token:
+
+| Input | Status | Body |
+|---|---|---|
+| Malformed request | 400 | Empty |
+| Complete head, 32,768 bytes | 401 | Broker JSON |
+| Complete head, 32,769 bytes | 431 | Empty |
+| Incomplete head, 32,768 bytes | 431 | Empty |
+| Incomplete head, 65,536 bytes | 431 | Empty |
+| 100 header lines | 401 | Broker JSON |
+| 101 header lines | 431 | Empty |
+| Small head, 70,000-byte body | 401 | Broker JSON |
+| Head exceeding 32 KiB after token-to-key expansion | 401 | Broker JSON |
+
+The expansion refusal remains the broker's own `401`, not a parser
+`431`. The reviewer ran
+`cargo test -p rusthorse --all-features --bin rusthorse -- the_ai_guide`
+(3 passed) and
+`cargo test -p rusthorse-broker --all-features --test broker`
+(80 passed). These probes and tests ran in the first review of this change.

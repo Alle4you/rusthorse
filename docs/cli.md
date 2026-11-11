@@ -724,10 +724,12 @@ The broker's own answers — a missing or misplaced token, a request it does
 not forward, a grant that has ended — are short JSON errors of type
 `rusthorse_broker`, whose message starts with `rusthorse-broker:`; an error
 in the destination's own form comes from the destination, passed on as it
-came. Two exceptions: the broker's HTTP parser answers a malformed request
-itself, with `400` or `431` and an empty body — which a destination can
-send too — and a connection can close with no answer at all. A grant that has ended answers `403`, with a message
-that says to run the command again with `rusthorse run`. A program that
+came. Two exceptions: the broker's HTTP parser answers itself, with an
+empty body — which a destination can send too — a request it cannot parse
+(`400`) and one whose head exceeds its limits, 32 KiB or 100 header lines
+(`431`); and a connection can close with no answer at all. A grant that
+has ended answers `403`, with a message that says to run the command again
+with `rusthorse run`. A program that
 shows only the message still says who answered: Claude Code showed the
 broker's message after its own `Please run /login · API Error: 403`, and its
 `/login` does not apply here.

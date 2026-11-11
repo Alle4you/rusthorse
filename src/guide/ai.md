@@ -260,9 +260,10 @@ rusthorse run --broker DEEPSEEK_API_KEY=deepseek@https://api.deepseek.com --brok
 - The broker's own errors have the type `rusthorse_broker` and a message
   that starts with `rusthorse-broker:` (a missing or wrong token: `401`; a
   grant that has ended: `403`). An error in the destination's own form comes
-  from the destination. The broker's HTTP parser can answer a malformed
-  request with an empty `400` or `431`; a destination can answer so too, so
-  such an answer alone does not say who answered.
+  from the destination. The broker's HTTP parser can answer with an empty
+  `400` a request it cannot parse, and with an empty `431` one whose head
+  exceeds its limits (32 KiB, 100 header lines); a destination can answer
+  so too, so such an answer alone does not say who answered.
 - Every retry of an SDK is a new request: it counts against the grant's
   limit, and a retried POST may be acted on twice. Turn the retries off in
   code you write (`max_retries=0` in Python, `maxRetries: 0` in TypeScript).
