@@ -822,32 +822,32 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-02 | Broker foundation: independent verification V01–V07, then Codex B01/S1–S3 (AI-assisted). | Fixed; foundation ready. See the phase 1 entries below. |
 | 2026-11-02 | Broker shared helpers: implementer's checks (AI-assisted). | Reviewed with the whole; mutation limits recorded below. |
 | 2026-11-02–03 | Phase 1 pieces B–E: implementation checks, independent verification and fixes (AI-assisted). | Fixed or explicitly documented; whole review still required. |
-| 2026-11-03 | Whole phase 1 at `0d71da0` (Codex, AI-assisted). | Not ready: P01–P06; fixes below. |
+| 2026-11-03 | Whole phase 1 at `189703f` (Codex, AI-assisted). | Not ready: P01–P06; fixes below. |
 | 2026-11-03 | Pieces F and G: system tests and packaging, independent verification and fixes (AI-assisted). | Coverage and packaging fixes, accepted test gaps and incident below. |
-| 2026-11-03 | Re-review at `9f7599b` (Codex, AI-assisted). | Ready: no medium or higher finding left; Q01/Q02 low, dispositions below. |
-| 2026-11-03 | Documentation consolidation at `4ff834a` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `b999e72` and `3953912` (merged in `453e772`). Manual SDK validation remained pending then (since done on 2026-11-04; see the manual tests below). |
-| 2026-11-03 | Documentation revision at `453e772` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
-| 2026-11-03 | Final review at `4b0186d`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `17c1965` (packaging through a private staging directory); see below. |
-| 2026-11-03 | Re-review at `88b9ea4`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `3ca5ebb`. |
-| 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `d8f2eb9` and `e86e6bd`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `7a1d63b`. |
-| 2026-11-04 | Confirmation of `7a1d63b` and its history at `4ef519f` (Codex, AI-assisted). | Ready: U01–U03 confirmed resolved and the history accurate; V01 low and V02 low, fixed in `49bf590`. |
-| 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `c0aebc0` and `4fefa4c`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; W01 and W02 fixed in `2fafe05`, W03 partly, completed in `f51391c` (X02). The count of 401 answers held under every probe. |
-| 2026-11-04 | Confirmation of `2fafe05` and its history at `db0af0e` (Codex, AI-assisted). | Not ready: W01 and W02 confirmed resolved, W03 partly; X01 medium (older than this work: `list` and `show` printed what the vault holds unescaped), X02 and X03 low; X02 and X03 fixed in `f51391c`, X01 partly, completed in `f20d7d0` (Y01, Y02). |
-| 2026-11-04 | Confirmation of `f51391c` and its history at `5dd639a` (Codex, AI-assisted). | Not ready: X02 and X03 confirmed resolved, X01 partly; Y01 medium (`open` printed a URL from the vault unescaped) and Y02 low, both older than this work, fixed in `f20d7d0`. |
-| 2026-11-04 | Confirmation of `f20d7d0` and its history at `df52e23`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `2a4549d`. |
-| 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `013262d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
-| 2026-11-04 | The product's scope and the broker's dropped phases, at `443be7c` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `ccf7f5b`, on the documents as `19bce15` and `3e349c9` had rewritten them. |
-| 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `443be7c..de88005` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low. D01–D04, D06 and D07 were fixed in `14bfe0c`; D05 was partly fixed there, and completed by E02 (below). These are design and documentation changes; the code is unchanged. |
-| 2026-11-04 | Confirmation of the broker design at `8813b19` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `3a6af38`, with D05 completed by E02. Design and documents only. |
-| 2026-11-04 | Confirmation of E01–E04 at `3b38924` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
-| 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `2df51fd` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `d84f014`. |
-| 2026-11-04 | Confirmation of G01 and G02 and their record, `2df51fd..4f8c00b` (Codex, AI-assisted). | Ready: G01 and G02 confirmed resolved, no new finding; `2df51fd`'s tree is the one reviewed as `9c069d4`, and the record is accurate. |
-| 2026-11-04 | Saving a vault that KeePassXC wrote as KDBX 4.0, `6a8d394` (Codex, AI-assisted). | Ready: no finding. |
+| 2026-11-03 | Re-review at `38ef1f0` (Codex, AI-assisted). | Ready: no medium or higher finding left; Q01/Q02 low, dispositions below. |
+| 2026-11-03 | Documentation consolidation at `70ad512` (Codex, AI-assisted). | Body and history aligned to the implementation; Q01 was pending then and is recorded below as fixed in `2dabbff` and `96e7e43` (merged in `d1cab93`). Manual SDK validation remained pending then (since done on 2026-11-04; see the manual tests below). |
+| 2026-11-03 | Documentation revision at `d1cab93` (maintainer's agent review; Codex corrections, AI-assisted). | Ten requested corrections and reread dispositions below; reviewed guarantees restored and Q01's exact cleanup recorded. |
+| 2026-11-03 | Final review at `c599800`: independent Q01 verification, Q02 and documentation (Codex, AI-assisted). | Not ready: R01 medium and R02–R04 low. Q01 partly resolved; Q02 confirmed resolved. Fixed in `a65dca3` (packaging through a private staging directory); see below. |
+| 2026-11-03 | Re-review at `72494de`: private staging, R01–R04, manifest-path guard and history (Codex, AI-assisted). | Ready: R01–R04 and the manifest-path finding confirmed resolved; S01 low (a mutation-coverage gap) fixed in `1eb2e3b`. |
+| 2026-11-03 | Test hygiene and behaviour under load: the maintainer's agent's T01–T05, fixed in `a0594f4` and `1001e1e`, then their review (Codex, AI-assisted). | Ready: no medium or higher finding; T01, T03–T05 confirmed for the reported cases, T02 partly resolved; U01–U03 low, fixed in `a3d66b0`. |
+| 2026-11-04 | Confirmation of `a3d66b0` and its history at `897700e` (Codex, AI-assisted). | Ready: U01–U03 confirmed resolved and the history accurate; V01 low and V02 low, fixed in `8726b17`. |
+| 2026-11-04 | The feedback for a key the destination refused, and an edit's answer, at `cf28a7c` and `0060692`, with the maintainer's manual test so far (Codex, AI-assisted). | Not ready: W01 medium (an edit's answer printed a title from the vault unescaped), W02 and W03 low; W01 and W02 fixed in `59735de`, W03 partly, completed in `1ec2af1` (X02). The count of 401 answers held under every probe. |
+| 2026-11-04 | Confirmation of `59735de` and its history at `7397634` (Codex, AI-assisted). | Not ready: W01 and W02 confirmed resolved, W03 partly; X01 medium (older than this work: `list` and `show` printed what the vault holds unescaped), X02 and X03 low; X02 and X03 fixed in `1ec2af1`, X01 partly, completed in `6cb4f53` (Y01, Y02). |
+| 2026-11-04 | Confirmation of `1ec2af1` and its history at `2de6b34` (Codex, AI-assisted). | Not ready: X02 and X03 confirmed resolved, X01 partly; Y01 medium (`open` printed a URL from the vault unescaped) and Y02 low, both older than this work, fixed in `6cb4f53`. |
+| 2026-11-04 | Confirmation of `6cb4f53` and its history at `7a0f7be`, with a last sweep of what the CLI shows (Codex, AI-assisted). | Ready: Y01 and Y02 confirmed resolved; no other output shows supplied text unescaped; Z01 low (a test's stand-in script broke with a TMPDIR holding a space), fixed in `e5de2c2`. |
+| 2026-11-04 | The guide for AI agents and the documents after the maintainer left Claude Code's manual check for later, at `cb9ef8d` (Codex, AI-assisted). | Ready: no finding; the guide and documents match the code (`list`, `show` and `grants`) and the recorded evidence, and the deferred check is not taken for compatibility. |
+| 2026-11-04 | The product's scope and the broker's dropped phases, at `4f9fe79` (Codex, AI-assisted). | Not ready: S01 medium (the scope statement promised more control over ordinary `run` than it has), S02–S04 low; all four fixed in `85fb56f`, on the documents as `b91fc92` and `8eab1d3` had rewritten them. |
+| 2026-11-04 | The product's definition, S01–S04 and the design of the broker without profiles, `4f9fe79..dd81cc2` (Codex, AI-assisted). | Not ready: S01–S04 confirmed resolved; D01–D04 and D06 medium, D05 and D07 low. D01–D04, D06 and D07 were fixed in `9c0efd8`; D05 was partly fixed there, and completed by E02 (below). These are design and documentation changes; the code is unchanged. |
+| 2026-11-04 | Confirmation of the broker design at `8089080` (Codex, AI-assisted). | Not ready: D01–D04, D06 and D07 confirmed resolved, D05 partly; E01 medium (a new request type, so that an older agent refuses it), E02–E04 low; all fixed in `1c2923a`, with D05 completed by E02. Design and documents only. |
+| 2026-11-04 | Confirmation of E01–E04 at `92b0f78` (Codex, AI-assisted). | Ready: E01–E04 and D05 confirmed resolved; the design of the broker without profiles is complete enough to implement, within what protects the key and the approval. The ready applies to the design; its implementation is to be tested and reviewed. |
+| 2026-11-04 | The implementation of the broker without profiles, reviewed as `9c069d4` and squashed into `93848a9` with the same tree (Codex, AI-assisted). | Not ready: G01 medium (response headers that a destination's `Connection` names were relayed), G02 low (bindings by value accepted unknown fields); both fixed in `1edafe7`. |
+| 2026-11-04 | Confirmation of G01 and G02 and their record, `93848a9..0ec231b` (Codex, AI-assisted). | Ready: G01 and G02 confirmed resolved, no new finding; `93848a9`'s tree is the one reviewed as `9c069d4`, and the record is accurate. |
+| 2026-11-04 | Saving a vault that KeePassXC wrote as KDBX 4.0, `935743b` (Codex, AI-assisted). | Ready: no finding. |
 | 2026-11-04 | Manual test of the broker without profiles, with a real key (the maintainer and the maintainer's agent; a test, not a review). | `curl`, the Anthropic Python SDK 2.4.0 and Claude Code 2.1.318 worked through it for what was tried; see below. No client version is claimed supported. |
 | 2026-11-05 | The manager's History page (Codex, AI-assisted). | Not ready, then ready: the first review's findings fixed; see below. |
 | 2026-11-05 | The agent's settings and the manager's Settings page: design opinion, reviews and confirmations (Codex, AI-assisted). | Not ready until the last confirmation, then ready: R1–R7 fixed; see below. |
-| 2026-11-09 | Documentation audit: every document against the code at `3521f90`, in two rounds (eleven read-only audits by the maintainer's agent, AI-assisted). | Corrected in the same change; three behaviours of the code stated as they are and left to the maintainer; see below. |
-| 2026-11-09 | The SSH recipes of the guide for AI agents, `d88f7a5` and `eb75d19` (Codex, AI-assisted). | Not ready: SSH01 medium (the probe "without a secret" offered the human's own keys), SSH02–SSH05 low; fixed in the same change; see below. |
+| 2026-11-09 | Documentation audit: every document against the code at `1061b89`, in two rounds (eleven read-only audits by the maintainer's agent, AI-assisted). | Corrected in the same change; three behaviours of the code stated as they are and left to the maintainer; see below. |
+| 2026-11-09 | The SSH recipes of the guide for AI agents, `5cb9117` and `da0737f` (Codex, AI-assisted). | Not ready: SSH01 medium (the probe "without a secret" offered the human's own keys), SSH02–SSH05 low; fixed in the same change; see below. |
 | 2026-11-09 | The documentation correction, whole, and the SSH fixes (Codex, AI-assisted). | Not ready: SSH01–SSH05 confirmed fixed; DOC01–DOC06 low, fixed. Confirmation the same day: ready, no new finding; see below. |
 | 2026-11-10 | The SSH recipes tried against servers, by hand (the maintainer and the maintainer's agent; a test, not a review). | The probe, the key recipe and the password recipe worked for what was tried, on two routers; SSH06 low (nothing tells a password from a private key, and the agent first chose the wrong recipe), fixed in the guide, with a design decision left to the maintainer. The record and the fix reviewed the same day (Codex, AI-assisted): not ready with T01–T04 low, fixed, then ready; see below. |
 | 2026-11-10 | The entry kind `ssh-key` and protocol 11, the maintainer's answer to SSH06 ([ADR 0008, amended](adr/0008-entry-kinds.md#amendment-2026-11-10-the-kind-ssh-key)). | A label, like the other kinds: no policy reads it and nothing checks it against the value. Reviewed the same day (Codex, AI-assisted): not ready with K01–K03 low, fixed; the confirmation found K04 and K05 low, in the record, fixed; then ready; see below. |
@@ -857,6 +857,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | Keep restoring a backup a manual procedure (Codex, AI-assisted). | Not ready with RST01 and RST02 low; both confirmed fixed, then ready. The maintainer dropped restore through the agent; the manual procedure, its tests and the review's limits are recorded below. |
 | 2026-11-19 | The limits that the two reviews of 2026-11-10 left to the maintainer's acceptance, in P12 and in P16 and L26 (the maintainer's decision; not a review). | Accepted as stated; no code, property or limit changed. The reviewers' recommendations remain open; see the entry of that date below. |
 | 2026-11-19 | Drop the manager's three unbuilt features: listing and revoking single remembered approvals, the KeePassXC hand-off and editing notes (the maintainer's decision). | Nothing of ADR 0007 is left to build. Three messages in the manager and the documents changed; no code of the agent, the vault or the CLI. See below. Reviewed the same day (Codex, AI-assisted): not ready with MGR01 low, fixed, then ready. |
+| 2026-11-19 | The history rewritten before publication, at the maintainer's decision (rewritten by Gemini, AI-assisted; specified and verified by the maintainer's agent). | The same 221 commits and content, less a list of example names in the prototype, the session links of commit messages and a personal e-mail address. The commit ids this history cites were mapped to the rewritten commits. See below. Reviewed the same day (Codex, AI-assisted): not ready with HIS01 low, fixed, then ready. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -979,7 +980,7 @@ a first real test):
 | N26 — the protocol version stayed 1 across incompatible changes, so an older agent passed the check and then deadlocked | **Fixed:** protocol version 2; a check that gets anything but a status answer fails. |
 | N27 — `doctor` checked the vault named in the client's environment, not the one the agent uses | **Fixed:** it checks the vault and audit log the agent reports (new `status.audit_log`). |
 | Partial imports were not summarised; duplicates were not shown in the preview | **Fixed.** |
-| KeePassXC round trip is checked with the same parser, not by opening the result in KeePassXC | **Open** then (since closed: an ignored round-trip test was run with KeePassXC 2.7.6, `beaf9af`, S2 below; and KeePassXC 2.7.6 reopened the results of the KDBX 4.0 fix, `6a8d394`). |
+| KeePassXC round trip is checked with the same parser, not by opening the result in KeePassXC | **Open** then (since closed: an ignored round-trip test was run with KeePassXC 2.7.6, `e4920e4`, S2 below; and KeePassXC 2.7.6 reopened the results of the KDBX 4.0 fix, `935743b`). |
 | Coverage | A mutation run reverted each of 46 fixes in turn: 44 make the suite fail. The test for the N23 shutdown order only became effective after its command stopped producing output (output workers blocked by the unread output had masked the order) and with a small agent-side send buffer, a test-only setting. The two not caught are those described in the sixth table. |
 
 Findings of the ninth review (N23, N26 and N27 confirmed fixed; verdict: not
@@ -1880,7 +1881,7 @@ tables give the final dispositions; later rounds record the cases where
 earlier amendments had not yet closed a finding.
 
 Review (Codex, AI-assisted, 2026-11-02; verdict: not ready). The proposed
-ADR at `aff56e1` left 25 findings (F01–F25), ten open questions and further
+ADR at `24db2f6` left 25 findings (F01–F25), ten open questions and further
 questions needed to implement phase 1 without inventing security policy.
 
 | Finding | Disposition |
@@ -2000,14 +2001,14 @@ At the maintainer's request, the foundation and each parallel piece were
 checked before integration, then the whole was reviewed against ADR 0013. This
 history was consolidated by Codex (AI-assisted) on 2026-11-03 from the
 implementers' notes, independent Claude verifier reports, Codex reviews and
-commits, initially checked against code at `4ff834a`. Q01's follow-up and this
-documentation revision use `453e772`, which includes its two fixes. It records
+commits, initially checked against code at `70ad512`. Q01's follow-up and this
+documentation revision use `d1cab93`, which includes its two fixes. It records
 historical results, not a fresh rerun of every reported mutation.
 Finding/mutation names below are scoped by piece to avoid collisions. Severity
 is the reviewer's; notes without one remain observations rather than invented
 security findings. Earlier design-review entries above remain historical.
 
-**2026-11-02 — Foundation (`e9f0b46`, then `a7e26b5`).**
+**2026-11-02 — Foundation (`24c59b9`, then `d654f5e`).**
 
 Review (Claude independent verifier, AI-assisted, 2026-11-02; verdict: needs
 fixes), requested before the broker, agent, CLI and manager depended on the
@@ -2016,25 +2017,25 @@ checks, all caught; the seven fixes had 27, all caught.
 
 | Finding | Disposition |
 |---|---|
-| High — V01: optional fields on plain run/edit let a protocol-7 agent silently drop broker authority after a restart between connections. | **Fixed in `a7e26b5`:** separate `broker_run` and `broker_edit`; plain run/edit refuse broker fields; protocol-7 decoding and real old-agent probes refuse the new requests whole. |
-| Medium — V02: credentials of 1–8192 bytes were accepted, including values below the redactor's minimum. | **Fixed in `a7e26b5`:** 8–4096 visible ASCII characters; compile-time relation to the redactor minimum and boundary tests. |
-| Medium — V03: request-body limit was 32 MiB and the aggregate budget was missing. | **Fixed in `a7e26b5`:** 16 MiB per body, 64 MiB budget constants. |
-| Medium — V04: the control channel could not express `vault_changed`. | **Fixed in `a7e26b5`:** the end reason and its serialization tests. |
-| Low — V05: malformed/disallowed routes returned 400 rather than the specified 404. | **Fixed in `a7e26b5`:** route/query failures are 404; non-origin-form targets remain a framing 400. |
-| Low — V06: header, Ready, resolver and control-EOF deadlines lacked shared constants. | **Fixed in `a7e26b5`:** phase 1 constants in `broker_protocol.rs`. |
-| Low — V07: the temporary agent refusals and plain-edit clear guard had no policy tests. | **Fixed in `a7e26b5`:** end-to-end refusal tests, later replaced/extended as the real handlers arrived. |
+| High — V01: optional fields on plain run/edit let a protocol-7 agent silently drop broker authority after a restart between connections. | **Fixed in `d654f5e`:** separate `broker_run` and `broker_edit`; plain run/edit refuse broker fields; protocol-7 decoding and real old-agent probes refuse the new requests whole. |
+| Medium — V02: credentials of 1–8192 bytes were accepted, including values below the redactor's minimum. | **Fixed in `d654f5e`:** 8–4096 visible ASCII characters; compile-time relation to the redactor minimum and boundary tests. |
+| Medium — V03: request-body limit was 32 MiB and the aggregate budget was missing. | **Fixed in `d654f5e`:** 16 MiB per body, 64 MiB budget constants. |
+| Medium — V04: the control channel could not express `vault_changed`. | **Fixed in `d654f5e`:** the end reason and its serialization tests. |
+| Low — V05: malformed/disallowed routes returned 400 rather than the specified 404. | **Fixed in `d654f5e`:** route/query failures are 404; non-origin-form targets remain a framing 400. |
+| Low — V06: header, Ready, resolver and control-EOF deadlines lacked shared constants. | **Fixed in `d654f5e`:** phase 1 constants in `broker_protocol.rs`. |
+| Low — V07: the temporary agent refusals and plain-edit clear guard had no policy tests. | **Fixed in `d654f5e`:** end-to-end refusal tests, later replaced/extended as the real handlers arrived. |
 
 Review (Codex, AI-assisted, 2026-11-02; verdict: ready), requested on the
 fixed foundation against ADR 0013, before the parallel pieces used it.
 
 | Finding or suggestion | Disposition |
 |---|---|
-| Low — B01: cursor syntax, ID length and all-dot segments differed from the ADR. | **Fixed in `f600896`:** cursors accept the same colon-bearing ID syntax; 128-character IDs/cursors, 1–4-digit limit and rejection of all-dot segments are explicit in the ADR. Five mutations for this commit, including S3 below, all caught. |
-| Suggestion — S1: Admit's documentation implied the body was already read. | **Fixed in `f600896`:** declared length and budget are checked before admission; body reading follows it. |
-| Suggestion — S2: prove preservation through KeePassXC itself, not only a compatible fixture. | **Deferred, then tested in `beaf9af`:** an ignored round-trip test was run with KeePassXC 2.7.6; it is not required in CI where that program may be absent. |
-| Suggestion — S3: cap Install's lifetime by the stored profile too. | **Fixed in `f600896`:** validation rejects an excessive lifetime, with a mutation check. Independent enforcement at runtime was still incomplete until P02. |
+| Low — B01: cursor syntax, ID length and all-dot segments differed from the ADR. | **Fixed in `623589c`:** cursors accept the same colon-bearing ID syntax; 128-character IDs/cursors, 1–4-digit limit and rejection of all-dot segments are explicit in the ADR. Five mutations for this commit, including S3 below, all caught. |
+| Suggestion — S1: Admit's documentation implied the body was already read. | **Fixed in `623589c`:** declared length and budget are checked before admission; body reading follows it. |
+| Suggestion — S2: prove preservation through KeePassXC itself, not only a compatible fixture. | **Deferred, then tested in `e4920e4`:** an ignored round-trip test was run with KeePassXC 2.7.6; it is not required in CI where that program may be absent. |
+| Suggestion — S3: cap Install's lifetime by the stored profile too. | **Fixed in `623589c`:** validation rejects an excessive lifetime, with a mutation check. Independent enforcement at runtime was still incomplete until P02. |
 
-**2026-11-02 — Shared helpers (`625df43`).**
+**2026-11-02 — Shared helpers (`8873451`).**
 
 Implementation checks (Claude, AI-assisted, 2026-11-02), requested to settle
 helper lookup, CA trust and optional audit fields before parallel work. There
@@ -2056,8 +2057,8 @@ are named here by operation because the commit supplies no IDs:
 
 **2026-11-03 — Piece B: the broker program.**
 
-Implementation checks (Claude, AI-assisted, 2026-11-03) in `a28b83b` and
-`18689b4`, requested for the HTTP process and fake HTTPS tests. The WIP checks
+Implementation checks (Claude, AI-assisted, 2026-11-03) in `8f01426` and
+`7b0fb51`, requested for the HTTP process and fake HTTPS tests. The WIP checks
 corrected pending-admission outcomes, revocation/counting races, lifetime
 starting at Install, Ready after runtime setup, bounded buffers and panic/exit
 handling. They reported 60 mutations, 57 caught. Three independent deletions
@@ -2073,17 +2074,17 @@ shared CA unit tests cover its validation. The panic-hook gap was closed in
 the following verification.
 
 Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: needs
-fixes), requested before integration. Fixes are in `256f805` unless another
+fixes), requested before integration. Fixes are in `6ad1bdb` unless another
 commit is named.
 
 | Finding | Disposition |
 |---|---|
-| Medium — B-V1: the body budget was released while Hyper still retained unwritten bytes. | **Fixed in `256f805`:** the reservation is shared by forwarding until the response head and by the owned Bytes until Hyper releases them; writev avoids an unaccounted copy. Tests cover a stalled reader, no response and an early response. |
-| Low — B-V2: no test proved an active stream survives the connection idle timeout. | **Fixed in `256f805`:** a stream four times longer than the idle limit completes; dropping its busy guard fails the test. |
-| Low — B-V3: TLS/client-pause deadlines, resolver wiring, panic exit and several revocation races lacked tests. | **Fixed in `256f805`:** targeted tests, biased revocation branches and a test-only panic trigger. |
-| Low — B-V4: “never reads the environment” was stronger than the dependencies permit. | **Fixed in `256f805`, documented here:** the broker's own production code reads none; loader/resolver/runtime variables are unset by the agent. An explicit resolver-thread stack size avoids RUST_MIN_STACK. |
-| Low — B-V5: Revoked's ordering did not state that all admission answers must arrive first. | **Fixed in `256f805` and `d0c4acb`:** broker waits for every answer/Finished; agent refuses pending admissions immediately on revoke. Early-ack tolerance is documented in `6ed1ad7`. |
-| Low — B-V6: a test-upstream build could look like a production helper. | **Fixed in `256f805` and `095414b`:** compile-time release guard, check marker, doctor refusal. Runtime use with an empty environment was revisited and fixed as P05. |
+| Medium — B-V1: the body budget was released while Hyper still retained unwritten bytes. | **Fixed in `6ad1bdb`:** the reservation is shared by forwarding until the response head and by the owned Bytes until Hyper releases them; writev avoids an unaccounted copy. Tests cover a stalled reader, no response and an early response. |
+| Low — B-V2: no test proved an active stream survives the connection idle timeout. | **Fixed in `6ad1bdb`:** a stream four times longer than the idle limit completes; dropping its busy guard fails the test. |
+| Low — B-V3: TLS/client-pause deadlines, resolver wiring, panic exit and several revocation races lacked tests. | **Fixed in `6ad1bdb`:** targeted tests, biased revocation branches and a test-only panic trigger. |
+| Low — B-V4: “never reads the environment” was stronger than the dependencies permit. | **Fixed in `6ad1bdb`, documented here:** the broker's own production code reads none; loader/resolver/runtime variables are unset by the agent. An explicit resolver-thread stack size avoids RUST_MIN_STACK. |
+| Low — B-V5: Revoked's ordering did not state that all admission answers must arrive first. | **Fixed in `6ad1bdb` and `6885f24`:** broker waits for every answer/Finished; agent refuses pending admissions immediately on revoke. Early-ack tolerance is documented in `db91106`. |
+| Low — B-V6: a test-upstream build could look like a production helper. | **Fixed in `6ad1bdb` and `d5691ff`:** compile-time release guard, check marker, doctor refusal. Runtime use with an empty environment was revisited and fixed as P05. |
 
 The fix report enumerates checks rather than a unique aggregate: B-MB1–MB4 all
 caught, each budget holder by its applicable test; B-M48 (busy), B-M1 (TLS),
@@ -2100,17 +2101,17 @@ compilation was refused, and a getenv probe logged names only.
 **2026-11-03 — Piece C: agent integration and the unlock fingerprint.**
 
 Implementation checks (Claude, AI-assisted, 2026-11-03), requested for the
-registry, preparation transaction and every grant-ending event (`ac0bfc7`,
-`d29ec09`). WIP findings and their subsequent status:
+registry, preparation transaction and every grant-ending event (`9e6d598`,
+`d7bfbcc`). WIP findings and their subsequent status:
 
 | Finding | Disposition |
 |---|---|
-| High — C-W1: a grant revoked while starting could attach an unrevoked broker and hang cleanup. | **Fixed in `d29ec09`, strengthened by P03 in `d8c8fe3`:** reject attachment after starting ends; register before credential delivery. |
-| Medium — C-W2: a stuck broker writer could delay revocation under the writer lock. | **Fixed in `d29ec09`:** bounded/non-blocking writer acquisition and forced cleanup. |
-| Medium — C-W3: one realistic broker grant did not fit zenity's approval estimate. | **Fixed in `d29ec09`:** shorter factual dialog text and a height test; multiple grants can still be too tall. |
-| Low — C-W4: late admission refusals could be missing from end counts. | **Fixed in `d29ec09` and refined in `d0c4acb`:** registry accounting and answer ordering. |
-| Low — C-W5: the unlock barrier waited on the unlock audit record. | **Initially reported fixed in `d29ec09`; reopened as P01:** deciding revocation alone did not contain the broker. Actual containment before audit is fixed in `c1249d5`. |
-| Low — C-W6: control work needed a bounded queue. | **Fixed in `d29ec09`:** JOB_QUEUE 256 and violation/cleanup tests. |
+| High — C-W1: a grant revoked while starting could attach an unrevoked broker and hang cleanup. | **Fixed in `d7bfbcc`, strengthened by P03 in `7ac4c15`:** reject attachment after starting ends; register before credential delivery. |
+| Medium — C-W2: a stuck broker writer could delay revocation under the writer lock. | **Fixed in `d7bfbcc`:** bounded/non-blocking writer acquisition and forced cleanup. |
+| Medium — C-W3: one realistic broker grant did not fit zenity's approval estimate. | **Fixed in `d7bfbcc`:** shorter factual dialog text and a height test; multiple grants can still be too tall. |
+| Low — C-W4: late admission refusals could be missing from end counts. | **Fixed in `d7bfbcc` and refined in `6885f24`:** registry accounting and answer ordering. |
+| Low — C-W5: the unlock barrier waited on the unlock audit record. | **Initially reported fixed in `d7bfbcc`; reopened as P01:** deciding revocation alone did not contain the broker. Actual containment before audit is fixed in `0932d31`. |
+| Low — C-W6: control work needed a bounded queue. | **Fixed in `d7bfbcc`:** JOB_QUEUE 256 and violation/cleanup tests. |
 
 Initial checks reported 56 mutations, 53 caught. Survivors were the serialized
 request-limit recheck, an unused broker remembering key (the non-rememberable
@@ -2126,18 +2127,18 @@ fixes), requested before integrating the agent with the broker.
 
 | Finding | Disposition |
 |---|---|
-| Medium — C-F1: no test proved a failed grant-created record prevents the credential handoff. | **Fixed in `d0c4acb`:** unit test rejects the run, starts no broker and leaves no grant; C-M1 catches ignoring that write error. |
-| Low — C-F2: audit work could delay pending admission answers needed for Revoked. | **Fixed in `d0c4acb`:** the reader reserves admissions, revoke answers them at once, and containment work does not block the audit worker. |
-| Low — C-F3: retained-listener protection against port reuse was untested. | **Fixed in `d0c4acb`:** binding the port fails until the run releases it. |
-| Low — C-F4: activation's starting-state guard was untested. | **Fixed in `d0c4acb`:** a revoked preparation never becomes active. |
-| Low — C-F5: expiry timer and StopGrants were not exercised. | **Partly fixed in `d0c4acb`:** timer tests added; timer-start failure later fixed by P02. **Accepted coverage gap:** C-V20/C-M8 removes StopGrants and survives; direct stop_all is tested, but serve returning/unwinding with grants needs a test seam. SIGTERM does not run that guard (L23). |
-| Low — C-F6: starting state and status/capacity counts were unclear. | **Fixed in `d0c4acb`, documented here:** status counts starting/active/exhausted; listing and capacity also retain revoked grants. |
-| Low — C-F7: automatic locks preserved starting continue grants contrary to the ADR. | **Fixed in `d0c4acb`:** every lock ends all starting grants. |
-| Low — C-F8: fingerprint keys and collision claims exceeded what RandomState promises. | **Fixed in `e729ebd`, documented in L22:** one key drawn on its own thread (fallback to the caller if spawning fails), domain-separated outputs; no unconditional cryptographic 128-bit claim. |
-| Low — C-F9: the manager's AgentConfig literals would not compile after integration. | **Fixed in `0d71da0`:** new test configuration fields supplied at the merge. |
-| Low — C-F10: failures after approval could lack an aborted record. | **Fixed in `d0c4acb`:** shared best-effort aborted recording, including plain runs; P01 subsequently ensured cleanup precedes that audit. |
-| Low — C-F11: missing Python silently skipped policy tests. | **Fixed in `d0c4acb`:** fail unless the explicit RUSTHORSE_TEST_WITHOUT_PYTHON opt-out is set. |
-| Low — C-F12: multi-broker preparation failure and a lock during startup lacked end-to-end tests. | **Fixed in `d0c4acb`:** stand-in brokers force both failure paths and verify complete cleanup. |
+| Medium — C-F1: no test proved a failed grant-created record prevents the credential handoff. | **Fixed in `6885f24`:** unit test rejects the run, starts no broker and leaves no grant; C-M1 catches ignoring that write error. |
+| Low — C-F2: audit work could delay pending admission answers needed for Revoked. | **Fixed in `6885f24`:** the reader reserves admissions, revoke answers them at once, and containment work does not block the audit worker. |
+| Low — C-F3: retained-listener protection against port reuse was untested. | **Fixed in `6885f24`:** binding the port fails until the run releases it. |
+| Low — C-F4: activation's starting-state guard was untested. | **Fixed in `6885f24`:** a revoked preparation never becomes active. |
+| Low — C-F5: expiry timer and StopGrants were not exercised. | **Partly fixed in `6885f24`:** timer tests added; timer-start failure later fixed by P02. **Accepted coverage gap:** C-V20/C-M8 removes StopGrants and survives; direct stop_all is tested, but serve returning/unwinding with grants needs a test seam. SIGTERM does not run that guard (L23). |
+| Low — C-F6: starting state and status/capacity counts were unclear. | **Fixed in `6885f24`, documented here:** status counts starting/active/exhausted; listing and capacity also retain revoked grants. |
+| Low — C-F7: automatic locks preserved starting continue grants contrary to the ADR. | **Fixed in `6885f24`:** every lock ends all starting grants. |
+| Low — C-F8: fingerprint keys and collision claims exceeded what RandomState promises. | **Fixed in `5654dcc`, documented in L22:** one key drawn on its own thread (fallback to the caller if spawning fails), domain-separated outputs; no unconditional cryptographic 128-bit claim. |
+| Low — C-F9: the manager's AgentConfig literals would not compile after integration. | **Fixed in `189703f`:** new test configuration fields supplied at the merge. |
+| Low — C-F10: failures after approval could lack an aborted record. | **Fixed in `6885f24`:** shared best-effort aborted recording, including plain runs; P01 subsequently ensured cleanup precedes that audit. |
+| Low — C-F11: missing Python silently skipped policy tests. | **Fixed in `6885f24`:** fail unless the explicit RUSTHORSE_TEST_WITHOUT_PYTHON opt-out is set. |
+| Low — C-F12: multi-broker preparation failure and a lock during startup lacked end-to-end tests. | **Fixed in `6885f24`:** stand-in brokers force both failure paths and verify complete cleanup. |
 
 The fix report says “31 mutations and one control”, but its detailed list
 contains 30 distinct variants: 27 caught, three surviving; C-M3r/C-M11r are
@@ -2158,7 +2159,7 @@ they are not presented as full-system proofs.
 **2026-11-02–03 — Piece D: CLI and guide.**
 
 Implementation checks (Claude, AI-assisted, 2026-11-02), requested for the
-commands clients would use (`d13f237`, `948234a`, `a54cb22`). Audit output was
+commands clients would use (`3f687b5`, `5d92a0e`, `6e956ba`). Audit output was
 escaped because same-user editable records could forge terminal lines (one
 mutation caught); the CLI's 29 mutations were all caught. A later independent
 review found these six low findings (Claude, AI-assisted, 2026-11-03; verdict:
@@ -2166,12 +2167,12 @@ ready):
 
 | Finding | Disposition |
 |---|---|
-| Low — D-V1: grant-table escaping tests missed most agent-controlled cells. | **Fixed in `cad9d14`:** hostile values in every cell and order are tested. |
-| Low — D-V2: duplicate ordinary bindings could reach the agent unnecessarily. | **Fixed in `cad9d14`:** early CLI refusal, no request sent. |
-| Low — D-V3: status called every retained grant active. | **Fixed in `cad9d14`/`d0c4acb`, documented here:** label/count semantics distinguish starting/exhausted from revoked listings. |
-| Low — D-V4: the Claude Code recipe and compatible-origin wording promised unverified support. | **Fixed in `cad9d14`, documented here:** explicit origin and pending manual validation; no claim of testing with a real key. |
-| Low — D-V5: version checks and doctor-without-agent tests missed paths. | **Fixed in `cad9d14`:** checks before edit/grants effects and targeted fake-agent/doctor tests. |
-| Low — D-V6: doctor wording implied it parsed and validated the CA certificates. | **Fixed in `cad9d14` and installation docs in `7dc27dc`:** doctor checks the file; the broker parses certificates at grant startup. |
+| Low — D-V1: grant-table escaping tests missed most agent-controlled cells. | **Fixed in `3faa4d8`:** hostile values in every cell and order are tested. |
+| Low — D-V2: duplicate ordinary bindings could reach the agent unnecessarily. | **Fixed in `3faa4d8`:** early CLI refusal, no request sent. |
+| Low — D-V3: status called every retained grant active. | **Fixed in `3faa4d8`/`6885f24`, documented here:** label/count semantics distinguish starting/exhausted from revoked listings. |
+| Low — D-V4: the Claude Code recipe and compatible-origin wording promised unverified support. | **Fixed in `3faa4d8`, documented here:** explicit origin and pending manual validation; no claim of testing with a real key. |
+| Low — D-V5: version checks and doctor-without-agent tests missed paths. | **Fixed in `3faa4d8`:** checks before edit/grants effects and targeted fake-agent/doctor tests. |
+| Low — D-V6: doctor wording implied it parsed and validated the CA certificates. | **Fixed in `3faa4d8` and installation docs in `d7c83a1`:** doctor checks the file; the broker parses certificates at grant startup. |
 
 The fixes had 15 mutations, all caught; prose is supported by code review, not
 counted as mutation-tested behaviour. CLI broker operations refuse old agents
@@ -2181,38 +2182,38 @@ variable/header wording further.
 **2026-11-02–03 — Piece E: manager.**
 
 Implementation checks (Claude, AI-assisted, 2026-11-02) completed the WIP in
-`af6f830`, at the maintainer's request for a metadata-only grants page and
+`c023127`, at the maintainer's request for a metadata-only grants page and
 profile display. All 24 implementation mutations were caught.
 
 | Finding or observation | Disposition |
 |---|---|
-| Low — E-F1: maximum lifetime rounded down despite “at the latest”. | **Fixed in `af6f830`:** round up, with boundary tests. |
-| Low — E-F2: “unverified” was appended to requester-controlled text. | **Fixed in `af6f830`:** put it in the fixed field label. |
-| Low — E-F3: listing/revocation could leave controls waiting ten minutes. | **Fixed in `af6f830`:** 30-second limit; whole-job enforcement refined below. |
-| Low — E-F4: lifetime display arithmetic could overflow. | **Fixed in `af6f830`:** saturating arithmetic and u64 boundary test. |
-| Info — E-F5: listing epochs changed redundantly at request start and end. | **Changed in `af6f830`:** invalidate at completion; both remaining invalidations tested. |
-| Low — E-F6: manager docs attributed agent enforcement to the manager. | **Fixed in `af6f830`:** describe the client's behaviour and the agent's authority separately. |
-| Low — E-F7: a partial list of end reasons looked exhaustive. | **Fixed in `af6f830`:** qualified wording and warning about already-sent requests. |
-| Info — E-F8: replacing an imported entry removed its profile without a manager note. | **Fixed in `af6f830`:** import warning. |
-| Test-gap observation — E-F9: missing refused/unanswered requests, empty/no-agent and stale-listing cases. | **Fixed in `af6f830`:** fake-agent widget scenarios, never real credentials. |
+| Low — E-F1: maximum lifetime rounded down despite “at the latest”. | **Fixed in `c023127`:** round up, with boundary tests. |
+| Low — E-F2: “unverified” was appended to requester-controlled text. | **Fixed in `c023127`:** put it in the fixed field label. |
+| Low — E-F3: listing/revocation could leave controls waiting ten minutes. | **Fixed in `c023127`:** 30-second limit; whole-job enforcement refined below. |
+| Low — E-F4: lifetime display arithmetic could overflow. | **Fixed in `c023127`:** saturating arithmetic and u64 boundary test. |
+| Info — E-F5: listing epochs changed redundantly at request start and end. | **Changed in `c023127`:** invalidate at completion; both remaining invalidations tested. |
+| Low — E-F6: manager docs attributed agent enforcement to the manager. | **Fixed in `c023127`:** describe the client's behaviour and the agent's authority separately. |
+| Low — E-F7: a partial list of end reasons looked exhaustive. | **Fixed in `c023127`:** qualified wording and warning about already-sent requests. |
+| Info — E-F8: replacing an imported entry removed its profile without a manager note. | **Fixed in `c023127`:** import warning. |
+| Test-gap observation — E-F9: missing refused/unanswered requests, empty/no-agent and stale-listing cases. | **Fixed in `c023127`:** fake-agent widget scenarios, never real credentials. |
 
 Review (Claude independent verifier, AI-assisted, 2026-11-03; verdict: ready),
 requested before integration; six low findings:
 
 | Finding | Disposition |
 |---|---|
-| Low — E-V1: refreshed rows could move a different grant under a Revoke click. | **Fixed in `a22687f`:** stable keyed rows, disappeared grants shown ended in place, tests bind the clicked ID. |
-| Low — E-V2: error-text filtering lacked a widget test. | **Fixed in `a22687f`:** hostile listing/revocation messages tested through dialog_text. |
-| Low — E-V3: missing-vault note, unreported status and refresh-after-request paths were untested. | **Fixed in `a22687f`:** fake-agent and first-start coverage. |
-| Low — E-V4: the stated 30-second bound actually allowed about 50 seconds across job stages. | **Fixed in `a22687f`:** one deadline from the start of the whole job, also for human requests. |
-| Low — E-V5: starting grants lacked their intended description and count semantics. | **Fixed in `a22687f` and `d0c4acb`:** starting label and status count aligned. |
+| Low — E-V1: refreshed rows could move a different grant under a Revoke click. | **Fixed in `0b7787b`:** stable keyed rows, disappeared grants shown ended in place, tests bind the clicked ID. |
+| Low — E-V2: error-text filtering lacked a widget test. | **Fixed in `0b7787b`:** hostile listing/revocation messages tested through dialog_text. |
+| Low — E-V3: missing-vault note, unreported status and refresh-after-request paths were untested. | **Fixed in `0b7787b`:** fake-agent and first-start coverage. |
+| Low — E-V4: the stated 30-second bound actually allowed about 50 seconds across job stages. | **Fixed in `0b7787b`:** one deadline from the start of the whole job, also for human requests. |
+| Low — E-V5: starting grants lacked their intended description and count semantics. | **Fixed in `0b7787b` and `6885f24`:** starting label and status count aligned. |
 | Low — E-V6: shared architecture/changelog/invariant docs lagged the feature. | **Documented in this 2026-11-03 consolidation:** protocol 8, grants page, profiles and ownership of secrets. |
 
 All 11 verification-fix mutations were caught; parallel load checks and
 private-Xvfb light/dark inspection used fake data. Grants carries no token;
 profile forms stay read-only and the manager never sends broker_edit.
 
-**2026-11-03 — Whole phase 1 at `0d71da0`.**
+**2026-11-03 — Whole phase 1 at `189703f`.**
 
 Review (Codex, AI-assisted, 2026-11-03; verdict: not ready), requested by the
 maintainer to examine the seams after pieces B–E were integrated, before
@@ -2220,22 +2221,22 @@ system tests and packaging were finished.
 
 | Finding | Disposition |
 |---|---|
-| Medium — P01: unlock decided revocation but waited for audit before containing brokers. | **Fixed in `c1249d5`:** contain first, record outside the state lock, recheck generation before publishing; aborted-run cleanup also precedes its audit. |
-| Medium — P02: expiry depended on an agent timer that could fail to start, and the broker did not independently end open work. | **Fixed in `c14c4f9` and `24bea7e`:** refuse grants without the agent timer; broker boot-time task and per-step deadline checks drop credentials/work without an unsolicited Revoked. |
-| Medium — P03: Install could deliver the credential before the process was registered for revocation. | **Fixed in `d8c8fe3`:** register Link and non-blocking Install under one registry lock, only while starting; failures kill/reap. |
-| Medium — P04: another revoker could treat a requested kill as completed containment. | **Fixed in `d8c8fe3`:** Running/Ending/Gone; publish Gone only after kill/reap; waiters share confirmed/dead state. |
-| Medium — P05: a test build started by the production agent could reach loopback. | **Fixed in `4c2c5d4`:** absent RUSTHORSE_BROKER_TEST_ROOTS selects production settings before other hooks are read; agent env_clear is the runtime boundary. |
-| Low — P06: the manager's Anthropic snippet bound the wrong variable for the library recipe. | **Fixed in `37e97c6`:** ANTHROPIC_API_KEY and BASE_URL, note to leave AUTH_TOKEN out, separate Claude Code recipe. |
-| Suggestion — document early Revoked tolerance. | **Fixed in `6ed1ad7`:** the agent's tolerance is explicit; the real broker still orders its acknowledgement after all answers/Finished. |
+| Medium — P01: unlock decided revocation but waited for audit before containing brokers. | **Fixed in `0932d31`:** contain first, record outside the state lock, recheck generation before publishing; aborted-run cleanup also precedes its audit. |
+| Medium — P02: expiry depended on an agent timer that could fail to start, and the broker did not independently end open work. | **Fixed in `a23450c` and `38ddb0b`:** refuse grants without the agent timer; broker boot-time task and per-step deadline checks drop credentials/work without an unsolicited Revoked. |
+| Medium — P03: Install could deliver the credential before the process was registered for revocation. | **Fixed in `7ac4c15`:** register Link and non-blocking Install under one registry lock, only while starting; failures kill/reap. |
+| Medium — P04: another revoker could treat a requested kill as completed containment. | **Fixed in `7ac4c15`:** Running/Ending/Gone; publish Gone only after kill/reap; waiters share confirmed/dead state. |
+| Medium — P05: a test build started by the production agent could reach loopback. | **Fixed in `ea3e3c8`:** absent RUSTHORSE_BROKER_TEST_ROOTS selects production settings before other hooks are read; agent env_clear is the runtime boundary. |
+| Low — P06: the manager's Anthropic snippet bound the wrong variable for the library recipe. | **Fixed in `f8c6554`:** ANTHROPIC_API_KEY and BASE_URL, note to leave AUTH_TOKEN out, separate Claude Code recipe. |
+| Suggestion — document early Revoked tolerance. | **Fixed in `db91106`:** the agent's tolerance is explicit; the real broker still orders its acknowledgement after all answers/Finished. |
 | Suggestion — test P01–P05 with both real components. | **Partly covered and accepted:** F tests P01, expiry and production settings with real components. Deterministic registry/stand-in tests force P03/P04 interleavings; doing so in a full-system test would require new agent test hooks. |
 
 Fix verification (Claude, AI-assisted, 2026-11-03), requested for these
-findings: the agent branch tip is `6ed1ad7`, not the superseded `36db9c3`; 11
+findings: the agent branch tip is `db91106`, not the superseded `36db9c3`; 11
 mutations all caught. Install/check atomicity is by one critical section, not
 by a test interrupting inside it. A non-blocking Install relies on room for
 the <=64 KiB frame in the Unix socket send buffer; an incomplete write or
 WouldBlock fails closed (a short sendmsg may be completed by the remaining
-write_all). Broker/manager fixes end at `37e97c6`: 16 mutations all caught,
+write_all). Broker/manager fixes end at `f8c6554`: 16 mutations all caught,
 with 36 loaded lifetime-test runs. A long-sleep mutation first survived; a
 paused-clock suspend test then caught removal of periodic CLOCK_BOOTTIME
 rereads. No claim of a real-time scheduling bound follows from these tests.
@@ -2244,7 +2245,7 @@ rereads. No claim of a real-time scheduling bound follows from these tests.
 
 Implementation checks (Claude, AI-assisted, 2026-11-03), requested to prove
 ADR 0013 with the real library agent and broker, fake HTTPS and scripted UI
-(`1117cb8`, `beaf9af`). WIP checks corrected false-positive stream-cut
+(`5041e19`, `e4920e4`). WIP checks corrected false-positive stream-cut
 assertions, reading records before the final grant record, an idle test with
 no actual requests, a vacuous SSL_CERT_FILE check, a Finished branch that
 never ran and named-pipe interference. The supplied implementation notes do
@@ -2262,14 +2263,14 @@ fixes), requested before merging the system suite.
 
 | Finding | Disposition |
 |---|---|
-| Medium — F-V1: failed unlock coverage never reached a cancelled unlock that had already read a new fingerprint. | **Fixed in `170ea78`:** automatic-lock password hook, surviving stream, cancelled attempt preserving the old fingerprint, then a valid unlock revoking it; F-N27 caught. |
-| Low — F-V2: Lock and RevokeAll tested only one grant. | **Fixed in `170ea78`:** two concurrent runs/streams for all-grant ends and a one-grant-only control; F-N29/N30/N31 caught. |
-| Low — F-V3: failing tests could leave late-writing agents/brokers and temporary files. | **Fixed in `170ea78`:** System Drop locks, releases gates, signals command loops and waits for runs/registry/end records before TempDir destruction; F-N32/N33/N36 caught. F-N34 remains a gap below. |
-| Low — F-V4: one route could not prove completion records belonged to the right request number. | **Fixed in `170ea78`:** alternate two routes and compare each numbered admission/finish; F-N28 caught. |
-| Low — F-V5: environment requirements were incomplete and pipe synchronization depended on kernel wchan names. | **Fixed in `170ea78`:** module requirements, full pipes and owned-descriptor observation; nix mkfifo replaces the external command, no wchan; F-N38 caught. |
-| Low — F-V6: default workspace/CI checks omitted the broker. | **Fixed in `7dc27dc`:** broker is a default member; feature/no-feature checks and CA preflight cover it. |
-| Low — F-V7: report claims overstated moved-entry streaming, profile ALPN, branch tip and mutation names. | **Corrected here:** the moved entry gets its own stream only in `170ea78`; ALPN http/1.1 is fixed by the broker, not its profile; agent-fix tip is `6ed1ad7`; F-M15-limit and F-M15-other are distinct, with the latter's missing description explicit. |
-| Low — F-V8: a failing mutation assertion printed the development session's environment, including a real development-tool session token, into that agent's log. | **Code fixed in `170ea78`:** assertions check variable names before any fixed test-value comparison. **Maintainer notified:** deleting the log does not undo transcript exposure; review/rotation of that token is the maintainer's action and is not claimed complete here. No value is reproduced. |
+| Medium — F-V1: failed unlock coverage never reached a cancelled unlock that had already read a new fingerprint. | **Fixed in `101b1f2`:** automatic-lock password hook, surviving stream, cancelled attempt preserving the old fingerprint, then a valid unlock revoking it; F-N27 caught. |
+| Low — F-V2: Lock and RevokeAll tested only one grant. | **Fixed in `101b1f2`:** two concurrent runs/streams for all-grant ends and a one-grant-only control; F-N29/N30/N31 caught. |
+| Low — F-V3: failing tests could leave late-writing agents/brokers and temporary files. | **Fixed in `101b1f2`:** System Drop locks, releases gates, signals command loops and waits for runs/registry/end records before TempDir destruction; F-N32/N33/N36 caught. F-N34 remains a gap below. |
+| Low — F-V4: one route could not prove completion records belonged to the right request number. | **Fixed in `101b1f2`:** alternate two routes and compare each numbered admission/finish; F-N28 caught. |
+| Low — F-V5: environment requirements were incomplete and pipe synchronization depended on kernel wchan names. | **Fixed in `101b1f2`:** module requirements, full pipes and owned-descriptor observation; nix mkfifo replaces the external command, no wchan; F-N38 caught. |
+| Low — F-V6: default workspace/CI checks omitted the broker. | **Fixed in `d7c83a1`:** broker is a default member; feature/no-feature checks and CA preflight cover it. |
+| Low — F-V7: report claims overstated moved-entry streaming, profile ALPN, branch tip and mutation names. | **Corrected here:** the moved entry gets its own stream only in `101b1f2`; ALPN http/1.1 is fixed by the broker, not its profile; agent-fix tip is `db91106`; F-M15-limit and F-M15-other are distinct, with the latter's missing description explicit. |
+| Low — F-V8: a failing mutation assertion printed the development session's environment, including a real development-tool session token, into that agent's log. | **Code fixed in `101b1f2`:** assertions check variable names before any fixed test-value comparison. **Maintainer notified:** deleting the log does not undo transcript exposure; review/rotation of that token is the maintainer's action and is not claimed complete here. No value is reproduced. |
 
 The verification summary reports 11 checks, 10 caught; its detailed list names
 only ten variants (F-N27/N28/N29/N30/N31/N32/N33/N36/N34/N38), nine caught and
@@ -2279,14 +2280,14 @@ race after a run has answered and the registry emptied but the audit worker
 has not written its last record. No outside test widens it without an agent
 hook; no product behaviour changes, but a failed test could rarely leave its
 directory. This is an accepted harness-coverage gap, not an assertion that
-files cannot ever be left. `9f7599b` enabled the previously ignored P01/P05
+files cannot ever be left. `38ef1f0` enabled the previously ignored P01/P05
 tests after their fixes merged; the system suite then had 35 passing tests.
 
 **2026-11-03 — Piece G: packaging and release checks.**
 
 Implementation checks (Claude, AI-assisted, 2026-11-03), requested for the
-fourth program, feature-safe builds and licence completeness (`7dc27dc`,
-`e418949`). The report records 25 mutation checks; the negative-protocol check
+fourth program, feature-safe builds and licence completeness (`d7c83a1`,
+`ecb3720`). The report records 25 mutation checks; the negative-protocol check
 mutation survived because the runtime protocol is unsigned and the runtime
 would reject that value anyway. It is a defensive packaging check, not a
 release-feature bypass; the strict check remains. The supplied summary does
@@ -2302,12 +2303,12 @@ test-safety finding:
 
 | Finding | Disposition |
 |---|---|
-| Low — G-V1: text-only tests could miss a disabled build-deb refusal. | **Fixed in `7f113fb`:** run the whole script against stand-in cargo/dpkg, prove no packaging after refusal; explicit `|| exit 1` guards. |
-| Low — G-V2: the checked release binary could differ from the one cargo-deb packaged via --profile/--target. | **Fixed in `7f113fb`:** unpack and check every packaged broker; reject pre-check install and alternate-target paths; refuse and delete the packages of that run on failure. The remaining output-name cleanup gap was found as Q01. |
-| Low — G-V3: ring's Portions Copyright notices were omitted. | **Fixed in `5fdcb19`:** recognize the prefix and include the four notices, including the ARM line. |
-| Low — G-V4: a notice-count test did not detect missing ring source directories. | **Fixed in `5fdcb19`:** independent expected-notice oracle, not just a count. |
-| Low — G-V5: test docs implied feature-only execution covered every broker test. | **Fixed in `8946ec5`:** some production-configuration tests run only without features; run both configurations. |
-| Low — G-V6 (fixer): stand-in executables could hit ETXTBSY under load and dash could fall through to real system tools. | **Fixed in `ca393fb`:** child-created file and rename before execution. Real loginctl was observed in 2/96 pre-fix runs; a real systemctl stop was a possible consequence, not an observed one. Post-fix: 0/96. |
+| Low — G-V1: text-only tests could miss a disabled build-deb refusal. | **Fixed in `a9017d1`:** run the whole script against stand-in cargo/dpkg, prove no packaging after refusal; explicit `|| exit 1` guards. |
+| Low — G-V2: the checked release binary could differ from the one cargo-deb packaged via --profile/--target. | **Fixed in `a9017d1`:** unpack and check every packaged broker; reject pre-check install and alternate-target paths; refuse and delete the packages of that run on failure. The remaining output-name cleanup gap was found as Q01. |
+| Low — G-V3: ring's Portions Copyright notices were omitted. | **Fixed in `089d7ea`:** recognize the prefix and include the four notices, including the ARM line. |
+| Low — G-V4: a notice-count test did not detect missing ring source directories. | **Fixed in `089d7ea`:** independent expected-notice oracle, not just a count. |
+| Low — G-V5: test docs implied feature-only execution covered every broker test. | **Fixed in `9ad5da2`:** some production-configuration tests run only without features; run both configurations. |
+| Low — G-V6 (fixer): stand-in executables could hit ETXTBSY under load and dash could fall through to real system tools. | **Fixed in `28f4025`:** child-created file and rename before execution. Real loginctl was observed in 2/96 pre-fix runs; a real systemctl stop was a possible consequence, not an observed one. Post-fix: 0/96. |
 
 Fix mutations: 30, 27 caught. **G-M06** (append `|| true` after `|| exit 1`)
 survives because the failing command still exits first. **G-M28/G-M29** (omit
@@ -2318,7 +2319,7 @@ shown packaging a test build with cargo-deb 3.8.0 and --profile dev; the fixed
 script refused and removed it. No package was installed. Hosted CI and a
 manual installed-broker check remain separate from these local checks.
 
-**2026-11-03 — Codex re-review at `9f7599b`; Q02 at `4ff834a`.**
+**2026-11-03 — Codex re-review at `38ef1f0`; Q02 at `70ad512`.**
 
 Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
 maintainer after the four merges and P01–P06 fixes, with F and G included.
@@ -2328,11 +2329,11 @@ reasons above. No medium or higher finding remained.
 
 | Finding | Disposition |
 |---|---|
-| Low — Q01: a refused package whose filename did not end in .deb/.ddeb survived cleanup (release.pkg reproduced it). | **Fixed in `b999e72` and `3953912` (merged in `453e772`); reopened by R01–R04 of the final review and replaced in `17c1965` (merged in `dbf6a4b`), which packages into a private staging directory instead (see the final review below).** As first fixed, cleanup recognized reported regular files by their Debian-package prefix or case-insensitive .deb/.ddeb suffix. Content-recognized packages are emptied, then unlinked; a permission failure permits unlinking only without another hard link. Extension-only candidates are unlinked without emptying. Nothing else is deleted. Symbolic links are named, not followed; unreadable or undeletable candidates are reported and do not stop other cleanup. |
-| Low — Q02: the manager docs universally attributed one Anthropic header to SDKs, contradicting the dated ADR survey. | **Fixed in `4ff834a`:** describe ANTHROPIC_API_KEY and the preset's two accepted headers; leave competing AUTH_TOKEN unset; no universal SDK precedence/header claim. |
+| Low — Q01: a refused package whose filename did not end in .deb/.ddeb survived cleanup (release.pkg reproduced it). | **Fixed in `2dabbff` and `96e7e43` (merged in `d1cab93`); reopened by R01–R04 of the final review and replaced in `a65dca3` (merged in `23b8f52`), which packages into a private staging directory instead (see the final review below).** As first fixed, cleanup recognized reported regular files by their Debian-package prefix or case-insensitive .deb/.ddeb suffix. Content-recognized packages are emptied, then unlinked; a permission failure permits unlinking only without another hard link. Extension-only candidates are unlinked without emptying. Nothing else is deleted. Symbolic links are named, not followed; unreadable or undeletable candidates are reported and do not stop other cleanup. |
+| Low — Q02: the manager docs universally attributed one Anthropic header to SDKs, contradicting the dated ADR survey. | **Fixed in `70ad512`:** describe ANTHROPIC_API_KEY and the preset's two accepted headers; leave competing AUTH_TOKEN unset; no universal SDK precedence/header claim. |
 
 Q01 follow-up (2026-11-03): the two fix commit messages report 24 mutation
-checks, all caught (22 in `b999e72`, two in `3953912`). These are attributed
+checks, all caught (22 in `2dabbff`, two in `96e7e43`). These are attributed
 results, not a new mutation run by this documentation task. The separate
 Claude subagent verification was interrupted by a usage limit and did not
 complete; the final review of the whole implementation is still to come.
@@ -2357,14 +2358,14 @@ maintainer-script tests), and the KeePassXC round trip; diff whitespace check
 passed. It did not run system.rs/full agent tests, GTK, MSRV, clippy, docs or
 a full package build in that review: it had interpreted the earlier /proc
 restriction as excluding product ancestry reads. The maintainer's agent
-separately reported all AGENTS.md checks passing at `9f7599b`; that report is
+separately reported all AGENTS.md checks passing at `38ef1f0`; that report is
 attributed, not presented as Codex's execution. The current documentation task
 explicitly permits the normal test suites. The phase remains unreleased; live
 Claude Code/SDK validation is pending (since done on 2026-11-04; see the
 manual tests below).
 
 
-**2026-11-03 — Documentation checkpoint at `4ff834a` (uncommitted).**
+**2026-11-03 — Documentation checkpoint at `70ad512` (uncommitted).**
 
 Review (Codex subagents, AI-assisted, 2026-11-03), requested as AGENTS.md's
 independent checkpoint for this documentation update. Read-only checks against
@@ -2374,7 +2375,7 @@ are corrected in this patch, with no runtime changes.
 | Finding | Disposition |
 |---|---|
 | Documentation — revoke_grant was included among requests whose lost replies imply outcome_unknown. | **Fixed (docs):** protocol.md follows Request::has_effects: revocation is repeatable, a lost reply is a regular error, not proof of completion. |
-| Documentation — package cleanup was described as complete before Q01 merged. | **Fixed (docs):** the initial draft qualified the remaining output-name gap. After Q01 merged, architecture, changelog and ADRs were updated to the exact cleanup rules in `b999e72` and `3953912` (merged in `453e772`), as was the Q01 disposition above. |
+| Documentation — package cleanup was described as complete before Q01 merged. | **Fixed (docs):** the initial draft qualified the remaining output-name gap. After Q01 merged, architecture, changelog and ADRs were updated to the exact cleanup rules in `2dabbff` and `96e7e43` (merged in `d1cab93`), as was the Q01 disposition above. |
 | Documentation — ADR audit fields named a separate method field. | **Fixed (docs):** the method is part of the route template, as AuditEvent stores it. |
 | Documentation — response limit could be read as bounding the expanded redacted body. | **Fixed (docs):** 64 MiB bounds upstream bytes before replacement. |
 | Documentation — fingerprint thread creation omitted its fallback. | **Fixed (docs):** caller-thread fallback is stated; no stronger hash guarantee added. |
@@ -2387,7 +2388,7 @@ are corrected in this patch, with no runtime changes.
 | Low — roadmap said one broker per entry. | **Fixed (docs):** one per grant; concurrent runs of one entry have separate grants. |
 | Low — README still called manager M1 unreviewed. | **Fixed (docs):** status matches the recorded reviews and roadmap. |
 | Low — deleting an entry was said not to revoke anything. | **Fixed (docs):** it does revoke its grants, but not the provider's source credential. |
-| Low — B01's five mutations appeared to exclude the S3 lifetime check. | **Fixed (history):** five for the whole f600896 commit, including S3. |
+| Low — B01's five mutations appeared to exclude the S3 lifetime check. | **Fixed (history):** five for the whole 623589c commit, including S3. |
 | Documentation — piece F's aggregate did not match its detailed mutation list. | **Documented:** summary 11/10 versus ten named variants/nine caught; no extra result inferred. Piece C's analogous discrepancy is also explicit above. |
 
 Checks for this documentation task: `cargo fmt --all --check`,
@@ -2401,7 +2402,7 @@ changed. Live SDK checks, hosted CI, full packaging and the optional
 KeePassXC/KDF runs were not repeated for this documentation-only change.
 
 
-**2026-11-03 — Documentation revision at `453e772` (uncommitted).**
+**2026-11-03 — Documentation revision at `d1cab93` (uncommitted).**
 
 Review (the maintainer's agent, AI-assisted, 2026-11-03), requested to check
 that the phase 1 draft retained true, reviewed guarantees as well as adding
@@ -2418,13 +2419,13 @@ documentation revision, not the pending final implementation review.
 | Documentation — item 5: roadmap removed still-planned connectors, reasons and prior art. | **Fixed (docs):** restore Why, Design, Connectors, Secretless Broker and Limits; distinguish completed HTTP phase 1 from later device, SSH, database and signed-request work. |
 | Documentation — item 6: invariant 1 narrowed ownership to broker credentials. | **Fixed (docs):** AGENTS.md and CONTRIBUTING.md cover all vault secrets, with the one-grant handoff, ordinary-run delivery and unchanged client exceptions. |
 | Documentation — item 7: new prose had overlong and uneven lines. | **Fixed (docs):** reflow changed prose across the 14-file draft, preserving code spans, links, tables and examples. |
-| Documentation — item 8: Q01's integration was still pending in the draft. | **Fixed (docs):** record `b999e72` and `3953912` (merged in `453e772`), exact content-versus-extension cleanup and all 24 reported mutation checks caught. The interrupted independent verification and pending final review remain explicit. |
+| Documentation — item 8: Q01's integration was still pending in the draft. | **Fixed (docs):** record `2dabbff` and `96e7e43` (merged in `d1cab93`), exact content-versus-extension cleanup and all 24 reported mutation checks caught. The interrupted independent verification and pending final review remain explicit. |
 | Documentation — item 9: CLI grant capacity was explained in registry/listener terms. | **Fixed (docs):** explain that revocation may not free a place while its command runs; list grants and wait for commands to finish. Broker exit can remove a revoked grant sooner. |
 | Documentation — item 10: CHANGELOG's approval, auditing and redaction claims needed checking. | **Confirmed and clarified:** broker approvals have no remembering key and cannot be remembered; the agent durably records admission before authorizing forwarding; response bodies lose literal copies of the credential and credential-bearing headers are dropped. |
 | Documentation — reread: protocol.md still said any short Install send failed. | **Fixed (docs):** a partial sendmsg can be completed by write_all; failure to complete the non-blocking send fails preparation closed. |
 | Documentation — reread: two true component/caller statements were omitted. | **Fixed (docs):** architecture again says only the agent decrypts the vault and that helpers are optional; README again states that the caller receives the result, never the secret, beside the mode-specific limits. |
 
-Checks for this revision at `453e772`: `cargo fmt --all --check`,
+Checks for this revision at `d1cab93`: `cargo fmt --all --check`,
 `cargo test --all-features` (553 passed; two opt-in tests ignored),
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`, and
 `cargo test -p rusthorse-manager` (38 passed; private virtual displays).
@@ -2440,13 +2441,13 @@ committed. Live SDK validation and the final implementation review remain
 separate pending work (both since done: the reviews and the manual tests of
 2026-11-04, below).
 
-**2026-11-03 — Final phase 1 review at `4b0186d`.**
+**2026-11-03 — Final phase 1 review at `c599800`.**
 
 Review (Codex, AI-assisted, 2026-11-03; verdict: not ready), requested by
-the maintainer to verify Q01's fixes in `b999e72` and `3953912` (merged in
-`453e772`) independently, confirm Q02 in `4ff834a`, and check the
-documentation in `4b0186d` against the code and the review records. The
-reviewed range was `9f7599b..4b0186d`; no repository file was changed.
+the maintainer to verify Q01's fixes in `2dabbff` and `96e7e43` (merged in
+`d1cab93`) independently, confirm Q02 in `70ad512`, and check the
+documentation in `c599800` against the code and the review records. The
+reviewed range was `38ef1f0..c599800`; no repository file was changed.
 
 Q02 is confirmed resolved: the documentation names the Anthropic key
 variable and both accepted token headers without asserting which header
@@ -2457,11 +2458,11 @@ changed documentation; the history's 42 commit references resolved.
 
 | Finding | Disposition |
 |---|---|
-| Medium — R01: the cleanup classified, emptied and unlinked a file through separate operations on its name. A package replaced by a hard link to another file after the read open had that file emptied, and an installable alias of the package survived without a warning; a file swapped in before the unlink was deleted; a FIFO swapped in after the lstat blocked the cleanup. | **Fixed in `17c1965` (merged in `dbf6a4b`):** cargo-deb no longer writes where the user asked. `build-deb.sh` takes `--output DIR` itself and has cargo-deb write into a new private staging directory (mode 0700) inside `target/release/packaging`; `check-broker.py --staged` checks every entry there, refusing anything that is not a regular file without opening it, and only when all pass moves the packages into DIR, by a rename or, between file systems, a new `O_EXCL` file renamed over the final name, so that a file or link at that name is replaced, never followed or written through. Whatever stops the check removes the staging directory whole. Nothing outside it is classified, emptied or deleted. |
-| Low — R02: the package prefix also matched an ar archive whose first member is `debian-binary.o`, which was deleted although dpkg-deb refuses it. | **Fixed in `17c1965`:** no file is taken for a package by its first bytes any more; everything in the staging directory belongs to the run, and nothing else is deleted. |
-| Low — R03: a read error on a `.deb`/`.ddeb` took the name-only path, unlinking it without emptying it, so another hard link kept an installable package, unreported. | **Fixed in `17c1965`:** a refused package never leaves the staging directory, and removing that directory leaves nothing in DIR. |
-| Low — R04: the package list was split on newlines, but cargo-deb accepts a newline in its output name: a refused `line\nname.pkg` survived and the cleanup said "deleted nothing". | **Fixed in `17c1965`:** the staging directory is listed with `os.scandir`, never parsed from cargo-deb's output; a name with a newline is moved or removed whole (tested). |
-| Low — found while fixing R01: with `--manifest-path` to another manifest whose package name holds `../`, cargo-deb 3.8.0 wrote the package outside the staging directory, where no check would see it (reproduced). | **Fixed in `17c1965`:** `build-deb.sh` refuses `--manifest-path`, as it refuses `--target`. |
+| Medium — R01: the cleanup classified, emptied and unlinked a file through separate operations on its name. A package replaced by a hard link to another file after the read open had that file emptied, and an installable alias of the package survived without a warning; a file swapped in before the unlink was deleted; a FIFO swapped in after the lstat blocked the cleanup. | **Fixed in `a65dca3` (merged in `23b8f52`):** cargo-deb no longer writes where the user asked. `build-deb.sh` takes `--output DIR` itself and has cargo-deb write into a new private staging directory (mode 0700) inside `target/release/packaging`; `check-broker.py --staged` checks every entry there, refusing anything that is not a regular file without opening it, and only when all pass moves the packages into DIR, by a rename or, between file systems, a new `O_EXCL` file renamed over the final name, so that a file or link at that name is replaced, never followed or written through. Whatever stops the check removes the staging directory whole. Nothing outside it is classified, emptied or deleted. |
+| Low — R02: the package prefix also matched an ar archive whose first member is `debian-binary.o`, which was deleted although dpkg-deb refuses it. | **Fixed in `a65dca3`:** no file is taken for a package by its first bytes any more; everything in the staging directory belongs to the run, and nothing else is deleted. |
+| Low — R03: a read error on a `.deb`/`.ddeb` took the name-only path, unlinking it without emptying it, so another hard link kept an installable package, unreported. | **Fixed in `a65dca3`:** a refused package never leaves the staging directory, and removing that directory leaves nothing in DIR. |
+| Low — R04: the package list was split on newlines, but cargo-deb accepts a newline in its output name: a refused `line\nname.pkg` survived and the cleanup said "deleted nothing". | **Fixed in `a65dca3`:** the staging directory is listed with `os.scandir`, never parsed from cargo-deb's output; a name with a newline is moved or removed whole (tested). |
+| Low — found while fixing R01: with `--manifest-path` to another manifest whose package name holds `../`, cargo-deb 3.8.0 wrote the package outside the staging directory, where no check would see it (reproduced). | **Fixed in `a65dca3`:** `build-deb.sh` refuses `--manifest-path`, as it refuses `--target`. |
 
 The fix was implemented by a Claude subagent (AI-assisted) and was not
 separately verified by another; Codex's re-review of it follows. Its
@@ -2480,18 +2481,18 @@ staging directory until the next run, which removes
 hidden `.check-broker-*.tmp` in DIR); two runs at once on one target
 directory are not supported.
 
-Checks after the merge (`dbf6a4b`), whole output read: every check of
+Checks after the merge (`23b8f52`), whole output read: every check of
 AGENTS.md passed — fmt; clippy with all features and as released; `cargo
 test --all-features` and `--no-default-features` (packaging 24, system 35,
 `tests/agent.rs` 158 and 139); rustdoc with warnings denied; MSRV 1.89 both
 ways; the dialog's and the manager's clippy and tests; the KeePassXC round
 trip.
 
-**2026-11-03 — Re-review of private staging at `88b9ea4`.**
+**2026-11-03 — Re-review of private staging at `72494de`.**
 
 Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
-maintainer to verify the staging design in `17c1965` (merged in `dbf6a4b`)
-and its history in `88b9ea4`. The reviewed range was `4b0186d..88b9ea4`. No
+maintainer to verify the staging design in `a65dca3` (merged in `23b8f52`)
+and its history in `72494de`. The reviewed range was `c599800..72494de`. No
 medium or higher finding remained.
 
 R01–R04 are confirmed resolved: cargo-deb writes into a fresh private
@@ -2504,7 +2505,7 @@ newline whole. The `--manifest-path` escape was reproduced with cargo-deb
 
 | Finding | Disposition |
 |---|---|
-| Low — S01: the surviving mutation that removes the `fsync` was justified only as durability across a crash, which no test can observe. Without the `fsync` a write that fails late also goes unnoticed: with an injected `EIO`, the current code refused the copy, while the mutation published the package. | **Fixed in `3ca5ebb`:** a test runs `check-broker.py --staged` with an `fsync` that fails, copying to another file system: nothing is published, the file already at the package's name is unchanged, the copy's new file and the staging directory are deleted. Without the `fsync` the test fails (mutation check on a copy with its own target directory). The final review's section above now says so. |
+| Low — S01: the surviving mutation that removes the `fsync` was justified only as durability across a crash, which no test can observe. Without the `fsync` a write that fails late also goes unnoticed: with an injected `EIO`, the current code refused the copy, while the mutation published the package. | **Fixed in `1eb2e3b`:** a test runs `check-broker.py --staged` with an `fsync` that fails, copying to another file system: nothing is published, the file already at the package's name is unchanged, the copy's new file and the staging directory are deleted. Without the `fsync` the test fails (mutation check on a copy with its own target directory). The final review's section above now says so. |
 
 The other surviving mutation, copying after any rename error and not only
 `EXDEV`, keeps the check before publication and the publication without
@@ -2523,34 +2524,34 @@ overrides with path separators, a repeated `--output`, names with a
 newline, accepted and refused runs, links and files in DIR left as they
 were); the injected `EIO` against the mutation; the copy fallback after
 `EPERM`; `git diff --check`. The maintainer's agent then ran the 25
-packaging tests, clippy and the MSRV check on `3ca5ebb`.
+packaging tests, clippy and the MSRV check on `1eb2e3b`.
 
-**2026-11-03 — Test hygiene and behaviour under load at `e86e6bd`.**
+**2026-11-03 — Test hygiene and behaviour under load at `1001e1e`.**
 
 The maintainer asked for the old tests that left files behind to be fixed.
 The maintainer's agent ran the end-to-end suite in four parallel copies next
 to eight CPU burners, each copy with a `TMPDIR` of its own, and then every
 test binary alone in a `TMPDIR` of its own. Every loaded run of the suite
 left directories behind, and 7 of 56 failed. Five problems were found, all
-in the tests: T01–T04 were fixed in `d8f2eb9` and T05 in `e86e6bd`.
+in the tests: T01–T04 were fixed in `a0594f4` and T05 in `1001e1e`.
 
 Review (Codex, AI-assisted, 2026-11-03; verdict: ready), requested by the
 maintainer to verify those fixes: whether they prevent late writes and
 load-dependent failures without hiding a product defect or weakening the
-intended checks. The reviewed range was `99bda92..e86e6bd`. No medium or
+intended checks. The reviewed range was `7e8d602..1001e1e`. No medium or
 higher finding, or product defect behind the reported failures, was
 identified.
 
 | Finding | Disposition |
 |---|---|
-| T01 — Tests returned before the agent recorded a disconnected run's end, allowing the audit log to recreate the removed temporary directory. | **Fixed in `d8f2eb9` for the reported cases:** `wait_for_run_end` shares three existing waits and is added to nine further tests. The prior process and cancellation assertions remain. Removing the `exited` outcome makes all 13 callers, including T04, fail. Other asynchronous records still needed synchronization: U02 and U03 below. |
-| T02 — An immediate port check could observe a descriptor inherited by another test's child between fork and exec. | **Partly fixed in `d8f2eb9`:** two checks retry for up to five seconds; both still fail with a leaked listener. Source review confirms `RunGrants::stop` clears its listeners before the run answers. A third immediate check remained: U01 below. |
-| T03 — The watcher-stop test required less than three seconds although shutdown deliberately waits up to three seconds for its threads. | **Fixed in `d8f2eb9`:** the assertion allows five seconds, matching the companion test's scheduling margin, and still checks the inhibitor's release. An injected six-second delay is rejected. This no longer detects a regression that merely makes every stop consume the allowed three-second wait; it does not establish that normal stops are prompt. |
-| T04 — A requester-disconnection test inspected the run outcome after the grants disappeared but before `run/exited` was recorded. | **Fixed in `d8f2eb9`:** it waits for the run's end record before inspecting that outcome, retaining its revocation-order and broker-exit assertions. |
-| T05 — GTK widget tests activated desktop services that outlived them, and Xvfb could write Mesa's cache after cleanup. | **Fixed in `e86e6bd`:** the tests use private D-Bus sessions without service activation, disable GVfs, the settings portal and Mesa's shader cache, and use GTK's test accessibility backend. Accessible properties and relations, clipboard access through xclip and dialog assertions remain checked. The dialog skips with a diagnostic when required tools are absent; the manager requires them. CI installs dbus-daemon, which supplies dbus-run-session. |
-| Low — U01: the successful broker-run test still checked port release with an immediate bind. | **Fixed in `7a1d63b`:** it uses `port_released`, and keeps the broker-exit assertion. |
-| Low — U02: some tests inspected grant-end records or removed their directory before asynchronous grant auditing finished; one also required an unnecessary global created/ended alternation across grants. | **Fixed in `7a1d63b`:** the tests wait for each grant's end record by ID and check the order per grant. Where the audit log is a FIFO that fails every record, they wait until the end record has been written into it before they put the log back, without requiring a successful record. The same probe found a fourth test that returned before a grant's end record. |
-| Low — U03: the read-only polling test returned when status became locked, before the idle-lock audit record necessarily finished. | **Fixed in `7a1d63b`:** it waits for `lock/idle_timeout` before it returns. |
+| T01 — Tests returned before the agent recorded a disconnected run's end, allowing the audit log to recreate the removed temporary directory. | **Fixed in `a0594f4` for the reported cases:** `wait_for_run_end` shares three existing waits and is added to nine further tests. The prior process and cancellation assertions remain. Removing the `exited` outcome makes all 13 callers, including T04, fail. Other asynchronous records still needed synchronization: U02 and U03 below. |
+| T02 — An immediate port check could observe a descriptor inherited by another test's child between fork and exec. | **Partly fixed in `a0594f4`:** two checks retry for up to five seconds; both still fail with a leaked listener. Source review confirms `RunGrants::stop` clears its listeners before the run answers. A third immediate check remained: U01 below. |
+| T03 — The watcher-stop test required less than three seconds although shutdown deliberately waits up to three seconds for its threads. | **Fixed in `a0594f4`:** the assertion allows five seconds, matching the companion test's scheduling margin, and still checks the inhibitor's release. An injected six-second delay is rejected. This no longer detects a regression that merely makes every stop consume the allowed three-second wait; it does not establish that normal stops are prompt. |
+| T04 — A requester-disconnection test inspected the run outcome after the grants disappeared but before `run/exited` was recorded. | **Fixed in `a0594f4`:** it waits for the run's end record before inspecting that outcome, retaining its revocation-order and broker-exit assertions. |
+| T05 — GTK widget tests activated desktop services that outlived them, and Xvfb could write Mesa's cache after cleanup. | **Fixed in `1001e1e`:** the tests use private D-Bus sessions without service activation, disable GVfs, the settings portal and Mesa's shader cache, and use GTK's test accessibility backend. Accessible properties and relations, clipboard access through xclip and dialog assertions remain checked. The dialog skips with a diagnostic when required tools are absent; the manager requires them. CI installs dbus-daemon, which supplies dbus-run-session. |
+| Low — U01: the successful broker-run test still checked port release with an immediate bind. | **Fixed in `a3d66b0`:** it uses `port_released`, and keeps the broker-exit assertion. |
+| Low — U02: some tests inspected grant-end records or removed their directory before asynchronous grant auditing finished; one also required an unnecessary global created/ended alternation across grants. | **Fixed in `a3d66b0`:** the tests wait for each grant's end record by ID and check the order per grant. Where the audit log is a FIFO that fails every record, they wait until the end record has been written into it before they put the log back, without requiring a successful record. The same probe found a fourth test that returned before a grant's end record. |
+| Low — U03: the read-only polling test returned when status became locked, before the idle-lock audit record necessarily finished. | **Fixed in `a3d66b0`:** it waits for `lock/idle_timeout` before it returns. |
 
 Codex's checks used an isolated export with its own target directory and
 short TMPDIRs. Four concurrent runs of the 158 agent tests, alongside eight
@@ -2572,7 +2573,7 @@ runs and the complete AGENTS.md checks. Those complete checks were not
 repeated by Codex. The range's diff check and formatting check passed.
 No repository file was changed by this review.
 
-The maintainer's agent then fixed U01–U03 in `7a1d63b` and checked the
+The maintainer's agent then fixed U01–U03 in `a3d66b0` and checked the
 fix with the same probe, in a copy with its own target directory: with
 the pauses, each run of the suite had failed two tests and left six
 directories; after the fix, two runs passed and left nothing. Without the
@@ -2582,10 +2583,10 @@ fails. Twelve loaded runs (four copies next to eight CPU burners) passed
 with nothing left; formatting, both clippy runs, the end-to-end tests
 without default features and the MSRV checks passed.
 
-**2026-11-04 — Confirmation of the test fixes at `4ef519f`.**
+**2026-11-04 — Confirmation of the test fixes at `897700e`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `7a1d63b` and
-of the history entry above, in `4ef519f`. U01–U03 were confirmed resolved:
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `a3d66b0` and
+of the history entry above, in `897700e`. U01–U03 were confirmed resolved:
 a retained listener fails the port check; replacing the `grant/ended`
 outcome fails the six tests that wait for it, and replacing
 `lock/idle_timeout` fails the polling test. `BlockedAudit::wait_for_end_of`
@@ -2597,14 +2598,14 @@ history entry was found accurate. No product defect was found.
 
 | Finding | Disposition |
 |---|---|
-| Low — V01: `admissions_are_recorded_before_the_broker_forwards_anything` read the records of the grant's requests before waiting for the grant's end. The second request is refused without the agent's audit thread, so the first one's `completed` record can come after the run's answer: a 500 ms pause before it left the test with only `admitted`, and the late records recreated its directory. Found by extending the probe to the records of requests' ends and of automatic locks. | **Fixed in `49bf590`:** it waits for the grant's end record first, which the same thread writes after the records of the grant's requests. |
-| Low — V02 (from a note of the review's): `the_run_dialog_shows_destination_settings_without_credentials` shows the test's own environment, directory and process chain, and with a 41-character TMPDIR zenity's height estimate of its dialog was 889 pixels, over the 880-pixel limit, so the agent refused the request (as it must) and the test failed. | **Fixed in `49bf590`:** the test, which is about what the dialog shows, uses a dialog that scrolls, as `rusthorse-dialog`'s does; the height limit keeps tests of its own. |
+| Low — V01: `admissions_are_recorded_before_the_broker_forwards_anything` read the records of the grant's requests before waiting for the grant's end. The second request is refused without the agent's audit thread, so the first one's `completed` record can come after the run's answer: a 500 ms pause before it left the test with only `admitted`, and the late records recreated its directory. Found by extending the probe to the records of requests' ends and of automatic locks. | **Fixed in `8726b17`:** it waits for the grant's end record first, which the same thread writes after the records of the grant's requests. |
+| Low — V02 (from a note of the review's): `the_run_dialog_shows_destination_settings_without_credentials` shows the test's own environment, directory and process chain, and with a 41-character TMPDIR zenity's height estimate of its dialog was 889 pixels, over the 880-pixel limit, so the agent refused the request (as it must) and the test failed. | **Fixed in `8726b17`:** the test, which is about what the dialog shows, uses a dialog that scrolls, as `rusthorse-dialog`'s does; the height limit keeps tests of its own. |
 
 Codex's checks: an isolated export; the 158 end-to-end tests without
 pauses, with the earlier pauses and with the extended probe (with V01's
 fix applied in its copy); the mutations above; a probe of the FIFO's
 behaviour; formatting and `git diff --check`. The maintainer's agent then
-checked `49bf590`: with pauses before the records of a grant's end, a
+checked `8726b17`: with pauses before the records of a grant's end, a
 request's end, the idle lock and an automatic lock, two runs passed and
 left nothing; with TMPDIRs of 19, 41 and 75 characters, and three more
 shell levels in the process chain, the suite passed; eight loaded runs
@@ -2638,8 +2639,8 @@ Python SDK requests work through the broker, and Claude Code's own requests
 reach the API through it, but no answer from Claude Code through the
 broker has been seen yet.
 
-`4fefa4c` names the entry in an edit's answer (its title, or the new name
-after a rename). `c0aebc0` counts per grant the requests whose destination
+`0060692` names the entry in an edit's answer (its title, or the new name
+after a rename). `cf28a7c` counts per grant the requests whose destination
 answered `401`, once the report matches an open request; reports the count
 in `grants`, and in `exited` once the run's grants are gone, from which
 `rusthorse run` prints a note after the command with its status unchanged;
@@ -2649,17 +2650,17 @@ ended saying to run the command again. The feedback comes from the status
 alone, never from a provider's body, so it is the same for every
 destination.
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `4fefa4c`
-and `c0aebc0` against `4c7e2eb`. No defect was found in the count: two
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `0060692`
+and `cf28a7c` against `47cd529`. No defect was found in the count: two
 grants kept separate counts, the report of a command that ended at once
 after its last request stayed complete with a 500 ms pause before the audit
 thread's records, and the broker's own `401` was never counted.
 
 | Finding | Disposition |
 |---|---|
-| Medium — W01: since `4fefa4c`, an edit's answer names the entry by the title stored in the vault, which another KeePass program can write with terminal controls in it, and the CLI printed the agent's messages as they came: editing by UUID an entry titled `SAFE\u{1b}[2J\rFORGED` sent ESC and CR to the terminal. | **Fixed in `2fafe05`:** the CLI escapes the messages of the agent's answers and errors, a run's errors and an import's per-batch results, as it already escaped the grants; the vault keeps the title as it is. Tested with such a title written into the file, then edited and removed by UUID, and with a fake agent's answer, error and run error; without the escaping, both tests fail. `f51391c` and `f20d7d0` escaped the rest of what the CLI shows from the vault, the agent or a keyring (X01, Y01 and Y02, below). |
-| Low — W02: the command the note suggests, `rusthorse edit NAME --value`, reads a name that starts with `-` as an option (for `--help`, it shows the help). | **Fixed in `2fafe05`:** for such a name the note suggests `rusthorse edit --value -- NAME`; a test parses the suggested command for `KEY`, a name the shell would split, `-k` and `--help`, and fails without the fix. |
-| Low — W03: the CLI's documentation and the guide said that every error without the broker's prefix comes from the destination, but the broker's HTTP parser answers a malformed request itself, with `400` or `431` and an empty body, and a connection can close with no answer. | **Partly fixed in `2fafe05`:** `docs/cli.md`, the guide, `docs/ai-agents.md`, the ADR's amendment and the CHANGELOG limit the prefix to the JSON errors the broker writes, and name these exceptions; but the guide then said that every empty `400` or `431` is the broker's, which a destination can send too. Completed in `f51391c` (X02, below). |
+| Medium — W01: since `0060692`, an edit's answer names the entry by the title stored in the vault, which another KeePass program can write with terminal controls in it, and the CLI printed the agent's messages as they came: editing by UUID an entry titled `SAFE\u{1b}[2J\rFORGED` sent ESC and CR to the terminal. | **Fixed in `59735de`:** the CLI escapes the messages of the agent's answers and errors, a run's errors and an import's per-batch results, as it already escaped the grants; the vault keeps the title as it is. Tested with such a title written into the file, then edited and removed by UUID, and with a fake agent's answer, error and run error; without the escaping, both tests fail. `1ec2af1` and `6cb4f53` escaped the rest of what the CLI shows from the vault, the agent or a keyring (X01, Y01 and Y02, below). |
+| Low — W02: the command the note suggests, `rusthorse edit NAME --value`, reads a name that starts with `-` as an option (for `--help`, it shows the help). | **Fixed in `59735de`:** for such a name the note suggests `rusthorse edit --value -- NAME`; a test parses the suggested command for `KEY`, a name the shell would split, `-k` and `--help`, and fails without the fix. |
+| Low — W03: the CLI's documentation and the guide said that every error without the broker's prefix comes from the destination, but the broker's HTTP parser answers a malformed request itself, with `400` or `431` and an empty body, and a connection can close with no answer. | **Partly fixed in `59735de`:** `docs/cli.md`, the guide, `docs/ai-agents.md`, the ADR's amendment and the CHANGELOG limit the prefix to the JSON errors the broker writes, and name these exceptions; but the guide then said that every empty `400` or `431` is the broker's, which a destination can send too. Completed in `1ec2af1` (X02, below). |
 
 Codex's checks: an isolated export with offline builds and fake
 credentials; targeted tests of the destination's and the broker's `401`, a
@@ -2668,19 +2669,19 @@ and omissions, the CLI's statuses and output, the broker's messages, and
 the manager's model and widgets on their own Xvfb display; probes of two
 grants and of a command that ends at once, with a 500 ms pause before the
 audit thread's records; formatting and `git diff --check`. The maintainer's
-agent had checked `c0aebc0` with all of AGENTS.md's checks and with twelve
+agent had checked `cf28a7c` with all of AGENTS.md's checks and with twelve
 mutations, each failing a test — no count, every status counted, a
 violation counted, the count made late by the audit thread, no listing, no
 run note, a note on an unknown outcome, the agent's identity for the typed
 name, no grants note, the edit's answer echoing the request's name, no
 prefix, no hint — and three of the manager's (a fact that always says *No*,
-the warning never added, never removed); then `2fafe05` with all of the checks
+the warning never added, never removed); then `59735de` with all of the checks
 again and the mutations of W01 and W02, each failing its test.
 
-**2026-11-04 — Confirmation of the fixes at `db0af0e`.**
+**2026-11-04 — Confirmation of the fixes at `7397634`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `2fafe05`
-and of the history above, in `db0af0e`. W01 and W02 were confirmed
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `59735de`
+and of the history above, in `7397634`. W01 and W02 were confirmed
 resolved: the agent's messages are escaped, the title stays as stored, and
 the suggested command parses as an edit of the named entry for `-k` and
 `--help`; reverting either fix fails its tests. W03 was confirmed partly
@@ -2688,9 +2689,9 @@ resolved (X02).
 
 | Finding | Disposition |
 |---|---|
-| Medium — X01, older than this work: `list` and `show` printed what the vault holds as it came, so a title or a username another KeePass program wrote with terminal controls reached the terminal: the review's probe with the title `SAFE\u{1b}[2J\rFORGED\u{202e}` sent ESC and CR to the standard output of both. The import preview and the text of `status` did the same with what a keyring or the agent supplies. | **Partly fixed in `f51391c`:** `list` and `show` (before a table's widths are measured), `status`, `doctor`'s lines, the import preview and the CLI's own errors (names given twice in a keyring import, for one) have their control and invisible characters escaped; `--json` gives the values as they are, and what `reveal` prints and a command's output are not touched. Tested with a title and a username written into the file (`list`, `show`, and `show --json` as stored), a status with controls in its vault, dialogs and program, keyring names in a dry run and in the error that refuses names given twice, and `doctor`'s lines; without the escaping in any one of these places, a test fails. `open`'s notice and an import's transport and decoding errors were completed in `f20d7d0` (Y01, Y02, below). |
-| Low — X02: the guide said that an empty `400` or `431` is the broker's answer to a malformed request; the review's probe had a destination send both, relayed by the real broker with one admission and its status in the request's end, besides the broker's own empty `400` with no admission. | **Fixed in `f51391c`:** the guide says that the broker's HTTP parser can answer that way and that a destination can too, so such an answer alone does not tell who answered; `docs/cli.md` says the same. |
-| Low — X03: the documents said that the account refused "the same requests" of Claude Code with the key by value, and grouped the Sonnet and Haiku comparisons. Claude Code's own requests went through the broker only; the comparisons both ways were SDK requests: create and streaming to Sonnet 5.5, and streaming to Haiku 5.5 with a minimal input, plain or with some of Claude Code's parameters. | **Fixed in `f51391c`:** answer 9 of ADR 0013 and its amendment, `docs/cli.md`, the guide, `docs/ai-agents.md`, the roadmap, the threat model and the CHANGELOG say what was tried, and the fourth paragraph of the entry above was reworded the same way. |
+| Medium — X01, older than this work: `list` and `show` printed what the vault holds as it came, so a title or a username another KeePass program wrote with terminal controls reached the terminal: the review's probe with the title `SAFE\u{1b}[2J\rFORGED\u{202e}` sent ESC and CR to the standard output of both. The import preview and the text of `status` did the same with what a keyring or the agent supplies. | **Partly fixed in `1ec2af1`:** `list` and `show` (before a table's widths are measured), `status`, `doctor`'s lines, the import preview and the CLI's own errors (names given twice in a keyring import, for one) have their control and invisible characters escaped; `--json` gives the values as they are, and what `reveal` prints and a command's output are not touched. Tested with a title and a username written into the file (`list`, `show`, and `show --json` as stored), a status with controls in its vault, dialogs and program, keyring names in a dry run and in the error that refuses names given twice, and `doctor`'s lines; without the escaping in any one of these places, a test fails. `open`'s notice and an import's transport and decoding errors were completed in `6cb4f53` (Y01, Y02, below). |
+| Low — X02: the guide said that an empty `400` or `431` is the broker's answer to a malformed request; the review's probe had a destination send both, relayed by the real broker with one admission and its status in the request's end, besides the broker's own empty `400` with no admission. | **Fixed in `1ec2af1`:** the guide says that the broker's HTTP parser can answer that way and that a destination can too, so such an answer alone does not tell who answered; `docs/cli.md` says the same. |
+| Low — X03: the documents said that the account refused "the same requests" of Claude Code with the key by value, and grouped the Sonnet and Haiku comparisons. Claude Code's own requests went through the broker only; the comparisons both ways were SDK requests: create and streaming to Sonnet 5.5, and streaming to Haiku 5.5 with a minimal input, plain or with some of Claude Code's parameters. | **Fixed in `1ec2af1`:** answer 9 of ADR 0013 and its amendment, `docs/cli.md`, the guide, `docs/ai-agents.md`, the roadmap, the threat model and the CHANGELOG say what was tried, and the fourth paragraph of the entry above was reworded the same way. |
 
 Codex's checks: the diff and the commit messages; the escaping tests, the
 binary's tests (the suggested command, the guide), the edit test; its own
@@ -2701,14 +2702,14 @@ and of an unknown error of `run` (escaped, statuses `0`, `1`, `4` and
 a destination (X02); the reverted escape and `--` form, each failing its
 tests; formatting and `git diff --check`. It did not rerun the comparison
 scripts, which need the maintainer's key and dialogs. The maintainer's
-agent then checked `f51391c` with all of AGENTS.md's checks, and with six
+agent then checked `1ec2af1` with all of AGENTS.md's checks, and with six
 mutations — no escaping in `list`, `show`, `status`, the import preview,
 the main error printer or `doctor`'s lines — each failing a test.
 
-**2026-11-04 — Confirmation of the fixes at `5dd639a`.**
+**2026-11-04 — Confirmation of the fixes at `2de6b34`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `f51391c`
-and of the history above, in `5dd639a`. X02 and X03 were confirmed
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `1ec2af1`
+and of the history above, in `2de6b34`. X02 and X03 were confirmed
 resolved: the documents no longer tell who answered by an empty `400` or
 `431`, and they keep the SDK comparisons apart from Claude Code's own
 requests. X01 was confirmed partly resolved: the review's probe found
@@ -2721,8 +2722,8 @@ or start the agent name paths of the local configuration.
 
 | Finding | Disposition |
 |---|---|
-| Medium — Y01: `open` printed `Opening URL` with the URL from the vault as it came, so a URL another KeePass program wrote, such as `https://example.invalid/\u{1b}[2J\rFORGED`, sent ESC and CR to the terminal after passing the check of its scheme. | **Fixed in `f20d7d0`:** the notice shows the URL escaped, and the browser gets the URL as stored. Tested with such a URL written into the file and a stand-in for `xdg-open` that records what it is given; without the escaping, the test fails. |
-| Low — Y02: an import's transport and decoding errors printed the error as it came, which quotes an answer the client could not read: an answer of an unknown type holding ESC and CR reached the terminal, though the exit status was rightly `124`. | **Fixed in `f20d7d0`:** both arms escape the error, with exit statuses `124` and `1` unchanged. Tested with a scripted agent whose `import_from` answer has such a type; without the escaping, the test fails. |
+| Medium — Y01: `open` printed `Opening URL` with the URL from the vault as it came, so a URL another KeePass program wrote, such as `https://example.invalid/\u{1b}[2J\rFORGED`, sent ESC and CR to the terminal after passing the check of its scheme. | **Fixed in `6cb4f53`:** the notice shows the URL escaped, and the browser gets the URL as stored. Tested with such a URL written into the file and a stand-in for `xdg-open` that records what it is given; without the escaping, the test fails. |
+| Low — Y02: an import's transport and decoding errors printed the error as it came, which quotes an answer the client could not read: an answer of an unknown type holding ESC and CR reached the terminal, though the exit status was rightly `124`. | **Fixed in `6cb4f53`:** both arms escape the error, with exit statuses `124` and `1` unchanged. Tested with a scripted agent whose `import_from` answer has such a type; without the escaping, the test fails. |
 
 Codex's checks: the diff, the commits and the history; the escaping tests
 (the fake keyring's included), the binary's tests, the CLI tests of the
@@ -2731,13 +2732,13 @@ metadata and of the output contracts (`--json`, `reveal`, a command's
 output), of `open` with a stand-in browser (Y01) and of an import answer
 that cannot be read (Y02), both of which passed with the fix applied in
 its copy; formatting and `git diff --check`. The maintainer's agent then
-checked `f20d7d0` with all of AGENTS.md's checks, and reverting either fix
+checked `6cb4f53` with all of AGENTS.md's checks, and reverting either fix
 failed its test.
 
-**2026-11-04 — Confirmation of the fixes at `df52e23`.**
+**2026-11-04 — Confirmation of the fixes at `7a0f7be`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `f20d7d0` and
-of the history above, in `df52e23`. Y01 and Y02 were confirmed resolved:
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `6cb4f53` and
+of the history above, in `7a0f7be`. Y01 and Y02 were confirmed resolved:
 `open`'s notice is escaped and a stand-in browser gets the stored URL; an
 import's errors are escaped, with `124` for an answer that cannot be read
 after the request was sent and `1` for a failure before it. A sweep of
@@ -2751,45 +2752,45 @@ are. The history entries above were found consistent with the commits.
 
 | Finding | Disposition |
 |---|---|
-| Low — Z01: the stand-in for `xdg-open` in `open_shows_a_url_written_elsewhere_escaped` wrote to a path it did not quote, so with a TMPDIR holding a space the script failed (`xdg-open failed (exit status: 2)`) though the product was right; `open_hands_only_http_links_to_the_browser`, older, had the same script. | **Fixed in `2a4549d`:** both scripts quote the path (`util::shell_quote`). With a TMPDIR holding a space, both tests failed before and pass after; with an ordinary one, they pass. |
+| Low — Z01: the stand-in for `xdg-open` in `open_shows_a_url_written_elsewhere_escaped` wrote to a path it did not quote, so with a TMPDIR holding a space the script failed (`xdg-open failed (exit status: 2)`) though the product was right; `open_hands_only_http_links_to_the_browser`, older, had the same script. | **Fixed in `e5de2c2`:** both scripts quote the path (`util::shell_quote`). With a TMPDIR holding a space, both tests failed before and pass after; with an ordinary one, they pass. |
 
 Codex's checks: the escaping tests (six), the binary's tests, the CLI
 tests of the broker and the tests of an import's batches; its own probes
 of the output and its contracts and of both of an import's errors; the
 mutations that remove Y01's and Y02's fixes, each caught; the `open` test
 with a TMPDIR holding a space (Z01); formatting and `git diff --check`.
-The maintainer's agent then checked `2a4549d` with all of AGENTS.md's checks.
+The maintainer's agent then checked `e5de2c2` with all of AGENTS.md's checks.
 
-**2026-11-04 — The product's scope at `443be7c`.**
+**2026-11-04 — The product's scope at `4f9fe79`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `443be7c`,
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `4f9fe79`,
 which stated the product's scope after phase 1's manual test and dropped
 the broker's later phases (documents only). Before the review ended, the
 maintainer defined the product more precisely — the only secret is a
 credential's value, the agent says where it uses it, the human approves —
-and `19bce15` and `3e349c9` rewrote several of the passages reviewed
+and `b91fc92` and `8eab1d3` rewrote several of the passages reviewed
 (ADR 0013 now specifies a broker without profiles or presets); the
 findings were fixed on those documents.
 
 | Finding | Disposition |
 |---|---|
-| Medium — S01: "Rusthorse controls who uses a credential, when, for how long and how often, and records each use" was stronger than ordinary `run`, which gives the approved command the value: Rusthorse approves and records the run but cannot limit or count what the command does with the value, and a later lock does not stop it; limits of time and requests, revocation and per-request records belong to broker grants, and the requester's process chain is not verified. | **Fixed in `ccf7f5b`:** the README, AGENTS.md, `docs/ai-agents.md` and ADR 0013's scope amendment say what each mode does: the approval decides which command uses a credential and is recorded; with `run` the command has the value while it runs; through the broker it has a token limited in time and requests, revocable and recorded request by request; the process chain is shown, not verified. |
-| Low — S02: dropped plans still read as future work: ADR 0005's typed operations and SSH agent, ADR 0013's WebSocket, Unix socket listener, phase 3's `ssh-agent` and sandboxed clients, the roadmap's Unix socket, and an entry of the manager guide's "Comes later" column. | **Fixed in `ccf7f5b`:** each is marked as superseded (not planned) or moved out of the column. |
-| Low — S03: the roadmap and ADR 0013 said the dropped items could be proposed again on a concrete need, against AGENTS.md and CONTRIBUTING.md. | **Fixed in `ccf7f5b`:** both say they are outside the product's scope and not on the roadmap. |
-| Low — S04: "any HTTP API" was stronger than a broker that presents the key in a request header: an API that signs its requests with the key, or takes it in the URL or the body, cannot use it. | **Fixed in `ccf7f5b`:** the roadmap, the README, the threat model and ADR 0013 limit it to APIs that take the key in a request header, and send the others to `run`. |
+| Medium — S01: "Rusthorse controls who uses a credential, when, for how long and how often, and records each use" was stronger than ordinary `run`, which gives the approved command the value: Rusthorse approves and records the run but cannot limit or count what the command does with the value, and a later lock does not stop it; limits of time and requests, revocation and per-request records belong to broker grants, and the requester's process chain is not verified. | **Fixed in `85fb56f`:** the README, AGENTS.md, `docs/ai-agents.md` and ADR 0013's scope amendment say what each mode does: the approval decides which command uses a credential and is recorded; with `run` the command has the value while it runs; through the broker it has a token limited in time and requests, revocable and recorded request by request; the process chain is shown, not verified. |
+| Low — S02: dropped plans still read as future work: ADR 0005's typed operations and SSH agent, ADR 0013's WebSocket, Unix socket listener, phase 3's `ssh-agent` and sandboxed clients, the roadmap's Unix socket, and an entry of the manager guide's "Comes later" column. | **Fixed in `85fb56f`:** each is marked as superseded (not planned) or moved out of the column. |
+| Low — S03: the roadmap and ADR 0013 said the dropped items could be proposed again on a concrete need, against AGENTS.md and CONTRIBUTING.md. | **Fixed in `85fb56f`:** both say they are outside the product's scope and not on the roadmap. |
+| Low — S04: "any HTTP API" was stronger than a broker that presents the key in a request header: an API that signs its requests with the key, or takes it in the URL or the body, cannot use it. | **Fixed in `85fb56f`:** the roadmap, the README, the threat model and ADR 0013 limit it to APIs that take the key in a request header, and send the others to `run`. |
 
 Codex's checks: the commit's diff, a search of the 106 tracked text files
 (ADRs, the design prototype, the code, the tests and the guide), the code
 that gives a value to a command, admits broker requests and identifies the
 requester, `git diff --check`, and the summary of all of AGENTS.md's
-checks on that tree. The maintainer's agent then checked `ccf7f5b`: the
+checks on that tree. The maintainer's agent then checked `85fb56f`: the
 documents only changed, the formatting check and the packaging tests (the
 links of the packaged documents) passed.
 
-**2026-11-04 — The design of the broker without profiles, at `de88005`.**
+**2026-11-04 — The design of the broker without profiles, at `dd81cc2`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `19bce15`,
-`3e349c9`, `ccf7f5b` and `de88005`: the maintainer's definition of the
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `b91fc92`,
+`8eab1d3`, `85fb56f` and `dd81cc2`: the maintainer's definition of the
 product, the fixes of S01–S04, and the design that replaces phase 1's
 profiles and presets (ADR 0013's scope amendment), before any code. S01–S04
 were confirmed resolved. The findings concern the design and the documents;
@@ -2797,13 +2798,13 @@ none adds a control beyond what protects the key and the approval.
 
 | Finding | Disposition |
 |---|---|
-| Medium — D01: a token-shaped HTTP method passes the inherited framing (a probe confirmed it), and the design would have recorded it; raw paths can carry data (as F19 found). | **Fixed in `14bfe0c`:** the token is refused in the method too, and an admitted request is recorded with its method's label only (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OTHER`), never a raw method, path, query, header or body. |
-| Medium — D02: the design relayed the destination's `Content-Length`, which no longer matches a body that redaction changed (a probe showed the length change). | **Fixed in `14bfe0c`:** `Content-Length` and `Transfer-Encoding` are never relayed; the broker frames the body itself, chunked where HTTP allows a body. |
-| Medium — D03: the dialog would show a base path as if it limited the requests, which go to any path of the origin. | **Fixed in `14bfe0c`:** the approval covers the whole origin; the base path only sets up the program's base URL; the dialog shows them apart and says that the key may be sent to any path at the origin. |
-| Medium — D04: phase 1's framing allows a body only on `POST` (a probe confirmed a refused `PATCH`), an assumption about APIs. | **Fixed in `14bfe0c`:** a body is allowed on any accepted method, within the existing size, room, timeout and admission rules. |
-| Low — D05: a token in a header the broker drops or rebuilds would have satisfied the check without the key reaching the destination; the replacement, duplicates and other grants' tokens were not specified. | **Partly fixed in `14bfe0c`:** only forwarded values count; the replacement is exact and in one pass; the forbidden places are refused; the header block's limit holds after the key is in; the value's 8–4096 visible ASCII rule stays. What a token-shaped string is, its case variants and every duplicate header value were left to E02 (below). |
-| Medium — D06: per-entry policies (programs or hosts) were still planned in the roadmap and the threat model; ADR 0013 kept a stale mark and called them worth having; ADR 0008 said a stored endpoint could check a destination. | **Fixed in `14bfe0c`:** they are outside the scope and not planned; the marks are corrected; ADR 0008 says the endpoint is context and gives the broker no default. |
-| Low — D07: the definition called notes context, but notes and the fields KeePass marks protected are withheld like the value. | **Fixed in `14bfe0c`:** the definition says that the URL, username, host, port and tags are context and that notes and protected fields stay withheld. |
+| Medium — D01: a token-shaped HTTP method passes the inherited framing (a probe confirmed it), and the design would have recorded it; raw paths can carry data (as F19 found). | **Fixed in `9c0efd8`:** the token is refused in the method too, and an admitted request is recorded with its method's label only (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OTHER`), never a raw method, path, query, header or body. |
+| Medium — D02: the design relayed the destination's `Content-Length`, which no longer matches a body that redaction changed (a probe showed the length change). | **Fixed in `9c0efd8`:** `Content-Length` and `Transfer-Encoding` are never relayed; the broker frames the body itself, chunked where HTTP allows a body. |
+| Medium — D03: the dialog would show a base path as if it limited the requests, which go to any path of the origin. | **Fixed in `9c0efd8`:** the approval covers the whole origin; the base path only sets up the program's base URL; the dialog shows them apart and says that the key may be sent to any path at the origin. |
+| Medium — D04: phase 1's framing allows a body only on `POST` (a probe confirmed a refused `PATCH`), an assumption about APIs. | **Fixed in `9c0efd8`:** a body is allowed on any accepted method, within the existing size, room, timeout and admission rules. |
+| Low — D05: a token in a header the broker drops or rebuilds would have satisfied the check without the key reaching the destination; the replacement, duplicates and other grants' tokens were not specified. | **Partly fixed in `9c0efd8`:** only forwarded values count; the replacement is exact and in one pass; the forbidden places are refused; the header block's limit holds after the key is in; the value's 8–4096 visible ASCII rule stays. What a token-shaped string is, its case variants and every duplicate header value were left to E02 (below). |
+| Medium — D06: per-entry policies (programs or hosts) were still planned in the roadmap and the threat model; ADR 0013 kept a stale mark and called them worth having; ADR 0008 said a stored endpoint could check a destination. | **Fixed in `9c0efd8`:** they are outside the scope and not planned; the marks are corrected; ADR 0008 says the endpoint is context and gives the broker no default. |
+| Low — D07: the definition called notes context, but notes and the fields KeePass marks protected are withheld like the value. | **Fixed in `9c0efd8`:** the definition says that the URL, username, host, port and tags are context and that notes and protected fields stay withheld. |
 
 Codex's checks: the diff and the 106 tracked text files; the design against
 phase 1's framing, forwarding, validation, storage and protocol code; the
@@ -2811,12 +2812,12 @@ guide's tests; three probes in an isolated copy (a token-shaped method
 accepted by the framing, a refused `PATCH` body, a length change after
 redaction), which test phase 1, not a broker without profiles; `git diff
 --check`. The maintainer's agent then ran all of AGENTS.md's checks on
-`14bfe0c`; the code is unchanged.
+`9c0efd8`; the code is unchanged.
 
-**2026-11-04 — Confirmation of the broker design at `8813b19`.**
+**2026-11-04 — Confirmation of the broker design at `8089080`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `14bfe0c`
-and its record in `8813b19`. D01–D04, D06 and D07 were confirmed resolved
+Review (Codex, AI-assisted, 2026-11-04; verdict: not ready) of `9c0efd8`
+and its record in `8089080`. D01–D04, D06 and D07 were confirmed resolved
 in the design; D05 partly. It checked, without finding a new defect, how
 `--url` pairs with `VAR=ENTRY@URL`, several entries in one run, the same
 entry twice, the run's limits, the phase 1 profile field and the error
@@ -2824,15 +2825,15 @@ contracts.
 
 | Finding | Disposition |
 |---|---|
-| Medium — E01: adding the destination and the limits to protocol 8's `broker_run` would let an agent of protocol 8, met after the client's version check, accept the request and ignore them: a probe showed that its parser drops the new fields, and that it refuses an unknown request type. | **Fixed in `3a6af38`:** a run through the broker is a new request, `broker_run_v2`; agents of protocol 9 refuse `broker_run` and `broker_edit` before any approval; a client never retries a refused request as an older type or an ordinary `run`; a test must switch the agent's version between the client's two connections. |
-| Low — E02 (completes D05): "a token-shaped string" had no grammar, and its case and the duplicate header values were not stated. | **Fixed in `3a6af38`:** `rh_` and 64 hexadecimal digits, in any ASCII case, at any byte position of the method, the target, the header names and every header value; each must equal the grant's token byte for byte, so a case variant is refused, not replaced; no other grant's token is looked up. |
-| Low — E03: the design did not say what the manager's command for an entry becomes without a profile. | **Fixed in `3a6af38`:** two labelled templates, one giving the value (`run`), one through the broker with the destination and the variables left to fill in; nothing is inferred and nothing is stored. |
-| Low — E04: listings, the manager and the `401` note showed the origin with the base path, as if the base path limited the requests. | **Fixed in `3a6af38`:** they show the approved origin; a base path is shown apart, as setup of the program's base URL; `GrantInfo` gets an optional `base_path` and loses `preset`. |
+| Medium — E01: adding the destination and the limits to protocol 8's `broker_run` would let an agent of protocol 8, met after the client's version check, accept the request and ignore them: a probe showed that its parser drops the new fields, and that it refuses an unknown request type. | **Fixed in `1c2923a`:** a run through the broker is a new request, `broker_run_v2`; agents of protocol 9 refuse `broker_run` and `broker_edit` before any approval; a client never retries a refused request as an older type or an ordinary `run`; a test must switch the agent's version between the client's two connections. |
+| Low — E02 (completes D05): "a token-shaped string" had no grammar, and its case and the duplicate header values were not stated. | **Fixed in `1c2923a`:** `rh_` and 64 hexadecimal digits, in any ASCII case, at any byte position of the method, the target, the header names and every header value; each must equal the grant's token byte for byte, so a case variant is refused, not replaced; no other grant's token is looked up. |
+| Low — E03: the design did not say what the manager's command for an entry becomes without a profile. | **Fixed in `1c2923a`:** two labelled templates, one giving the value (`run`), one through the broker with the destination and the variables left to fill in; nothing is inferred and nothing is stored. |
+| Low — E04: listings, the manager and the `401` note showed the origin with the base path, as if the base path limited the requests. | **Fixed in `1c2923a`:** they show the approved origin; a base path is shown apart, as setup of the program's base URL; `GrantInfo` gets an optional `base_path` and loses `preset`. |
 
 Codex's checks: the diff, the related code and the record; the 106 tracked
 text files; `git diff --check`; two deserialisation probes and the guide's
 tests in an isolated copy; the summary of all of AGENTS.md's checks. The
-maintainer's agent then ran the packaging tests on `3a6af38`; the code is
+maintainer's agent then ran the packaging tests on `1c2923a`; the code is
 unchanged.
 
 **2026-11-04 — The implementation of the broker without profiles at
@@ -2845,12 +2846,12 @@ protocol 9, control channel 2, the agent, the registry, the audit, the
 vault, the CLI and the guide), the broker crate (`broker/src/token.rs`, the
 header rules, the server and the exchange), the manager, the tests and the
 documents, the removed lines of the documents included. The work commits
-were then squashed into `2df51fd`, whose tree is `9c069d4`'s.
+were then squashed into `93848a9`, whose tree is `9c069d4`'s.
 
 | Finding | Disposition |
 |---|---|
-| Medium — G01: the broker dropped a fixed list of hop-by-hop headers from a response but relayed the headers its `Connection` names, which are hop-by-hop too (RFC 9110, section 7.6.1): a probe with `Connection: X-Hop` and `X-Hop: private-to-this-hop` saw `X-Hop` reach the client. | **Fixed in `d84f014`:** the names in every `Connection` header of a response, whatever their case and spacing, are dropped with the other hop-by-hop headers; a unit test and the broker's test of relayed response headers cover them, and the latter fails without the fix (mutation on a copy with its own target directory). A client's `Connection` that names anything but `close` and `keep-alive` was already refused by the framing (`400`). |
-| Low — G02: `broker_run_v2` refused unknown fields in its broker bindings and its limits, but not in its bindings by value: a binding there with a `destination` and a `max_requests` was read as a plain binding, and the entry would have been given by value, contrary to `docs/protocol.md`. | **Fixed in `d84f014`:** `Binding` refuses unknown fields, in `run` too, before any dialog; the protocol's test and the agent's end-to-end test of refused requests cover it, and both fail without the fix (mutation). |
+| Medium — G01: the broker dropped a fixed list of hop-by-hop headers from a response but relayed the headers its `Connection` names, which are hop-by-hop too (RFC 9110, section 7.6.1): a probe with `Connection: X-Hop` and `X-Hop: private-to-this-hop` saw `X-Hop` reach the client. | **Fixed in `1edafe7`:** the names in every `Connection` header of a response, whatever their case and spacing, are dropped with the other hop-by-hop headers; a unit test and the broker's test of relayed response headers cover them, and the latter fails without the fix (mutation on a copy with its own target directory). A client's `Connection` that names anything but `close` and `keep-alive` was already refused by the framing (`400`). |
+| Low — G02: `broker_run_v2` refused unknown fields in its broker bindings and its limits, but not in its bindings by value: a binding there with a `destination` and a `max_requests` was read as a plain binding, and the entry would have been given by value, contrary to `docs/protocol.md`. | **Fixed in `1edafe7`:** `Binding` refuses unknown fields, in `run` too, before any dialog; the protocol's test and the agent's end-to-end test of refused requests cover it, and both fail without the fix (mutation). |
 
 Codex's checks, in an isolated copy with its own target and temporary
 directories: `cargo test --all-features` and `--no-default-features` of the
@@ -2879,17 +2880,17 @@ outside it: a vault that KeePassXC 2.7 saved as KDBX 4.0 cannot be saved by
 Rusthorse again (`keepass` 0.17 writes KDBX 4.1 only), and the error does not
 say so; left for the maintainer to decide.
 
-**2026-11-04 — Confirmation of G01 and G02, `2df51fd..4f8c00b`.**
+**2026-11-04 — Confirmation of G01 and G02, `93848a9..0ec231b`.**
 
-Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `d84f014` and
-the record in `4f8c00b`. G01 is resolved: every `Connection` header of a
+Review (Codex, AI-assisted, 2026-11-04; verdict: ready) of `1edafe7` and
+the record in `0ec231b`. G01 is resolved: every `Connection` header of a
 response, its comma-separated members trimmed and compared without regard
 to case, names headers that are dropped in every occurrence, at the only
 place where response headers are relayed, bodiless responses included; the
 framing refuses a client's `Connection` with any member but `close` and
 `keep-alive`. G02 is resolved: `Binding` refuses unknown fields in
 `broker_run_v2` and in `run`, and the CLI and the manager's templates send
-only `var` and `entry`. `2df51fd`'s tree is `9c069d4`'s; the record above and
+only `var` and `entry`. `93848a9`'s tree is `9c069d4`'s; the record above and
 the sentence added to L21 are accurate.
 
 Codex's checks, offline in an isolated copy with its own target and
@@ -2900,12 +2901,12 @@ and four mutations, each fix removed in turn, which failed the unit and
 integration tests of G01 and the protocol and end-to-end tests of G02 by
 their assertions.
 
-**2026-11-04 — Saving a vault that KeePassXC wrote as KDBX 4.0, `6a8d394`.**
+**2026-11-04 — Saving a vault that KeePassXC wrote as KDBX 4.0, `935743b`.**
 
 Noted by the end-to-end tests' implementer during the review of the broker
 without profiles, and older than that work: KeePassXC 2.7 writes KDBX 4.0
 when nothing in a file needs 4.1, and `keepass` 0.17 writes 4.1 only, so
-every change to such a vault failed with an unexplained error. `6a8d394`
+every change to such a vault failed with an unexplained error. `935743b`
 writes a 4.0 file back as 4.1 and refuses, saying why, to write a newer
 KDBX 4; a fixture saved by `keepassxc-cli` 2.7.6 as 4.0 tests it, and both
 mutations of the fix fail its tests.
@@ -2929,28 +2930,28 @@ two mutations, which failed by their assertions.
 **2026-11-04 — Manual tests of the broker without profiles.**
 
 Not a review: what was tried by hand, with a real key of the maintainer's,
-through the broker without profiles (`2df51fd`, `d84f014`) at
+through the broker without profiles (`93848a9`, `1edafe7`) at
 `https://api.anthropic.com`, after the test of phase 1's broker recorded
 above ("A key the destination refused, and the manual test so far"). From
 2026-11-09 this history is the one place that holds the whole account; the
 other documents state only what was tried last.
 
-- **`curl`, by the maintainer** (recorded in `cc42442`), the token in
+- **`curl`, by the maintainer** (recorded in `2e059c3`), the token in
   `x-api-key`: a `GET /v1/models` was answered `200`, and the audit recorded
   it with the method's label only; a `POST /v1/messages` was answered by
   Claude Haiku 5.5; a request with the token in its URL was refused by the
   broker itself, and nothing was sent.
 - **The Anthropic Python SDK 2.4.0, by the maintainer's agent at the
-  maintainer's request** (`0c34c65`), the token in `ANTHROPIC_API_KEY` and
+  maintainer's request** (`a90f191`), the token in `ANTHROPIC_API_KEY` and
   the broker's address in `ANTHROPIC_BASE_URL`: a message and two streams
   were answered `200`, and the audit recorded three `POST` admissions by
   label only.
 - **Claude Code 2.1.318 in print mode** (`claude -p`), by the maintainer's
-  agent at the maintainer's request (`e943667`), with a home directory of
+  agent at the maintainer's request (`4e0caf1`), with a home directory of
   its own and so no login, the token in `ANTHROPIC_AUTH_TOKEN` and the
   broker's address in `ANTHROPIC_BASE_URL`: it answered, in one `POST` that
   the destination answered `200`.
-- **Claude Code interactively, by the maintainer** (`65a901d`), with the
+- **Claude Code interactively, by the maintainer** (`72bf636`), with the
   guide's recipe: it worked. The `400` "credit balance is too low" that
   phase 1's test met, which the API gave to requests with Claude Code's
   beta whether or not they went through the broker, did not recur.
@@ -3160,7 +3161,7 @@ The implementer reports that the full `AGENTS.md` matrix passed after the
 last code fix. Codex did not rerun that full matrix or the GTK suites in
 the final re-review.
 
-**2026-11-09 — Documentation audit against the code at `3521f90`.**
+**2026-11-09 — Documentation audit against the code at `1061b89`.**
 
 At the maintainer's request, the maintainer's agent ran seven read-only
 audits (AI-assisted; nothing was built, run or changed by them), each
@@ -3180,7 +3181,7 @@ each reported what it did not check. What they found, by class:
 | The manual tests of the broker told in five documents, mixed with phase 1's. | **Corrected:** the whole account is in this history ("A key the destination refused, and the manual test so far" and "Manual tests of the broker without profiles"); L24 and the other documents state the last result. |
 | Omissions: options, fields, refusals and pages the documents did not mention; code maps without the newer modules; §10 and the roadmap's Hardening table listing different items. | **Corrected.** §10 and the Hardening table now list the same items, and the roadmap carries their status. |
 | L18 and L19 out of order; L2 spoke of `rusthorse-dialog` in the future. | **Corrected.** |
-| No review recorded for the SSH recipes of the guide (`d88f7a5`, `eb75d19`). | **Reviewed on 2026-11-09:** see the next entry. |
+| No review recorded for the SSH recipes of the guide (`5cb9117`, `da0737f`). | **Reviewed on 2026-11-09:** see the next entry. |
 
 No finding of this first round changed what the code does or what this
 model's sections 1 to 9 guarantee; P9 was stated more strongly than the code
@@ -3222,14 +3223,14 @@ programs read a `.env` file or a connection string, the measured heights of
 dialogs, the dependencies the package computes when it is built, and the
 entries of this history before 2026-11-04.
 
-**2026-11-09 — The SSH recipes of the guide for AI agents (`d88f7a5`,
-`eb75d19`).**
+**2026-11-09 — The SSH recipes of the guide for AI agents (`5cb9117`,
+`da0737f`).**
 
 The two commits of 2026-11-04 added to `rusthorse guide ai` a recipe for
 SSH with a password (`sshpass -e`) and one with a private key from the vault
 (a temporary `ssh-agent`), and mentioned them in `docs/ai-agents.md` and the
 CHANGELOG. They changed no code and had no review on record; the
-documentation audit above found that. Review of the text at `3521f90`
+documentation audit above found that. Review of the text at `1061b89`
 (Codex, AI-assisted, 2026-11-09; verdict: **not ready**, one medium and four
 low findings), and what was done:
 
@@ -3325,7 +3326,7 @@ await the maintainer's decision.
 
 **2026-11-10 — The SSH recipes tried against servers.**
 
-A test by hand, not a review. With the package built from `194c7f5`
+A test by hand, not a review. With the package built from `837eeb0`
 installed, the maintainer's agent followed the built-in guide on the
 maintainer's machine (OpenSSH 9.6, sshpass 1.09), and the maintainer
 answered each dialog. The servers were three devices of the maintainer's
@@ -4430,7 +4431,7 @@ within those limits; A01, found in existing audit code, is recorded next.
 
 **2026-11-11 — Open the audit log's directories as directories only.**
 
-A01 was found during the 7f9 review in code from `cf6ba67`.
+A01 was found during the 7f9 review in code from `18bb564`.
 `audit::open_directory` used `File::open`: a FIFO replacing the log's
 directory or a parent awaiting sync blocked a record while holding the
 log mutex. It now delegates to `util::open_directory` (`O_DIRECTORY`),
@@ -4636,7 +4637,7 @@ is unchanged.
 **Final matrix (Codex, AI-assisted, 2026-11-11).** The working tree
 matched staged tree `fe82d669ecd593eba6f3e7620557c376f35ea76b` before and
 after each of the twelve checks. This matrix covers the code of both
-kuz (committed as `3ffe25c`, included in this tree) and this K01 fix with
+kuz (committed as `1b8862d`, included in this tree) and this K01 fix with
 the L01 regression test. Commands ran sequentially after
 `source ~/.cargo/env`, with `CARGO_BUILD_JOBS=5`, `RUST_TEST_THREADS=5`
 and a private `TMPDIR` of mode 0700; GTK tests used their own virtual
@@ -4744,7 +4745,7 @@ so no mutation applies.
 
 The initial review was **not ready**, with MGR01 low and no serious
 correctness, security, concurrency or regression finding. Confirmation of
-the staged tree at HEAD `eb4b95d` is **ready**: MGR01 is fixed and there is
+the staged tree at HEAD `f20ecd9` is **ready**: MGR01 is fixed and there is
 no new finding. After undoing that wording correction in memory, the
 aggregate SHA-256 of the 110 inventoried files matches the reviewed tree.
 There was no other difference and no unstaged change before this record.
@@ -4865,3 +4866,194 @@ once), `cargo test --no-default-features` 553 with 2 ignored, the dialog's
 the one that needs `keepassxc-cli`. No package was built or installed and
 no service changed: the installed manager still shows the earlier texts
 until the next package.
+
+**2026-11-19 — The history rewritten before publication.**
+
+The repository had never been published and had no remote. Before its
+first publication the maintainer's agent (Claude Code, AI-assisted) read
+everything a push would publish — the 221 commits of `main`, every
+version of every file (1,420 blobs) and every commit message — for
+credentials and private data. It found no credential: every key-shaped
+string is a made-up test value, the private-key PEM examples contain only
+dummy test material, and the two
+KDBX fixtures hold test data (both were opened with the password their
+test names). It found three things that the maintainer decided to remove
+from the whole history, as old material not meant for publication:
+
+- a list of example names in the reference prototype's simulated keyring
+  import (`docs/design/manager/index.html`), with the name of one of its
+  fake entries, and an example in the roadmap taken from that list:
+  replaced by made-up names;
+- the `Claude-Session:` line of 199 commit messages, a link to the
+  session that made the commit: removed;
+- the maintainer's personal e-mail address, in the identity of every
+  commit and in `Cargo.toml`, `packaging/copyright.py` and
+  `packaging/deb/changelog`: replaced by the account's GitHub noreply
+  address.
+
+A backup of the repository was made first. Gemini (AI-assisted), given
+the exact replacements, rewrote a separate clone in one run of
+`git filter-repo`; nothing else was asked of it. The maintainer's agent
+then compared the backup with the result, with a program of its own:
+
+- the same 221 commits in the same order, each with the same parent,
+  author and committer names and dates;
+- each message equal to the old one without its session line and with
+  the commit ids it cites mapped (71 ids in 40 messages), ending with one
+  newline;
+- each tree different from the old one only in the five files named
+  above, and each of the 56 distinct changed blobs equal to the old blob
+  with the decided replacements applied and nothing else;
+- no session link, old address or old name in any commit or message, and
+  `git fsck` without errors.
+
+Every commit id changed. The ids cited in the files — 335 references to
+88 commits, in this document, in ADR 0013 and in three comments of the
+code — were mapped by a script to the commits that took their place, in
+the commit that adds this entry. So the ids this history cites, in
+entries of any date, are those of the published history, not the ones
+written at the time. Left as recorded, because they name objects that
+were never part of `main`: the commits `9c069d4` and `36db9c3`, and the
+ids of the staged trees in the "Final matrix" records. The published
+repository does not have them.
+
+Not changed: the products that ADR 0013 and earlier versions of the
+roadmap name as technical examples. The rewrite changes no behaviour:
+the code differs from the reviewed tree only in the maintainer's address
+that the package carries and in the commit ids of three comments.
+
+**Independent review (Codex, AI-assisted, 2026-11-19).**
+
+The initial verdict was **not ready**, with HIS01 low and no serious
+correctness, security, concurrency or regression finding. Confirmation of
+the staged correction at HEAD `37c2b12` is **ready**: HIS01 is fixed and
+there is no new finding. Reversing only that wording correction in memory
+reproduces the saved SHA-256 of the reviewed index's path, mode, stage and
+blob-ID entries. There was no other staged difference and no unstaged
+change before this record.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| HIS01 — The record said "no private key has a body", but the PEM examples have dummy bodies: `AAAA` in `broker/src/setup.rs:255` and fake key material in `3294e0b:src/import.rs`. This was an inaccurate description, not an exposed private key. | Low | **Fixed and confirmed:** the staged record says "the private-key PEM examples contain only dummy test material". |
+
+The following checks belong to the initial review; this confirmation did
+not repeat them. The reviewer read AGENTS.md, the repository's context
+documents and the complete staged diff, including the summary row, the
+last entry and the prototype README addition. Independent Python scripts,
+run in memory, compared objects read with `git rev-list`,
+`git cat-file --batch` and `git show`; the implementer's comparison
+program was not used.
+
+The backup and clone each had 221 commits, matched by all 221 rows of the
+commit map, in the same topological order, with all 230 parent links
+mapped correctly and no commit pruned. All 221 raw headers and subjects
+were compared. Author and committer names, dates and time zones were
+preserved; all 442 author/committer identities used the decided noreply
+address. No header was lost: the original headers contained only tree,
+parent, author and committer fields, with no encoding or signature header.
+
+The scripts recomputed Git object hashes for 1,420 distinct blobs and
+889 tree nodes, rebuilding the trees of all 221 commits with only the
+decided replacements. File paths and modes were unchanged. All 56
+distinct changed blobs were in the five authorised files and equalled
+the original bytes with exactly those replacements; no other difference
+was found.
+
+The two KDBX fixtures were byte-for-byte unchanged. The reviewer opened
+both with `keepassxc-cli export --quiet` and their documented test
+password, capturing XML in memory with isolated temporary directories.
+Both commands exited zero; the contents were test data, with no
+attachments and no removed term in the XML. The files' hashes remained
+unchanged, and the temporary directory was removed.
+
+All 221 messages were compared byte for byte: exactly 199 session lines
+were removed from 199 commits, and 71 commit-ID occurrences were mapped
+in 40 messages. There was no other difference, including final newlines.
+The contexts of the 71 substitutions were commit references, not
+unrelated hexadecimal tokens.
+
+The staged files mapped exactly 335 references to 88 old commits, with
+the same number of digits and the correct replacement: 316 references
+in this document, 16 in ADR 0013, two in `src/protocol.rs` and one in
+`tests/agent.rs`. Outside those substitutions, only the specified record
+and prototype README additions differed. No old-main commit-ID token
+remained in the staged files; no new abbreviation was ambiguous among
+the commits of main.
+
+The unmapped message references `10fa623`, `888fe95` and `9c069d4`
+correctly remained: they name backup commits outside the old main.
+The files' `9c069d4` and `36db9c3` have the same justification. The
+three hashes in earlier "Final matrix" records name trees, not commits:
+
+- `e86de9e37794381b5d9407c176e9a4431639a4f2`;
+- `04c9e7ca02989a5f98fbcff27a19a2066eed2ab4`;
+- `fe82d669ecd593eba6f3e7620557c376f35ea76b`.
+
+The fixture NOTICE's `26cb076aa5cbbe36e175326dfdaf5a19799c4085`
+references upstream. The other retained tokens were a UUID fragment
+(`c5f546e5`), a numeric address test (`2130706433`), a date
+(`20250219`) and an algorithm name (`ed25519`), not commits to map.
+
+Case-insensitive privacy searches covered all 1,420 reachable blobs,
+221 messages and their headers, 113 historical paths, and the initial
+staged files. There were no hits for the removed example names, personal
+address or session links in the rewritten history. The initial staged
+record contained one explanatory occurrence of the removed session-line
+label, without a link or session identifier.
+
+The `session_` searches found 2,550 occurrences in 349 historical blobs
+and 115 occurrences in 18 initial staged files: code, D-Bus, configuration
+and example identifiers, not private session identifiers. Other e-mail
+matches were the authorised noreply identity, 219 public noreply
+coauthor trailers, test examples or parser false positives. Home paths
+were examples or vault-group paths; hosts and IP addresses were examples,
+documented public destinations or test vectors. The reviewer examined
+credential-shaped patterns, PEM delimiters and 415 distinct long quoted
+literals, including 11 candidates selected by an additional entropy
+filter. These were test data, examples, UUIDs, widget names, paths or
+build options; no real credential was identified. The technical product
+examples deliberately retained by the maintainer were unchanged.
+
+`git fsck --full --strict --no-reflogs`, `git diff --check` and
+`git diff --cached --check` exited zero without output. The clone had
+only `refs/heads/main`; filter-repo's local metadata is not included
+in an ordinary push of main. The backup and old objects in the real
+repository remain local; their presence alone does not publish them.
+The initial review left the index and files unchanged, verified against
+its starting hashes, and found the real repository clean.
+
+The reviewer ran no Cargo checks, application tests or mutations.
+Since that review, the implementer reports that all twelve AGENTS.md
+checks passed sequentially from a cold build in this clone, before the
+HIS01 wording correction: `cargo test --all-features` passed 663 tests
+with 2 ignored (the descriptor-limit test's child rerun counted once),
+`cargo test --no-default-features` passed 553 with 2 ignored, and the
+dialog and manager passed 9 and 45 respectively. These are the
+implementer's results, not checks run or independently validated by
+the reviewer.
+
+The reviewer did not establish that the repository had never been
+published, observe Gemini's original run or Claude's original checks,
+verify the fixtures' provenance externally, or prove that no arbitrary
+string had ever been used as a secret. The material results were
+checked; the reported execution history was not independently observed.
+No network, real vault, running agent, on-screen dialog, installation or
+inspection of other processes through /proc was used.
+
+No further obstacle was found in the transfer plan. Before
+`git reset --hard`, check again that the real repository is clean and
+that the fetched commit is the approved final commit. Push only main,
+only with the maintainer's explicit approval. The reviewer performed
+none of the planned commit, fetch, reset, branch deletion or push steps.
+This confirmation adds only this record and the summary sentence above,
+left unstaged for the implementer to read.
+
+**Final checks (the maintainer's agent, Claude Code, AI-assisted,
+2026-11-19).** The matrix that the reviewer's record attributes to the
+implementer ran in the rewritten clone from a cold build, on the staged
+tree before the HIS01 wording change. After that change and the
+reviewer's record, which touch this document only, `git diff --check`,
+`cargo fmt --all --check` and the 25 packaging and documentation tests
+(`cargo test --all-features --test packaging`) passed again on the tree
+as committed, less this paragraph. The whole matrix was not repeated
+for those two additions.

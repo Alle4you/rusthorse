@@ -23,7 +23,7 @@
   [threat model's review history](../threat-model.md#11-review-history).
 
 - Amended: 2026-11-03, to match the reviewed phase 1 implementation at
-  `4ff834a`. The dated
+  `70ad512`. The dated
   [implementation amendments](#implementation-amendments-2026-11-03) below
   explain each change; the review history records the findings, fixes and
   coverage gaps. Manual SDK validation with the maintainer is still pending.
@@ -1022,23 +1022,23 @@ is the one `rusthorse guide ai` prints.)
 
 ## Implementation amendments (2026-11-03)
 
-These amendments record what was implemented and reviewed at `4ff834a`, at the
+These amendments record what was implemented and reviewed at `70ad512`, at the
 maintainer's request, after the phase 1 implementation reviews (AI-assisted).
 They correct the normative specification above; the 2026-11-02 client survey
 remains a dated observation, not a guarantee about all installed SDK versions.
 The guide uses the library's key variable and leaves a competing
-`ANTHROPIC_AUTH_TOKEN` unset (Q02, `4ff834a`). The package cleanup description
-was updated on the same date for Q01's fixes in `b999e72` and `3953912`,
-merged in `453e772`; that cleanup was then replaced by a staging directory
+`ANTHROPIC_AUTH_TOKEN` unset (Q02, `70ad512`). The package cleanup description
+was updated on the same date for Q01's fixes in `2dabbff` and `96e7e43`,
+merged in `d1cab93`; that cleanup was then replaced by a staging directory
 that only checked packages leave (R01–R04).
 
 | Area amended | Why and implementation evidence |
 |---|---|
-| Components, CA file and test feature | `broker/src/config.rs`, `destination.rs`, `broker_protocol::open_ca_file`: PEM parsing through `rustls-pki-types`, descriptor/ancestor checks, and production settings unless the test roots variable is present. P05 fixed in `4c2c5d4`; package and doctor checks are separate controls. |
+| Components, CA file and test feature | `broker/src/config.rs`, `destination.rs`, `broker_protocol::open_ca_file`: PEM parsing through `rustls-pki-types`, descriptor/ancestor checks, and production settings unless the test roots variable is present. P05 fixed in `ea3e3c8`; package and doctor checks are separate controls. |
 | HTTP handling and bounds | `broker/src/framing.rs`, `exchange.rs`, `destination.rs`: OPTIONS refused, Hyper's fragment normalization and parser errors, 408/504/505 and unknown outcomes after sending, bounded redaction, ordered resolution with retained resolver slots, explicit IPv6 exclusions. No promise to cancel a blocking libc resolver or to inspect opaque bodies. |
-| Registry and Install | P03/P04, `d8c8fe3`: register and send under one lock; confirmation or actual death before reporting containment. `broker_host.rs` counts all retained grants for capacity, including revoked ones, and every lock ends starting grants (`d0c4acb`). |
-| Unlock barrier | P01, `c1249d5`: contain before audit, audit outside the state lock, then generation recheck. Cancellation before comparison preserves the old fingerprint; cancellation after the decision never undoes revocation. Fingerprint implementation clarified in `e729ebd`. |
-| Lifetime and control contract | P02, `c14c4f9` and `24bea7e`: no serving without the agent timer, independent broker expiry. `6ed1ad7` documents early-Revoked tolerance; the broker sends no unsolicited acknowledgement on expiry. |
+| Registry and Install | P03/P04, `7ac4c15`: register and send under one lock; confirmation or actual death before reporting containment. `broker_host.rs` counts all retained grants for capacity, including revoked ones, and every lock ends starting grants (`6885f24`). |
+| Unlock barrier | P01, `0932d31`: contain before audit, audit outside the state lock, then generation recheck. Cancellation before comparison preserves the old fingerprint; cancellation after the decision never undoes revocation. Fingerprint implementation clarified in `5654dcc`. |
+| Lifetime and control contract | P02, `a23450c` and `38ddb0b`: no serving without the agent timer, independent broker expiry. `db91106` documents early-Revoked tolerance; the broker sends no unsolicited acknowledgement on expiry. |
 | User-visible state, audit and approvals | `grants` includes retained revoked entries; status excludes them. End records are best effort and SIGTERM does not unwind `StopGrants`. The zenity height estimate can refuse multi-grant runs. Manual SDK support validation is pending, as answer 9 requires (done on 2026-11-04: see answer 9). |
 
 The review history records remaining coverage gaps and accepted limitations; a
@@ -1088,8 +1088,8 @@ Rusthorse protects. No further controls are planned.
 ### The broker without profiles or presets
 
 This replaces phase 1's profiles and presets. It was reviewed before any code,
-and phase 1 stayed as it was until it was built: implemented in `2df51fd` and
-`d84f014`, and reviewed ready on 2026-11-04.
+and phase 1 stayed as it was until it was built: implemented in `93848a9` and
+`1edafe7`, and reviewed ready on 2026-11-04.
 
 - **No profile.** An entry carries no broker profile, and the code knows no
   preset, route or header of any API. `rusthorse edit --broker`,

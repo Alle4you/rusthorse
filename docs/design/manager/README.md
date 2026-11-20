@@ -2,6 +2,8 @@
 
 `index.html` preserves the maintainer-approved HTML prototype with fake data.
 Only its two Portuguese prototype controls were translated into English.
+On 2026-11-19 the names in its simulated keyring list and the name of one
+fake entry were replaced by other made-up names.
 Open it locally; it makes no agent requests and saves nothing. Its simulated
 approvals, clipboard, settings, restore and KeePassXC handoff are not real
 implementations or security guarantees. In particular, locking alone cannot

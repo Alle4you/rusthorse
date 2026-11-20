@@ -11152,7 +11152,7 @@ mod broker_cli {
     }
 
     /// How an agent of protocol 8 answers a `broker_run_v2`: a request it
-    /// cannot read (`invalid_request`), in the words of `c06af42`'s agent,
+    /// cannot read (`invalid_request`), in the words of `12bbe4b`'s agent,
     /// the position in the frame aside.
     const REFUSED_BY_PROTOCOL_8: &str = "malformed request: unknown variant `broker_run_v2`, \
         expected one of `status`, `unlock`, `create_vault`, `lock`, `list`, `show`, `add`, \

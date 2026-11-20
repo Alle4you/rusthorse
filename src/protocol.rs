@@ -2018,7 +2018,7 @@ mod tests {
         }
     }
 
-    /// The requests of protocol 8, as `c06af42` defines them: an internally
+    /// The requests of protocol 8, as `12bbe4b` defines them: an internally
     /// tagged enum of these variants, with no catch-all, that ignores
     /// fields it does not know. Their contents do not matter here, except
     /// that of `broker_run`, which is read as protocol 8 read it.
@@ -2080,7 +2080,7 @@ mod tests {
             .to_string();
         assert!(err.contains("unknown variant `broker_run_v2`"), "{err}");
         // The variants protocol 8's own type names in this error, in its
-        // order: the mirror is faithful to `c06af42`'s request type.
+        // order: the mirror is faithful to `12bbe4b`'s request type.
         assert!(
             err.contains(
                 "expected one of `status`, `unlock`, `create_vault`, `lock`, `list`, `show`, \
