@@ -6595,6 +6595,12 @@ fn a_run_reports_the_grants_whose_destination_answered_401() {
 /// its other processes are terminated and its output drained — so that a
 /// token kept by a descendant that left its process group (`setsid`) no
 /// longer works (ADR 0013, the end of the command; threat model L17).
+///
+/// This test checks the revoke against the drain only, with a fake broker:
+/// a descendant that escaped sees the broker told to revoke, and what it
+/// prints afterwards is still in the run's output. It cannot tell a revoke
+/// before the group is terminated from one right after it; that the real
+/// token stops working is checked in the broker's system tests.
 #[test]
 fn the_end_of_the_command_revokes_its_grants_before_its_output_is_drained() {
     use rusthorse::protocol::Response;
@@ -6606,31 +6612,55 @@ fn the_end_of_the_command_revokes_its_grants_before_its_output_is_drained() {
     let log = fake_broker(&h, "ready");
     h.decide(&[Decision::AllowOnce]);
     // A descendant in a session of its own goes on printing after the
-    // leader exits, and notes when it sees the broker told to revoke.
+    // leader exits, and notes when it sees the broker told to revoke. It
+    // first notes that it runs — `setsid` has moved it out of the
+    // command's process group by then — and only then does the leader
+    // exit: a descendant still on its way to `setsid` would be terminated
+    // with the group.
+    let started = h.dir.path().join("descendant-started");
     let seen = h.dir.path().join("revoked-while-it-ran");
     let descendant = h.dir.path().join("descendant.sh");
     std::fs::write(
         &descendant,
         format!(
-            "i=0\nwhile [ $i -lt 100 ]; do\n  if grep -q '\"event\": \"revoke\"' '{}'; then \
+            ": > '{}'\n\
+             i=0\nwhile [ $i -lt 100 ]; do\n  if grep -q '\"event\": \"revoke\"' '{}'; then \
              touch '{}'; break; fi\n  echo tick\n  sleep 0.05\n  i=$((i+1))\ndone\necho after\n",
+            started.display(),
             log.display(),
             seen.display()
         ),
     )
     .expect("write");
-    let script = format!("setsid sh '{}' & exit 3", descendant.display());
-    let response = broker_run(
+    let script = format!(
+        "setsid sh '{}' & i=0; while [ ! -e '{}' ] && [ $i -lt 600 ]; do sleep 0.05; \
+         i=$((i+1)); done; exit 3",
+        descendant.display(),
+        started.display()
+    );
+    let running = start(
         &h,
         broker_run_request(&h, vec![], vec![brokered("K", "KEY", None)], &script),
     );
-    match response {
+    match running.wait() {
         Response::Exited { code, .. } => assert_eq!(code, Some(3)),
         other => panic!("unexpected {}", other.kind()),
     }
+    assert!(started.exists(), "the descendant did not start");
     assert!(
         seen.exists(),
         "the grant was not revoked while the output was drained"
+    );
+    // The marker shows that the descendant saw the revoke; `after`, which
+    // it prints next, is in the run's output only if the output was still
+    // being drained then. Both are needed: the marker alone would also be
+    // there after a revoke that came once the drain was over, and `after`
+    // alone is also printed by a descendant that gave up without seeing
+    // one.
+    let output = running.output.text();
+    assert!(
+        output.lines().any(|line| line == "after"),
+        "what the descendant printed after the revoke is not in the output: {output:?}"
     );
     let revoke = logged(&log, "revoke");
     assert_eq!(revoke["message"]["reason"], "command_ended");

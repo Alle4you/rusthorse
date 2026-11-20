@@ -859,6 +859,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-19 | Drop the manager's three unbuilt features: listing and revoking single remembered approvals, the KeePassXC hand-off and editing notes (the maintainer's decision). | Nothing of ADR 0007 is left to build. Three messages in the manager and the documents changed; no code of the agent, the vault or the CLI. See below. Reviewed the same day (Codex, AI-assisted): not ready with MGR01 low, fixed, then ready. |
 | 2026-11-19 | The history rewritten before publication, at the maintainer's decision (rewritten by Gemini, AI-assisted; specified and verified by the maintainer's agent). | The same 221 commits and content, less a list of example names in the prototype, the session links of commit messages and a personal e-mail address. The commit ids this history cites were mapped to the rewritten commits. See below. Reviewed the same day (Codex, AI-assisted): not ready with HIS01 low, fixed, then ready. |
 | 2026-11-19 | The first run of the CI, at publication: two end-to-end tests failed on the runner (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The tests assumed an environment; the agent's refusal was right. Tests only changed. See below. Reviewed the same day (Codex, AI-assisted): not ready with CI01–CI03 low, fixed, then ready. |
+| 2026-11-20 | The second run of the CI: the two corrected tests passed on the runner, and a third failed intermittently (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | A race in the test's own command, not in the agent: the grant was revoked first, as it must be. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI04 medium and CI05–CI06 low; CI04 and CI05 fixed, CI06 left as a follow-up; CI07 low found on confirmation and fixed; then ready. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5202,3 +5203,270 @@ descriptor-limit test's child rerun counted once),
 `cargo test --no-default-features` 553 with 2 ignored, the dialog's 9
 and the manager's 45. Whether the runner agrees is what the next run of
 the CI says.
+
+**2026-11-20 — The second CI run: a race in the test of revocation at the
+leader's exit.**
+
+The second run, on the push of `f7ad355` (2026-11-20 02:22 UTC), passed
+the two tests corrected above: they no longer depend on the runner's
+three variables. The same job failed again at `cargo test
+--all-features`, in another end-to-end test, 195 of 196 passing:
+`the_end_of_the_command_revokes_its_grants_before_its_output_is_drained`,
+with "the grant was not revoked while the output was drained". That test
+had passed in the first run; a second attempt of the same job, asked for
+by the maintainer's agent, failed in the same way. The job's later steps
+have still never run on the runner. The GTK and MSRV jobs passed again.
+
+The failing assertion is about a security property (ADR 0013, the end
+of the command; L17): a grant must end when the command's leader exits,
+before its output is drained. So the diagnosis had to say whether the
+agent had failed to revoke. It was made by a subagent of the
+maintainer's agent (Claude Opus 5.5, AI-assisted), which changed no file
+of the repository; the maintainer's agent (Claude Code, AI-assisted)
+read in the code the order it rests on.
+
+The cause is in the test's own command, `setsid sh '<descendant>' & exit
+3`. The leader forks the background child and exits at once. The agent,
+told of that exit, ends the run's grants and waits for the broker's
+confirmation, then terminates what is left of the command's process
+group, then drains the output (`src/agent.rs`, after the `waitid` loop).
+A child that has not yet returned from `setsid()` is still in that group
+and is terminated with it: the descendant that the test relies on never
+runs, and never writes the marker the test looks for. The subagent
+traced nine failing runs (with `strace`, the test pinned to one CPU with
+four busy loops on it: 9 failures in 60 runs): in each the fake broker
+had logged the revoke 0.3 to 3.8 ms after the leader's exit, the group
+was signalled at 11.0 to 16.5 ms, and the child was killed before it
+ran the descendant's script. In an isolated measurement of the window
+on the maintainer's idle machine, a group signalled 0.25 ms after the
+leader's exit kept 4 of 200 descendants, and one signalled after 1 ms or
+more kept all 200: there the child wins by about a millisecond.
+
+What this does and does not establish. In every failure reproduced, the
+grant was revoked first, and the code has no path that skips the revoke
+when the leader exits. The failure was not reproduced without `strace`
+on the maintainer's machine (0 failures in about 450 runs under several
+loads), and the run on the runner cannot be observed: its log has no
+output of the command. The subagent's argument for the runner is one of
+timing: the test ended there as soon as on a run that passes, where a
+revoke that never came would have kept the descendant printing for five
+seconds. A descendant that had escaped and then stalled for half a
+second is not excluded by that argument.
+
+The fix is in the test only, made by Gemini (AI-assisted) from exact
+edits, in two steps. First the race: the descendant notes that it runs,
+by which time `setsid` has moved it out of the group, and the leader
+polls for that note for up to 600 iterations, sleeping 50 ms each time,
+then exits with status 3 (an iteration bound, not a deadline of 30
+seconds); the test rejects a missing note. Then, after the review below
+(CI04), the proof: the marker alone shows that the descendant saw a
+revoke at some time, so the test now also requires, in the run's output,
+the line that the descendant prints last. The marker shows that it saw
+the revoke; that line, printed next, reaches the output only while it
+is still being drained. Both are needed: a descendant that gives up
+without seeing a revoke prints the line too. The
+system test of the same property with the real broker
+(`a_stolen_token_stops_working_once_the_commands_leader_exits`) already
+waited for its descendant in this way and is not affected.
+
+**Implementer's checks (Gemini, AI-assisted).** These are the runs
+made on the test as it is committed, after both steps; the first step
+alone had been checked in the same way before the review. The test
+passed 20 of 20 runs on the idle machine and 20 of 20 pinned to one CPU
+with four busy loops on it, the condition under which the earlier one
+failed when traced. Mutations, in a temporary copy with its own target
+directory:
+
+- M1: the revoke moved to after the output is drained — caught: the
+  test fails at "the grant was not revoked while the output was
+  drained", after 5.7 seconds (the descendant prints its hundred lines
+  and never sees a revoke).
+- M2: the descendant never notes that it runs — caught: the test fails
+  at "the descendant did not start", after 31.5 seconds.
+- M3, the reviewer's survivor: M1 with a pause of 0.75 seconds in the
+  descendant right after its note — caught 6 times out of 6, at the new
+  requirement ("what the descendant printed after the revoke is not in
+  the output"). Before that requirement the test passed under it.
+- M4, the pause alone, with the agent unchanged: the test fails 6 times
+  out of 6 at the same requirement. This is not a mutation to catch but
+  the measure of a margin, stated below.
+
+`cargo fmt --all --check` and both clippy runs passed;
+`cargo test --all-features` passed 663 tests with 2 ignored, and again
+with the runner's three variables set; `cargo test --no-default-features`
+passed 553 with 2 ignored. The maintainer's agent compared the first
+step with the diff that the diagnosis proposed (identical) and the
+second with the edits it had specified, ran the test, and checked that
+no load process was left.
+
+Left as they are:
+
+- The test does not tell a revoke before the group is terminated from
+  one between that and the drain: an escaped descendant sees the same
+  (the reviewer confirmed it with that mutation, which passes). The
+  test's comment now says which part of the order it checks.
+- The drain ends after 500 ms without output once the leader is gone, so
+  a descendant kept from running for that long between two lines, which
+  it prints 50 ms apart, fails the test without a defect in the agent:
+  M4 above. With the new requirement such a stall fails the test, where
+  before it could hide a late revoke; the margin is that of the agent's
+  drain, some ten times the descendant's pace.
+- `processes_with_non_utf8_names_are_terminated_too` forks and exits in
+  the same way. Its assertion holds whichever side wins, but it can pass
+  without testing what it means to (a child killed before it changes its
+  name), its own check relies on a fixed sleep of 300 ms, and, as the
+  reviewer found (CI06), that check kills only its shell and leaves a
+  `sleep 30` running for some 29 seconds after the tests have ended,
+  which an empty `TMPDIR` does not show. It is older than this change
+  and is a follow-up of its own.
+
+**Independent review (Codex, AI-assisted, 2026-11-20).** My initial
+verdict was **not ready**, with CI04 medium and CI05–CI06 low. At the
+first confirmation I found CI04 and CI05 fixed and accepted CI06 as a
+separate follow-up, but found CI07 low in the new explanation, so the
+verdict remained **not ready**. I have now confirmed CI07 fixed in both
+places on the staged tree. The final verdict is **ready**, with CI06
+remaining a separate follow-up.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| CI04 — the marker could be created after the drain ended, allowing a late revoke to pass. | Medium | Fixed: the test retains the captured output through `start` and `running.wait()`, checks the marker, and also requires the line `after`. The doc comment now distinguishes its coverage from group termination and real-token rejection. |
+| CI05 — the record promised a 30-second deadline and an exit only after the start note. | Low | Fixed: it describes 600 iterations with 50 ms sleeps, followed by exit status 3, and the assertion that rejects a missing note. |
+| CI06 — the non-UTF-8 sibling test leaves its sanity check's `sleep 30` alive after killing only its shell. | Low | Open as a separate follow-up, an acceptable disposition for this pre-existing issue. It needs whole-group cleanup, including failure paths, and readiness after the relevant exec instead of a fixed sleep. |
+| CI07 — the new explanation said the descendant prints `after` only after seeing a revoke. | Low | Fixed and confirmed in both places: the marker shows that a revoke was seen; the final line, printed next, reaches the run's output only while it is still being drained. The wording now explicitly requires both, since a descendant that gives up without seeing a revoke also prints `after`. |
+
+I compared the staged correction with the previously reviewed state.
+Replacing only the two changed blobs in memory reproduced the previous
+index signature across all 110 tracked files. Only the specified test
+correction and rewritten entry differed; the roadmap and table row
+were unchanged. The working tree equalled the index. I did not repeat
+the experiments or run Cargo for either confirmation. At the first
+confirmation this record was supplied but not appended because CI07
+was new. At the final confirmation I checked that only its two wording
+corrections differed from that state, again across all 110 tracked
+files. I then appended this record and extended the table's outcome
+cell, leaving both additions unstaged.
+
+In the original review I read the diff, AGENTS.md, the workflow, the
+relevant documentation, the harness and fake broker, and the end-of-run
+path in `src/agent.rs` and `src/broker_host.rs`. The inspected path calls
+`end(CommandEnded)` before `terminate_group`, `leader_done` and the
+pump joins. `tell` and `wait_confirmed` wait for confirmation or contain
+the broker, killing and reaping it when necessary. Previously revoked
+grants are also waited for when needed. The connection watcher preserves
+revocation before group termination. The fake broker closes its log
+write before sending confirmation.
+
+I found no product revocation defect in those paths. The startup race
+explains the local failures I reproduced, but this does not directly
+establish the cause of each runner failure. I read the three supplied
+CI logs, containing 727, 719 and 719 lines. They show the earlier two
+tests passing in both attempts of the second run and the revocation
+test failing, with 195 of 196 end-to-end tests passing. Their aggregate
+timestamps are consistent with the diagnosis; they contain neither the
+command's output nor individual start times sufficient to exclude all
+other scheduling explanations on the runner.
+
+I independently recomputed the nine supplied failure traces. The fake
+broker logged the revoke 0.262–3.803 ms after the leader's exit; the group
+was signalled at 10.954–16.496 ms. The descendant's script did not execute
+in those cases. These are my readings of supplied traces, not nine
+additional reproductions of my own.
+
+My experiments used 71 sequential Cargo commands, including three
+`--no-run` builds, in a temporary copy of the index with its own target
+directory and private TMPDIR. I used Rust 1.99.1, offline mode and
+`RUSTFLAGS=-D warnings` only in that copy. The principal command was:
+
+```sh
+cargo test --offline --all-features --test agent \
+  the_end_of_the_command_revokes_its_grants_before_its_output_is_drained \
+  -- --exact --nocapture
+```
+
+For load I pinned the command to CPU 0 with four busy processes on that
+CPU and used `strace -f --seccomp-bpf`. A separate controlled-delay probe
+added `-e inject=setsid:delay_enter=100ms`. The times below are test times,
+excluding compilation.
+
+| My experiment | Result |
+|---|---|
+| Startup fix, idle | 5/5 passed, 0.33–0.35 s. |
+| Old test, one CPU, four busy processes and trace | 5/20 failed with the original marker assertion. |
+| Startup fix, the same load and trace | 20/20 passed, 0.37–0.60 s. |
+| Old test, 100 ms injected delay in setsid | 5/5 failed, 0.30–0.32 s. |
+| Startup fix, the same injected delay | 5/5 passed, 0.24–0.48 s. |
+| M1: revoke after the pump joins | Failed in 5.87 s: "the grant was not revoked while the output was drained". |
+| M2: no start note | Failed in 32.11 s: "the descendant did not start". |
+| Revoke after group termination but before the drain | Passed in 0.41 s, confirming the stated coverage limit. |
+| M1 plus a 0.75 s pause immediately after the start note | Passed incorrectly in 6/6 runs, 0.88–0.91 s. |
+| Proposed output assertion, with M1 and that pause | Failed in 0.91 s: "the descendant final output was not received". |
+| Proposed output assertion, original agent and no pause | Passed in 0.35 s. |
+
+In my five traced failures under load, the fake broker logged the revoke
+0.202–0.859 ms after the leader exited, before signals to the group at
+12.996–17.340 ms. In the six false positives, the descendant created the
+marker after the pumps had ended; its final `echo after` failed with
+`EPIPE`. Requiring receipt of that line, together with the marker, caught
+this survivor. The current staged code implements that requirement.
+
+I also ran the real-broker test:
+
+```sh
+cargo test --offline --all-features -p rusthorse-broker --test system \
+  a_stolen_token_stops_working_once_the_commands_leader_exits \
+  -- --exact --nocapture
+```
+
+It passed: one test, 34 filtered out, 0.41 s. It waits for the
+descendant's pid before releasing the leader and holds the client's
+drain while checking that the token no longer works.
+
+The start note is a valid startup barrier: the script creates it after
+`setsid` has established the new session, including when the utility
+forks. It does not eliminate later scheduling sensitivity. The test
+still cannot distinguish revocation before group termination from
+revocation immediately after it. A sufficiently long pause can also
+exhaust the output pumps' quiet timeout and fail the test without a
+product defect. I accept those stated limits for this correction; they
+do not justify claiming a universal timing guarantee.
+
+I searched background launches, setsid and forks in the tests and related
+modules, and read the relevant siblings in `src/supervise.rs`,
+`src/dialog_program.rs` and `src/ui.rs`. In ordinary cleanup tests,
+killing the forked child before exec still satisfies the property.
+The non-UTF-8 test additionally needs the child to reach its changed
+name, so it can pass without exercising that condition. Its own sanity
+check also leaked a live sleep: the test passed in 0.61 s, but that child
+exited 29.406 s after the test process. An empty TMPDIR did not reveal it.
+
+The maintainer reports Gemini's post-correction checks: 20/20 idle and
+20/20 under CPU load; M1 caught at the marker after 5.67 s; M2 caught at
+the missing-note assertion after 31.53 s; M3, the late revoke plus pause,
+caught 6/6 at the new output assertion; and M4, the pause with the agent
+unchanged, failing 6/6 at that assertion. These reports do not contradict
+my experiments. I did not run M4 myself. Gemini's reported fmt and both
+clippy runs passed, as did the all-features suite with 663 passed and
+2 ignored, again with the runner's three variables, and the suite
+without default features with 553 passed and 2 ignored. Those results
+belong to Gemini, not to me. The maintainer's agent reports that the
+separate full AGENTS.md matrix completed before the CI07 wording change:
+all twelve steps ran sequentially and exited zero. It reports 663 passed
+and 2 ignored with all features (counting the descriptor-limit test's
+child rerun once), 553 passed and 2 ignored without default features,
+9 passed for the dialog and 45 for the manager. After the CI07 comment
+and documentation change, it reports that `git diff --check`,
+`cargo fmt --all --check` and one run of the changed test passed. These
+are reports of the implementer's executions, which I did not observe.
+I did not repeat Cargo checks or tests for either confirmation.
+
+I did not run GitHub Actions, reproduce its exact toolchain or cache,
+run the full matrix, fmt, clippy, GTK, MSRV or the full suites for this
+review. I did not observe Gemini's original runs, repeat the diagnosis's
+approximately 450 runs or execute its isolated `window.py` experiment.
+
+All recorded runtime TMPDIR checks were empty. I terminated and waited
+for all eight load processes and reaped the probes' adopted descendants.
+The temporary copy, targets, scripts, traces and logs were removed.
+No repository file or index entry was changed by the review or the first
+confirmation. No real vault, running agent or external network was used.

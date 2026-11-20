@@ -232,7 +232,7 @@ The same items as the threat model's
 
 | Item | Status | Notes |
 |---|---|---|
-| CI on every push to `main` and every pull request | In progress | The workflow (`.github/workflows/ci.yml`) ran for the first time when the repository was published, on 2026-11-19: two of its three jobs passed, and the third failed in two end-to-end tests that depended on the runner's environment. Their correction awaits a run. |
+| CI on every push to `main` and every pull request | In progress | The workflow (`.github/workflows/ci.yml`) ran for the first time when the repository was published, on 2026-11-19: two of its three jobs passed, and the third failed in two end-to-end tests that depended on the runner's environment. Those two pass there since their correction; the second run failed in a third test, intermittently, by a race in the test's own command. Its correction awaits a run. |
 | Publish on GitHub | Done | The source was published on 2026-11-19, on the owner's approval: <https://github.com/Alle4you/rusthorse>. No release is published. The clean reinstall planned before it was left to the owner and is not recorded as done. |
 | Debian package (`.deb`): programs, user service enabled for every user, menu entry, completions, documentation | Done (unreleased) | [ADR 0010](adr/0010-debian-package.md); four programs including the broker; built from a clone with `packaging/build-deb.sh` until releases are published. |
 | Published releases: the `.deb`, static binaries, signed checksums; `.rpm` | Planned | Static binaries with `install.sh` / `uninstall.sh` (or `rusthorse setup`) for other distributions. |
