@@ -224,6 +224,14 @@ not guaranteed.
   real `rusthorse` binary, with a scripted UI (`ScriptedUi`: queued passwords,
   values and decisions; timeouts by prompt index). Automated tests never run
   zenity.
+- **The client of the end-to-end tests has an environment of the tests'
+  own.** A run's dialog lists parts of the requester's environment
+  (destinations, routes, risky and loader variables), so `Harness::cmd`
+  clears the inherited one and sets only `RUSTHORSE_SOCKET`,
+  `RUSTHORSE_AUDIT_LOG`, `RUSTHORSE_VAULT`, `XDG_RUNTIME_DIR` (the test's
+  directory), `PATH` and `TMPDIR`. A test that needs a variable sets it.
+  Do not call `env_clear()` on such a command again: it would drop those
+  too, and with them what keeps the client away from the user's agent.
 - **Fake agents** that must refuse a later connection remove their socket
   file before their last answer: a child forked by another test keeps a copy
   of the listener until its exec. For the same reason a test that checks

@@ -369,19 +369,33 @@ impl Harness {
         }
     }
 
+    /// `rusthorse ARGS…` on this agent, in the test's directory, with an
+    /// environment of the tests' own instead of the test process's: a run's
+    /// dialog lists parts of the requester's environment (destinations,
+    /// routes, risky and loader variables), and what a test checks of a
+    /// dialog must not depend on what the machine's environment holds. A
+    /// test that needs a variable sets it.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rusthorse"));
         cmd.args(args)
+            // First: it also drops what was set before it. No DISPLAY or
+            // WAYLAND_DISPLAY then: only the agent shows dialogs, and in
+            // these tests it scripts them, so a command that tried to show
+            // one itself (as `init` without an agent does) fails instead of
+            // reaching the desktop.
+            .env_clear()
             .env("RUSTHORSE_SOCKET", &self.socket)
             .env("RUSTHORSE_AUDIT_LOG", &self.audit)
             .env("RUSTHORSE_VAULT", self.dir.path().join("vault.kdbx"))
+            // Should a test remove RUSTHORSE_SOCKET, the client's default
+            // is in the test's directory too, never the user's agent.
+            .env("XDG_RUNTIME_DIR", self.dir.path())
+            // The programs the tests run.
+            .env("PATH", "/usr/bin:/bin")
+            // Temporary files where this process makes its own.
+            .env("TMPDIR", std::env::temp_dir())
             .current_dir(self.dir.path())
-            .stdin(Stdio::null())
-            // Only the agent shows dialogs, and in these tests it scripts
-            // them: a command that tried to show one itself (as `init`
-            // without an agent does) fails instead of reaching the desktop.
-            .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY");
+            .stdin(Stdio::null());
         cmd
     }
 
@@ -2789,11 +2803,9 @@ fn every_unanswered_passwd_dialog_is_recorded_once_and_changes_nothing() {
 fn a_request_too_tall_to_read_at_once_is_refused() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
-    // Line breaks in an environment value are shown as escapes: 300 of them
-    // are 1500 characters, which leaves room for what the client's
-    // environment adds to the dialog on the CI's runner (its three
-    // GITHUB_*_URL variables) and is still far taller than zenity allows.
-    // The client still inherits the test process's environment.
+    // Line breaks are escaped: 300 of them contribute 1500 characters. This
+    // keeps the test request below the character limit while pushing it
+    // above zenity's estimated height limit.
     let out = h
         .cmd(&["run", "T", "--", "true"])
         .env("GIT_SSH_COMMAND", "\n".repeat(300))
@@ -2809,15 +2821,30 @@ fn a_request_too_tall_to_read_at_once_is_refused() {
 
 #[test]
 fn the_allow_for_note_counts_toward_the_height_limit() {
+    use rusthorse::client::{Client, RunIo};
+    use rusthorse::protocol::ErrorCode;
     use rusthorse::ui::{REMEMBER_NOTE_HEIGHT, approval_height, metrics};
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
+    // Sent from this process: the dialog shows the requester's process
+    // chain, which is then the same in every request. A client started for
+    // each could have a process id one digit longer than the first one's,
+    // and its line in the dialog one line more.
+    let run = |value: &str| {
+        let mut request = run_request(&h, &["true"], false);
+        request.env.push(("GIT_SSH_COMMAND".into(), value.into()));
+        let io = RunIo {
+            input: None,
+            stdout: Box::new(std::io::sink()),
+            stderr: Box::new(std::io::sink()),
+        };
+        let response = Client::new(h.socket.clone())
+            .run_with(request, io)
+            .expect("run");
+        error_of(&response)
+    };
     h.decide(&[Decision::Deny]);
-    let first = h
-        .cmd(&["run", "T", "--", "true"])
-        .env("GIT_SSH_COMMAND", "x")
-        .finish();
-    assert_eq!(first.status.code(), Some(125));
+    assert_eq!(run("x").0, ErrorCode::Denied);
     let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
     // The same request with a longer value, as the agent will build it.
     let with_value = |value: &str| {
@@ -2833,29 +2860,13 @@ fn the_allow_for_note_counts_toward_the_height_limit() {
         .find(|v| approval_height(&with_value(v)) + REMEMBER_NOTE_HEIGHT > metrics::MAX_HEIGHT)
         .expect("a value that is too tall");
     assert!(approval_height(&with_value(&value)) <= metrics::MAX_HEIGHT);
-    let second = h
-        .cmd(&["run", "T", "--", "true"])
-        .env("GIT_SSH_COMMAND", &value)
-        .finish();
-    assert_eq!(second.status.code(), Some(125));
-    assert!(
-        text(&second.stderr).contains("too tall to read at once"),
-        "{}",
-        text(&second.stderr)
-    );
+    let (code, message) = run(&value);
+    assert_eq!(code, ErrorCode::InvalidRequest, "{message}");
+    assert!(message.contains("too tall to read at once"), "{message}");
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
     // One character less, and it is asked.
     h.decide(&[Decision::Deny]);
-    let third = h
-        .cmd(&["run", "T", "--", "true"])
-        .env("GIT_SSH_COMMAND", &value[1..])
-        .finish();
-    assert_eq!(third.status.code(), Some(125));
-    assert!(
-        text(&third.stderr).contains("denied"),
-        "{}",
-        text(&third.stderr)
-    );
+    assert_eq!(run(&value[1..]).0, ErrorCode::Denied);
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 2);
 }
 
@@ -7771,9 +7782,9 @@ fn an_ssh_key_entry_is_told_apart_by_its_kind() {
 fn the_run_dialog_shows_destination_settings_without_credentials() {
     let h = Harness::new();
     // A dialog that scrolls, as rusthorse-dialog's does: this one shows the
-    // test's own environment, directory and process chain, and with a
-    // longer TMPDIR (41 characters) zenity's estimate of its height passed
-    // the limit, which is tested elsewhere.
+    // test's directory and process chain, and with a long TMPDIR and a long
+    // process chain zenity's estimate of its height passes the limit, which
+    // is tested elsewhere.
     h.ui.scrolls.store(true, Ordering::SeqCst);
     h.add_secret(
         "OPENAI_API_KEY",
@@ -7832,7 +7843,6 @@ fn the_run_dialog_shows_destination_settings_without_credentials() {
         .iter()
         .find(|w| w.contains("route the program's connections"))
         .expect("a warning about routes");
-    // (Variables of the test's own environment may be listed too.)
     for part in [
         "SSL_CERT_FILE=/tmp/fake-ca.pem",
         "https_proxy=http://…@proxy.invalid:3128",

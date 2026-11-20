@@ -860,6 +860,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-19 | The history rewritten before publication, at the maintainer's decision (rewritten by Gemini, AI-assisted; specified and verified by the maintainer's agent). | The same 221 commits and content, less a list of example names in the prototype, the session links of commit messages and a personal e-mail address. The commit ids this history cites were mapped to the rewritten commits. See below. Reviewed the same day (Codex, AI-assisted): not ready with HIS01 low, fixed, then ready. |
 | 2026-11-19 | The first run of the CI, at publication: two end-to-end tests failed on the runner (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The tests assumed an environment; the agent's refusal was right. Tests only changed. See below. Reviewed the same day (Codex, AI-assisted): not ready with CI01–CI03 low, fixed, then ready. |
 | 2026-11-20 | The second run of the CI: the two corrected tests passed on the runner, and a third failed intermittently (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | A race in the test's own command, not in the agent: the grant was revoked first, as it must be. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI04 medium and CI05–CI06 low; CI04 and CI05 fixed, CI06 left as a follow-up; CI07 low found on confirmation and fixed; then ready. |
+| 2026-11-20 | The third run of the CI: the corrected test passed on the runner, and two tests of the broker's dialog failed for their height (designed by a Claude Opus 5.5 subagent, applied by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The cause of the first run's failures again: the client of the end-to-end tests inherited the machine's environment. It now has an environment of the tests' own. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI08–CI12 low, fixed, then ready. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5470,3 +5471,278 @@ for all eight load processes and reaped the probes' adopted descendants.
 The temporary copy, targets, scripts, traces and logs were removed.
 No repository file or index entry was changed by the review or the first
 confirmation. No real vault, running agent or external network was used.
+
+**2026-11-20 — The third CI run: an environment of the tests' own for
+their client.**
+
+The third run, on the push of `99e6b85` (2026-11-20 03:51 UTC), passed
+the test of revocation corrected above. The same job failed again at
+`cargo test --all-features`, 194 of 196 end-to-end tests passing, in the
+two tests of the broker's dialog that the first review had named as
+close to a limit: `a_broker_runs_destination_and_limits_are_checked_before_any_dialog`
+was refused with "too tall to read at once (estimated 897 pixels, limit
+880)", and `a_broker_run_shows_and_lists_its_origin_apart_from_its_base_path`
+"waited too long for the command to start". Both had passed on the
+runner in the first two runs. The GTK and MSRV jobs passed again; the
+job's later steps have still never run there.
+
+Three runs had failed in different tests, two of them for one cause:
+`Harness::cmd` started the client with the environment of the test
+process, the client sends its environment with a run, and the agent's
+dialog lists parts of it. The maintainer's agent (Claude Code,
+AI-assisted) decided to correct that cause instead of another test's
+margin, and had the change designed and validated in a copy by a
+subagent (Claude Opus 5.5, AI-assisted), which changed no file of the
+repository.
+
+The change, in `tests/agent.rs` only:
+
+- `Harness::cmd` clears the inherited environment first and then sets
+  six variables: `RUSTHORSE_SOCKET`, `RUSTHORSE_AUDIT_LOG` and
+  `RUSTHORSE_VAULT` as before; `XDG_RUNTIME_DIR`, the test's directory;
+  `PATH`, `/usr/bin:/bin`, as the tests' requests sent through the
+  library already had; and `TMPDIR`, that of the test process. The clear
+  comes first because it also drops what was set before it. A test that
+  needs a variable sets it. Clients that talk to a fake agent or to none
+  are started elsewhere and were left as they were.
+- Clearing the environment would also clear the socket's variable, and
+  the client's default is the user's own agent. The three variables are
+  set after the clear in the same expression, and `XDG_RUNTIME_DIR` is a
+  second defence: with it the default socket is in the test's directory.
+- `the_allow_for_note_counts_toward_the_height_limit` sends its three
+  requests from the test process, through the library's client, so that
+  the requester's process chain, which the dialog shows, is the same in
+  each: a client started for each request could have a process id one
+  digit longer than the first one's (CI02 above).
+- Three comments that the change made false are corrected. No test
+  failed with the change: none relied on an inherited variable.
+
+**The subagent's findings**, which the maintainer's agent did not
+repeat beyond what is said below. Under an ambient environment made
+hostile on purpose (the runner's three variables, ten more endpoint
+variables, three proxies, a risky and a loader variable), 32 of the 196
+end-to-end tests failed before the change, each with an approval refused
+as too tall, and `input_is_not_read_before_the_command_starts` passed
+without exercising its scripted denial: the request was refused for
+height instead. It still checked that stdin remained untouched. With the
+change all tests pass. The third run's exact
+pattern, 897 pixels and these two tests, was reproduced on the
+maintainer's machine with the runner's three variables and
+`SGX_AESM_ADDR=1`, a variable some hosted runners are said to set; what
+the runner really held is not known, and the first run's numbers fit
+the three variables alone. With the change, the first broker test's
+dialog measured 626 to 683 pixels and the second's 708 to 727, for
+TMPDIR paths of 19 to 70 characters. For a 70-character TMPDIR and an
+eight-process chain with 15-letter ASCII names and seven-digit pids, the
+derived heights are 702 and 746 pixels, leaving margins of 178 and 134
+pixels. These two requests have character margins above 2,300 in those
+configurations. These are estimates for the stated configurations, not
+minimum margins for every test or machine.
+
+**Implementer's checks (Gemini, AI-assisted).** The two diffs applied
+as they were, and the file has the checksum of the one validated.
+`cargo fmt --all --check` and both clippy runs passed;
+`cargo test --all-features` passed 663 tests with 2 ignored, and again
+under the hostile environment; `cargo test --no-default-features`
+passed 553 with 2 ignored. Mutations, in a temporary copy with its own
+target directory, each caught:
+
+- H1: the clear removed — under the hostile environment 31 of the 196
+  end-to-end tests fail, the two broker tests among them (one fewer than
+  the subagent's 32: the boundary test no longer goes through
+  `Harness::cmd`).
+- H2: `loader_variables_are_stripped` without its own
+  `LD_LIBRARY_PATH` — it fails: before the change, the one cargo gives
+  the test process satisfied it.
+- H3: the height of the "Allow for" note ignored in
+  `ui::approval_too_tall` — the boundary test fails.
+- H4: the socket's variable removed, one test run
+  (`status_works_while_locked`) — the client fails with "cannot reach
+  the agent at" a socket in the test's own temporary directory, not the
+  user's.
+
+The maintainer's agent read both diffs, checked that they apply to the
+repository and give the validated file, and compared the checksum after
+Gemini applied them.
+
+What the change does not do, and its side effects:
+
+- For `doctor` started through `Harness::cmd`, `systemctl --user` no
+  longer reaches the user's systemd; no test asserts on that line.
+  `FakeAgent::cmd` and the standalone `doctor` constructor still inherit
+  the test process's environment. Coverage-tool environment variables
+  are no longer inherited by clients started through `Harness::cmd`.
+- If the test process can start `python3` through its PATH but the
+  command cannot find it in `/usr/bin:/bin`,
+  `a_process_whose_main_thread_exited_is_still_terminated` now fails. If
+  its preliminary check cannot start `python3`, the test is skipped.
+- For the same projected configuration, the library request in
+  `a_run_reports_the_grants_whose_destination_answered_401` has an
+  estimated height of 784 pixels, leaving 96 pixels. This change does
+  not affect that request.
+- A test that calls `env_clear()` again on a harness command would drop
+  both defences. AGENTS.md now says not to.
+- CI06, the process left by an older sibling test, is still a follow-up
+  of its own.
+
+**Independent review (Codex, AI-assisted, 2026-11-20).** My initial
+verdict was **not ready**, with CI08–CI12 low, all wording findings.
+I have now confirmed all five corrections on the staged tree. The final
+verdict is **ready**. I found no serious product defect, new route to the
+maintainer's real agent, or demonstrated loss of test coverage caused by
+this change.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| CI08 — the record generalized measured and projected margins to every affected request. | Low | Fixed and confirmed: the two broker requests' margins are limited to the stated configurations. The library request's 784-pixel height and 96-pixel margin are identified as a projection for the same configuration, not an unconditional minimum. |
+| CI09 — the record said the input test passed without testing anything. | Low | Fixed and confirmed: it missed its scripted denial because height refusal came first, but still checked that stdin remained untouched. |
+| CI10 — the systemd and coverage statements also appeared to cover unchanged client constructors. | Low | Fixed and confirmed: the effects are scoped to `Harness::cmd`; `FakeAgent::cmd` and the standalone `doctor` constructor still inherit the test process's environment. |
+| CI11 — absence of `/usr/bin/python3` was said to make the main-thread test fail unconditionally. | Low | Fixed and confirmed: failure requires the preliminary PATH check to start Python while `/usr/bin:/bin` cannot find it; inability to start Python in that preliminary check skips the test. |
+| CI12 — a comment described physical screen capacity instead of the height estimate. | Low | Fixed and confirmed: 300 escaped line breaks contribute 1500 characters and push the request above zenity's estimated height limit while staying below the character limit. |
+
+For this confirmation I compared the staged files with the Git blobs
+read in the original review. Only the five wording corrections and their
+line wrapping differed; AGENTS.md and the roadmap were unchanged. The
+working tree equalled the index. I did not repeat experiments or run
+Cargo. This record and the sentence extending the table's outcome cell
+are the only additions I made, and are left unstaged.
+
+In the original review I read the diff, AGENTS.md, the relevant README,
+architecture and threat-model text, the workflow, and the affected code
+in `tests/agent.rs`, `tests/*.rs`, `broker/tests/` and
+`manager/src/widget_tests.rs`. I also read the relevant paths in
+`src/paths.rs`, `src/client.rs`, `src/main.rs`, `src/exec.rs`,
+`src/peer.rs`, `src/ui.rs` and `src/agent.rs`. My inventory of
+`tests/agent.rs` found 25 direct constructions of the rusthorse binary,
+15 calls to `Client::new`, one `env_clear()`, 66 `.env()` calls and
+eight `env_remove()` calls.
+
+The call order preserves the private paths: `Harness::cmd` clears first,
+then sets its six variables. I found no later call that drops those
+protections. `XDG_RUNTIME_DIR` is a second defence for the socket only;
+it does not redirect the vault or audit log. Reading `src/paths.rs`,
+without their RUSTHORSE overrides, their XDG base variables and HOME,
+the defaults are `/.local/share/rusthorse/vault.kdbx` and
+`/.local/state/rusthorse/audit.jsonl`; the code does not look up the
+login user's home. I reasoned about those defaults from the code and
+did not try them. The other clients I examined use explicit private
+sockets. H4 below exercised only removal of the socket override while
+keeping the private `XDG_RUNTIME_DIR`.
+
+I checked the assertions and inputs for OLDPWD, `_`, loader variables,
+destinations, PATH, remembered approvals, doctor, init without an agent
+and program resolution. The environment-sensitive tests supply the
+values they check. I found no dependency on HOME or LANG whose removal
+made an assertion vacuous. I found these 18 tools locally in
+`/usr/bin:/bin`: sh, true, printenv, python3, setsid, sleep, grep, cat,
+env, touch, head, tr, ln, readlink, chmod, mv, cp and mkdir. This was a
+local check, not an inventory of the runner. The boundary test still
+checks refusal with the note and a dialog request with one character
+less. `a_request_too_tall_to_read_at_once_is_refused` still checks the
+CLI's status 125 and its height-refusal message.
+
+My experiments used a temporary copy of all 110 indexed files, its own
+target directory, private paths and offline Cargo, with local Rust and
+Cargo 1.99.1. I ran 13 build/test commands sequentially. The hostile
+ambient environment contained the three GitHub URL variables, ten fake
+endpoint variables, HTTPS_PROXY, HTTP_PROXY, NO_PROXY, PYTHONPATH and
+LD_RUSTHORSE_HOSTILE. The following are my executions on the tree before
+the five wording corrections, not Gemini's or the subagent's runs.
+
+| Check | Command or temporary variant | Result and time |
+|---|---|---|
+| Build | `cargo test --all-features --no-run` | Passed; 126.76 s total. |
+| Initial setup error | `cargo test --all-features`, hostile environment | Six settings-permission tests failed because I created the TMPDIR subdirectory with mode 0775; 1.91 s total. This did not reach the end-to-end suite. |
+| Staged tree, private TMPDIR | `cargo test --all-features`, hostile environment | 663 passed, 2 ignored; 61.42 s total; TMPDIR empty. |
+| First instrumentation run | `cargo test --all-features --test agent`, hostile environment | 196 passed; 40.01 s total. I discarded its interleaved metric records. |
+| Corrected instrumentation | `cargo test --all-features --test agent`, hostile environment | 196 passed; 39.89 s total; the measurements below come from this run and the next. |
+| Long-directory measurements | `cargo test --all-features --test agent -- --exact` with the two broker tests, the 401-report test and the height-boundary test | Four passed, 192 filtered out; 8.34 s total. |
+| Old code | `cargo test --all-features --test agent`, hostile environment | 164 passed, 32 failed; 61.90 s in the tests, 69.46 s total. All 32 had an instrumented height refusal. |
+| Old code, runner-shaped example | The two broker tests selected with `--exact`, all features, the three GitHub URL variables and `SGX_AESM_ADDR=1` | Both failed; 60.04 s in the tests, 60.13 s total. |
+| H1 | Remove only `env_clear()`; `cargo test --all-features --test agent`, hostile environment | 165 passed, 31 failed; 61.90 s in the tests, 69.19 s total. |
+| H2 | Remove the loader test's own `LD_LIBRARY_PATH`; select `loader_variables_are_stripped` with all features and `--exact` | Failed at the assertion requiring the LD_LIBRARY_PATH warning; 0.26 s in the test. |
+| H3 | Ignore the note's height in `approval_too_tall`; select the height-boundary test with all features and `--exact` | Failed: Denied instead of InvalidRequest, "the request was denied"; 0.08 s in the test. |
+| H4 | Remove only `RUSTHORSE_SOCKET`; select `status_works_while_locked` with all features and `--exact` | Failed with "cannot reach the agent at" the test's temporary `rusthorse/agent.sock`; 0.01 s in the test. |
+| Staged tree, no default features | `cargo test --no-default-features`, hostile environment | 553 passed, 2 ignored; 77.64 s total including compilation; TMPDIR empty. |
+
+The suite counts count the descriptor-limit test's child rerun only
+once. H1's failure set differed from the old code's by exactly the
+height-boundary test, now sent through the library. In the runner-shaped
+example, the first broker test reported 897 pixels against the limit of
+880; the second ended with "waited too long for the command to start",
+and its instrumented request measured 979 pixels. This independently
+reproduced the reported pattern without establishing which variables
+the runner actually held.
+
+I recorded 244 approval evaluations associated with 216 harness
+instances. Heights below are estimates and include the note reservation
+when applicable. The first broker row is
+`a_broker_runs_destination_and_limits_are_checked_before_any_dialog`;
+the second is
+`a_broker_run_shows_and_lists_its_origin_apart_from_its_base_path`.
+The library row is
+`a_run_reports_the_grants_whose_destination_answered_401`.
+
+| Request | TMPDIR length 23: characters / pixels | TMPDIR length 70: characters / pixels | Projected height with TMPDIR length 70 and eight 15-letter ASCII names with seven-digit pids |
+|---|---|---|---|
+| Broker destination and limits | 1019 / 626 | 1113 / 683 | 702 pixels |
+| Broker origin and base path | 1184 / 708 | 1231 / 727 | 746 pixels |
+| Library request reporting 401 responses | 1180 / 727 | 1274 / 765 | 784 pixels |
+
+The projection replaced the requester's displayed chain in a copy of
+an approval request; it did not create that process chain. The boundary
+pair measured 884 pixels for the refused request and 865 pixels for the
+one-character-shorter request that reached the dialog. These figures
+support the stated configurations, not universal margins. Deliberately
+near-limit or over-limit tests and dialogs that scroll cannot be included
+in a claim that every request has those margins.
+
+Two limitations of my preparation are included in the command count.
+The first run's six permission failures came from my mode-0775 TMPDIR
+subdirectory. I corrected that temporary directory to 0700 and removed
+its residue before rerunning; it was not a product failure. My first
+metric logger interleaved concurrent writes. I discarded that collection
+and repeated it with one write per record. Neither correction changed a
+repository file.
+
+I read the saved logs of the first three CI runs and the supplied
+investigation's results and measurements. I checked that the original
+staged test file matched the final validated copy's checksum. I also
+verified that the earlier threat-model history was unchanged apart from
+the new row and appended entry, and both unstaged and staged
+`git diff --check` passed during the original review. Those readings do
+not make the supplied executions my own.
+
+I could not determine the runner's actual environment. Directory paths,
+process ancestry and scheduling still vary. I found no reason introduced
+by this change for the later no-default-features run or TMPDIR cleanup
+to fail; my two full suites passed under the hostile environment.
+An empty TMPDIR does not establish that no process survives. CI06 remains
+an accepted separate follow-up. I accept the plan to commit with the
+noreply identity and no session link, push main with the maintainer's
+authorization, and mark CI done only after all three jobs pass.
+
+I did not run GitHub Actions, use the external network, run fmt, clippy,
+GTK, MSRV, `cargo doc` or the release-build refusal for this review. I did
+not reproduce the runner's exact toolchain or cache, a real transition
+in pid digits, or the dialogs' appearance. I did not observe Gemini's or
+the subagent's original executions. After the wording corrections, the
+maintainer's agent reports that `git diff --check` and
+`cargo fmt --all --check` passed; those are its results. Its full matrix
+in progress is not part of my results, and I do not state its outcome.
+
+The original review's temporary copy, target, scripts and logs were
+removed. Its supervisor reaped 87 adopted descendant statuses; no review
+process was left running. No real vault, running agent or manual reading
+of another process's /proc was used. The original review changed no
+repository file or index entry. This confirmation changes only the two
+unstaged additions to this history; it does not change the index.
+
+**Final matrix (the maintainer's agent, Claude Code, AI-assisted,
+2026-11-20).** After the five corrections and before the reviewer's
+record above, the twelve checks of AGENTS.md ran on the staged tree, one
+after another, and all exited zero: `cargo test --all-features` passed
+663 tests with 2 ignored (the descriptor-limit test's child rerun
+counted once), `cargo test --no-default-features` 553 with 2 ignored,
+the dialog's 9 and the manager's 45. Whether the runner agrees is what
+the next run of the CI says.
