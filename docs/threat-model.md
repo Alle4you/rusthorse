@@ -862,6 +862,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-20 | The second run of the CI: the two corrected tests passed on the runner, and a third failed intermittently (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | A race in the test's own command, not in the agent: the grant was revoked first, as it must be. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI04 medium and CI05–CI06 low; CI04 and CI05 fixed, CI06 left as a follow-up; CI07 low found on confirmation and fixed; then ready. |
 | 2026-11-20 | The third run of the CI: the corrected test passed on the runner, and two tests of the broker's dialog failed for their height (designed by a Claude Opus 5.5 subagent, applied by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The cause of the first run's failures again: the client of the end-to-end tests inherited the machine's environment. It now has an environment of the tests' own. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI08–CI12 low, fixed, then ready. |
 | 2026-11-20 | The fourth run of the CI (a record of its result; not a review). | All three jobs passed on `742a8ff`, the later steps of the test job for the first time on the runner. One passing run; see below for what it does not show. |
+| 2026-11-20 | The package installed again on the maintainer's machine (a record of a result; not a review). | `rusthorse doctor`, run by the maintainer: fifteen lines ok, one warning (the X11 session, L2). The installed programs are those of the package built from `36d6d15`. Not a first installation, and nothing was used; see below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5779,3 +5780,40 @@ seconds, is open, and an empty `TMPDIR` does not show such a process.
 The directory and the process chain of a request still vary from
 machine to machine, within the margins recorded above. The roadmap now
 gives the CI as done, with these limits.
+
+**2026-11-20 — The package installed again on the maintainer's machine.**
+
+A record of a result; not a review. The roadmap had planned a clean
+reinstall before the publication, and the publication's entry left it to
+the maintainer. It was done after the publication.
+
+What was done, from dpkg's log on that machine, read by the maintainer's
+agent (Claude Code, AI-assisted): the package `rusthorse` 0.1.0-1 was
+removed, not purged, on 2026-11-20 at 00:39 UTC, and installed again at
+09:51 UTC by the maintainer. The package file installed was built by
+`packaging/build-deb.sh` from `36d6d15`. The agent checked that the
+installation is that file's: `dpkg --verify rusthorse` reported nothing,
+and each of the four programs in `/usr/bin` has the SHA-256 of the one
+in the package file.
+
+The maintainer then ran `rusthorse doctor` and sent its output: sixteen
+lines, fifteen `ok` and one `warn`, none a failure. The client and the
+agent are 0.1.0, protocol 11, and the agent runs the same program file
+as the client, `/usr/bin/rusthorse`; the dialog program and the broker
+are found next to it, both 0.1.0; the vault locks when the computer
+suspends and when the screen locks; the broker's file of certificate
+authorities is one only root can change; the user service is enabled;
+zenity is installed; Yama's `ptrace_scope` is 1; the files of the
+agent's configuration, the vault file and the socket's directory pass
+their checks. The warning is the X11 session, L2, a limit of the
+session and not of the installation.
+
+What this does not show. The vault was locked when `doctor` ran:
+nothing here unlocked it, answered a dialog, ran a command with a
+secret, started a broker or opened the manager from the installed
+package. It was not a first installation: removing the package keeps
+the user's vault, audit log and settings, and it was removed without a
+purge, so what a new user meets first, with no vault and no settings,
+was not exercised. It is one machine, Linux Mint 22.3 with an X11
+session. The roadmap now gives the reinstall as done, with these
+limits.
