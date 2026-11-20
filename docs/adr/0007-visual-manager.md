@@ -8,9 +8,11 @@
   Of M2, the agent's settings and the History page (both reviewed ready on
   2026-11-05) and the lock on screen lock and suspend
   ([ADR 0009](0009-lock-on-screen-lock-and-suspend.md)); listing and
-  revoking remembered approvals is not built. Of M3, the import windows
-  ([ADR 0012](0012-import-read-by-the-agent.md)); the KeePassXC handoff is
-  not built, and restoration was dropped on 2026-11-10 (section 5).
+  revoking remembered approvals was dropped on 2026-11-19 (section 4). Of
+  M3, the import windows
+  ([ADR 0012](0012-import-read-by-the-agent.md)); restoration was dropped on
+  2026-11-10 (section 5) and the KeePassXC handoff on 2026-11-19 (section
+  6). Nothing of this ADR is left to build.
 - Date: 2026-11-01
 - Amended: 2026-11-01 — Copy of a value (section 2), at the maintainer's
   request: without it, long random keys had to be retyped. A first design
@@ -37,6 +39,26 @@
   and for the same one, is in the
   [installation guide](../installation.md#backups-and-restore), and
   end-to-end tests follow its steps.
+- Amended: 2026-11-19 — Remembered approvals (section 4), the KeePassXC
+  handoff (section 6) and editing notes, at the maintainer's decision: none
+  of the three will be built. The maintainer's agent put to each the
+  question asked of restoration, what it gives that is not there already,
+  and recommended dropping them; the maintainer agreed. Remembered approvals
+  are off by default; `status` and the manager's Status page count them and
+  a lock forgets them all, so the requests that would list them and revoke
+  one alone would serve only those who turn the setting on, and only to
+  forget one instead of all. The handoff needed a mode of the agent that
+  refuses to unlock and to save until released, with recovery after a crash
+  of the manager, for a task that is rare: editing in KeePassXC stays the
+  manual procedure of the
+  [installation guide](../installation.md#editing-the-vault-in-keepassxc),
+  within L15 (a lock does not reserve the vault). Notes, which M1 shows and
+  does not edit, are changed with `rusthorse edit --notes` or in KeePassXC:
+  the manager's forms carry metadata only, and notes are withheld like a
+  value, so editing them there would take a dialog of the agent to type
+  them in. No code of the agent, the vault or the CLI changes; the manager's
+  page of remembered approvals and its Edit form now say this instead of
+  announcing a later version.
 
 ## Context
 
@@ -70,7 +92,8 @@ Existing groups cannot be changed by `edit`; M1 says so instead of emulating
 a move with delete/add (which would lose identity/history). (Since protocol
 7, `edit.group` moves an entry for real — same UUID, history kept — and the
 manager's Edit form uses it.) Notes can be
-shown but not edited in M1. Protected metadata is displayed as withheld and
+shown but not edited in M1. (Since 2026-11-19 editing them in the manager
+is not planned at all; see the amendment of that date above.) Protected metadata is displayed as withheld and
 left untouched by forms. Only fields the user changes are sent.
 
 The manager does not embed a command runner in M1: the snippet uses
@@ -291,6 +314,9 @@ those can themselves contain credentials. Return safe metadata (entry UUIDs,
 command, directory, expiry); process names remain unverified. Revocation is
 atomic with grant consumption, audited, and stops future uses, not commands
 already started. Lock remains the M1 way to forget all grants.
+(Superseded 2026-11-19: these requests and their page will not be built.
+Remembered approvals are counted by `status` and forgotten together by a
+lock; see the amendment of that date above.)
 
 History reads the audit log at the path the agent reports in
 `status.audit_log`, not a path the manager guesses, as `rusthorse audit`
@@ -359,6 +385,10 @@ that refuses unlock/writes until explicitly released, with recovery after a
 manager crash. It must still document non-cooperating external writers (L15).
 M1 recommends opening a **backup copy** in KeePassXC and offers no automatic
 launch of the live vault. The manager never writes a KDBX itself.
+(Superseded 2026-11-19: no maintenance mode and no automatic handoff will
+be built. Editing in KeePassXC stays the manual procedure of the
+[installation guide](../installation.md#editing-the-vault-in-keepassxc),
+within L15; see the amendment of that date above.)
 
 ### 7. Protocol, packaging and tests
 
@@ -423,4 +453,6 @@ then: M1 was reviewed on 2026-11-01, in the rounds the
 and manager milestone 1", and the settings and the History page on 2026-11-05;
 this ADR was accepted on 2026-11-09. Listing and revoking remembered
 approvals, restoration and the KeePassXC handoff are still not built.
-On 2026-11-10 restoration through the agent was dropped: section 5.)
+On 2026-11-10 restoration through the agent was dropped: section 5.
+On 2026-11-19 the listing and revoking of remembered approvals and the
+KeePassXC handoff were dropped too: sections 4 and 6.)

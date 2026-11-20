@@ -9,33 +9,35 @@ approval dialog.
 
 The manager is designed in [ADR 0007](adr/0007-visual-manager.md), in three
 milestones. The first is done and reviewed, and so are the Settings and
-History pages of the second and the import windows of the third. Not built
-yet: the page that lists and revokes single remembered approvals, and a safe
-hand-off to KeePassXC. Restoring a backup is not planned in the manager or
+History pages of the second and the import windows of the third. The rest
+of that design will not be built: listing and revoking single remembered
+approvals, a hand-off to KeePassXC, and editing notes, which the Edit form
+announced (ADR 0007, amended 2026-11-19). The table below says what serves
+instead. Restoring a backup is not planned in the manager or
 in the agent: it is done by hand, by putting the backup file in the vault's
 place ([installation](installation.md#backups-and-restore)). No version of
 Rusthorse has been released: try the manager with fake entries first.
 
 ## What it does today
 
-| Available | Comes later (ADR 0007) |
+| Available | Not in the manager, and not planned |
 |---|---|
 | First start: start the agent, create the vault | |
 | Status of the agent, including what else locks it; unlock and lock | |
-| Browse, search and filter entries by group | Editing notes |
+| Browse, search and filter entries by group | Editing notes: `rusthorse edit NAME --notes TEXT` changes them (the text is on a command line, which other programs of yours can see), and so does KeePassXC |
 | Create, edit, rename, move and delete entries; generate a random value | |
-| Show a value or notes, after approval | Listing and revoking single remembered approvals (M2) |
+| Show a value or notes, after approval | Listing and revoking single remembered approvals: the Status page counts them, and **Lock now** forgets all of them |
 | Copy a value to the clipboard, after approval | |
-| Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | A safe hand-off to KeePassXC (M3). Restoring a backup is not planned in the manager: it is done by hand ([installation](installation.md#backups-and-restore)) |
+| Two commands to copy for an entry: one that gives its value to a program (`rusthorse run`), and a template that gives the program a temporary token through the credential broker instead (`rusthorse run --broker`) | A hand-off to KeePassXC: the vault is [edited there by hand](installation.md#editing-the-vault-in-keepassxc). Restoring a backup is not planned in the manager: it is done by hand ([installation](installation.md#backups-and-restore)) |
 | Import from GNOME Keyring or a `.env` file; the agent reads the values | |
 | Verified backup of the vault; change of the master password | |
 | The grants of the credential broker: list them, revoke one or all, also while the vault is locked | |
 | The history: what the agent recorded in its audit log, newest first, while the vault is unlocked | |
 | The agent's settings — auto-lock, remembered approvals, the dialog timeout, locking on suspend and on screen lock — changed with the agent's approval while the vault is unlocked | |
 
-The page for remembered approvals is in the window already; it says what is
-missing and what to do meanwhile. An entry has no broker profile: the run
-names where a key goes, and you approve it in the agent's dialog
+The window has a page for remembered approvals; it says that they are not
+listed one by one, and what serves instead. An entry has no broker profile:
+the run names where a key goes, and you approve it in the agent's dialog
 ([ADR 0013](adr/0013-credential-broker.md#scope-amendment-2026-11-04)).
 
 ## Before you start
@@ -94,7 +96,7 @@ The pages, in the sidebar's order:
 |---|---|
 | **Entries** | The list and the details, above. |
 | **Grants** | The credential broker's grants: [list and revoke](#grants-of-the-credential-broker). |
-| **Remembered approvals** | Not built yet: the page says so. The Status page counts them, and **Lock now** forgets all of them. |
+| **Remembered approvals** | A note only: they are not listed or revoked one by one. The Status page counts them, and **Lock now** forgets all of them. |
 | **History** | The agent's [audit log](#history). |
 | **Import & backup** | [Import](#import-from-gnome-keyring-or-a-env-file) and [back up](#back-up-the-vault). |
 | **Settings** | The [agent's settings](#agent-settings) and the [master password](#change-the-master-password). |

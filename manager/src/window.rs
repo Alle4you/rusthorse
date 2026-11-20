@@ -657,10 +657,10 @@ impl Manager {
                 "approvals",
                 "Remembered approvals",
                 "emblem-ok-symbolic",
-                Self::planned_page(
+                Self::notice_page(
                     "emblem-ok-symbolic",
                     "Remembered approvals",
-                    "Listing and revoking single remembered approvals comes in a later version. The Status page shows how many there are; Lock now forgets all of them (commands already running are not stopped).",
+                    "Remembered approvals are not listed or revoked one by one. The Status page shows how many there are; Lock now forgets all of them (commands already running are not stopped).",
                 ),
             ),
             (
@@ -1166,7 +1166,7 @@ impl Manager {
         self.clear_entries();
     }
 
-    fn planned_page(icon: &str, title: &str, text: &str) -> gtk::Widget {
+    fn notice_page(icon: &str, title: &str, text: &str) -> gtk::Widget {
         // StatusPage descriptions are markup: these texts are fixed and
         // contain no markup characters.
         adw::StatusPage::builder()
@@ -3153,7 +3153,7 @@ impl Manager {
         body.append(&value_group);
         if old.is_some() {
             body.append(&styled(
-                "Editing notes comes in a later version.",
+                "Notes are not edited here. From a terminal, rusthorse edit NAME --notes TEXT changes them.",
                 &["caption", "dim-label"],
             ));
             // Any entry can be used through the broker, and the agent ends

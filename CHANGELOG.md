@@ -243,6 +243,15 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 
 ### Changed
 
+- **Three planned features of the manager are dropped, by decision.**
+  What ADR 0007 planned or the manager announced for a later version will
+  not be built: listing and revoking single remembered approvals (the Status
+  page counts them, and a lock forgets them all), an exclusive hand-off to
+  KeePassXC (editing there stays the manual procedure of the installation
+  guide, which now says not to answer an unlock dialog meanwhile) and
+  editing notes in the manager (`rusthorse edit --notes` and KeePassXC
+  change them). The manager's page of remembered approvals and its Edit form
+  say so instead of announcing them.
 - **Restoring a backup is done by hand, by decision.** A backup is the
   vault file as it was, encrypted with the master password it had then, so
   restoring it is putting that file in the vault's place. The installation

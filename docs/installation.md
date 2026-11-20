@@ -451,6 +451,12 @@ time:
    KeePassXC.
 3. Use Rusthorse again; the next unlock reads the file KeePassXC wrote.
 
+A lock does not reserve the vault. Until you have closed the database in
+KeePassXC, do not answer an unlock dialog: another program may ask for the
+vault meanwhile, and two programs writing it can lose a change
+([threat model L15](threat-model.md)). Nothing asks while the agent's
+service is stopped.
+
 Fields, groups, tags, attachments and history that Rusthorse does not
 manage are kept when Rusthorse saves (a test runs Rusthorse's edits on a file
 written by KeePassXC 2.7.12 and checks that every untouched entry is

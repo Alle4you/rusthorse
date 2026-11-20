@@ -251,7 +251,7 @@ fn nonempty(text: &str) -> Option<String> {
 fn editable(entry: &EntryInfo, field: &str) -> Result<(), String> {
     if entry.protected_fields.iter().any(|f| f == field) {
         Err(format!(
-            "{field} is protected; edit it in KeePassXC using the documented handoff procedure."
+            "{field} is protected; edit it in KeePassXC, with Rusthorse locked first (see the installation guide)."
         ))
     } else {
         Ok(())

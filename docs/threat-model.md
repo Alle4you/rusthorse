@@ -369,7 +369,9 @@ for commands whose inputs you control. A remembered approval names the program
 and the directory by their paths, not by the files that were there: a program
 replaced at the same path between two uses runs without asking, as one whose
 contents changed does (L4). See
-[ADR 0005](adr/0005-remembered-approvals-opt-in.md). Broker grants are a
+[ADR 0005](adr/0005-remembered-approvals-opt-in.md). Remembered approvals
+are not listed, and one cannot be revoked alone: `status` counts them and
+`rusthorse lock` forgets them all. Broker grants are a
 separate capability: no `--remember`, but each grant permits multiple API
 calls, to any path at its approved origin, until its limit or end (L25). A
 request count is not a spending limit, and the broker does not inspect
@@ -488,7 +490,10 @@ The agent refuses to save if the vault file changed since it was loaded and
 checks again right before replacing it, but the check and the rename are not
 atomic: KeePassXC or a sync client saving at that exact moment can lose its
 change. Only one program should write the vault at a time — lock the agent
-(`rusthorse lock`) before editing in KeePassXC.
+(`rusthorse lock`) before editing in KeePassXC. A lock does not reserve
+the vault: another program can ask the agent to unlock it while KeePassXC
+has the file, and the agent mode that would have refused that (ADR 0007's
+hand-off) will not be built.
 
 ### L16 — Approved commands run outside the requester's sandbox
 
@@ -783,11 +788,13 @@ and carries their status:
   requests (L4).
 
 Other planned work in the [roadmap](roadmap.md) touches this model without
-being hardening: a manager page that lists and revokes remembered approvals
-(the manager already lists and revokes broker grants; remembered approvals
-remain separate, L8), a "waiting for your answer" hint in the terminal while
+being hardening: a "waiting for your answer" hint in the terminal while
 a dialog is open, driven by an explicit event from the agent, and signed
-checksums for published releases.
+checksums for published releases. A manager page that lists and revokes
+remembered approvals one by one is no longer planned (2026-11-19; the
+manager already lists and revokes broker grants; remembered approvals
+remain separate, L8), nor is an exclusive hand-off of the vault to
+KeePassXC (L15).
 
 Per-entry policies that restrict an entry to listed programs or hosts are
 outside the product's scope and not planned; L3 and L4 remain limits.
@@ -848,7 +855,8 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | Sync the audit log's directory entries before its records: three reviews (Codex, AI-assisted). | Not ready with AUD01–AUD04; those confirmed fixed, then not ready with AUD05; that confirmed fixed, then ready, with no new finding. The second behaviour left by the documentation audit is closed within P12's stated limits, whose acceptance remains the maintainer's. The twelve checks passed again on main with the broker's header-limit change; see below. |
 | 2026-11-10 | Stop a request whose requester goes away during its dialog: four reviews and a final confirmation (Codex, AI-assisted). | Not ready with CON01–CON04, then CON05–CON07, then CON08, then CON09 low; the final confirmation is ready within P16 and L26's limits, whose acceptance remains the maintainer's. The twelve checks passed on main with the staged change; see below. |
 | 2026-11-10 | Keep restoring a backup a manual procedure (Codex, AI-assisted). | Not ready with RST01 and RST02 low; both confirmed fixed, then ready. The maintainer dropped restore through the agent; the manual procedure, its tests and the review's limits are recorded below. |
-| 2026-11-19 | The limits that the two reviews of 2026-11-10 left to the maintainer's acceptance, in P12 and in P16 and L26 (the maintainer's decision; not a review). | Accepted as stated; no code, property or limit changed. The reviewers' recommendations remain open; see the last entry below. |
+| 2026-11-19 | The limits that the two reviews of 2026-11-10 left to the maintainer's acceptance, in P12 and in P16 and L26 (the maintainer's decision; not a review). | Accepted as stated; no code, property or limit changed. The reviewers' recommendations remain open; see the entry of that date below. |
+| 2026-11-19 | Drop the manager's three unbuilt features: listing and revoking single remembered approvals, the KeePassXC hand-off and editing notes (the maintainer's decision). | Nothing of ADR 0007 is left to build. Three messages in the manager and the documents changed; no code of the agent, the vault or the CLI. See below. Reviewed the same day (Codex, AI-assisted): not ready with MGR01 low, fixed, then ready. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -4693,3 +4701,167 @@ remain open and are not work claimed done: setting, testing and
 documenting the broker's limits on a destination's response; a permanent
 outside check that the `fsync` calls are made; and a permanent check of
 the `Interrupted` retries in `Watch` and `Connection::gone`.
+
+**2026-11-19 — Drop the manager's three unbuilt features.**
+
+The review of 2026-11-10 that kept restoring a backup manual left a
+question to the maintainer: whether the two manager items ADR 0007 still
+planned deserved the same answer. On 2026-11-19 the maintainer's agent
+(Claude Code, AI-assisted) put that question to them and to a third item,
+which the manager's Edit form announced, said what each would add to what
+is there already, and recommended dropping the three; the maintainer
+agreed.
+
+- **Listing and revoking single remembered approvals** (ADR 0007, section
+  4). Remembered approvals are off by default; `status` and the manager's
+  Status page count them, and a lock forgets them all. The requests would
+  have added a way to forget one instead of all.
+- **The exclusive hand-off to KeePassXC** (section 6): a mode of the agent
+  that refuses to unlock and to save until released. Editing in KeePassXC
+  stays the manual procedure of the installation guide. The reviewer's
+  remark of 2026-11-10 stands: such a mode could solve the concurrent
+  writer that a lock does not (L15). That limit is kept, not closed.
+- **Editing notes in the manager.** `rusthorse edit --notes` and KeePassXC
+  change them. The manager's forms carry metadata only, and notes are
+  withheld like a value.
+
+What changed: the manager's page of remembered approvals and the note of
+its Edit form say this instead of announcing a later version, and its
+message for a protected field no longer names a hand-off. The roadmap,
+ADR 0007 (a dated amendment, with the original text left readable), the
+manager's guide, the prototype's note, the README and the CHANGELOG say
+the same. L8 now says that remembered approvals are not listed and that
+one cannot be revoked alone, and L15 that a lock does not reserve the
+vault and that no mode of the agent will; section 10 no longer plans the
+page. The installation guide's steps for editing in KeePassXC gained what
+the hand-off was for: do not answer an unlock dialog until the database
+is closed. No property changed, and no code of the agent, the vault, the
+CLI or the protocol. The three texts are fixed strings with no test of
+their own, as the restore note of 2026-11-10 was: no behaviour changed,
+so no mutation applies.
+
+**Independent review (Codex, AI-assisted, 2026-11-19).**
+
+The initial review was **not ready**, with MGR01 low and no serious
+correctness, security, concurrency or regression finding. Confirmation of
+the staged tree at HEAD `eb4b95d` is **ready**: MGR01 is fixed and there is
+no new finding. After undoing that wording correction in memory, the
+aggregate SHA-256 of the 110 inventoried files matches the reviewed tree.
+There was no other difference and no unstaged change before this record.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| MGR01 — The new summary row said that two manager texts changed, but the diff changes three messages: the remembered-approvals description and Edit caption in `manager/src/window.rs`, and the protected-field error in `manager/src/model.rs`. | Low | **Fixed and confirmed:** the staged row says "Three messages in the manager and the documents changed". |
+
+The reviewer read the full diff (10 files, 145 insertions, 39 deletions,
+no new files) and the removed lines with `git diff HEAD -U0 -- | rg '^-'`.
+No true, reviewed guarantee was lost or weakened. The code comparison
+found only the three messages and the helper's rename in the two Rust
+files; the agent, vault, CLI and protocol were unchanged.
+
+For L8, the reviewer read `State::lock`, `status`, approval handling and
+request dispatch in `src/agent.rs`, defaults in `src/settings.rs`, the
+requests and status fields in `src/protocol.rs`, and the manager's Status
+page. Lock clears remembered approvals; status counts unexpired ones;
+the protocol's individual revocation belongs to broker grants, not
+remembered approvals. Remembering is off by default.
+
+For L15 and the installation paragraph, the reviewer read
+`ensure_unlocked` and `Vault::write_file`, the CLI's initialization and
+connection paths, and both supplied systemd units. Lock permits a new
+unlock request. The two external-change checks remain, but the last
+check and rename are not atomic. The paragraph preserves that limit.
+"Nothing asks while the agent's service is stopped" was accepted in the
+documented service setup: clients do not start an agent automatically.
+It was not read as a guarantee against another agent started separately.
+
+For notes, the reviewer followed `EntryArgs.notes` through the CLI's
+`edit`, the agent's approval and commit, and `Vault::edit`: the supplied
+text replaces the protected `Notes` field. It is a command-line argument,
+so the guide's exposure warning is appropriate. The manager's forms leave
+notes untouched, and metadata omits their contents. The three messages
+match those paths; the StatusPage title and description contain none of
+`<`, `>` or `&`.
+
+Repository searches used `rg -n --hidden`, excluding `.git`, `target`
+and `.env*`: feature references matched 124 lines in 27 files, KeePassXC
+158 in 23, and future/planning wording 250 in 39. The relevant contexts
+were checked across code, docs, packaging, the AI guide, AGENTS.md,
+CONTRIBUTING.md, desktop files and the prototype. No current promise of
+the three dropped features remained. Historical entries, superseded ADR
+text and the explicitly identified prototype remain. The prototype
+simulates restoration, remembered approvals and opening KeePassXC; it
+does not edit notes. No other implementation commitment remained in
+ADR 0007's milestones, and no control or feature was added.
+
+A programmatic comparison confirmed that section 11's earlier content
+was unchanged apart from the stated table pointer, excluding the new
+row and entry. The new entry claimed neither an independent review nor
+test results before this record was added.
+
+**Checks run by the reviewer during the initial review.** Cargo commands
+ran sequentially with a private `TMPDIR`; the test directories were empty
+afterwards. Formatting and whitespace checks passed:
+
+| Command | Result |
+|---|---|
+| `git diff HEAD --check` | Exit 0; no whitespace errors. |
+| `cargo fmt --all --check` | Exit 0. |
+| `cargo test -p rusthorse-manager` | 45 passed, 0 failed, 0 ignored, including isolated widget tests. |
+| `cargo test --all-features --test agent -- ...` | The four filters below: 4 passed, 0 failed, 0 ignored, 192 filtered out. |
+| `cargo build -p rusthorse --lib --all-features --message-format=json` | Exit 0; library used by the temporary probe. |
+
+The four integration-test filters were:
+
+- `remembered_approval_skips_the_dialog_for_identical_requests_only`;
+- `notes_can_be_revealed_with_approval`;
+- `a_backup_put_back_by_hand_is_the_vault_at_the_next_unlock`;
+- `a_lock_while_the_password_is_typed_keeps_the_vault_locked`.
+
+These were 49 test executions, plus a separate temporary probe compiled
+with `rustc` against the library. It used a real agent, scripted UI,
+temporary vault/socket/audit paths, fake values and the real CLI. A denied
+`edit --notes` exited 4 and preserved the original notes; an allowed edit
+persisted the replacement across reopening and preserved the password.
+`show` withheld the notes. After lock, another request asked for an
+unlock; an approved `reveal --notes` returned the persisted text. The
+audit log omitted that text. With no agent at the private socket,
+`unlock`, `edit --notes` and `list` each exited 1 with a connection error.
+The probe process exited and its temporary files were removed.
+
+The reviewer accepts no test of the three fixed messages themselves and
+no mutation for this change, as for the restore note: request construction,
+authorization and persistence did not change. Comparing the code against
+HEAD confirmed only the messages and helper rename; a test repeating the
+wording would not prove its truth. No mutation was performed.
+
+**Checks reported by the implementer, not repeated as a full matrix by
+the reviewer.** All twelve AGENTS.md checks exited zero: formatting,
+both default-member clippy runs, both feature-set test suites, docs with
+warnings denied, both MSRV checks, and clippy and tests for the dialog
+and manager. Reported totals: 663 passed and 2 ignored with all features
+(counting the descriptor-limit test's child rerun once), 553 passed and
+2 ignored without default features, 9 passed for the dialog and 45 for
+the manager. These runs preceded the two-line re-wrap of
+`docs/manager.md` (words unchanged) and the MGR01 wording correction.
+
+Not checked by the reviewer: KeePassXC itself, a real systemd installation,
+manual visual inspection, power loss, every concurrent-writer interleaving
+or mutations. No real vault, socket, audit log or keyring was used, and no
+dialog appeared on the maintainer's screen. The reviewer did not inspect
+other processes through /proc; the agents under test use their normal
+requester-identification code. The initial review changed no repository
+file. This confirmation did not rerun Cargo checks or the probe; it adds
+only this record and the summary sentence above, left unstaged for the
+implementer to read.
+
+**Final matrix (the maintainer's agent, Claude Code, AI-assisted,
+2026-11-19).** After the reviewer's record above, the twelve checks of
+AGENTS.md ran again on the tree as committed, less this paragraph, one
+after another, and all exited zero: `cargo test --all-features` passed
+663 tests with 2 ignored (the descriptor-limit test's child rerun counted
+once), `cargo test --no-default-features` 553 with 2 ignored, the dialog's
+9 and the manager's 45. The two ignored tests are the real KDF timing and
+the one that needs `keepassxc-cli`. No package was built or installed and
+no service changed: the installed manager still shows the earlier texts
+until the next package.

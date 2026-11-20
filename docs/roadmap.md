@@ -10,7 +10,7 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
 
 ## Visual manager
 
-**M1 done and reviewed; M2 and M3 in progress**
+**Done, unreleased; what was left of M2 and M3 is not planned**
 ([ADR 0007](adr/0007-visual-manager.md), [guide](manager.md)).
 
 - **M1, done and reviewed:** metadata browsing, search and groups,
@@ -22,19 +22,27 @@ Status: **Done**, **In progress**, **Planned** (agreed direction), **Idea**
   agent's settings through its approval; the History page, which reads the
   audit log in pages while the vault is unlocked; locking on screen lock
   and suspend, in the agent
-  ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). Not built — a
-  page that lists and revokes remembered approvals (the manager shows a
-  placeholder for it).
+  ([ADR 0009](adr/0009-lock-on-screen-lock-and-suspend.md)). Not planned — a
+  page that lists and revokes remembered approvals one by one: the
+  maintainer decided on 2026-11-19 that the count on the Status page and a
+  lock, which forgets them all, are enough (the manager's page for them
+  says so).
 - **M3:** done — import from GNOME Keyring and `.env` files, read by the
-  agent ([ADR 0012](adr/0012-import-read-by-the-agent.md)). Not built — the
-  exclusive handoff to KeePassXC. Not planned — restoring a backup through
+  agent ([ADR 0012](adr/0012-import-read-by-the-agent.md)). Not planned — the
+  exclusive handoff to KeePassXC: the maintainer decided on 2026-11-19 that
+  the vault is edited there by hand
+  ([installation](installation.md#editing-the-vault-in-keepassxc)). Not
+  planned — restoring a backup through
   the agent: the maintainer decided on 2026-11-10 that it is done by hand,
   by putting the backup file in the vault's place
   ([installation](installation.md#backups-and-restore); ADR 0007, amended).
+- Editing notes in the manager, which its Edit form announced for a later
+  version, is not planned either (2026-11-19): `rusthorse edit --notes` and
+  KeePassXC change them.
 
-The [reference prototype](design/manager/index.html) uses fake data and
-simulates features not yet implemented, and one that will not be: restoring
-a backup.
+The [reference prototype](design/manager/index.html) uses fake data. Among
+what it simulates, three features will not be built: restoring a backup, a
+page that lists remembered approvals, and opening the vault in KeePassXC.
 
 ## Credential broker: secrets that never enter the client
 
@@ -200,7 +208,7 @@ Nothing else is planned for the broker.
 | **Move entries between groups** | Done (unreleased) | `edit --group` and the manager's Edit form; protocol 7. Groups (KeePass folders) keep related entries together — a device's API token and its web login, say — until one entry can hold several secrets. |
 | **Entries with several secrets** | Planned | Extra protected fields on one entry (a device's web password and API token); `run` names the field (`VAR=ENTRY:field`, syntax to be decided), and the dialog and the audit log say which. Needs an ADR. |
 | **Group related entries on import** | Idea | `DDNS_HOST`, `DDNS_USER`, `DDNS_KEY` become one entry with host, username and password; `run` gains access to an entry's username and host as variables, as `--url` does for the URL. |
-| **Visual manager** | M1 done and reviewed; M2, M3 in progress | [ADR 0007](adr/0007-visual-manager.md) and the milestones above. Done: the broker's Grants page (ADR 0013), the History and Settings pages, import. Not built: a page for remembered approvals, the KeePassXC handoff. Not planned: restoring a backup through the agent (it is done by hand). The manager stays an agent client. |
+| **Visual manager** | Done (unreleased) | [ADR 0007](adr/0007-visual-manager.md) and the milestones above. Done: the broker's Grants page (ADR 0013), the History and Settings pages, import. Not planned: a page that lists and revokes remembered approvals, the KeePassXC handoff, editing notes, and restoring a backup through the agent (it is done by hand). The manager stays an agent client. |
 | **Browser integration** through native messaging | Idea | Needs its own threat analysis: the browser is a large, exposed client. |
 | **Copy a value** | Done (manager M1) | After its own approval, as plain text: it stays on the clipboard until something else is copied, and a clipboard history may keep it even after that. A single-paste design was dropped: the desktop keeps its own copy ([ADR 0007](adr/0007-visual-manager.md#copy)). |
 | **Drag a value onto a field** | Idea | Only the drop target receives it; no clipboard. Needs its own approval wording and a test on Xvfb. |

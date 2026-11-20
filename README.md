@@ -193,7 +193,8 @@ cargo run --locked -p rusthorse-manager   # Rust 1.92, GTK 4.12+, libadwaita 1.4
 
 The manager is described in [ADR 0007](docs/adr/0007-visual-manager.md); what
 is built has been reviewed. The [manager guide](docs/manager.md) explains
-every action, where a shown or copied value can end up, and what comes later.
+every action, where a shown or copied value can end up, and what the manager
+leaves to the CLI and to KeePassXC.
 
 ## Using it with AI agents
 
