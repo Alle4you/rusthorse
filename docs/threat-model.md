@@ -848,6 +848,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-10 | Sync the audit log's directory entries before its records: three reviews (Codex, AI-assisted). | Not ready with AUD01–AUD04; those confirmed fixed, then not ready with AUD05; that confirmed fixed, then ready, with no new finding. The second behaviour left by the documentation audit is closed within P12's stated limits, whose acceptance remains the maintainer's. The twelve checks passed again on main with the broker's header-limit change; see below. |
 | 2026-11-10 | Stop a request whose requester goes away during its dialog: four reviews and a final confirmation (Codex, AI-assisted). | Not ready with CON01–CON04, then CON05–CON07, then CON08, then CON09 low; the final confirmation is ready within P16 and L26's limits, whose acceptance remains the maintainer's. The twelve checks passed on main with the staged change; see below. |
 | 2026-11-10 | Keep restoring a backup a manual procedure (Codex, AI-assisted). | Not ready with RST01 and RST02 low; both confirmed fixed, then ready. The maintainer dropped restore through the agent; the manual procedure, its tests and the review's limits are recorded below. |
+| 2026-11-19 | The limits that the two reviews of 2026-11-10 left to the maintainer's acceptance, in P12 and in P16 and L26 (the maintainer's decision; not a review). | Accepted as stated; no code, property or limit changed. The reviewers' recommendations remain open; see the last entry below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -4654,3 +4655,41 @@ after the checks and left unstaged.
 | `cargo test -p rusthorse-dialog` | 9 passed (4 unit, 5 Xvfb) |
 | `cargo clippy -p rusthorse-manager --all-targets -- -D warnings` | Pass |
 | `cargo test -p rusthorse-manager` | 45 passed |
+
+**2026-11-19 — The maintainer accepts the limits left by the reviews of
+2026-11-10.**
+
+A decision of the maintainer's, not a review: no code, property or limit
+changed. Two reviews of 2026-11-10 found their changes ready within
+limits that they left to the maintainer's explicit acceptance, and
+recorded none. On 2026-11-19 the maintainer's agent (Claude Code,
+AI-assisted) listed those limits to the maintainer, who accepted all of
+them, as P12, P16 and L26 state them:
+
+- From "Sync the audit log's directory entries before its records" (P12).
+  An agent process started later does not know of a directory that an
+  earlier one made for the log and could not sync. After the agent's
+  check, the names another program gives the log are its own to sync; the
+  directories the agent did not make, and a symbolic link to the log with
+  the directories on the way to it, are taken as durable and as not
+  changing.
+- From "Stop a request whose requester goes away during its dialog" (P16
+  and L26). A wait for the lock of the registry of grants is not followed
+  by a check: the grants a barrier ended stay ended, and a run's grants
+  can be entered and then ended by the next check, before any is recorded
+  or started. The human's answer stands for a requester that left: an
+  "Allow for N" can be remembered, and the idle lock postponed. The start
+  of a run's brokers is one step, in which credentials can reach the
+  agent's own brokers after the departure; the next check ends them
+  before the command starts, and tokens leave only with the command. An
+  effect under way is not undone. `aborted` is written best effort, so a
+  record written before its effect can stand alone.
+
+The acceptance is of these limits as the properties state them, no wider.
+It does not make them impossible to narrow: the reviewer's remark stands
+that a check inside the registry is a choice of scope, not a technical
+impossibility. It does not cover the reviewers' recommendations, which
+remain open and are not work claimed done: setting, testing and
+documenting the broker's limits on a destination's response; a permanent
+outside check that the `fsync` calls are made; and a permanent check of
+the `Interrupted` retries in `Watch` and `Connection::gone`.
