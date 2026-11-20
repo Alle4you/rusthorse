@@ -863,6 +863,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-20 | The third run of the CI: the corrected test passed on the runner, and two tests of the broker's dialog failed for their height (designed by a Claude Opus 5.5 subagent, applied by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The cause of the first run's failures again: the client of the end-to-end tests inherited the machine's environment. It now has an environment of the tests' own. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI08–CI12 low, fixed, then ready. |
 | 2026-11-20 | The fourth run of the CI (a record of its result; not a review). | All three jobs passed on `742a8ff`, the later steps of the test job for the first time on the runner. One passing run; see below for what it does not show. |
 | 2026-11-20 | The package installed again on the maintainer's machine (a record of a result; not a review). | `rusthorse doctor`, run by the maintainer: fifteen lines ok, one warning (the X11 session, L2). The installed programs are those of the package built from `36d6d15`. Not a first installation, and nothing was used; see below. |
+| 2026-11-20 | "Why Rusthorse, not just KeePassXC": the comparison and its links, reviewed by Gemini and Codex (AI-assisted). | Gemini checked 53 statements: 46 confirmed and seven corrected. Codex: not ready with WHY01–WHY17 (WHY04 and WHY12 medium, fifteen low); then not ready with WHY18–WHY19 low; all corrected, then ready. Documentation only; see the entry of this date below. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5817,3 +5818,144 @@ purge, so what a new user meets first, with no vault and no settings,
 was not exercised. It is one machine, Linux Mint 22.3 with an X11
 session. The roadmap now gives the reinstall as done, with these
 limits.
+
+**2026-11-20 — Why Rusthorse, not just KeePassXC.**
+
+The change adds `docs/why-rusthorse.md`, "Why Rusthorse, not just
+KeePassXC", comparing Rusthorse with KeePassXC 2.7.6 and 2.8.0 as read
+on 2026-11-20. The README's "Why" bullet about password managers, which
+said they "are built for humans copying and pasting", is rewritten, and
+its Documentation list links to the comparison. There is also a
+CHANGELOG bullet and a row in AGENTS.md's "When you change… also update"
+table. No code or behaviour changes.
+
+The maintainer's agent, Claude Code, reports the following preparation,
+all AI-assisted. Two Claude Opus 5.5 subagents wrote fact sheets: one
+read the Rusthorse repository without changing it; the other read
+KeePassXC's documentation, source at tags 2.7.6 and 2.8.0, changelog and
+issue tracker. A third wrote the document from those sheets alone, under
+a specification. The orchestrator edited it for readability and made the
+links.
+
+Gemini's independent verification (AI-assisted) was read-only in the
+repository and used primary sources it fetched itself. Its report
+checked 53 statements: 46 confirmed and seven not confirmed as written.
+All seven were corrected:
+
+- G1: attachment text editing arrived in 2.7.11; 2.7.10 added the
+  preview dialog.
+- G2: the browser access dialog shows the site's origin in both
+  versions, not just in 2.8.0.
+- G3: `keepassxc-cli` reads the database password, not the whole master
+  key, from standard input; key files and hardware keys use options, and
+  `open` keeps an interactive session.
+- G4: the 2.7.6 guide listing Secret Service is Getting Started.
+- G5: the password is not among the attributes a Secret Service client
+  reads without confirmation.
+- G6: the account of issue #11206 omitted the later answer welcoming a
+  pull request.
+- G7: the README incorrectly called SSH keys "the exception".
+
+**Independent review (Codex, AI-assisted).** My first pass was NOT READY
+with WHY01–WHY17: WHY04 and WHY12 medium, the other fifteen low. All
+were accepted and corrected, including alternative wording where it
+preserved the evidence.
+
+WHY04 removed the unconditional promise that saving over a file changed
+by another program is refused: the check and replacement are not atomic,
+as L15 states. WHY12 replaced "before suspend" with the logind
+announcement and retained L20's limits; locking before sleep is not
+guaranteed.
+
+The fifteen low findings and their corrections were:
+
+- WHY01 narrowed the statement about what had not been tried to
+  KeePassXC's window and integrations; a scratch copy of a public test
+  fixture had been exported with its CLI.
+- WHY02 qualified the table's protected-field claim to fields Rusthorse
+  creates or replaces.
+- WHY03 specified that `open` uses an unprotected HTTP(S) URL.
+- WHY05 identified Getting Started as the 2.7.6 guide listing Secret
+  Service.
+- WHY06 distinguished the database password from the whole master key
+  and accounted for key-file and hardware-key options and `open`.
+- WHY07 specified the checks after approval, including their identity
+  rather than content checks and their non-atomicity with command start.
+- WHY08 preserved redaction across read boundaries in one stream while
+  explaining the transformations and divided streams it cannot cover.
+- WHY09 distinguished programs needing a terminal from commands that can
+  read input through `--stdin`; not every interactive command needs
+  `--no-redact`.
+- WHY10 placed the 1000- and 4000-character limits before and after
+  escaping respectively, and attributed the height refusal to Rusthorse
+  before it shows zenity.
+- WHY11 qualified audit coverage, mode 0600 on creation, and the
+  distinction between withheld values and potentially sensitive
+  arguments or metadata.
+- WHY13 stated that importing leaves the originals under their existing
+  access rules without denying the protection of the imported copy.
+- WHY14 distinguished an ordinary run's value from a broker binding's
+  token.
+- WHY15 restored the step to start the service again after editing the
+  shared file in KeePassXC.
+- WHY16 removed "and older" from the readable KDBX formats; KDBX 2 is
+  not supported.
+- WHY17 scoped the browser claim to logins, removed the exclusive SSH
+  exception, and limited the CHANGELOG claim to the integrations
+  described.
+
+My second pass confirmed those corrections and checked Gemini's seven
+findings against the available primary sources. It was still NOT READY
+with two new low findings. WHY18 found that the corrected Secret Service
+sentence made confirmation sound mandatory. WHY19 found two added lines
+over the requested 76 columns.
+
+The final confirmation resolves both. For WHY18, I read
+`DBusClient.cpp`, `Item.cpp` and `SettingsWidgetFdoSecrets.ui` at both
+cached tags: the setting can disable confirmation, and a remembered
+authorization permits retrieval. The corrected sentence makes both
+qualifications. For WHY19, a whitespace-normalized comparison found
+unchanged words; the README addition is now three lines, at most 68
+columns, and the CHANGELOG bullet at most 76. The final verdict is READY
+for the comparison, README, CHANGELOG and AGENTS.md.
+
+The review read the Rusthorse code and relevant tests, the cited limits
+and related repository documents, using the fact sheets as maps rather
+than evidence. It checked commands, numbers, table cells, shared-file
+instructions and wording. The second pass compared the saved original
+with the corrected document and the tracked-file diffs. Static checks
+found no broken local target or anchor among 65 link occurrences across
+the four files. The final comparison has no prose line over 76 columns;
+tables and link definitions were excluded from that count. `git diff
+--check` passed in this confirmation before the history additions.
+
+What this review did not cover. KeePassXC's window and integrations were
+not run by anyone for this comparison: those statements rest on
+documentation, source and the issue tracker read on 2026-11-20, as the
+document says. I did not check the cached sources against remote
+repositories. The two programs were not tested writing one file. I ran
+no Rusthorse command, opened no database and ran no test suite for these
+reviews. No test suite was needed for this documents-only change; the
+orchestrator is to run the repository's checks before committing, and
+this record does not claim they passed.
+
+The work also identified issues in older documents, tracked for a
+separate commit and not fixed here:
+
+- `installation.md` says attachments and history are kept on save and
+  cites a test whose fixture contains neither.
+- `rusthorse edit` rewrites a metadata field marked protected as
+  unprotected, which no document explains.
+- README, `cli.md` and `architecture.md` imply that `edit --value`
+  always needs approval.
+- `cli.md` still mentions the manager's "pending features".
+- Three older CHANGELOG lines are superseded.
+- Two documents give the default of `ptrace_scope` for different
+  distributions.
+- `installation.md` omits the dialog path of `init` without an agent and
+  says KDBX 3 "and older" files can be read, although KDBX 2 is
+  unsupported.
+
+The new comparison repeats none of those older issues. This confirmation
+adds only this entry and its table row to the review history, unstaged;
+it changes no earlier row or entry and does not change the index.

@@ -212,6 +212,7 @@ Breaking one of these is a security bug, whatever the tests say.
 | a planned or proposed feature | `docs/roadmap.md` |
 | installation or setup | `docs/installation.md`, `docs/getting-started.md`; the package (`packaging/`) when it installs files or services |
 | advice to users of AI agents | `docs/ai-agents.md` |
+| a way a secret is used, what a dialog shows, a limit, or how the vault file works with KeePassXC | `docs/why-rusthorse.md`, the comparison with KeePassXC: what it says of KeePassXC is dated and names its sources, so check them again before changing it |
 
 Documentation must be true and no stronger than the code: state assumptions
 (the dialog height is *estimated* for an 11-point font), never promise what is

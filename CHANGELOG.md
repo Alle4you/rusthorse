@@ -240,6 +240,13 @@ under **Changed** and protocol changes always bump `PROTOCOL_VERSION`.
 - Exit status 124 (outcome unknown) when a request with effects was sent but
   no usable answer came back, or the agent could not confirm it; `run` keeps
   125 for "did not run".
+- Documentation: [Why Rusthorse, not just KeePassXC](docs/why-rusthorse.md)
+  compares the two as read on 2026-11-20 (KeePassXC 2.7.6 and 2.8.0): what
+  KeePassXC does that Rusthorse does not, how a secret reaches a program
+  through the KeePassXC integrations it describes, what Rusthorse adds and
+  where each addition stops, and how to use both on one file. The README's
+  "Why" no longer says that password managers are built only for copying and
+  pasting.
 
 ### Changed
 

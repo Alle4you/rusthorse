@@ -80,15 +80,22 @@ Summary written to out.md
 
 AI coding agents increasingly need credentials: an API key to call a model, a
 token to open a pull request, a password to log into a router. The usual
-options are all bad:
+options each have a problem here:
 
 - **Pasting the secret into the chat or a `.env` file** puts it in the model's
   context, in transcripts, in logs and sometimes in commits.
 - **The desktop keyring** (GNOME Keyring, KWallet) is unlocked for the whole
   session, and any process running as you — including the agent's shell — can
   read every secret in it without asking.
-- **Password managers** are built for humans copying and pasting, not for a
-  program that should use a secret without learning it.
+- **A password manager** such as KeePassXC serves a person first. Where a
+  program asks it for a password — its browser extension for a login, a
+  client of the Secret Service — the program receives the value. For SSH
+  keys it can instead load the key into `ssh-agent`, which signs for the
+  client without handing the key over. Its documentation describes no way
+  for a program to have a named command run with a secret that goes to the
+  command and not to the program that asked.
+  [Why Rusthorse, not just KeePassXC](docs/why-rusthorse.md) compares the
+  two.
 
 Rusthorse puts a human-approved checkpoint between the agent and the secret,
 and keeps the value out of the agent's reach in the common case.
@@ -296,6 +303,9 @@ assumption and limitation.
 - [Installation](docs/installation.md) — the Debian package, building from source, systemd, migration, uninstall
 - [CLI reference](docs/cli.md) — commands, options, environment, exit statuses
 - [Using Rusthorse with AI agents](docs/ai-agents.md)
+- [Why Rusthorse, not just KeePassXC](docs/why-rusthorse.md) —
+  what KeePassXC's own integrations already do, what Rusthorse adds,
+  and where each stops
 - [Architecture](docs/architecture.md) — components, request flow, storage format
 - [Threat model](docs/threat-model.md) — what is protected, what is not, and why
 - [Protocol](docs/protocol.md) — the agent socket protocol, for client authors
