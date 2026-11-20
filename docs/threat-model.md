@@ -858,6 +858,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-19 | The limits that the two reviews of 2026-11-10 left to the maintainer's acceptance, in P12 and in P16 and L26 (the maintainer's decision; not a review). | Accepted as stated; no code, property or limit changed. The reviewers' recommendations remain open; see the entry of that date below. |
 | 2026-11-19 | Drop the manager's three unbuilt features: listing and revoking single remembered approvals, the KeePassXC hand-off and editing notes (the maintainer's decision). | Nothing of ADR 0007 is left to build. Three messages in the manager and the documents changed; no code of the agent, the vault or the CLI. See below. Reviewed the same day (Codex, AI-assisted): not ready with MGR01 low, fixed, then ready. |
 | 2026-11-19 | The history rewritten before publication, at the maintainer's decision (rewritten by Gemini, AI-assisted; specified and verified by the maintainer's agent). | The same 221 commits and content, less a list of example names in the prototype, the session links of commit messages and a personal e-mail address. The commit ids this history cites were mapped to the rewritten commits. See below. Reviewed the same day (Codex, AI-assisted): not ready with HIS01 low, fixed, then ready. |
+| 2026-11-19 | The first run of the CI, at publication: two end-to-end tests failed on the runner (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The tests assumed an environment; the agent's refusal was right. Tests only changed. See below. Reviewed the same day (Codex, AI-assisted): not ready with CI01–CI03 low, fixed, then ready. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5057,3 +5058,147 @@ reviewer's record, which touch this document only, `git diff --check`,
 (`cargo test --all-features --test packaging`) passed again on the tree
 as committed, less this paragraph. The whole matrix was not repeated
 for those two additions.
+
+**2026-11-19 — The first CI run: two tests that depended on the runner's
+environment.**
+
+The repository was published on GitHub on 2026-11-19, on the maintainer's
+explicit approval, and its workflow ran for the first time, on the push of
+`bc71509` (2026-11-20 01:23 UTC). Two of its three jobs passed: the GTK
+clients and the minimum supported Rust version. The third failed at
+`cargo test --all-features`: 194 of the 196 end-to-end tests passed, and
+`a_request_too_tall_to_read_at_once_is_refused` and
+`a_dialog_that_scrolls_takes_what_is_too_tall_for_zenity` failed with
+"this request has too much detail to show in one dialog (4031
+characters, limit 4000)", 4037 for the second. The job's later steps
+(the tests without default features, the documentation, the release
+build that must refuse the broker's feature for tests) did not run.
+
+The cause was diagnosed by a subagent of the maintainer's agent (Claude
+Opus 5.5, AI-assisted), which changed no file; the maintainer's agent
+(Claude Code, AI-assisted) then read the three facts it rests on in the
+code and repeated its reproduction. Both tests gave the command a
+`GIT_SSH_COMMAND` of 600 line breaks, 3,000 characters as the dialog
+shows them, which left the dialog about 120 characters under its limit
+of 4,000 on the maintainer's machine (3,879 and 3,885, measured by the
+subagent). `Harness::cmd` lets the client inherit the environment of the
+test process; the agent lists in the dialog every variable whose name
+ends as an endpoint's does (`_URL` and the others, L4); and every step
+of GitHub Actions sets `GITHUB_API_URL`, `GITHUB_GRAPHQL_URL` and
+`GITHUB_SERVER_URL`, 149 characters in the dialog. The character limit,
+which the agent checks before the height, refused the request first.
+With those three variables set, both tests failed in the same way on the
+maintainer's machine. The agent was right to refuse: the tests assumed
+an environment.
+
+The fix is in the tests only, made by Gemini (AI-assisted) from the
+exact edits: 300 line breaks instead of 600, which is 1,500 characters,
+far from the character limit, and still a dialog far taller than zenity
+allows (estimated at 1,349 pixels against 880 in the second test); and
+the second test now also requires that the approval it was asked be one
+that `ui::approval_too_tall` refuses, so that it cannot pass with a
+request that zenity could have shown.
+
+**Implementer's checks (Gemini, AI-assisted).** Before the change, with
+the three variables set, both tests failed; after it, both pass with and
+without them. Mutations, in a temporary copy with its own target
+directory, each caught:
+
+- M1: the height check removed from the agent — the first test fails
+  ("the request was denied").
+- M2: only `&& self.ui.limits_height()` removed — the second test fails
+  ("too tall to read at once").
+- M3: 3 line breaks instead of 300 in the second test — it fails at the
+  new assertion.
+
+`cargo fmt --all --check` and both clippy runs passed;
+`cargo test --all-features` passed 663 tests with 2 ignored, and again
+with the three variables set; `cargo test --no-default-features` passed
+553 with 2 ignored. The maintainer's agent read the diff, which is the
+specified one, and ran the two tests with the variables set: both pass.
+
+Left as they are. The diagnosis reports other tests whose margin the
+ambient environment narrows, none failing, and the maintainer's agent
+did not verify these figures: two tests of the broker's run dialog
+(`a_broker_runs_destination_and_limits_are_checked_before_any_dialog`,
+measured 207 pixels under zenity's height limit on the maintainer's
+machine and derived at about 125 on the runner, and
+`a_broker_run_shows_and_lists_its_origin_apart_from_its_base_path`, not
+measured), and `the_allow_for_note_counts_toward_the_height_limit`,
+whose one-character boundary a longer process id could move. An
+environment of the tests' own for the client, instead of the inherited
+one, would remove the variation that inherited variables bring; the test
+of the height boundary also has to allow for the requester's process ids
+and the layout of its process chain. Both are follow-up work, not done
+here.
+
+The publication and this first, failed run are recorded now, in the
+roadmap and in AGENTS.md as well; a run that passes will be recorded
+after it completes. GitHub's private vulnerability reporting, which
+SECURITY.md points to, was enabled on the repository the same day. The
+clean reinstall that the roadmap planned before publication was left to
+the maintainer, and nothing here records it as done.
+
+**Independent review (Codex, AI-assisted, 2026-11-19).** Recorded by the
+maintainer's agent from the reviewer's two deliverables: the reviewer
+confirmed the corrections and its verdict, and its own attempt to add
+this record stopped on a patch that did not apply.
+
+The initial verdict was **not ready**, with CI01–CI03 low, no serious
+defect in the product and no regression from the change. The
+confirmation on the staged tree is **ready**: the three are fixed and
+there is no new finding.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| CI01 — The new comment promised a margin "whatever the requester's environment": the client still inherits it, and with the runner's three variables and six more endpoint variables the changed test failed again ("4138 characters, limit 4000"). | Low | **Fixed and confirmed:** the comment claims room for the runner's three variables only, and says that the client still inherits the test process's environment. |
+| CI02 — The record said that an environment of the tests' own would remove the cause for all the other tests. The height-boundary test also varies with the requester's process ids: in a probe on a captured request, one id going from five to six digits moved the estimate from 880 to 899 pixels. | Low | **Fixed and confirmed:** the record says what such an environment removes, and that the follow-up must also cover process ids and the layout of the process chain. |
+| CI03 — Waiting for a run that passes before correcting the documents kept statements known to be false: the repository was published and its workflow had run. | Low | **Fixed and confirmed:** the roadmap and AGENTS.md record the publication and the first, failed run now; a run that passes is recorded after it completes. |
+
+The reviewer ran 33 cargo commands, one after another, in a temporary
+copy of the index with its own target directory and `TMPDIR`, offline,
+with Rust 1.99.1, `RUSTFLAGS="-D warnings"` and `CARGO_INCREMENTAL=0`,
+in an environment without the variables the agent's lists recognise. It
+reproduced the failure its own way: with the three variables the earlier
+tests failed (4,036 and 4,042 characters there), and the staged ones
+pass with and without them. The whole suites passed in that copy: 663
+tests with 2 ignored with all features, the 196 end-to-end tests among
+them, and 553 with 2 ignored without default features, with nothing left
+in `TMPDIR`. `cargo doc` with warnings denied exited zero for both
+feature sets, and a release check of the broker with its feature for
+tests was refused with the expected message.
+
+Measured by the reviewer's instrumentation, in characters and estimated
+pixels of height:
+
+| Request | Controlled environment | With the runner's three variables |
+|---|---|---|
+| First changed test | 2,387 / 1,349 | 2,536 / 1,431 |
+| Second changed test | 2,393 / 1,349 | 2,542 / 1,431 |
+| `a_broker_runs_destination_and_limits_are_checked_before_any_dialog` | 1,045 / 673 | 1,194 / 755 |
+| `a_broker_run_shows_and_lists_its_origin_apart_from_its_base_path` | 1,213 / 755 | 1,362 / 837 |
+
+So the three variables add 149 characters, the first broker test keeps
+125 pixels under zenity's 880 on the runner, and the second 43. The
+reviewer reran the three mutations in a temporary copy: M1 failed the
+first test with "the request was denied", M2 the second with "too tall
+to read at once", M3 the second at the new assertion; restored, both
+passed. It also showed what stays fragile: with the three variables,
+two more endpoint variables and a proxy, the first broker test failed
+at 935 pixels; and the process-id probe of CI02.
+
+The reviewer accepts leaving the other three tests to a follow-up, which
+must cover inherited variables and the requester's identity and process
+chain. Not checked by the reviewer: GitHub Actions itself, the runner's
+exact compiler and cache; formatting, clippy, the GTK and MSRV jobs;
+`cargo doc` with the workflow's exact flags; a real change of process
+id; Gemini's original runs. Its confirmation ran no cargo.
+
+**Final matrix (the maintainer's agent, Claude Code, AI-assisted,
+2026-11-19).** After the three corrections, the twelve checks of
+AGENTS.md ran on the staged tree, one after another, and all exited
+zero: `cargo test --all-features` passed 663 tests with 2 ignored (the
+descriptor-limit test's child rerun counted once),
+`cargo test --no-default-features` 553 with 2 ignored, the dialog's 9
+and the manager's 45. Whether the runner agrees is what the next run of
+the CI says.

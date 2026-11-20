@@ -2789,12 +2789,14 @@ fn every_unanswered_passwd_dialog_is_recorded_once_and_changes_nothing() {
 fn a_request_too_tall_to_read_at_once_is_refused() {
     let h = Harness::new();
     h.add_secret("T", "abcdefgh", &[]);
-    // Line breaks in an environment value are shown as escapes: 600 of them
-    // are 3000 characters, under the character limit, but far more lines
-    // than fit on the screen.
+    // Line breaks in an environment value are shown as escapes: 300 of them
+    // are 1500 characters, which leaves room for what the client's
+    // environment adds to the dialog on the CI's runner (its three
+    // GITHUB_*_URL variables) and is still far taller than zenity allows.
+    // The client still inherits the test process's environment.
     let out = h
         .cmd(&["run", "T", "--", "true"])
-        .env("GIT_SSH_COMMAND", "\n".repeat(600))
+        .env("GIT_SSH_COMMAND", "\n".repeat(300))
         .finish();
     assert_eq!(out.status.code(), Some(125));
     assert!(
@@ -2893,7 +2895,7 @@ fn a_dialog_that_scrolls_takes_what_is_too_tall_for_zenity() {
     h.decide(&[Decision::Deny]);
     let out = h
         .cmd(&["run", "WIDE", "--", "true"])
-        .env("GIT_SSH_COMMAND", "\n".repeat(600))
+        .env("GIT_SSH_COMMAND", "\n".repeat(300))
         .finish();
     assert_eq!(out.status.code(), Some(125));
     assert!(
@@ -2902,6 +2904,9 @@ fn a_dialog_that_scrolls_takes_what_is_too_tall_for_zenity() {
         text(&out.stderr)
     );
     assert_eq!(h.ui.approvals_asked.load(Ordering::SeqCst), 1);
+    // The approval that was asked is one that zenity could not have shown.
+    let request = h.ui.last_approval.lock().unwrap().clone().expect("asked");
+    assert!(rusthorse::ui::approval_too_tall(&request).is_some());
 }
 
 #[test]

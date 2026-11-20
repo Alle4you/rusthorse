@@ -9,8 +9,8 @@ file and the code disagree, stop and ask.
 
 Rusthorse is a local secrets vault (KeePass KDBX4) with an agent that lets
 programs — AI agents above all — **use** a secret without **seeing** it, after
-a human approves each use in a dialog. Status: 0.1.0, pre-release, not
-published.
+a human approves each use in a dialog. Status: 0.1.0, pre-release: the
+source is published on GitHub, and no release is.
 
 **Scope — the product is defined; do not add to it.** Rusthorse is a
 credential vault prepared for AI agents (README, "What it is"). The secret
