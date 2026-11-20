@@ -861,6 +861,7 @@ those uses, with L3–L5 ([ADR 0013](adr/0013-credential-broker.md#scope-amendme
 | 2026-11-19 | The first run of the CI, at publication: two end-to-end tests failed on the runner (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The tests assumed an environment; the agent's refusal was right. Tests only changed. See below. Reviewed the same day (Codex, AI-assisted): not ready with CI01–CI03 low, fixed, then ready. |
 | 2026-11-20 | The second run of the CI: the two corrected tests passed on the runner, and a third failed intermittently (diagnosed by a Claude Opus 5.5 subagent, fixed by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | A race in the test's own command, not in the agent: the grant was revoked first, as it must be. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI04 medium and CI05–CI06 low; CI04 and CI05 fixed, CI06 left as a follow-up; CI07 low found on confirmation and fixed; then ready. |
 | 2026-11-20 | The third run of the CI: the corrected test passed on the runner, and two tests of the broker's dialog failed for their height (designed by a Claude Opus 5.5 subagent, applied by Gemini, both AI-assisted; specified and checked by the maintainer's agent). | The cause of the first run's failures again: the client of the end-to-end tests inherited the machine's environment. It now has an environment of the tests' own. Tests only changed. See below. Reviewed (Codex, AI-assisted): not ready with CI08–CI12 low, fixed, then ready. |
+| 2026-11-20 | The fourth run of the CI (a record of its result; not a review). | All three jobs passed on `742a8ff`, the later steps of the test job for the first time on the runner. One passing run; see below for what it does not show. |
 
 Findings of the 2026-10-31 review and what was done:
 
@@ -5746,3 +5747,35 @@ after another, and all exited zero: `cargo test --all-features` passed
 counted once), `cargo test --no-default-features` 553 with 2 ignored,
 the dialog's 9 and the manager's 45. Whether the runner agrees is what
 the next run of the CI says.
+
+**2026-11-20 — The fourth CI run passed.**
+
+A record of a result, read by the maintainer's agent (Claude Code,
+AI-assisted) from GitHub; not a review. The fourth run of the workflow,
+on the push of `742a8ff` (2026-11-20 05:24 to 05:34 UTC), passed all
+three jobs:
+
+- the GTK clients: clippy, and the widget tests of the dialog and the
+  manager on a virtual display;
+- the minimum supported Rust version: both checks;
+- the default members: formatting, both clippy runs, and
+  `cargo test --all-features`, which had failed in each of the first
+  three runs; then, for the first time on the runner,
+  `cargo test --no-default-features`, the documentation with warnings
+  denied, and the release build that must refuse the broker's feature
+  for tests. Each test step ends by requiring an empty `TMPDIR`, and
+  passed.
+
+So the corrections of the three earlier entries hold on the runner for
+this run: the two tests of a request too tall, the test of revocation at
+the leader's exit, and the two tests of the broker's dialog, with the
+client of the end-to-end tests in an environment of the tests' own.
+
+What one passing run does not show. It is one run: the second run's
+failure was intermittent, and nothing here measures how often a test
+may still fail there. What the runner's environment holds is still not
+known. CI06, the process an older test leaves running for some thirty
+seconds, is open, and an empty `TMPDIR` does not show such a process.
+The directory and the process chain of a request still vary from
+machine to machine, within the margins recorded above. The roadmap now
+gives the CI as done, with these limits.
